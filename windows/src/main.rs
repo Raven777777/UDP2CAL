@@ -172,10 +172,11 @@ impl AppState {
                 }
                 self.last_bitrate = info.bitrate_kbps;
                 self.last_level_db = info.level_db;
-                if let Some(msg) = info.error_msg {
-                    self.status_text = msg.to_string();
-                }
-                // 【大刀阔斧删除】原逻辑这里每500ms调用一次 detect_vb_cable()，极度消耗性能
+                self.status_text = match info.error_msg {
+                    Some(msg) => msg.to_string(),
+                    None if self.connected => String::new(),
+                    None => self.status_text.clone(),
+                };
                 Task::none()
             }
             Message::Disconnected => {
@@ -377,6 +378,7 @@ fn udp_receiver_stream() -> impl iced::futures::Stream<Item = Message> {
         let mut rms_sum: f64 = 0.0;
         let mut rms_count: u64 = 0;
         let mut last_packet = Instant::now();
+        let mut was_disconnected = false;
 
         loop {
             if output.is_closed() {
@@ -392,9 +394,9 @@ fn udp_receiver_stream() -> impl iced::futures::Stream<Item = Message> {
             let (len, _src) = match result {
                 Ok(Ok(v)) => v,
                 _ => {
-                    if last_packet.elapsed() > std::time::Duration::from_secs(3) {
+                    if !was_disconnected && last_packet.elapsed() > std::time::Duration::from_secs(3) {
                         let _ = output.send(Message::Disconnected).await;
-                        break;
+                        was_disconnected = true;
                     }
                     continue;
                 }
@@ -415,6 +417,15 @@ fn udp_receiver_stream() -> impl iced::futures::Stream<Item = Message> {
             };
 
             last_packet = Instant::now();
+            // Android 重连后自动恢复连接状态
+            if was_disconnected {
+                was_disconnected = false;
+                let _ = output.send(Message::StatusUpdate(StatusInfo {
+                    bitrate_kbps: 0.0,
+                    level_db: -60.0,
+                    error_msg: Some("已重新连接"),
+                })).await;
+            }
             byte_count += len as u64;
 
             rb.insert_and_drain(h.seq_num, h.sample_rate, &buf[protocol::HEADER_SIZE..len], |sr, payload| {
