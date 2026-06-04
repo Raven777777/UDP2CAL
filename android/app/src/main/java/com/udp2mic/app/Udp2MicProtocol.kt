@@ -84,8 +84,7 @@ object Udp2MicProtocol {
     }
 
     /**
-     * 构建UDP音频包
-     * @param bitrate 编码码率(kbps)，0=auto让接收端使用默认码率显示
+     * 构建UDP音频包（分配新数组）
      */
     fun buildPacket(sampleRate: Byte, seqNum: Byte, payload: ByteArray, bitrate: Byte = BITRATE_AUTO): ByteArray {
         val len = minOf(payload.size, MAX_PAYLOAD)
@@ -99,5 +98,38 @@ object Udp2MicProtocol {
         encodeHeader(header, packet)
         System.arraycopy(payload, 0, packet, HEADER_SIZE, len)
         return packet
+    }
+
+    /**
+     * 构建UDP音频包（写入预分配缓冲区，零分配）
+     * @return 写入的字节数
+     */
+    fun buildPacketTo(dest: ByteArray, offset: Int, sampleRate: Byte, seqNum: Byte, payload: ByteArray, bitrate: Byte = BITRATE_AUTO): Int {
+        val len = minOf(payload.size, MAX_PAYLOAD)
+        require(offset + HEADER_SIZE + len <= dest.size) { "目标缓冲区不足" }
+        dest[offset] = (((1 and 0x01) shl 7) or ((1 and 0x07) shl 4) or (sampleRate.toInt() and 0x0F)).toByte()
+        dest[offset + 1] = seqNum
+        dest[offset + 2] = (len shr 8).toByte()
+        dest[offset + 3] = len.toByte()
+        dest[offset + 4] = bitrate
+        dest[offset + 5] = 0
+        System.arraycopy(payload, 0, dest, offset + HEADER_SIZE, len)
+        return HEADER_SIZE + len
+    }
+
+    /**
+     * 在预分配缓冲区写入 UDP 包头（负载已在 dest[payloadOffset] 中）
+     * 与 encoderEncodeTo 搭配使用，实现 Pipeline 完全零分配
+     * @return 包头 + 负载总字节数
+     */
+    fun writeHeader(dest: ByteArray, headerOffset: Int, payloadLen: Int, sampleRate: Byte, seqNum: Byte, bitrate: Byte = BITRATE_AUTO): Int {
+        require(headerOffset + HEADER_SIZE + payloadLen <= dest.size) { "目标缓冲区不足" }
+        dest[headerOffset] = (((1 and 0x01) shl 7) or ((1 and 0x07) shl 4) or (sampleRate.toInt() and 0x0F)).toByte()
+        dest[headerOffset + 1] = seqNum
+        dest[headerOffset + 2] = (payloadLen shr 8).toByte()
+        dest[headerOffset + 3] = payloadLen.toByte()
+        dest[headerOffset + 4] = bitrate
+        dest[headerOffset + 5] = 0
+        return HEADER_SIZE + payloadLen
     }
 }

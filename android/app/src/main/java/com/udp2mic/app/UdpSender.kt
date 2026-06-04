@@ -32,6 +32,18 @@ class UdpSender(
         }
     }
 
+    /** 发送缓冲区中的一段，消除 sendBuffer.copyOf()，实现 Pipeline 完全零分配 */
+    suspend fun send(data: ByteArray, offset: Int, length: Int): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val sock = socket ?: return@withContext false
+            val addr = InetAddress.getByName(host)
+            sock.send(DatagramPacket(data, offset, length, addr, port))
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun close() {
         try { socket?.close() } catch (_: Exception) {}
         socket = null

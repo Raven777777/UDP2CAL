@@ -17,6 +17,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.udp2mic.app.service.CaptureService
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     companion object { private const val TAG = "MainActivity" }
@@ -54,7 +56,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Prefs.init(this)
+        Prefs.init(applicationContext)
         bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) 
@@ -122,6 +124,8 @@ fun MainScreen(
     var agcMaxGain by remember { mutableStateOf(Prefs.agcMaxGain) }
     var negSr by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf("") }
+    var isSearching by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var agcGainDb by remember { mutableStateOf(0f) }
     var ngActive by remember { mutableStateOf(false) }
     var agcGainX by remember { mutableStateOf(0f) }
@@ -145,19 +149,45 @@ fun MainScreen(
             label = { Text("目标 IP") }, singleLine = true,
             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
                 if (!fs.isFocused) { Prefs.targetIp = targetIp }
+            },
+            trailingIcon = {
+                Box(modifier = Modifier.clickable(enabled = !isSearching) {
+                    scope.launch {
+                        isSearching = true
+                        errorMsg = "正在搜索局域网内的PC端..."
+                        val result = DiscoveryManager.discoverServer()
+                        if (result != null) {
+                            targetIp = result.first
+                            targetPort = result.second.toString()
+                            Prefs.targetIp = result.first
+                            Prefs.targetPort = result.second
+                            errorMsg = "已自动连接到 PC: ${result.first}:${result.second}"
+                        } else {
+                            errorMsg = "未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下"
+                        }
+                        isSearching = false
+                    }
+                }) {
+                    Icon(
+                        imageVector = AutorenewIcon,
+                        contentDescription = "自动搜索",
+                        tint = if (isSearching) Color(0xFF888888) else Color(0xFF00B0FF),
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             })
 
         OutlinedTextField(value = targetPort, onValueChange = { targetPort = it },
             label = { Text("端口") }, singleLine = true,
             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
-                if (!fs.isFocused) { Prefs.targetPort = targetPort.toIntOrNull() ?: 8899 }
+                if (!fs.isFocused) { Prefs.targetPort = targetPort.toIntOrNull() ?: 44044 }
             })
 
         Spacer(Modifier.height(4.dp))
 
         Button(onClick = {
             if (isRunning) { onStop() }
-            else { val p = targetPort.toIntOrNull() ?: 8899; onStart(targetIp, p, testToneMode, noiseGate) }
+            else { val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p, testToneMode, noiseGate) }
         }, modifier = Modifier.fillMaxWidth().height(48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFD32F2F) else Color(0xFF00C853))
         ) { Text(if (isRunning) "停止采集" else "开始采集", fontSize = 18.sp) }
@@ -167,7 +197,7 @@ fun MainScreen(
             Switch(checked = testToneMode, onCheckedChange = {
                 testToneMode = it; Prefs.testToneMode = it
                 if (it) { noiseGate = false; Prefs.noiseGate = false }
-                if (isRunning) { onStop(); val p = targetPort.toIntOrNull() ?: 8899; onStart(targetIp, p, it, noiseGate) }
+                if (isRunning) { onStop(); val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p, it, noiseGate) }
             }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFFFF9800)))
         }
 

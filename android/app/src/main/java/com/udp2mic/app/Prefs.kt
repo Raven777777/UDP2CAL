@@ -16,7 +16,7 @@ object Prefs {
         set(v) = prefs.edit().putString("target_ip", v).apply()
 
     var targetPort: Int
-        get() = prefs.getInt("target_port", 8899)
+        get() = prefs.getInt("target_port", 44044)
         set(v) = prefs.edit().putInt("target_port", v).apply()
 
     var testToneMode: Boolean

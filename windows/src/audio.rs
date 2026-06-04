@@ -48,9 +48,11 @@ impl AudioWriter {
                 let consume_rate = fill_delta / dt; // + = buffer shrinking
                 let produce_rate = self.device_rate as f64 - consume_rate;
                 
-                if produce_rate > 1000.0 {
+                if produce_rate > 1000.0 && produce_rate.is_normal() {
                     let measured = self.device_rate as f64 / produce_rate;
-                    self.drift_ratio = self.drift_ratio * 0.7 + measured * 0.3; // EMA α=0.3
+                    if measured.is_finite() && measured > 0.5 && measured < 1.5 {
+                        self.drift_ratio = self.drift_ratio * 0.7 + measured * 0.3; // EMA α=0.3
+                    }
                 }
             }
 
@@ -228,7 +230,7 @@ pub fn start_audio() -> Result<AudioWriter, String> {
     let now = Instant::now();
     match err_rx.recv() {
         Ok(Some(e)) => Err(e),
-        Ok(None) => Ok(AudioWriter {
+        Ok(None) =>         Ok(AudioWriter {
             buf,
             device_rate: actual_rate,
             resample_count: 0,
@@ -237,6 +239,8 @@ pub fn start_audio() -> Result<AudioWriter, String> {
             total_compensated: 0,
             drift_ratio: 1.0,
             phase: 0.0,
+            // 初始化为 1.0，首次 write 时若 source_rate != device_rate 会在 3s EMA 前使用此值，
+            // 但大部分场景下两者相等（均为 48kHz），故 1.0 作为安全起始值
             effective_ratio: 1.0,
             last_ratio_update: now,
             last_fill_sample: initial_fill,

@@ -1,5 +1,5 @@
 ﻿# UDP2Mic 项目文档
-> 最后更新: 2026-06-04 | 状态: **v1.0.4 — 并发安全、免重启热更新、无缝热重连**
+> 最后更新: 2026-06-05 | 状态: **v1.0.6 — Windows 端边缘场景容错强化、竞态消除、NaN 防线**
 
 > 项目简介与快速开始见根目录: [README.md](../README.md)
 
@@ -7,12 +7,11 @@
 
 UDP2Mic 是一个局域网麦克风系统：
 
-
 ```
-Android 手机 → [AGC (动态平滑)] → [噪声门] → Opus (CBR/VBR 热调节) → UDP (热重连) → Windows PC → WASAPI → VB-Cable
+Android 手机 → [AGC (样点级插值平滑)] → [噪声门] → Opus (CBR/VBR 热调节) → UDP (热重连 + 广播自动发现) → Windows PC → WASAPI → VB-Cable
 ```
 
-**双端均已编译通过。RNN/TFLite 降噪已彻底移除，当前管线为 纯动态 AGC + 噪声门。**
+**Pipeline 已实现 ByteArray + ShortArray 完全零堆分配（仅池热身期 3 次构造）。双端均已编译通过。**
 
 ---
 
@@ -26,6 +25,8 @@ build_windows.bat
 ```
 
 **前提**: Rust 1.96+, VS Build Tools 2022 (C++桌面开发), CMake 3.22+
+
+> 若使用 CMake ≥ 4.0，编译前需设置环境变量 `CMAKE_POLICY_VERSION_MINIMUM=3.5`，否则 `audiopus_sys` 构建脚本会因 CMake 版本兼容性检查失败。
 
 ### Android
 
@@ -52,20 +53,22 @@ build_android.bat
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
 | **UI 层** | Jetpack Compose | 采用 `Flow` 细粒度订阅与局部缓存变量，杜绝高频重绘引发的滑块卡顿 |
-| **网络层** | Kotlin Coroutines + UDP Socket | 动态比对 `Prefs`。网络配置改变时，在处理帧隙**静默关闭并无缝重连**，不断音频流 |
-| **音频采集** | AudioRecord (MediaRecorder.AudioSource.UNPROCESSED) | 硬件流常驻，除非切换测试音算法，否则在 App 生命周期内绝不物理销毁重建 |
-| **核心算法** | 智能解耦 AGC + 动态追踪噪声门 | 攻击/释放非对称平滑，自动上限锁定 100x。关闭转开启时边缘触发重置为 10x |
-| **编码层** | libopus (JNI 绑定) | **JNI 线程同步互斥锁保护**。参数指纹 Hash 变更时执行毫秒级原地 `update` |
+| **网络层** | Kotlin Coroutines + UDP Socket | 动态比对 `Prefs`，静默热重连不断流。支持 UDP 广播自动发现 |
+| **音频采集** | AudioRecord (UNPROCESSED) | **生产-消费双协程** + `ShortArrayPool` 帧复用，零分配 |
+| **核心算法** | 智能解耦 AGC + 动态追踪噪声门 | **样点级线性插值平滑**消除帧边界爆音，自动上限 100x |
+| **编码层** | libopus (JNI) | **`encoderEncodeTo` 直接写入 & 双重边界守卫** + `@Synchronized` 互斥锁 |
+| **发送层** | UDP DatagramSocket | **乒乓缓冲区 + `send(offset,length)` 零拷贝**，防脏数据 |
 
 ---
 
-## 自动协商与热同步机制 (v1.0.4)
+## 自动协商与热同步机制 (v1.0.5)
 | 协商项 | 策略 |
 | --- | --- |
-| 采样率 | 固定使用 48kHz（按 48k→24k→16k→8k 优先级硬匹配） |
-| 自动码率安全防线 | `Prefs` 码率为 0 时激活。根据采样率动态分配合理默认值（48kHz 对应 64kbps），防止向 JNI 传递 0kbps 导致死锁 |
-| 传输机制 | 码率和采样率通过 6 字节包头实时打包传给接收端，无需带外协商 |
-| 接收端解析 | `protocol::resolve_bitrate()` 自动解析; 5个独立 Opus 解码器; AudioWriter 自动重采样 |
+| 采样率 | 固定 48kHz（48k→24k→16k→8k 优先级硬匹配） |
+| 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值 |
+| 传输机制 | 6 字节包头（Big-Endian）实时携带码率/采样率 |
+| 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 重采样 |
+| **局域网自动发现** | Windows 监听 44043，回复 `"UDP2MIC_REPLY:{port}"`。Android 端 IP 框右侧图标一键搜索 |
 
 ---
 
@@ -79,6 +82,7 @@ build_android.bat
 | 防火墙规则 | `UDP2Mic 局域网麦克风` |
 | 单实例互斥锁 | `UDP2Mic_SingleInstance_Mutex` |
 | 线程名 | `udp2mic-audio`, `udp2mic-fw` |
+| 发现服务端口 | `44043` |
 | Android 包名 | `com.udp2mic.app` |
 | SharedPreferences | `udp2mic_prefs` |
 | 通知频道 | `udp2mic_capture` |

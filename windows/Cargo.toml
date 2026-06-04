@@ -1,6 +1,6 @@
 [package]
 name = "udp2mic"
-version = "1.0.0"
+version = "1.0.6"
 edition = "2021"
 description = "UDP2Mic - 局域网麦克风Windows接收端"
 build = "build.rs"
@@ -24,6 +24,7 @@ cpal = "0.15"
 windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging",

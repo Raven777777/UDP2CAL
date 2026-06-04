@@ -18,7 +18,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             listen_ip: "0.0.0.0".into(),
-            listen_port: 8899,
+            listen_port: 44044,
             auto_start: 0,
             float_window_enable: 1,
             float_window_x: 100,
@@ -28,6 +28,10 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn is_auto_start(&self) -> bool {
+        self.auto_start != 0
+    }
+
     pub fn load() -> Self {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = match hkcu.open_subkey_with_flags(REG_PATH, KEY_READ) {
@@ -39,7 +43,7 @@ impl Config {
         };
         Self {
             listen_ip: get_string(&path, "listen_ip", "0.0.0.0"),
-            listen_port: get_dword(&path, "listen_port", 8899),
+            listen_port: get_dword(&path, "listen_port", 44044),
             auto_start: get_dword(&path, "auto_start", 0),
             float_window_enable: get_dword(&path, "float_window_enable", 1),
             float_window_x: get_dword(&path, "float_window_x", 100) as i32,

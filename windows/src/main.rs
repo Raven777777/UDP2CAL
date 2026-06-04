@@ -13,7 +13,7 @@ use iced::{Alignment, Element, Length, Subscription, Task, Theme, Color};
 use iced::futures::SinkExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK, MB_ICONINFORMATION};
@@ -45,6 +45,7 @@ struct AppState {
     config: config::Config,
     ip_input: String,
     port_input: String,
+    port_valid: bool,
     is_running: bool,
     connected: bool,
     last_bitrate: f32,
@@ -54,6 +55,47 @@ struct AppState {
     float_window_enabled: bool,
     fw_level: Arc<AtomicU32>,
     fw_visible: Arc<AtomicBool>,
+    last_toggle_instant: Instant,
+}
+
+/// 局域网广播发现监听线程
+/// 监听 44043 端口，收到 "UDP2MIC_DISCOVER" 后回复 "UDP2MIC_REPLY:{audio_port}"
+pub fn start_broadcast_listener(audio_port: u16) {
+    std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:44043") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Discovery] 绑定广播端口失败: {}", e);
+                return;
+            }
+        };
+
+        println!("[Discovery] 自动发现服务已启动，监听端口 44043...");
+
+        let mut buf = [0u8; 1024];
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((amt, src)) => {
+                    let msg = String::from_utf8_lossy(&buf[..amt]);
+
+                    if msg.trim() == "UDP2MIC_DISCOVER" {
+                        println!("[Discovery] 收到来自手机的搜索请求: {}", src);
+
+                        let reply_msg = format!("UDP2MIC_REPLY:{}", audio_port);
+
+                        if let Err(e) = socket.send_to(reply_msg.as_bytes(), src) {
+                            eprintln!("[Discovery] 回复手机失败: {}", e);
+                        } else {
+                            println!("[Discovery] 已成功回复手机: {}", reply_msg);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Discovery] 接收广播包错误: {}", e);
+                }
+            }
+        }
+    });
 }
 
 fn main() -> Result<(), iced::Error> {
@@ -78,6 +120,9 @@ fn main() -> Result<(), iced::Error> {
         let _ = firewall::add_firewall_rule();
     });
 
+    // 启动局域网广播发现服务（监听 44043 端口）
+    start_broadcast_listener(config::Config::load().listen_port as u16);
+
     let fw = float::FloatWindow::new();
     let fw_level = fw.level.clone();
     let fw_visible = fw.visible.clone();
@@ -94,9 +139,11 @@ fn main() -> Result<(), iced::Error> {
         })
         .run_with(move || {
             let cfg = config::Config::load();
+            let now = Instant::now();
             let state = AppState {
                 ip_input: cfg.listen_ip.clone(),
                 port_input: cfg.listen_port.to_string(),
+                port_valid: true,
                 is_running: false,
                 connected: false,
                 last_bitrate: 0.0,
@@ -107,6 +154,7 @@ fn main() -> Result<(), iced::Error> {
                 fw_level,
                 fw_visible,
                 config: cfg,
+                last_toggle_instant: now,
             };
             (state, Task::none())
         })
@@ -131,6 +179,9 @@ impl AppState {
             }
             Message::PortChanged(s) => {
                 self.port_input = s;
+                // 实时校验端口号合法性
+                self.port_valid = self.port_input.parse::<u16>().is_ok()
+                    || self.port_input.is_empty();
                 Task::none()
             }
             Message::ToggleAutoStart(enabled) => {
@@ -146,6 +197,12 @@ impl AppState {
             }
 
             Message::ToggleRunning => {
+                // 200ms 防抖，防止快速双击导致多实例冲突
+                if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
+                    return Task::none();
+                }
+                self.last_toggle_instant = Instant::now();
+
                 if self.is_running {
                     self.is_running = false;
                     self.connected = false;
@@ -153,8 +210,20 @@ impl AppState {
                     self.last_level_db = -60.0;
                     self.status_text.clear();
                 } else {
+                    // 端口合法性校验
+                    let port: u16 = match self.port_input.parse() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.status_text = "端口号无效，请输入 1-65535".into();
+                            return Task::none();
+                        }
+                    };
+                    if port == 0 {
+                        self.status_text = "端口号不能为 0".into();
+                        return Task::none();
+                    }
                     self.config.listen_ip = self.ip_input.clone();
-                    self.config.listen_port = self.port_input.parse().unwrap_or(8899);
+                    self.config.listen_port = port as u32;
                     let _ = self.config.save();
                     self.is_running = true;
                     self.connected = false;
@@ -234,7 +303,7 @@ impl AppState {
         };
 
         let btn_c = if self.is_running { red } else { accent };
-        let auto_c = if self.config.auto_start != 0 { accent } else { grey };
+        let auto_c = if self.config.is_auto_start() { accent } else { grey };
         let flt_c = if self.float_window_enabled { accent } else { grey };
 
         let db = self.last_level_db.max(-60.0).min(0.0);
@@ -265,9 +334,23 @@ impl AppState {
                                 .on_input(Message::IpChanged)
                                 .width(140),
                             text(" : ").size(16).color(dim),
-                            text_input("8899", &self.port_input)
+                            text_input("44044", &self.port_input)
                                 .on_input(Message::PortChanged)
-                                .width(64),
+                                .width(64)
+                                .style(move |_, status| {
+                                    let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status);
+                                    iced::widget::text_input::Style {
+                                        border: iced::Border {
+                                            color: if self.port_valid {
+                                                base.border.color
+                                            } else {
+                                                iced::Color::from_rgb(0.95, 0.25, 0.30) // 红色边框
+                                            },
+                                            ..base.border
+                                        },
+                                        ..base
+                                    }
+                                }),
                         ]
                         .align_y(Alignment::Center)
                     },
@@ -296,7 +379,7 @@ impl AppState {
                     mk(
                         "自启",
                         auto_c,
-                        Message::ToggleAutoStart(!(self.config.auto_start != 0)),
+                        Message::ToggleAutoStart(!self.config.is_auto_start()),
                     )
                     .width(Length::FillPortion(1)),
                     Space::new(8, 0),
@@ -307,6 +390,8 @@ impl AppState {
                     )
                     .width(Length::FillPortion(1)),
                 ],
+                Space::new(0, 4),
+                text("广播地址 255.255.255.255:44043").size(10).color(grey),
             ]
             .padding(18),
         )
@@ -322,18 +407,19 @@ impl AppState {
     fn subscription(&self) -> Subscription<Message> {
         let tick = iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::Tick);
         if self.is_running {
-            Subscription::batch([tick, Subscription::run_with_id(UdpReceiverId, udp_receiver_stream())])
+            let ip = self.config.listen_ip.clone();
+            let port = self.config.listen_port;
+            Subscription::batch([tick, Subscription::run_with_id(UdpReceiverId, udp_receiver_stream(ip, port))])
         } else {
             tick
         }
     }
 }
 
-fn udp_receiver_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(64, |mut output| async move {
+fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(64, move |mut output| async move {
 
-        let cfg = config::Config::load();
-        let bind_addr = format!("{}:{}", cfg.listen_ip, cfg.listen_port);
+        let bind_addr = format!("{}:{}", listen_ip, listen_port);
 
         let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
             Ok(s) => s,

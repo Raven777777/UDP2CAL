@@ -1,6 +1,6 @@
 ﻿[package]
 name = "udp2mic-protocol"
-version = "1.0.0"
+version = "1.0.6"
 edition = "2021"
 description = "UDP2Mic 私有协议编解码 (Rust实现)"
 

@@ -58,6 +58,28 @@ class OpusEncoder(
         }
     }
 
+    /**
+     * 编码到预分配缓冲区（完全零分配版本）
+     * JNI 层直接将 Opus 压缩数据写入 dest[offset+HEADER_SIZE]，
+     * 然后由 writeHeader 原地写入 6 字节包头，无任何 ByteArray new。
+     * @return 写入的字节数（HEADER_SIZE + payload），失败返回 -1
+     */
+    @Synchronized
+    fun encodeTo(pcm: ShortArray, dest: ByteArray, offset: Int): Int {
+        val h = handle; if (h == 0L) return -1
+        return try {
+            val payloadOffset = offset + Udp2MicProtocol.HEADER_SIZE
+            val nbBytes = OpusNative.encoderEncodeTo(h, pcm, dest, payloadOffset)
+            if (nbBytes < 0) return -1
+            val written = Udp2MicProtocol.writeHeader(dest, offset, nbBytes, sampleRateId, seqNum++, bitrateId)
+            encodeCount++
+            written
+        } catch (e: Exception) {
+            Log.e(TAG, "EncodeTo failed", e)
+            -1
+        }
+    }
+
     @Synchronized
     fun update(complexity: Int, signalType: Int, bandwidth: Int, dtx: Int, vbr: Int, bitrateKbps: Int): Boolean {
         val h = handle; if (h == 0L) return false

@@ -1,50 +1,104 @@
 # UDP2Mic — 局域网麦克风
 
-UDP2Mic 是一个轻量级的局域网麦克风解决方案，支持 Android 端采集（AGC、噪声门）并通过 Opus 编码经 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable）供任意应用使用。
+> **当前版本: v1.0.6** — Windows 端边缘场景容错强化、竞态消除、NaN 防线
 
-目标用户：需要在局域网内将手机作为麦克风发送音频到 Windows 主机的开发者与个人用户。
+## 概述
 
-主要特性：
-- 低延迟 Opus CBR 编码（20ms 帧）
-- 自适应采样率与码率（48k/24k/16k/8k）
-- 音频处理链：AGC、噪声门
-- Windows 端使用 `iced` UI，支持悬浮窗与注册表配置
-- 协议实现为独立 crate：`protocol/`（唯一协议真源）
+```
+Android 手机 → AGC → 噪声门 → Opus 编码 → UDP (广播自动发现) → Windows PC → WASAPI → VB-Cable → 任意应用
+```
 
-快速开始
+UDP2Mic 是一个**工业级稳定、低延迟**的局域网麦克风系统。Android 端采集音频，经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。
 
-Windows（在项目根目录运行）：
+**全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。双端均已编译通过。
+
+## 主要特性
+
+### Android 发送端
+- **生产-消费双协程**：独占线程 `AudioRecord.read()` + `Channel` 投递消费者，消除饥饿
+- **全链路零堆分配**：`ShortArrayPool` 帧复用 + 乒乓发送缓冲区 + `encoderEncodeTo` 直接写入
+- **智能 AGC**：样点级线性插值平滑，消除帧边界爆音，自动上限 100x
+- **动态追踪噪声门**
+- **Opus CBR/VBR 热调节**：5 种采样率（48k/24k/16k/12k/8k）自适应协商
+- **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
+- **网络无缝热重连**：改 IP 不重启录音流
+- **UDP 广播自动发现**：一键搜索局域网内的 Windows 接收端
+
+### Windows 接收端
+- **Rust + iced 原生 UI**：暗色主题，悬浮窗实时音量显示
+- **5 独立 Opus 解码器**：支持所有采样率无缝切换
+- **相位连续流式重采样**：EMA 自适应漂移补偿，±0.2% 区间防止变调
+- **VB-Cable 自动检测**：无虚拟声卡时回退到默认输出设备
+- **局域网广播发现服务**：监听 44043 端口，自动回复手机搜索请求
+- **注册表持久化配置**：开机自启、悬浮窗位置、监听地址
+- **Windows 防火墙自动放行**
+- **单实例互斥锁检测**
+
+## 快速开始
+
+### Windows（项目根目录运行）
 
 ```powershell
 .\build_windows.bat
+# 产物: udp2mic.exe
 ```
 
-Android（在项目根目录运行）：
+**先决条件**: Rust 1.96+、VS Build Tools 2022 (C++桌面开发)、CMake 3.22+
+
+> 若使用 CMake ≥ 4.0，编译前需设置 `$env:CMAKE_POLICY_VERSION_MINIMUM="3.5"`。
+
+### Android（项目根目录运行）
 
 ```powershell
 .\build_android.bat
+# 产物: udp2mic-release.apk
 ```
 
-先决条件（摘要）
-- Rust 1.96+、VS Build Tools 2022、CMake 3.22+
-- Android: JDK 17、Android SDK 35、NDK 27.0.12077973
+**先决条件**: JDK 17 (Temurin)、Android SDK 35、NDK 27.0.12077973
 
-更多细节请参阅：
-- 项目构建与技术细节： `docs/build.md`
-- 交接与内部实现细节： `docs/handover.md`
-- 协议规范： `protocol/README.md`
+> 构建脚本会自动将产物复制到项目根目录。
 
-文件结构（简要）
+## 文件结构
 
 ```
 udp2mic/
 ├─ android/        # Android 发送端（Kotlin + JNI Opus）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
-├─ protocol/       # UDP 协议（Rust crate，唯一真源）
-├─ docs/           # 项目文档
+│  ├─ src/
+│  │  ├─ main.rs       # 主循环与 iced UI
+│  │  ├─ audio.rs      # WASAPI 输出 + 流式重采样
+│  │  ├─ config.rs     # 注册表配置读写
+│  │  ├─ decoder.rs    # Opus 解码器封装
+│  │  ├─ float.rs      # 悬浮窗线程（Win32 GDI）
+│  │  ├─ firewall.rs   # 防火墙规则
+│  │  └─ protocol.rs   # 协议重新导出
+│  └─ Cargo.toml
+├─ protocol/       # UDP 协议编解码（Rust crate，唯一真源）
+├─ docs/
+│  ├─ build.md         # 项目构建与技术细节
+│  └─ handover.md      # 架构精要与避坑指南
 ├─ build_windows.bat
 ├─ build_android.bat
-└─ README.md       # 本文件
+└─ README.md
 ```
 
-如需贡献或运行问题，请先阅读 `docs/handover.md`。谢谢使用！
+## 更多文档
+
+| 文档 | 内容 |
+| --- | --- |
+| `docs/build.md` | 编译方法、技术栈、自动协商机制、命名约定 |
+| `docs/handover.md` | 架构精要、双协程流水线、零分配实现、JNI 防卫、Changelog |
+| `protocol/README.md` | 协议规范 |
+
+## 命名约定
+
+| 项目 | 值 |
+| --- | --- |
+| 项目/EXE/APK | `UDP2Mic` / `udp2mic.exe` |
+| Rust crate | `udp2mic` / `udp2mic-protocol` |
+| 注册表 | `HKCU\Software\UDP2Mic` |
+| 开机自启 Run 键 | `UDP2Mic` |
+| 防火墙规则 | `UDP2Mic 局域网麦克风` |
+| 单实例互斥锁 | `UDP2Mic_SingleInstance_Mutex` |
+| 发现服务端口 | `44043` |
+| Android 包名 | `com.udp2mic.app` |

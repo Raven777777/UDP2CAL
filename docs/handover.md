@@ -1,19 +1,18 @@
 # UDP2Mic AI 继任者指南
 > 写给下一个接手这个项目的 AI / 开发者
-> 最后更新: 2026-06-04 | 状态: **v1.0.4 — 高并发安全、免重启热更新、无缝热重连**
+> 最后更新: 2026-06-05 | 状态: **v1.0.6 — Windows 端边缘场景容错强化、竞态消除、NaN 防线**
 
 ## 一、你现在接手的是什么
 
-一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持高级智能 AGC 与动态噪声门：
-
+一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持智能 AGC 与动态噪声门：
 
 ```
-[Android 手机] ──{非对称AGC → 噪声门}──→ Opus 线程锁 ──→ UDP热重连 ──→ [Windows PC] ──WASAPI──→ [VB-Cable]
+[Android 手机] ──{生产→消费双协程}──→ AGC样点插值 → 噪声门 → Opus完全零分配编码 → UDP零分配发送 → [Windows PC] ──WASAPI──→ [VB-Cable]
 ↓
 微信/Zoom/OBS/游戏
 ```
 
-**双端均已编译通过。无任何残留的神经网络降噪，全管线高度精简。**
+**双端均已编译通过。无任何残留的神经网络降噪。ByteArray + ShortArray 全链路完全零堆分配（仅池热身期 3 次构造）。**
 
 ---
 
@@ -41,42 +40,217 @@ build_android.bat
 
 ## 三、架构精要与并发避坑指南（核心技术资产）
 
-### 1. JNI 与音频流的高并发互斥防线（防闪退）
-在 `CaptureService.kt` 的 `while(isActive)` 循环体（IO 协程线程池）中，系统会极高频地调用 `encoder?.encode(...)`。与此同时，用户可能在 UI 二级菜单中疯狂滑动或切换属性，触发 `encoder?.update(...)`。
+### 1. 生产-消费双协程音频流水线（v1.0.5 新架构）
+过去 `AudioRecord.read()` 与 AGC/编码/发送串行在同一协程中，硬件阻塞读会导致后续处理错过最佳时机，造成缓冲区溢出（爆音）。
 
-* **核心防线**：`OpusEncoder.kt` 中的 `encode`、`update`、`start` 和 `stop` 方法全部强制加有 **`@Synchronized` 锁挡板**。这确保了底层的 C++ 指针句柄（`handle`）绝不会被两个线程同时操作，彻底封死了因内存越界导致系统爆出 `SIGSEGV (Fatal Signal 11)` 闪退的隐患。
+* **生产者协程**（`Dispatchers.IO`）：独占线程只做 `AudioRecord.read()` + 帧组装，通过 `Channel<ShortArray>(3)` 投递给消费者
+* **消费者协程**：从 Channel 取帧，串行执行 AGC → 编码参数更新 → 噪声门 → 编码 → UDP 发送
+* **Channel 容量 3**：提供 60ms 缓冲并行度，同时天然提供背压防止无限堆积
 
-### 2. 免重启音频管线与“无缝热重连”
-过去任何参数（IP、端口、音频属性）的修改都需要彻底掐断 `AudioRecord` 硬件流并重启协程。现在已被全面改造为**数据驱动架构**：
+### 2. Pipeline 完全零分配（ByteArray + ShortArray 双闭环）（v1.0.5 终极优化）
+**核心思路**：整个 Pipeline 中没有任何 `ByteArray` 或 `ShortArray` 的 `new`/`copyOf`（池热身期除外）。
 
-* **网络热重连**：当用户修改主界面的“目标 IP”或“端口”时，`MainActivity` 仅将数据写入 `Prefs`，**绝不调用 restart()**。`CaptureService` 在每一帧的交替间隙会进行 `Hash` 挡板比对，发现网络变更后原地静默销毁并重建 `UdpSender`，麦克风和编码器全程保持常驻。
-* **参数热更新**：Opus 二级菜单的所有参数更改同样通过计算参数指纹（`Hash`）边缘触发。在不破坏当前帧状态的前提下，通过 JNI 的 `encoderUpdate` 实时灌入底层。
+#### a) JNI 层 `encoderEncodeTo` — 写入预分配缓冲区
+```c
+// opus_jni.c — 不走 NewByteArray，直接 memcpy 到 dest
+jbyte* destBytes = (*env)->GetByteArrayElements(env, dest, NULL);
+memcpy(destBytes + offset, packet, nbBytes);
+(*env)->ReleaseByteArrayElements(env, dest, destBytes, 0);
+return nbBytes;
+```
 
-### 3. 智能 AGC 与滑块的彻底解耦
-* **边缘触发重置**：当 AGC 状态从“关闭”切到“开启”的瞬间，系统触发边缘检测，直接清空旧的 RMS 蓄水池并将增益重置到健康的 **10.0x** 启动点，避免直接继承用户之前在固定模式下拉出的 200x 巨型暴音。
-* **上限绝对独立**：自动 AGC 的动态调整上限被死死限制在 **100.0x**（防止硬件啸叫与过载），手动固定增益滑块的范围为 `0~200x`，两者在算法内部彻底解耦。
+#### b) `Udp2MicProtocol.writeHeader` — 原地写入包头
+```kotlin
+// 负载已在 dest 中，仅写入 6 字节包头
+fun writeHeader(dest, headerOffset, payloadLen, sampleRate, seqNum, bitrate): Int
+```
 
-### 4. Compose 状态流高频重绘优化
-* **问题背景**：`CaptureService` 每秒会向 `StateFlow` 抛出包含 `bitrateKbps`、`agcGainDb` 的全新大状态实例。
-* **优化策略**：`MainActivity` 内部的 `MainScreen` 通过 `LaunchedEffect` 精细化监听并分流赋值给局部 `remember` 变量，避免了每秒一次的全局强刷对 UI 组件（如用户正在拖动的 Slider）造成卡顿或跳变。
+#### c) `UdpSender.send(data, offset, length)` — 零拷贝发送
+```kotlin
+sock.send(DatagramPacket(data, offset, length, addr, port))  // 无需 copyOf
+```
 
-### 5. Opus 编码器 DTX 与 VBR 级联约束
-* **底层冲突**：Opus 官方标准中，不连续传输（DTX）必须基于动态码率（VBR）的信噪比评估。若强行在开启 DTX 时灌入 CBR (VBR=0)，底层控制权会被无视。
-* **解决策略**：App 采取“前端 UI 级联禁用 + 后台 Hash 挡板强控”的双流防线。当 DTX 开启时，VBR 切换自动锁定并强置为开，封死底层逻辑矛盾。
+#### d) `ShortArrayPool` — 帧复用池（线程安全）
+```kotlin
+private class ShortArrayPool(val frameSize: Int, val capacity: Int = 3) {
+    private val pool = arrayOfNulls<ShortArray>(capacity)
+    private var head = 0
+    private var count = 0
+
+    @Synchronized fun borrow(): ShortArray  // 生产者：从池中借出
+    @Synchronized fun recycle(buf: ShortArray)  // 消费者：处理完归还
+}
+```
+生产者不再 `pcmAccum.copyOf()`，而是从池中 `borrow()` 一块缓冲区直接发送。消费者处理完后 `recycle()` 回池。**仅池空时（热身期前3帧）触发 ShortArray 构造**，之后永久零分配。
+
+#### e) 乒乓发送缓冲区 — 防脏数据
+```kotlin
+val sendBuffers = arrayOf(ByteArray(MAX_PACKET), ByteArray(MAX_PACKET))
+var bufIndex = 0
+// 每帧轮换：当前帧用 bufIndex，下一帧自动切换
+val buf = sendBuffers[bufIndex]; bufIndex = (bufIndex + 1) % 2
+encoder?.encodeTo(frame, buf, 0)
+udpSender?.send(buf, 0, written)
+```
+两块缓冲区交替使用，发送中的缓冲区不会被下一帧擦写。
+
+#### f) 完整 Pipeline 分配图
+```
+AudioRecord.read → pcmBuffer (栈复用)
+    ↓
+accumBuf = framePool.borrow()  ← @Synchronized, 池空时才 new
+    ↓
+ch.send(accumBuf)  →  消费者 → AGC + 噪声门 → encodeTo(writeHeader + JNI memcpy)
+    ↑                                    ↓
+ consume 后 recycle(accumBuf)       sendBuffers[bufIndex]
+    ↑                                    ↓
+ 归还池中                                UdpSender.send(buf, 0, written)
+                                         (DatagramPacket offset+length, 零copy)
+```
+
+### 3. JNI 双重边界守卫 — 防缓冲区溢出（v1.0.5）
+`opus_jni.c` 的 `encoderEncodeTo` 设有两道防线：
+
+```c
+// 第1道：静态阈值守卫（编码前）
+// Opus 单帧 20ms 最恶劣情况下输出不超过 1276 字节
+jsize destLen = (*env)->GetArrayLength(env, dest);
+if (offset < 0 || offset >= destLen || (destLen - offset) < 1276) { return -1; }
+
+// ... opus_encode ...
+
+// 第2道：动态精确守卫（编码后，memcpy 前）
+if (destLen - offset < (jsize)nbBytes) { return -1; }
+```
+双重保护确保极端 VBR 膨胀、码率突增场景下也绝不写穿 Java ByteArray 边界导致 SIGSEGV。
+
+### 4. Channel 生命周期联动关闭（v1.0.5）
+```kotlin
+// 字段持有引用
+private var audioChannel: Channel<ShortArray>? = null
+
+fun stopCapture() {
+    audioChannel?.close()   // 先关闭 Channel，让消费者 for 循环退出
+    audioChannel = null
+    captureJob?.cancel()     // 再取消协程
+    captureJob = null
+}
+
+// doStartCapture finally 中也执行 ch.close() + audioChannel = null
+```
+双重保障：无论正常停止还是协程异常退出，Channel 都能及时关闭。
+
+### 5. JNI 与音频流的高并发互斥防线（防闪退）
+* **`@Synchronized`**：`OpusEncoder` 的 `encode`/`encodeTo`/`update`/`start`/`stop` 全部加锁，杜绝 JNI handle 多线程竞争。
+* **`uintptr_t`**：C 层使用 `(EncoderState*)(uintptr_t)handle` 而非 `intptr_t`，防止 32 位设备符号位扩展。
+
+### 6. AGC 样点级线性插值平滑（v1.0.5 修复）
+* 新增 `agcPreviousGain` 状态字段
+* 每帧内从 `gStart` 到 `gEnd` 逐样点线性插值，消除帧边界不连续
+
+### 7. 免重启音频管线与"无缝热重连"
+* **网络热重连**：消费者每帧检测 `Prefs` 变更，原地静默重建 `UdpSender`，麦克风/编码器常驻
+* **参数热更新**：Opus 参数指纹 Hash 挡板，边缘触发 JNI `encoderUpdate`
+
+### 8. 局域网广播自动发现（v1.0.5 新功能）
+* **Windows 端**：`start_broadcast_listener()` 常驻 44043 端口
+* **Android 端**：`DiscoveryManager.discoverServer()` + IP 输入框右侧 `autorenew` 图标
+
+### 9. 智能 AGC / Opus DTX-VBR / Compose 优化
+* AGC 边缘触发重置 10.0x，自动上限 100x，手动 0~200x
+* DTX 开启时 VBR 强制锁定，前端 UI 级联禁用
+* Compose `LaunchedEffect` 分流高频状态，防止全局 Recomposition
+
+### 10. Prefs 初始化安全
+* `Prefs.init(applicationContext)` 消除 Activity 隐式泄漏
+
 ---
 
-## 四、历史重大变更记录 (Changelog)
+## 四、Windows 接收端重点优化记录（v1.0.6）
+
+以下优化专为 Windows 端 Rust 代码在**极端边缘情况下的容错性、UI 异步处理行为、资源释放顺序**所做的强化。
+
+### 1. `udp_receiver_stream` 竞态条件消除（`main.rs`）
+
+**问题**：原代码在 `udp_receiver_stream` 异步流内部调用 `config::Config::load()` 重新读取注册表配置，而主线程在 `ToggleRunning` 时同步调用 `self.config.save()` 写入注册表。多线程读写注册表可能导致脏数据。
+
+**修复**：`udp_receiver_stream` 改为接收 `listen_ip: String` 和 `listen_port: u32` 参数，由 `subscription()` 通过 `self.config` 传值，消除跨线程注册表竞态。
+
+```rust
+// 之前：内部重新 load()
+fn udp_receiver_stream() -> impl Stream<Item = Message> {
+    let cfg = config::Config::load(); // 多线程竞态风险
+    ...
+}
+
+// 之后：从 subscription() 传参
+fn subscription(&self) -> Subscription<Message> {
+    let ip = self.config.listen_ip.clone();
+    let port = self.config.listen_port;
+    Subscription::run_with_id(UdpReceiverId, udp_receiver_stream(ip, port))
+}
+fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl Stream<Item = Message> { ... }
+```
+
+### 2. EMA 漂移比率 NaN/Infinity 防线（`audio.rs`）
+
+**问题**：极端网络抖动（如长时间断流后瞬间涌入大量包）可能导致 `produce_rate` 为 0 或异常值，使 `measured = device_rate / produce_rate` 变为 `Infinity` 或 `NaN`，污染 EMA 滤波器后使 `drift_ratio` 永久锁定为 `NaN`，导致音频静音。
+
+**修复**：在 EMA 更新前增加三层安全校验：
+```rust
+if produce_rate > 1000.0 && produce_rate.is_normal() {
+    let measured = self.device_rate as f64 / produce_rate;
+    if measured.is_finite() && measured > 0.5 && measured < 1.5 {
+        self.drift_ratio = self.drift_ratio * 0.7 + measured * 0.3;
+    }
+}
+```
+* `is_normal()`：排除零、次正则、Infinity、NaN
+* `is_finite()`：二次确认
+* `0.5 ~ 1.5` 范围限制：防止极端值大幅污染 EMA
+
+### 3. HINSTANCE 空指针修复（`float.rs`）
+
+**问题**：悬浮窗线程使用 `HINSTANCE(std::ptr::null_mut())` 创建窗口，不符合 Win32 最佳实践，在严格安全策略环境下可能导致窗口创建失败。
+
+**修复**：使用 `GetModuleHandleW(None)` 获取真实进程模块句柄：
+```rust
+let inst = GetModuleHandleW(None).unwrap_or_default();
+```
+
+### 4. 快速双击防抖 + 端口校验（`main.rs`）
+
+**问题**：快速双击"启动/停止"按钮可能导致旧 socket 未完全释放、新 socket 绑定失败，用户卡在"已启动但无法接收数据"的尴尬状态。
+
+**修复**：
+* **200ms 防抖**：`ToggleRunning` 入口检查 `last_toggle_instant.elapsed() < 200ms` 时直接跳过
+* **实时端口校验**：`PortChanged` 时实时校验 `parse::<u16>()`，非法输入时输入框边框变红
+* **启动时严格校验**：端口无效时拒绝启动并显示错误提示文字
+
+### 5. 代码可读性提升（`config.rs` + `main.rs`）
+
+* 新增 `Config::is_auto_start() -> bool` 便捷方法
+* 所有 `!(self.config.auto_start != 0)` 替换为 `!self.config.is_auto_start()`
+
+---
+
+## 五、历史重大变更记录 (Changelog)
 
 | 版本 | 变更点 | 核心目的 / 解决的痛点 |
 | --- | --- | --- |
-| **v1.0.4** | **JNI 同步锁 / 网络无缝热重连** | 引入 `@Synchronized` 彻底根除多线程并发闪退；主页修改 IP 绝不重启录音流，后台静默重连，UI 滑块零卡顿。 |
-| **v1.0.3** | **AGC 解耦 / Opus 免重启参数热更新** | 彻底剥离 `restart()` 逻辑，引入参数指纹挡板；修复自动码率传 0 导致底层死锁漏洞；AGC 上限与固定滑块彻底松绑。 |
-| **v1.0.2** | **移除了 RNN/TFLite 降噪** | 斩断过度设计的神经网络，回归轻量化、无延迟的经典语音信号处理管线。 |
-| **v1.0.1** | **重构为 Kotlin 协程常驻服务** | 废除频繁销毁重建线程的重型逻辑，改为常驻后台前台服务。 |
+| **v1.0.6** | **Windows 端边缘场景容错强化** | 消除 `udp_receiver_stream` 多线程注册表竞态条件；EMA 漂移比率增加 `is_normal()` + `is_finite()` + 范围限制三层防线，杜绝 NaN 永久锁定；`float.rs` HINSTANCE 空指针改用 `GetModuleHandleW`；启动按钮 200ms 防抖 + 端口实时校验红色边框；`is_auto_start()` 可读性优化 |
+| **v1.0.5** | **全链路零分配 / 双协程 / 双重边界守卫 / ShortArrayPool / 广播发现 / AGC插值** | 双协程消除 AudioRecord 阻塞饥饿；JNI `encoderEncodeTo` + `writeHeader` + `UdpSender::send(offset)` + `ShortArrayPool@Synchronized` 实现 ByteArray+ShortArray 全零分配，根除一切 GC 抖动；JNI 双重边界 1276+动态 守卫防越界写穿；Channel 生命周期联动关闭；UDP 广播自动搜索 PC；样点级 AGC 插值消除爆音；uintptr_t + applicationContext 消除底层隐患 |
+| **v1.0.4** | **JNI 同步锁 / 网络无缝热重连** | 引入 `@Synchronized` 根除多线程并发闪退；主页改 IP 不重启录音流 |
+| **v1.0.3** | **AGC 解耦 / Opus 免重启参数热更新** | 剥离 restart() 逻辑，参数指纹挡板 |
+| **v1.0.2** | **移除了 RNN/TFLite 降噪** | 回归轻量化经典管线 |
+| **v1.0.1** | **重构为 Kotlin 协程常驻服务** | 废除频繁线程销毁重建 |
 
 ---
 
-## 五、接手后推荐的后续演进方向
+## 六、接手后推荐的后续演进方向
 
-1. **JNI 层指针健壮性（可选）**：目前 Kotlin 层已经提供了完美的同步锁保护。如果未来需要对底层 C++ 进行大规模重构，可以在 `opus_jni.c` 的 `EncoderState` 结构体中加入 `pthread_mutex_t` 锁，实现双向保险。
-2. **局域网多播自动发现（可选）**：由于目前网络层支持了免断流的静默热重连，未来可以非常轻松地通过 `MDNS` 或 UDP 广播实现一键搜索 PC 接收端并热连接，完全消灭手动输入 IP 的步骤。
+1. **JNI 层双向锁（可选）**：在 `EncoderState` 中加入 `pthread_mutex_t` 锁，实现 Kotlin + C 双层保险。
+2. **MDNS 发现替代 UDP 广播**：支持跨子网、多网卡环境下的自动发现。
+3. **Compose 高频状态子组件拆分**：如需 100ms 级音量条刷新，将高频状态拆为独立子组件。
+4. **Windows 端也可考虑广播自动搜索**：让 PC 也能主动发现 Android 设备（反向搜索）。
+5. **Windows 端持续改进**：可考虑统一错误上报机制（如 toast 通知代替 UI 内状态文字）、支持多声卡切换 UI、以及音频链路的延迟统计仪表盘。

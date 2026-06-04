@@ -5,6 +5,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, FillRect, GetDC, GetStockObject, ReleaseDC, 
     SetBkMode, SetTextColor, TextOutW, GRAY_BRUSH, TRANSPARENT, HBRUSH,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, LoadCursorW, 
     PeekMessageW, PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes, ShowWindow, 
@@ -96,7 +97,7 @@ fn fw_main(running: Arc<AtomicBool>, level: Arc<AtomicU32>, visible: Arc<AtomicB
     std::thread::sleep(std::time::Duration::from_millis(200));
     
     unsafe {
-        let inst = windows::Win32::Foundation::HINSTANCE(std::ptr::null_mut());
+        let inst = GetModuleHandleW(None).unwrap_or_default();
         
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
