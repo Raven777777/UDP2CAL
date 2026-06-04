@@ -9,7 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetSystemMetrics, LoadCursorW, 
     PeekMessageW, PostQuitMessage, RegisterClassW, SetLayeredWindowAttributes, ShowWindow, 
     TranslateMessage, DispatchMessageW, CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LWA_ALPHA, 
-    MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, WM_DESTROY, WM_NCHITTEST, 
+    MSG, PM_REMOVE, SM_CXSCREEN, SW_HIDE, SW_SHOW, WM_DESTROY, WM_NCHITTEST, 
     WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WNDCLASSW, 
     HTCLIENT, HTCAPTION,
 };
@@ -113,16 +113,16 @@ fn fw_main(running: Arc<AtomicBool>, level: Arc<AtomicU32>, visible: Arc<AtomicB
         }
 
         let sw = GetSystemMetrics(SM_CXSCREEN);
-        let sh = GetSystemMetrics(SM_CYSCREEN);
-        let (ww, wh) = (240i32, 28i32);
+        let (ww, wh) = (260i32, 28i32);
+        let margin = 12i32;
 
         let hwnd = match CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             windows::core::w!("LmFlo\0"),
             windows::core::w!(""),
             WS_POPUP | WS_VISIBLE,
-            sw - ww - 16,
-            sh - wh - 80,
+            sw - ww - margin,
+            margin,
             ww,
             wh,
             None,

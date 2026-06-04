@@ -4,22 +4,18 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const RULE_NAME: &str = "UDP2Mic 局域网麦克风";
 
 pub fn add_firewall_rule() -> Result<(), String> {
-    let check = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", &format!("name={RULE_NAME}")])
+    // 先删除旧规则（忽略失败，可能本来就不存在）
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={RULE_NAME}")])
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("netsh: {e}"))?;
-
-    if String::from_utf8_lossy(&check.stdout).contains("Enabled:") {
-        return Ok(());
-    }
+        .output();
 
     let result = std::process::Command::new("netsh")
         .args([
             "advfirewall", "firewall", "add", "rule",
             &format!("name={RULE_NAME}"),
             "dir=in", "action=allow", "protocol=UDP",
-            "localport=8899", "enable=yes", "profile=any",
+            "localport=any", "enable=yes", "profile=any",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()

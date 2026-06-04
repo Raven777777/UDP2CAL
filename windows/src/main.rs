@@ -254,17 +254,23 @@ impl AppState {
                 .align_y(Alignment::Center),
                 Space::new(0, 12),
                 column![
-                    text("监听地址").size(11).color(dim),
-                    row![
-                        text_input("0.0.0.0", &self.ip_input)
-                            .on_input(Message::IpChanged)
-                            .width(140),
-                        text(" : ").size(16).color(dim),
-                        text_input("8899", &self.port_input)
-                            .on_input(Message::PortChanged)
-                            .width(64),
-                    ]
-                    .align_y(Alignment::Center),
+                    text(if self.is_running { "监听中" } else { "监听地址" }).size(11).color(dim),
+                    if self.is_running {
+                        let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
+                        row![text(addr).size(12).color(Color::WHITE)]
+                            .align_y(Alignment::Center)
+                    } else {
+                        row![
+                            text_input("0.0.0.0", &self.ip_input)
+                                .on_input(Message::IpChanged)
+                                .width(140),
+                            text(" : ").size(16).color(dim),
+                            text_input("8899", &self.port_input)
+                                .on_input(Message::PortChanged)
+                                .width(64),
+                        ]
+                        .align_y(Alignment::Center)
+                    },
                 ]
                 .spacing(4),
                 Space::new(0, 16),
@@ -456,10 +462,6 @@ fn udp_receiver_stream() -> impl iced::futures::Stream<Item = Message> {
                 rms_sum = 0.0;
                 rms_count = 0;
                 last_stats = Instant::now();
-                
-                // 【大刀阔斧删除】彻底移除 dec.shrink_pcm_buf()
-                // Opus 解码器的 pcm_buf 在初始化时已经预分配了最大空间，其容量永远不会超过 MAX_FRAME_SAMPLES
-                // 每秒调用 2 次 shrink_pcm_buf 是纯粹的性能浪费
 
                 let _ = output
                     .send(Message::StatusUpdate(StatusInfo {

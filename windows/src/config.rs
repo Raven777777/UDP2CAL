@@ -22,7 +22,7 @@ impl Default for Config {
             auto_start: 0,
             float_window_enable: 1,
             float_window_x: 100,
-            float_window_y: 100,
+            float_window_y: 200,
         }
     }
 }
@@ -43,7 +43,7 @@ impl Config {
             auto_start: get_dword(&path, "auto_start", 0),
             float_window_enable: get_dword(&path, "float_window_enable", 1),
             float_window_x: get_dword(&path, "float_window_x", 100) as i32,
-            float_window_y: get_dword(&path, "float_window_y", 100) as i32,
+            float_window_y: get_dword(&path, "float_window_y", 200) as i32,
         }
     }
 

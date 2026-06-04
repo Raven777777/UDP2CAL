@@ -1,0 +1,6 @@
+-keep class com.udp2mic.app.native.OpusNative { *; }
+-keepclassmembers class com.udp2mic.app.native.OpusNative { *; }
+-keepattributes *Annotation*
+-keep class kotlin.Metadata { *; }
+-dontwarn javax.annotation.**
+-dontwarn kotlinx.coroutines.**

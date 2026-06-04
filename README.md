@@ -1,13 +1,13 @@
 # UDP2Mic — 局域网麦克风
 
-UDP2Mic 是一个轻量级的局域网麦克风解决方案，支持 Android 端采集（AGC、Wiener 降噪、噪声门）并通过 Opus 编码经 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable）供任意应用使用。
+UDP2Mic 是一个轻量级的局域网麦克风解决方案，支持 Android 端采集（AGC、噪声门）并通过 Opus 编码经 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable）供任意应用使用。
 
 目标用户：需要在局域网内将手机作为麦克风发送音频到 Windows 主机的开发者与个人用户。
 
 主要特性：
 - 低延迟 Opus CBR 编码（20ms 帧）
 - 自适应采样率与码率（48k/24k/16k/8k）
-- 人声增强链：Wiener 降噪、噪声门、AGC
+- 音频处理链：AGC、噪声门
 - Windows 端使用 `iced` UI，支持悬浮窗与注册表配置
 - 协议实现为独立 crate：`protocol/`（唯一协议真源）
 
