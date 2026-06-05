@@ -33,7 +33,13 @@ a:hover { text-decoration: underline; }
 img { max-width: 100%; height: auto; }
 
 .container {
-  max-width: 960px;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+.lsx.container {
+  max-width: 1024px;
   margin: 0 auto;
   padding: 0 24px;
 }
@@ -50,7 +56,7 @@ img { max-width: 100%; height: auto; }
 }
 
 .nav-inner {
-  max-width: 960px;
+  max-width: 900px;
   margin: 0 auto;
   padding: 0 24px;
   height: 56px;
@@ -118,7 +124,7 @@ img { max-width: 100%; height: auto; }
 .hero-content {
   position: relative;
   text-align: center;
-  max-width: 700px;
+  max-width: 900px;
 }
 
 .hero-logo {
@@ -386,7 +392,7 @@ img { max-width: 100%; height: auto; }
 /* ===== Highlights ===== */
 .highlights {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 20px;
   margin-top: 40px;
 }
@@ -513,7 +519,7 @@ img { max-width: 100%; height: auto; }
 
   .pipeline {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 8px;
     margin-top: 28px;
   }
@@ -524,7 +530,7 @@ img { max-width: 100%; height: auto; }
 }
 
 @media (max-width: 480px) {
-  .pipeline { grid-template-columns: repeat(3, 1fr); }
+  .pipeline { grid-template-columns: repeat(4, 1fr); }
   .card-list li { font-size: 0.84rem; }
   .highlight p { font-size: 0.84rem; }
 }

@@ -1,6 +1,6 @@
 @echo off
-set "P1=C:\Users\lain\Documents\WWW\udp2mic\android\app\build\outputs\apk\release"
-set "P2=C:\Users\lain\Documents\WWW\udp2mic\windows\target\release"
+set "P1=android\app\build\outputs\apk\release"
+set "P2=windows\target\release"
 
 if exist "%P1%" (
     del /f /s /q "%P1%\*.*" >nul

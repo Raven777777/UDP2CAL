@@ -34,13 +34,15 @@
       <h1>UDP2Mic</h1>
       <p class="hero-sub">工业级稳定 · 低延迟 · 局域网麦克风</p>
       <p class="hero-pipeline">
-        Android 手机 → 智能AGC(底噪追踪+10dB安全区) → dBFS噪声门 → Opus 编码 → UDP → Windows PC → WASAPI → VB-Cable
+        Android 手机 → 智能AGC(底噪追踪+10dB安全区) → dBFS噪声门 → Opus 编码 → UDP → Windows PC → SyncChannel → 全局单例 Audio Worker 守护线程(常驻) → WASAPI → VB-Cable
       </p>
       <div class="hero-badges">
         <span class="badge">v1.0.6</span>
         <span class="badge">智能AGC安全区</span>
         <span class="badge">dBFS工业标准阈值</span>
         <span class="badge">硬件降噪联动</span>
+        <span class="badge">💚 单例音频守护线程</span>
+        <span class="badge">🎨 UI 现代化</span>
       </div>
     </div>
   </section>
@@ -50,10 +52,10 @@
     <div class="container">
       <h2 class="section-title">概述</h2>
       <p class="section-desc">
-        UDP2Mic 将 Android 手机变为高品质无线麦克风，音频经 Opus 编码通过 UDP 实时传输到 Windows 接收端，通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。
+        UDP2Mic 将 Android 手机变为高品质无线麦克风，音频经 Opus 编码通过 UDP 实时传输到 Windows 接收端。Windows 端采用<strong>全局单例音频守护线程</strong> + Channel 无锁通信架构，UI 启停不影响底层音频引擎，彻底杜绝反复启停导致的内存泄漏。音频通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。
       </p>
       <p class="section-desc strong">
-        全链路零堆分配 · 生产-消费双协程 · JNI 双重边界守卫
+        全链路零堆分配 · 生产-消费双协程 · 全局单例音频守护线程 · JNI 双重边界守卫
       </p>
     </div>
   </section>
@@ -85,7 +87,8 @@
             <h3>Windows 接收端</h3>
           </div>
           <ul class="card-list">
-            <li>Rust + iced 原生 UI，暗色主题，悬浮窗实时音量</li>
+            <li><strong>全局单例音频守护线程</strong>：解码器+音频引擎仅初始化一次，通过 SyncChannel 通信，UI 启停不影响底层，彻底根除内存泄漏</li>
+            <li>Rust + iced 原生 UI，<strong>模块化深色卡片布局</strong>，动态 VU 色彩表（绿/橙/红专业混音台风格）</li>
             <li>5 独立 Opus 解码器，支持所有采样率无缝切换</li>
             <li>相位连续流式重采样，EMA 自适应漂移补偿</li>
             <li>VB-Cable 自动检测，无虚拟声卡时回退默认设备</li>
@@ -100,7 +103,7 @@
 
   <!-- Pipeline -->
   <section class="section section-alt">
-    <div class="container">
+    <div class="lsx.container">
       <h2 class="section-title">音频流水线</h2>
       <div class="pipeline">
         <div class="pipe-node"><span class="node-icon">🎤</span><span>AudioRecord</span></div>
@@ -112,6 +115,8 @@
         <div class="pipe-node"><span class="node-icon">🎵</span><span>Opus</span></div>
         <div class="pipe-arrow">→</div>
         <div class="pipe-node"><span class="node-icon">📡</span><span>UDP</span></div>
+        <div class="pipe-arrow">→</div>
+        <div class="pipe-node"><span class="node-icon">⚙️</span><span>Audio Worker</span></div>
         <div class="pipe-arrow">→</div>
         <div class="pipe-node"><span class="node-icon">🔊</span><span>WASAPI</span></div>
         <div class="pipe-arrow">→</div>
@@ -153,6 +158,14 @@
       <h2 class="section-title">架构亮点</h2>
       <div class="highlights">
         <div class="highlight">
+          <h4>🎛️ 全局单例音频守护线程</h4>
+          <p>Windows 端解码器+AudioWriter 全程仅初始化一次，通过 <code>SyncChannel&lt;AudioMessage&gt;</code> 接收数据。UI 启停仅发送 Reset 消息清空缓冲区，不解构任何音频资源。内存和线程数始终稳定，彻底根除反复启停泄漏。</p>
+        </div>
+        <div class="highlight">
+          <h4>🖥️ Iced 现代化 UI</h4>
+          <p>模块化深色卡片布局包装"网络配置"与"数据监测"区域。音频电平条采用动态 VU 色彩策略（-60~-25dB 极客绿、-25~-10dB 警告橙、-10~0dB 过载红）。按钮 Hover/Pressed 平滑明暗反馈；状态文本精细放置在页脚。</p>
+        </div>
+        <div class="highlight">
           <h4>🔄 双协程流水线</h4>
           <p>生产者独占 IO 线程采集 AudioRecord，通过 Channel(3) 投递帧数据；消费者串行执行 AGC → 噪声门 → 编码 → 发送，天然背压防堆积。</p>
         </div>
@@ -185,8 +198,8 @@
         <img src="icon.png" alt="" class="footer-icon">
         <span>UDP2Mic</span>
       </div>
-      <p class="footer-version">v1.0.6 — Apache 2.0</p>
-      <p class="footer-meta">Android Kotlin + JNI Opus · Windows Rust + iced + cpal · 智能 AGC 安全区 · dBFS 噪声门 · 硬件降噪</p>
+      <p class="footer-version">v1.0.6 by love4z<br>四折光曲</p>
+      <p class="footer-meta">Android Kotlin + JNI Opus · Windows Rust + iced + cpal · 全局单例音频守护线程 · 智能 AGC 安全区 · dBFS 噪声门 · 硬件降噪 · 动态 VU 色彩表</p>
     </div>
   </div>
 </footer>

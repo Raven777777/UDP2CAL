@@ -1,14 +1,16 @@
 # UDP2Mic AI 继任者指南
 > 写给下一个接手这个项目的 AI / 开发者
-> 最后更新: 2026-06-05 | 状态: **v1.0.6 — 智能 AGC 底噪安全区 + dBFS 噪声门 + 硬件降噪联动 + Windows 端容错强化**
+> 最后更新: 2026-06-05 | 状态: **v1.0.6 — 智能 AGC 底噪安全区 + dBFS 噪声门 + 硬件降噪联动 + Windows 端 UI 现代化 + 全局单例音频守护线程**
 
 ## 一、你现在接手的是什么
 
-一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持**智能 AGC（底噪安全区锁定 + 目标 -18dBFS）**与**自适应/手动 dBFS 噪声门**：
+一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持**智能 AGC（底噪安全区锁定 + 目标 -18dBFS）**与**自适应/手动 dBFS 噪声门**。Windows 端采用**全局单例音频守护线程** + Channel 无锁通信，UI 启停不影响底层音频引擎：
 
 ```
-[Android 手机] ──{生产→消费双协程}──→ 智能AGC(底噪追踪+安全区10dB) → 噪声门(-40dBFS自动) → Opus完全零分配编码 → UDP零分配发送 → [Windows PC] ──WASAPI──→ [VB-Cable]
-↓
+[Android 手机] ──{生产→消费双协程}──→ 智能AGC(底噪追踪+安全区10dB) → 噪声门(-40dBFS自动) → Opus完全零分配编码 → UDP零分配发送 → [Windows PC]
+    ↓
+Windows：UDP 接收协程 → SyncChannel → 常驻 Audio Worker 线程（解码 + WASAPI 播放 → VB-Cable/扬声器）
+    ↓
 微信/Zoom/OBS/游戏
 ```
 
@@ -232,6 +234,58 @@ let inst = GetModuleHandleW(None).unwrap_or_default();
 * 新增 `Config::is_auto_start() -> bool` 便捷方法
 * 所有 `!(self.config.auto_start != 0)` 替换为 `!self.config.is_auto_start()`
 
+### 6. UI 现代化改造：卡片布局 + 动态 VU 表 + 交互反馈（`main.rs`）
+
+**问题**：原 UI 为单一纵向平铺，按钮为纯静态色块，音频电平条为单色，状态提示文本（"绑定失败"、"等待连接"）被遗忘在界面底部难以察觉。
+
+**修复**：
+
+- **模块化卡片布局**：放弃单一纵向平铺，改用深色渐进微卡片包装"网络配置"与"数据监测"区域，界面层级更加精致清晰
+- **动态 VU 色彩表**：为音频电平进度条注入动态色彩策略：
+  - `-60dB ~ -25dB`：**极客绿**（安全区）
+  - `-25dB ~ -10dB`：**警告橙**（过渡区）
+  - `-10dB ~ 0dB`：**电平过载红**（削波区）
+  - 逼真还原专业混音台的视觉回馈
+- **按钮 Hover/Pressed 反馈**：加入微调色彩算法，按钮在鼠标悬停及点击时拥有灵敏的平滑明暗反馈
+- **统一输入框样式**：美化了输入框底色与圆角边框，使其在暗黑主题下更加深邃融合，保留端口报错时的红色高亮
+- **状态文本精细化**：将 `status_text` 放置在页脚，让错误提示能真正直观、优雅地显现
+
+### 7. 全局单例音频守护线程 — 彻底根除反复启停内存泄漏（`main.rs`）
+
+**问题**：在 Iced UI 中反复点击"启动/停止"时，底层的 `udp_receiver_stream` 会被不断地销毁和重建。旧版每次启动调用 `audio::start_audio()`（封装 cpal/wasapi），销毁旧流时音频底层异步线程无法被优雅关停（多数音频库的默认封装都有此通病），导致每点一次"启动"就凭空多出一个新的驻留线程和音频缓冲区，造成内存和线程数疯狂上涨，最终导致系统卡死。
+
+**修复**：采用专业音频软件架构——**后台全局单例音频守护线程 (Audio Worker Thread)**：
+
+```rust
+enum AudioMessage {
+    Packet { seq_num: u8, sample_rate: u8, payload: Vec<u8> },
+    Reset,
+}
+
+static AUDIO_TX: OnceLock<SyncSender<AudioMessage>> = OnceLock::new();
+static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
+
+fn init_audio_worker() {
+    // 仅在程序启动时调用一次
+    let (tx, rx) = sync_channel::<AudioMessage>(200);
+    AUDIO_TX.set(tx).ok();
+    std::thread::spawn(move || {
+        let dec = ...;  // 解码器只初始化一次
+        let aw = ...;   // AudioWriter 只初始化一次
+        for msg in rx { /* 常驻循环，通过 Channel 接收数据 */ }
+    });
+}
+```
+
+**核心原理**：
+
+- **音频引擎（audio）和解码器（decoder）在整个软件生命周期内只初始化一次**，无论 UI 如何启停，底层音频线程不受影响
+- **Iced UI 和网络流只负责收发数据**，通过 `SyncChannel<AudioMessage>` 把数据喂给常驻后台线程
+- `Reset` 消息替代旧版的完全销毁重建：收到后仅清空 `ReorderBuffer` 和 RMS 统计，不解构任何音频资源
+- 同时为 Iced 的 `run_with_id` 引入 `session_id` 计数器，强迫每次启动当作全新订阅处理，避免 Iced 内部状态残留
+
+**效果**：无论用户点击多少次启动/停止，内存和线程数始终稳定，内存泄漏被彻底根除。
+
 ---
 
 ## 五、Android 发送端重点优化记录（v1.0.6）
@@ -319,7 +373,7 @@ if (shouldMuteFrame) {
 
 | 版本 | 变更点 | 核心目的 / 解决的痛点 |
 | --- | --- | --- |
-| **v1.0.6** | **智能 AGC + dBFS 噪声门 + Windows 端容错强化** | Android：智能 AGC 底噪安全区锁定（10dB）+ 目标 -18dBFS 杜绝底噪放大；dBFS 阈值滑块（-60~0dB）取代 RMS；关门保留 10% 环境音；NoiseSuppressor 硬件降噪联动；对象池 3→5、熔断保护、延迟静音解耦；安全区每帧热生效修复；清除 `noiseGateAuto`/`vbcable.rs` 死代码。Windows：消除 `udp_receiver_stream` 注册表竞态；EMA 漂移比率 NaN/Infinity 防线；HINSTANCE 空指针修复；200ms 防抖 + 端口校验；`is_auto_start()` 可读性优化 |
+| **v1.0.6** | **智能 AGC + dBFS 噪声门 + Windows 端 UI 现代化 + 全局单例音频守护线程** | Android：智能 AGC 底噪安全区锁定（10dB）+ 目标 -18dBFS 杜绝底噪放大；dBFS 阈值滑块（-60~0dB）取代 RMS；关门保留 10% 环境音；NoiseSuppressor 硬件降噪联动；对象池 3→5、熔断保护、延迟静音解耦；安全区每帧热生效修复；清除死代码。Windows：UI 卡面布局 + 动态 VU 色彩表 + 按钮 Hover/Pressed 反馈 + 统一输入框样式 + 状态文本页脚化；全局单例音频守护线程（Audio Worker）彻底根除反复启停内存泄漏；`run_with_id(session_id)` 状态隔离 |
 | **v1.0.5** | **全链路零分配 / 双协程 / 双重边界守卫 / ShortArrayPool / 广播发现 / AGC插值** | 双协程消除 AudioRecord 阻塞饥饿；JNI `encoderEncodeTo` + `writeHeader` + `UdpSender::send(offset)` + `ShortArrayPool@Synchronized` 实现 ByteArray+ShortArray 全零分配，根除一切 GC 抖动；JNI 双重边界 1276+动态 守卫防越界写穿；Channel 生命周期联动关闭；UDP 广播自动搜索 PC；样点级 AGC 插值消除爆音；uintptr_t + applicationContext 消除底层隐患 |
 | **v1.0.4** | **JNI 同步锁 / 网络无缝热重连** | 引入 `@Synchronized` 根除多线程并发闪退；主页改 IP 不重启录音流 |
 | **v1.0.3** | **AGC 解耦 / Opus 免重启参数热更新** | 剥离 restart() 逻辑，参数指纹挡板 |

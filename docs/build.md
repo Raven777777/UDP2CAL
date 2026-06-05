@@ -8,10 +8,14 @@
 UDP2Mic 是一个局域网麦克风系统：
 
 ```
-Android 手机 → [AGC (样点级插值平滑)] → [噪声门] → Opus (CBR/VBR 热调节) → UDP (热重连 + 广播自动发现) → Windows PC → WASAPI → VB-Cable
+Android 手机 → [AGC (样点级插值平滑)] → [噪声门] → Opus (CBR/VBR 热调节) → UDP (热重连 + 广播自动发现)
+    ↓
+Windows PC UDP 接收 → 网络解析协程 → Channel 投递 → 全局单例 Audio Worker 守护线程（常驻，不解构）
+    ↓
+[WASAPI → VB-Cable / 扬声器]
 ```
 
-**Pipeline 已实现 ByteArray + ShortArray 完全零堆分配（仅池热身期 3 次构造）。双端均已编译通过。**
+**Pipeline 已实现 ByteArray + ShortArray 完全零堆分配（仅池热身期 3 次构造）。Windows 端采用全局单例音频守护线程 + Channel 无锁通信，UI 启停不影响底层音频引擎。双端均已编译通过。**
 
 ---
 
@@ -52,12 +56,14 @@ build_android.bat
 ## 技术栈与高阶机制
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
-| **UI 层** | Jetpack Compose | 采用 `Flow` 细粒度订阅与局部缓存变量，杜绝高频重绘引发的滑块卡顿 |
-| **网络层** | Kotlin Coroutines + UDP Socket | 动态比对 `Prefs`，静默热重连不断流。支持 UDP 广播自动发现 |
+| **UI 层（Android）** | Jetpack Compose | 采用 `Flow` 细粒度订阅与局部缓存变量，杜绝高频重绘引发的滑块卡顿 |
+| **UI 层（Windows）** | Iced (Rust) | 模块化深色卡片布局 + 动态 VU 色彩表 + 按钮 hover/pressed 反馈；`run_with_id(session_id)` 强制状态隔离 |
+| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。支持 UDP 广播自动发现 |
 | **音频采集** | AudioRecord (UNPROCESSED) | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5） + **Android NoiseSuppressor 硬件降噪联动** |
 | **核心算法** | **智能 AGC（底噪安全区 10dB + 目标 -18dBFS）** + **自适应/手动 dBFS 噪声门** | **样点级线性插值平滑**消除帧边界爆音；底噪安全区锁定杜绝 Noise Pumping；噪声门关门保留 10% 环境音掩蔽听觉断层；延迟静音架构解耦 AGC |
 | **编码层** | libopus (JNI) | **`encoderEncodeTo` 直接写入 & 双重边界守卫** + `@Synchronized` 互斥锁 |
 | **发送层** | UDP DatagramSocket | **乒乓缓冲区 + `send(offset,length)` 零拷贝**，防脏数据 |
+| **Windows 音频引擎** | cpal / WASAPI — **全局单例 Audio Worker 守护线程** | **仅在 init_audio_worker() 初始化一次**，通过 `SyncChannel<AudioMessage>` 接收 Packet/Reset 消息，UI 启停不影响底层音频线程生命周期，杜绝反复 start/stop 导致的线程和缓冲区泄漏 |
 
 ---
 
