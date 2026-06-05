@@ -27,6 +27,10 @@ object Prefs {
         get() = prefs.getBoolean("noise_gate", true)
         set(v) = prefs.edit().putBoolean("noise_gate", v).apply()
 
+    var noiseGateThreshold: Float
+        get() = prefs.getFloat("noise_gate_threshold", -40f) // dBFS: -40dB = 典型底噪水平
+        set(v) = prefs.edit().putFloat("noise_gate_threshold", v).apply()
+
     // ── Opus 编码器设置 ──
     var opusComplexity: Int
         get() = prefs.getInt("opus_complexity", 10)
@@ -60,4 +64,8 @@ object Prefs {
     var agcMaxGain: Int
         get() = prefs.getInt("agc_max_gain", 40) // 0=1x .. 200=200x
         set(v) = prefs.edit().putInt("agc_max_gain", v.coerceIn(0, 200)).apply()
+
+    var agcSafeZone: Float
+        get() = prefs.getFloat("agc_safe_zone", 10f) // 0=关闭, 1~20=dB
+        set(v) = prefs.edit().putFloat("agc_safe_zone", v.coerceIn(0f, 20f)).apply()
 }

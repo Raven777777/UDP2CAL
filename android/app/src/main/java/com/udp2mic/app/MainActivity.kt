@@ -104,8 +104,8 @@ class MainActivity : ComponentActivity() {
         if (captureService != null) action(false) else pendingStart = action
     }
 
-    private fun doStop() { captureService?.stopCapture() }
-    override fun onDestroy() { if (serviceBound) unbindService(connection) ; super.onDestroy() }
+    private fun doStop() {pendingStart = null; captureService?.stopCapture(); stopService(Intent(this, CaptureService::class.java))}
+    override fun onDestroy() {pendingStart = null; if (serviceBound) unbindService(connection) ; super.onDestroy() }
 }
 
 @Composable
@@ -120,8 +120,10 @@ fun MainScreen(
     var isRunning by remember { mutableStateOf(false) }
     var testToneMode by remember { mutableStateOf(Prefs.testToneMode) }
     var noiseGate by remember { mutableStateOf(Prefs.noiseGate) }
+    var ngThreshold by remember { mutableStateOf(Prefs.noiseGateThreshold) }
     var agcEnabled by remember { mutableStateOf(Prefs.agcEnabled) }
     var agcMaxGain by remember { mutableStateOf(Prefs.agcMaxGain) }
+    var agcSafeZone by remember { mutableStateOf(Prefs.agcSafeZone) }
     var negSr by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf("") }
     var isSearching by remember { mutableStateOf(false) }
@@ -197,13 +199,33 @@ fun MainScreen(
             Switch(checked = testToneMode, onCheckedChange = {
                 testToneMode = it; Prefs.testToneMode = it
                 if (it) { noiseGate = false; Prefs.noiseGate = false }
-                if (isRunning) { onStop(); val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p, it, noiseGate) }
+                if (isRunning) { val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p, it, noiseGate) }
             }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFFFF9800)))
         }
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Text("噪声门", fontSize = 14.sp, color = if (noiseGate) Color(0xFF00B0FF) else Color(0xFFAAAAAA))
-            Switch(checked = noiseGate, onCheckedChange = { noiseGate = it; Prefs.noiseGate = it }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00B0FF)))
+            Text("自动噪声门", fontSize = 14.sp, color = if (noiseGate) Color(0xFF00B0FF) else Color(0xFFAAAAAA))
+            Switch(checked = noiseGate, onCheckedChange = {
+                noiseGate = it
+                Prefs.noiseGate = it
+                // ✅ 不重启 Service，算法在后台每帧读取 Prefs 热生效
+            }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00B0FF)))
+        }
+        if (!noiseGate) {
+            Spacer(Modifier.height(2.dp))
+            Column(Modifier.fillMaxWidth().padding(start = 8.dp)) {
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                    Text("切除阈值", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                    Text(if (ngThreshold <= -60f) "关闭" else "${ngThreshold.toInt()} dBFS", fontSize = 13.sp, color = Color(0xFF00E676))
+                }
+                Slider(
+                    value = ngThreshold,
+                    onValueChange = { ngThreshold = it; Prefs.noiseGateThreshold = it },
+                    valueRange = -60f..0f,  // -60dB=几乎不切, 0dB=封死所有声音
+                    steps = 60,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
@@ -211,10 +233,27 @@ fun MainScreen(
             Switch(checked = agcEnabled, onCheckedChange = { agcEnabled = it; Prefs.agcEnabled = it }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676)))
         }
         if (!agcEnabled) {
-            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) { Text("固定增益: ${agcMaxGain}x", fontSize = 13.sp, color = Color(0xFFB0B0B0)) }
-            Slider(value = (agcMaxGain / 10).toFloat(), onValueChange = {
-                agcMaxGain = (it * 10).toInt().coerceIn(0, 200); Prefs.agcMaxGain = agcMaxGain
-            }, valueRange = 0f..20f, steps = 19, modifier = Modifier.fillMaxWidth())
+            Column(Modifier.fillMaxWidth().padding(start = 8.dp)) {
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                    Text("固定增益: ${agcMaxGain}x", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                }
+                Slider(value = (agcMaxGain / 10).toFloat(), onValueChange = {
+                    agcMaxGain = (it * 10).toInt().coerceIn(0, 200); Prefs.agcMaxGain = agcMaxGain
+                }, valueRange = 0f..20f, steps = 19, modifier = Modifier.fillMaxWidth())
+
+                Spacer(Modifier.height(4.dp))
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                    Text("安全区", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                    Text(if (agcSafeZone < 0.5f) "关闭" else "${agcSafeZone.toInt()} dB", fontSize = 13.sp, color = if (agcSafeZone < 0.5f) Color(0xFF888888) else Color(0xFF00E676))
+                }
+                Slider(
+                    value = agcSafeZone,
+                    onValueChange = { agcSafeZone = it; Prefs.agcSafeZone = it },
+                    valueRange = 0f..20f,
+                    steps = 20,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) { Text("Opus 编码设置", color = Color(0xFFAAAAAA)) }

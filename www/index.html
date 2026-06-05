@@ -34,12 +34,13 @@
       <h1>UDP2Mic</h1>
       <p class="hero-sub">工业级稳定 · 低延迟 · 局域网麦克风</p>
       <p class="hero-pipeline">
-        Android 手机 → AGC → 噪声门 → Opus 编码 → UDP → Windows PC → WASAPI → VB-Cable
+        Android 手机 → 智能AGC(底噪追踪+10dB安全区) → dBFS噪声门 → Opus 编码 → UDP → Windows PC → WASAPI → VB-Cable
       </p>
       <div class="hero-badges">
         <span class="badge">v1.0.6</span>
-        <span class="badge">零堆分配</span>
-        <span class="badge">双协程流水线</span>
+        <span class="badge">智能AGC安全区</span>
+        <span class="badge">dBFS工业标准阈值</span>
+        <span class="badge">硬件降噪联动</span>
       </div>
     </div>
   </section>
@@ -70,8 +71,9 @@
           <ul class="card-list">
             <li>生产-消费双协程，消除 AudioRecord 阻塞饥饿</li>
             <li>全链路零堆分配：ShortArrayPool 帧复用 + 乒乓缓冲区</li>
-            <li>智能 AGC：样点级线性插值平滑，自动上限 100x</li>
-            <li>动态追踪噪声门</li>
+            <li><strong>智能 AGC 安全区锁定</strong>：极慢底噪 dBFS 追踪 + 10dB 安全区，目标人声 -18dBFS</li>
+            <li><strong>dBFS 自适应/手动噪声门</strong>：-60~0dB 工业标准阈值，关门保留 10% 环境音</li>
+            <li><strong>Android 硬件级 NoiseSuppressor 联动</strong>：随噪声门开关热生效</li>
             <li>Opus CBR/VBR 热调节，5 种采样率自适应协商</li>
             <li>UDP 广播自动发现局域网内 Windows 接收端</li>
             <li>网络无缝热重连，改 IP 不重启录音流</li>
@@ -166,6 +168,10 @@
           <h4>📡 广播自动发现</h4>
           <p>Windows 端常驻 44043 端口监听，Android 端一键搜索局域网内接收端，零配置即连。</p>
         </div>
+        <div class="highlight">
+          <h4>🔇 智能噪声管理</h4>
+          <p>智能 AGC 底噪安全区 10dB + 目标 -18dBFS，杜绝静音期 Noise Pumping；dBFS 噪声门 10% 关门衰减 + 160ms 尾音保护；Android 硬件级 NoiseSuppressor 联动降噪。</p>
+        </div>
       </div>
     </div>
   </section>
@@ -180,7 +186,7 @@
         <span>UDP2Mic</span>
       </div>
       <p class="footer-version">v1.0.6 — Apache 2.0</p>
-      <p class="footer-meta">Android Kotlin + JNI Opus · Windows Rust + iced + cpal</p>
+      <p class="footer-meta">Android Kotlin + JNI Opus · Windows Rust + iced + cpal · 智能 AGC 安全区 · dBFS 噪声门 · 硬件降噪</p>
     </div>
   </div>
 </footer>

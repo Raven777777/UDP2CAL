@@ -1,11 +1,11 @@
 # UDP2Mic — 局域网麦克风
 
-> **当前版本: v1.0.6** — Windows 端边缘场景容错强化、竞态消除、NaN 防线
+> **当前版本: v1.0.6** — 智能 AGC 底噪安全区 + dBFS 噪声门 + 硬件降噪联动 + Windows 端容错强化
 
 ## 概述
 
 ```
-Android 手机 → AGC → 噪声门 → Opus 编码 → UDP (广播自动发现) → Windows PC → WASAPI → VB-Cable → 任意应用
+Android 手机 → 智能 AGC(底噪追踪+10dB安全区) → dBFS噪声门 → Opus 编码 → UDP (广播自动发现) → Windows PC → WASAPI → VB-Cable → 任意应用
 ```
 
 UDP2Mic 是一个**工业级稳定、低延迟**的局域网麦克风系统。Android 端采集音频，经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。
@@ -17,8 +17,9 @@ UDP2Mic 是一个**工业级稳定、低延迟**的局域网麦克风系统。An
 ### Android 发送端
 - **生产-消费双协程**：独占线程 `AudioRecord.read()` + `Channel` 投递消费者，消除饥饿
 - **全链路零堆分配**：`ShortArrayPool` 帧复用 + 乒乓发送缓冲区 + `encoderEncodeTo` 直接写入
-- **智能 AGC**：样点级线性插值平滑，消除帧边界爆音，自动上限 100x
-- **动态追踪噪声门**
+- **智能 AGC（底噪安全区锁定）**：极慢底噪 dBFS 追踪 + 10dB 安全区（手动模式 0~20dB 可调），杜绝静音期 Noise Pumping；样点级线性插值平滑，目标人声 -18dBFS
+- **自适应/手动 dBFS 噪声门**：-60~0dBFS 工业标准阈值，关门保留 10% 环境音掩蔽听觉断层
+- **Android 硬件级 NoiseSuppressor 联动**：随噪声门开关热生效
 - **Opus CBR/VBR 热调节**：5 种采样率（48k/24k/16k/12k/8k）自适应协商
 - **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
 - **网络无缝热重连**：改 IP 不重启录音流

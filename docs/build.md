@@ -1,5 +1,5 @@
 ﻿# UDP2Mic 项目文档
-> 最后更新: 2026-06-05 | 状态: **v1.0.6 — Windows 端边缘场景容错强化、竞态消除、NaN 防线**
+> 最后更新: 2026-06-05 | 状态: **v1.0.6 — 智能 AGC 底噪安全区 + dBFS 噪声门 + 硬件降噪联动 + Windows 端容错强化**
 
 > 项目简介与快速开始见根目录: [README.md](../README.md)
 
@@ -54,8 +54,8 @@ build_android.bat
 | --- | --- | --- |
 | **UI 层** | Jetpack Compose | 采用 `Flow` 细粒度订阅与局部缓存变量，杜绝高频重绘引发的滑块卡顿 |
 | **网络层** | Kotlin Coroutines + UDP Socket | 动态比对 `Prefs`，静默热重连不断流。支持 UDP 广播自动发现 |
-| **音频采集** | AudioRecord (UNPROCESSED) | **生产-消费双协程** + `ShortArrayPool` 帧复用，零分配 |
-| **核心算法** | 智能解耦 AGC + 动态追踪噪声门 | **样点级线性插值平滑**消除帧边界爆音，自动上限 100x |
+| **音频采集** | AudioRecord (UNPROCESSED) | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5） + **Android NoiseSuppressor 硬件降噪联动** |
+| **核心算法** | **智能 AGC（底噪安全区 10dB + 目标 -18dBFS）** + **自适应/手动 dBFS 噪声门** | **样点级线性插值平滑**消除帧边界爆音；底噪安全区锁定杜绝 Noise Pumping；噪声门关门保留 10% 环境音掩蔽听觉断层；延迟静音架构解耦 AGC |
 | **编码层** | libopus (JNI) | **`encoderEncodeTo` 直接写入 & 双重边界守卫** + `@Synchronized` 互斥锁 |
 | **发送层** | UDP DatagramSocket | **乒乓缓冲区 + `send(offset,length)` 零拷贝**，防脏数据 |
 

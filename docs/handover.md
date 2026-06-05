@@ -1,18 +1,18 @@
 # UDP2Mic AI 继任者指南
 > 写给下一个接手这个项目的 AI / 开发者
-> 最后更新: 2026-06-05 | 状态: **v1.0.6 — Windows 端边缘场景容错强化、竞态消除、NaN 防线**
+> 最后更新: 2026-06-05 | 状态: **v1.0.6 — 智能 AGC 底噪安全区 + dBFS 噪声门 + 硬件降噪联动 + Windows 端容错强化**
 
 ## 一、你现在接手的是什么
 
-一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持智能 AGC 与动态噪声门：
+一个**工业级稳定、低延迟且高度解耦的**局域网麦克风系统，支持**智能 AGC（底噪安全区锁定 + 目标 -18dBFS）**与**自适应/手动 dBFS 噪声门**：
 
 ```
-[Android 手机] ──{生产→消费双协程}──→ AGC样点插值 → 噪声门 → Opus完全零分配编码 → UDP零分配发送 → [Windows PC] ──WASAPI──→ [VB-Cable]
+[Android 手机] ──{生产→消费双协程}──→ 智能AGC(底噪追踪+安全区10dB) → 噪声门(-40dBFS自动) → Opus完全零分配编码 → UDP零分配发送 → [Windows PC] ──WASAPI──→ [VB-Cable]
 ↓
 微信/Zoom/OBS/游戏
 ```
 
-**双端均已编译通过。无任何残留的神经网络降噪。ByteArray + ShortArray 全链路完全零堆分配（仅池热身期 3 次构造）。**
+**双端均已编译通过。无任何残留的神经网络降噪。Android 端已集成智能 AGC、dBFS 噪声门、Android 硬件级 NoiseSuppressor 联动。**
 
 ---
 
@@ -234,11 +234,92 @@ let inst = GetModuleHandleW(None).unwrap_or_default();
 
 ---
 
-## 五、历史重大变更记录 (Changelog)
+## 五、Android 发送端重点优化记录（v1.0.6）
+
+以下优化专为 Android 端 Kotlin 代码在**智能 AGC 底噪安全区锁定、dBFS 噪声门、硬件降噪联动、并发安全**方面所做的强化。
+
+### 1. 智能 AGC：底噪安全区锁定 + 目标 -18dBFS（`CaptureService.kt`）
+
+**问题**：旧版 AGC 持续追踪 `agcSmoothedRms`，在静音期会盲目放大环境底噪（Noise Pumping），产生"空气抽吸感"。
+
+**修复**：全新智能 AGC 架构：
+
+```kotlin
+// 极慢底噪追踪（alphaTrackNoise = 0.002）
+if (currentDb < agcNoiseFloorDb + 3.0 || currentDb < -45.0) {
+    agcNoiseFloorDb = agcNoiseFloorDb * (1.0 - alphaTrackNoise) + currentDb * alphaTrackNoise
+}
+// 安全区锁定：仅当声音高出底噪 10dB 才视为"真人说话"
+val isRealVoice = currentDb > (agcNoiseFloorDb + AGC_SAFE_ZONE_DB)
+if (isRealVoice) {
+    val dbDeficit = -18.0 - currentDb  // 目标人声 -18dBFS
+    val idealGain = 10^(dbDeficit / 20) // 计算理想放大倍数
+    val targetGain = idealGain.coerceAtMost(userMaxGainLimit)
+    agcCurrentGain = agcCurrentGain * 0.8f + targetGain * 0.2f // 快进慢出
+} else {
+    // 底噪区 → 增益沉降回 1.0f，绝不放大环境噪声
+    agcCurrentGain = agcCurrentGain * 0.7f + 1.0f * 0.3f
+}
+```
+
+**核心原理**：
+- `agcNoiseFloorDb` 极慢追踪麦克风底噪（-50dB → -45dB → ...）
+- `AGC_SAFE_ZONE_DB = 10.0`：能量高出底噪 10dB 才判定为"真人说话"，杜绝底噪被误放大
+- 目标人声 `-18dBFS`：国际广播标准电平，远近说话音量被归一化到统一响度
+- 样点级线性插值保持，从 `agcPreviousGain` 渐变到 `agcCurrentGain`，消除咔哒爆音
+
+### 2. dBFS 噪声门阈值（`CaptureService.kt` + `Prefs.kt` + `MainActivity.kt`）
+
+**问题**：旧 RMS 绝对值阈值（0~300）在嘈杂环境不够用，且不直观。
+
+**修复**：改用工业标准 dBFS（满刻度分贝）作为阈值：
+- UI 滑块范围：`-60 dBFS`（几乎不切）~ `0 dBFS`（封死所有声音）
+- 默认值：`-40 dBFS`（典型底噪水平）
+- 自动模式：内部 `ambientEnergy` 追踪转 dBFS 后对比
+- 手动模式：滑块值直接作为 dBFS 切除阈值
+
+### 3. 关门 10% 环境音保留 + 延迟静音架构（`CaptureService.kt`）
+
+**问题**：`frame.fill(0)` 彻底静音导致听觉断层，且过早 fill 会影响 AGC 底噪追踪。
+
+**修复**：
+- **延迟静音**：引入 `shouldMuteFrame` 标记，噪声门只标记不破坏缓冲区，在编码前最后执行衰减
+- **10% 保留**：关门时不彻底静音，保留 10% 环境音掩蔽听觉断层：
+```kotlin
+if (shouldMuteFrame) {
+    for (i in frame.indices) {
+        frame[i] = (frame[i] * 0.1f).toInt().coerceIn(-32768, 32767).toShort()
+    }
+}
+```
+
+### 4. Android 硬件级 NoiseSuppressor 联动（`CaptureService.kt`）
+
+**新增**：`android.media.audiofx.NoiseSuppressor` 实例化管理：
+- `updateHardwareNoiseCancellation()` 方法动态启停硬件降噪
+- 录音初始化时根据 `Prefs.noiseGate` 启动
+- 生产者循环每帧检测 Prefs 变化，热生效（无需重启 Service）
+- `stopCapture()` 时确保释放硬件资源
+
+### 5. 并发安全熔断与池容量调优（`CaptureService.kt`）
+
+| 修复 | 问题 | 方案 |
+| --- | --- | --- |
+| 对象池耗尽 | 池容量 3 ≤ 通道容量 3，生产者可能池空卡死 | 池容量 3 → **5** |
+| `ngActive` 不同步 | 仅在初始化赋值，UI 无法感知中途开关 | 每秒汇报 `ngActive = Prefs.noiseGate` |
+| 硬件故障无限重启 | 麦克风被占用时 `pendingRestart` 死循环 | 熔断：`errorMsg` 含"麦克风初始化失败"时清空 `pendingRestart` |
+| AGC-噪声门死锁 | 噪声门 fill(0) 导致 AGC 增益暴冲 100 倍 | 延迟静音架构解耦；AGC 使用原始信号 dBFS（不受噪声门影响） |
+| 快照误触发 | 说话声触发 `currentRms > ambientEnergy * 4.0` | 连续 6 帧计数器验证环境突变 |
+| 安全区不热生效 | `AGC_SAFE_ZONE_DB` 定义在 for 循环外，切换 AGC 模式不更新 | 移入循环内每帧读取 `Prefs.agcSafeZone` |
+| 死代码残留 | `Prefs.noiseGateAuto` 无引用；`windows/src/vbcable.rs` 未导入 | 已删除冗余代码 |
+
+---
+
+## 六、历史重大变更记录 (Changelog)
 
 | 版本 | 变更点 | 核心目的 / 解决的痛点 |
 | --- | --- | --- |
-| **v1.0.6** | **Windows 端边缘场景容错强化** | 消除 `udp_receiver_stream` 多线程注册表竞态条件；EMA 漂移比率增加 `is_normal()` + `is_finite()` + 范围限制三层防线，杜绝 NaN 永久锁定；`float.rs` HINSTANCE 空指针改用 `GetModuleHandleW`；启动按钮 200ms 防抖 + 端口实时校验红色边框；`is_auto_start()` 可读性优化 |
+| **v1.0.6** | **智能 AGC + dBFS 噪声门 + Windows 端容错强化** | Android：智能 AGC 底噪安全区锁定（10dB）+ 目标 -18dBFS 杜绝底噪放大；dBFS 阈值滑块（-60~0dB）取代 RMS；关门保留 10% 环境音；NoiseSuppressor 硬件降噪联动；对象池 3→5、熔断保护、延迟静音解耦；安全区每帧热生效修复；清除 `noiseGateAuto`/`vbcable.rs` 死代码。Windows：消除 `udp_receiver_stream` 注册表竞态；EMA 漂移比率 NaN/Infinity 防线；HINSTANCE 空指针修复；200ms 防抖 + 端口校验；`is_auto_start()` 可读性优化 |
 | **v1.0.5** | **全链路零分配 / 双协程 / 双重边界守卫 / ShortArrayPool / 广播发现 / AGC插值** | 双协程消除 AudioRecord 阻塞饥饿；JNI `encoderEncodeTo` + `writeHeader` + `UdpSender::send(offset)` + `ShortArrayPool@Synchronized` 实现 ByteArray+ShortArray 全零分配，根除一切 GC 抖动；JNI 双重边界 1276+动态 守卫防越界写穿；Channel 生命周期联动关闭；UDP 广播自动搜索 PC；样点级 AGC 插值消除爆音；uintptr_t + applicationContext 消除底层隐患 |
 | **v1.0.4** | **JNI 同步锁 / 网络无缝热重连** | 引入 `@Synchronized` 根除多线程并发闪退；主页改 IP 不重启录音流 |
 | **v1.0.3** | **AGC 解耦 / Opus 免重启参数热更新** | 剥离 restart() 逻辑，参数指纹挡板 |
@@ -247,7 +328,7 @@ let inst = GetModuleHandleW(None).unwrap_or_default();
 
 ---
 
-## 六、接手后推荐的后续演进方向
+## 七、接手后推荐的后续演进方向
 
 1. **JNI 层双向锁（可选）**：在 `EncoderState` 中加入 `pthread_mutex_t` 锁，实现 Kotlin + C 双层保险。
 2. **MDNS 发现替代 UDP 广播**：支持跨子网、多网卡环境下的自动发现。
