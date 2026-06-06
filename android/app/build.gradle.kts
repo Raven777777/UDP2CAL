@@ -13,11 +13,13 @@ android {
         applicationId = "com.udp2mic.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.6"
+        versionCode = 3
+        versionName = "1.0.8"
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            // -PtargetAbi=armeabi-v7a | arm64-v8a (default)
+            val targetAbi = project.findProperty("targetAbi") as? String ?: "arm64-v8a"
+            abiFilters += listOf(targetAbi)
         }
 
         externalNativeBuild {

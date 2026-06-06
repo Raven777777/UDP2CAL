@@ -1,4 +1,4 @@
-﻿// 配置管理 - 注册表读写
+// 配置管理 - 注册表读写
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -9,9 +9,6 @@ pub struct Config {
     pub listen_ip: String,
     pub listen_port: u32,
     pub auto_start: u32,
-    pub float_window_enable: u32,
-    pub float_window_x: i32,
-    pub float_window_y: i32,
 }
 
 impl Default for Config {
@@ -20,9 +17,6 @@ impl Default for Config {
             listen_ip: "0.0.0.0".into(),
             listen_port: 44044,
             auto_start: 0,
-            float_window_enable: 1,
-            float_window_x: 100,
-            float_window_y: 200,
         }
     }
 }
@@ -36,18 +30,12 @@ impl Config {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = match hkcu.open_subkey_with_flags(REG_PATH, KEY_READ) {
             Ok(k) => k,
-            Err(_) => {
-                let _ = Self::default().save();
-                return Self::default();
-            }
+            Err(_) => return Self::default(),
         };
         Self {
             listen_ip: get_string(&path, "listen_ip", "0.0.0.0"),
             listen_port: get_dword(&path, "listen_port", 44044),
             auto_start: get_dword(&path, "auto_start", 0),
-            float_window_enable: get_dword(&path, "float_window_enable", 1),
-            float_window_x: get_dword(&path, "float_window_x", 100) as i32,
-            float_window_y: get_dword(&path, "float_window_y", 200) as i32,
         }
     }
 
@@ -57,9 +45,6 @@ impl Config {
         key.set_value("listen_ip", &self.listen_ip)?;
         key.set_value("listen_port", &self.listen_port)?;
         key.set_value("auto_start", &self.auto_start)?;
-        key.set_value("float_window_enable", &self.float_window_enable)?;
-        key.set_value("float_window_x", &(self.float_window_x as u32))?;
-        key.set_value("float_window_y", &(self.float_window_y as u32))?;
         Ok(())
     }
 

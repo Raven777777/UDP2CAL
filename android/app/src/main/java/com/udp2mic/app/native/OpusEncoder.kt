@@ -11,15 +11,28 @@ class OpusEncoder(
     val signalType: Int = Prefs.opusSignal,
     val bandwidth: Int = Prefs.opusBandwidth,
     val dtx: Int = Prefs.opusDtx,
-    val vbr: Int = Prefs.opusVbr,
+    vbrRaw: Int = Prefs.opusVbr,
+    val fec: Int = Prefs.opusFec,
+    val packetLoss: Int = Prefs.opusPacketLoss,
+    vbrConstraintRaw: Int = Prefs.opusVbrConstraint,
 ) {
+    // 统一强制逻辑：DTX=1 时 VBR 必须=1；VBR=0 时 vbrConstraint 无意义强制=0
+    val vbr: Int = if (dtx == 1) 1 else vbrRaw
+    val vbrConstraint: Int = if (vbr == 1) vbrConstraintRaw else 0
     companion object {
         private const val TAG = "OpusEncoder"
+
+        /** 将 kbps 编码为协议头单字节：0→auto，1..255→(kbps/2)，支持 0–510kbps。
+         * 注意：512 → 512/2=256 → coerce 到 255 → 解码为 510kbps（OPUS 协议硬上限） */
+        private fun computeBitrateId(kbps: Int): Byte =
+            if (kbps <= 0) Udp2MicProtocol.BITRATE_AUTO
+            else (kbps / 2).coerceIn(1, 255).toByte()
     }
 
     @Volatile private var handle: Long = 0
     val sampleRateId: Byte = Udp2MicProtocol.hzToSampleRate(sampleRateHz)
-    val bitrateId: Byte = bitrateKbps.coerceIn(0, 255).toByte()
+    /** 协议头码率字段（Byte，0=auto，其它=(bitrateKbps/2).coerceIn(1,255) 支持 0–510kbps） */
+    @Volatile var bitrateId: Byte = computeBitrateId(bitrateKbps)
     private var seqNum: Byte = 0
     var encodeCount: Long = 0; private set
 
@@ -30,9 +43,9 @@ class OpusEncoder(
     fun start(): Boolean {
         if (handle != 0L) return true
         return try {
-            handle = OpusNative.encoderCreate(sampleRateHz, bitrateKbps, complexity, signalType, bandwidth, dtx, vbr)
+            handle = OpusNative.encoderCreate(sampleRateHz, bitrateKbps, complexity, signalType, bandwidth, dtx, vbr, fec, packetLoss, vbrConstraint)
             if (handle != 0L) {
-                Log.i(TAG, "Encoder: sr=$sampleRateHz br=${bitrateKbps}k cplx=$complexity sig=$signalType bw=$bandwidth dtx=$dtx vbr=$vbr")
+                Log.i(TAG, "Encoder: sr=$sampleRateHz br=${bitrateKbps}k cplx=$complexity sig=$signalType bw=$bandwidth dtx=$dtx vbr=$vbr fec=$fec pl=$packetLoss vbrc=$vbrConstraint")
                 true
             } else {
                 Log.e(TAG, "Encoder create returned 0")
@@ -81,10 +94,12 @@ class OpusEncoder(
     }
 
     @Synchronized
-    fun update(complexity: Int, signalType: Int, bandwidth: Int, dtx: Int, vbr: Int, bitrateKbps: Int): Boolean {
+    fun update(complexity: Int, signalType: Int, bandwidth: Int, dtx: Int, vbr: Int, bitrateKbps: Int, fec: Int, packetLoss: Int, vbrConstraint: Int): Boolean {
         val h = handle; if (h == 0L) return false
         return try {
-            OpusNative.encoderUpdate(h, complexity, signalType, bandwidth, dtx, vbr, bitrateKbps)
+            val ok = OpusNative.encoderUpdate(h, complexity, signalType, bandwidth, dtx, vbr, bitrateKbps, fec, packetLoss, vbrConstraint)
+            if (ok) { bitrateId = computeBitrateId(bitrateKbps) }
+            ok
         } catch (e: Exception) {
             Log.e(TAG, "Encoder update failed", e)
             false

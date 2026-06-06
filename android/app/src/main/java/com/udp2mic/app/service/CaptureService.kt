@@ -21,7 +21,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlin.math.*
 
 class CaptureService : Service() {
     companion object { private const val TAG = "CaptureService" }
@@ -42,63 +41,75 @@ class CaptureService : Service() {
 
     private data class CaptureParams(
         val sampleRateHz: Int, val bitrateKbps: Int, val targetIp: String, val targetPort: Int,
-        val testTone: Boolean, val noiseGate: Boolean
+        val testTone: Boolean
     )
     private var pendingRestart: CaptureParams? = null
 
-    // ── AGC 状态（旧版已废弃，新版 AGC 使用消费者协程内的局部变量）
-
-    // ── 自适应噪声门状态（v1.0.6 升级：硬静音 + 自动/手动模式）──
-    private var ambientEnergy = 50.0       // 动态追踪的环境底噪 RMS 能量（Short 域）
-    private val alphaTrack = 0.005         // 背景能量追踪系数（极慢跟随，约数秒平滑）
-    private var silenceFrameCount = 0      // 连续静音帧计数，用于平滑释放
-    private val HOLD_FRAMES = 8            // 说话停止后，保持门打开的帧数（8帧 * 20ms = 160ms 尾音保护）
-
-    // ── Android 硬件级主动降噪 ──
-    private var hardwareNoiseSuppressor: android.media.audiofx.NoiseSuppressor? = null
+    /** 音源描述枚举 */
+    object AudioSourceLabel {
+        const val MIC_RAW = "MIC直出"                    // 裸麦克风，硬件降噪关闭
+        const val SYSTEM_NS = "系统硬件降噪"              // VOICE_COMMUNICATION，安卓系统原生降噪
+        const val SYSTEM_NS_FALLBACK = "系统硬件降噪(已回退MIC)" // VOICE_COMMUNICATION失败，回退MIC
+    }
 
     data class CaptureStatus(
         val isRunning: Boolean = false,
-        val isConnected: Boolean = false,
         val bitrateKbps: Float = 0f,
         val sampleRateHz: Int = 0,
         val bitrateTargetKbps: Int = 0,
-        val errorMsg: String = "",
-        val agcGainDb: Float = 0f,
-        val agcGainX: Float = 0f,
-        val ngActive: Boolean = false
+        val vbrMode: String = "",                // "CBR" / "VBR" / "VBR约束" / "VBR(DTX)"
+        val audioSource: String = "",            // 当前音源描述
+        val opusMode: String = "",               // "语音模式" / "全频模式"
+        val errorMsg: String = ""
     )
 
     inner class LocalBinder : Binder() { fun getService(): CaptureService = this@CaptureService }
     override fun onBind(intent: Intent?): IBinder = binder
-    override fun onCreate() { super.onCreate() ; createNotificationChannel() }
+    override fun onCreate() { super.onCreate() }
+
+    // startForeground 必须在 startService→onStartCommand 时立即调用（5s限制）
+    //   NotificationChannel 必须在权限授予后创建 → 放这里而非 onCreate
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        createNotificationChannel()
+        try { startForeground(1, buildNotification()) } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
 
     fun startCapture(sampleRateHz: Int, bitrateKbps: Int, targetIp: String, targetPort: Int,
-                     testTone: Boolean = false, noiseGate: Boolean = true) {
+                     testTone: Boolean = false) {
         if (captureJob?.isActive == true) {
-            // 如果只是网络地址变了，我们可以动态处理，此处仅针对硬参数变更做物理重启
-            pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone, noiseGate)
+            pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
             captureJob?.cancel()
             return
         }
         pendingRestart = null
-        doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone, noiseGate)
+        doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
     }
+
+    /**
+     * 判断当前 Opus 信号类型是否为语音模式，驱动音源选择
+     * 仅此一个状态变量控制音源切换：
+     *   true  → VOICE_COMMUNICATION（系统原生硬件降噪）
+     *   false → MIC（裸麦克风，硬件降噪关闭）
+     */
+    private fun isVoiceMode(): Boolean = Prefs.opusSignal == 3001 // OPUS_SIGNAL_VOICE
 
     private fun doStartCapture(
         sampleRateHz: Int, bitrateKbps: Int, targetIp: String, targetPort: Int,
-        testTone: Boolean, noiseGate: Boolean
+        testTone: Boolean
     ) {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UDP2Mic:Capture")
         try { wakeLock.acquire(10 * 60 * 1000L) } catch (_: Exception) {}
 
-        try { startForeground(1, buildNotification()) } catch (e: Exception) {
-            _status.value = _status.value.copy(errorMsg = "前台服务: ${e.message}")
-            return
-        }
-
         hasNewCapture = true
+        // 捕获启动时的 isVoiceMode，用于消费者协程检测变更
+        val startIsVoiceMode = isVoiceMode()
+
         captureJob = serviceScope.launch {
             _status.value = _status.value.copy(isRunning = true, errorMsg = "")
 
@@ -112,7 +123,7 @@ class CaptureService : Service() {
 
                 encoder = OpusEncoder(sampleRateHz, bitrateKbps)
                 if (!encoder!!.start()) {
-                    _status.value = _status.value.copy(isRunning = false, errorMsg = "编码器初始化失败")
+                    _status.value = _status.value.copy(isRunning = false, errorMsg = "编码器初始化失败，已保留原始PCM通路")
                     stopSelf()
                     return@launch
                 }
@@ -124,18 +135,22 @@ class CaptureService : Service() {
                     return@launch
                 }
 
-                _status.value = _status.value.copy(ngActive = noiseGate, sampleRateHz = sampleRateHz, bitrateTargetKbps = bitrateKbps)
-                var byteCount = 0L
-                var lastReport = System.currentTimeMillis()
+                _status.value = _status.value.copy(
+                    sampleRateHz = sampleRateHz,
+                    bitrateTargetKbps = bitrateKbps,
+                    opusMode = if (startIsVoiceMode) "语音模式" else "全频模式"
+                )
 
                 if (testTone) {
+                    var byteCount = 0L
+                    var lastReport = System.currentTimeMillis()
                     val omega = 2.0 * Math.PI * 1000.0 / sampleRateHz
                     val testToneBuf = ShortArray(frameSize)
                     var phase = 0.0
                     val frameIntervalNs = (frameSize * 1_000_000_000L) / sampleRateHz
                     var nextFrameTime = System.nanoTime()
 
-                    _status.value = _status.value.copy(isRunning = true, isConnected = true)
+                    _status.value = _status.value.copy(isRunning = true)
 
                     val sendBuffer = ByteArray(Udp2MicProtocol.MAX_PACKET)
 
@@ -179,30 +194,60 @@ class CaptureService : Service() {
                     }
                     val bufferSize = (minBufSize * 2).coerceAtLeast((sampleRateHz / 1000) * 40)
 
-                    try {
-                        audioRecord = AudioRecord(MediaRecorder.AudioSource.UNPROCESSED, sampleRateHz, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
-                    } catch (_: Exception) {}
+                    // ═══ 音源选择：由 isVoiceMode（Opus信号类型）驱动 ═══
+                    var audioSourceLabel: String
+                    if (startIsVoiceMode) {
+                        // 语音模式 → 尝试 VOICE_COMMUNICATION（系统原生硬件降噪）
+                        try {
+                            audioRecord = AudioRecord(
+                                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                                sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
+                                AudioFormat.ENCODING_PCM_16BIT, bufferSize
+                            )
+                        } catch (_: Exception) {}
 
-                    if (audioRecord == null || audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                        audioRecord?.release()
-                        audioRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRateHz, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
+                        if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                            audioSourceLabel = AudioSourceLabel.SYSTEM_NS
+                            Log.i(TAG, "音源: VOICE_COMMUNICATION（系统硬件降噪）")
+                        } else {
+                            // 异常回退：VOICE_COMMUNICATION 不可用 → 降级到 MIC
+                            audioRecord?.release()
+                            Log.w(TAG, "VOICE_COMMUNICATION 不可用，回退到 MIC 裸采集")
+                            audioRecord = AudioRecord(
+                                MediaRecorder.AudioSource.MIC,
+                                sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
+                                AudioFormat.ENCODING_PCM_16BIT, bufferSize
+                            )
+                            audioSourceLabel = AudioSourceLabel.SYSTEM_NS_FALLBACK
+                        }
+                    } else {
+                        // 全频模式 → MIC 裸麦克风（硬件降噪关闭）
+                        audioRecord = AudioRecord(
+                            MediaRecorder.AudioSource.MIC,
+                            sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT, bufferSize
+                        )
+                        audioSourceLabel = AudioSourceLabel.MIC_RAW
+                        Log.i(TAG, "音源: MIC（裸麦克风，硬件降噪关闭）")
                     }
 
                     if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                        _status.value = _status.value.copy(isRunning = false, errorMsg = "麦克风初始化失败")
+                        _status.value = _status.value.copy(
+                            isRunning = false,
+                            errorMsg = "麦克风初始化失败",
+                            audioSource = AudioSourceLabel.MIC_RAW
+                        )
                         stopSelf()
                         return@launch
                     }
 
-                    // ── 重置状态 ──
-                    ambientEnergy = 50.0 ; silenceFrameCount = 0
-
                     val readSize = frameSize * 2
                     audioRecord?.startRecording()
-                    // 根据用户配置启动硬件降噪联动
-                    updateHardwareNoiseCancellation(Prefs.noiseGate)
 
-                    _status.value = _status.value.copy(isRunning = true, isConnected = true)
+                    _status.value = _status.value.copy(
+                        isRunning = true,
+                        audioSource = audioSourceLabel
+                    )
 
                     // ── 音频帧通道（容量 3：无需无限增长，又提供足够并行度）──
                     val ch = Channel<ShortArray>(3)
@@ -226,12 +271,6 @@ class CaptureService : Service() {
                         var accumBuf = framePool.borrow() // 第一帧从池中借出
 
                         while (isActive) {
-                            // 【硬件降噪联动】每帧检测 Prefs 状态变化，热生效
-                            val shouldNs = Prefs.noiseGate
-                            if (shouldNs != (hardwareNoiseSuppressor != null)) {
-                                updateHardwareNoiseCancellation(shouldNs)
-                            }
-
                             val read = audioRecord?.read(pcmBuffer, 0, readSize) ?: -1
                             if (read <= 0) continue
 
@@ -252,25 +291,17 @@ class CaptureService : Service() {
                         }
                     }
 
-                    // ═══ 消费者协程 ═══：AGC → 编码参数更新 → 噪声门 → 编码 → 发送
+                    // ═══ 消费者协程 ═══：编码参数同步 → 编码 → 发送
                     // 与生产者在两个独立协程并行执行，流水线消除 IO 阻塞间隙
-                    // ═══ 升级版：智能 AGC + 自适应噪声门 消费者协程 ═══
                     val consumerJob = launch {
                         var currentIp = targetIp
                         var currentPort = targetPort
                         var byteCount = 0L
                         var lastReport = System.currentTimeMillis()
                         var lastOpusConfigHash = 0
-                        var highEnergyFrameCount = 0
-
-                        // ── 智能 AGC 与底噪追踪核心状态 ──
-                        var agcNoiseFloorDb = -50.0       // 动态追踪的底噪分贝基准 (dBFS)
-                        val alphaTrackNoise = 0.002       // 极慢的底噪追踪系数
-                        var agcCurrentGain = 1.0f         // 当前帧最终生效增益
-                        var agcPreviousGain = 1.0f        // 上一帧的最终增益（用于插值平滑）
 
                         for (frame in ch) {
-                            // ── 步骤0: 网络目标动态热重连 ──
+                            // ── 网络目标动态热重连 ──
                             val targetIpFromPrefs = Prefs.targetIp
                             val targetPortFromPrefs = Prefs.targetPort
                             if (targetIpFromPrefs != currentIp || targetPortFromPrefs != currentPort) {
@@ -286,71 +317,17 @@ class CaptureService : Service() {
                                 }
                             }
 
-                            // ── 步骤1: 计算原始音频帧 RMS 与真实 dBFS（基于未加工的输入） ──
-                            var sumSq = 0L
-                            for (s in frame) { val v = s.toInt(); sumSq += (v * v).toLong() }
-                            val frameRmsLinear = sqrt(sumSq.toDouble() / frameSize)
-                            
-                            // 归一化到 32768.0 最大振幅，直接得到标准 dBFS (-100.0dB ~ 0.0dB)
-                            val currentDb = if (frameRmsLinear > 0.0) 20.0 * log10(frameRmsLinear / 32768.0) else -100.0
-
-                            // ── 步骤2: 智能自适应 AGC 模块 ──
-                            val menuAgcEnabled = Prefs.agcEnabled
-                            val userMaxGainLimit = Prefs.agcMaxGain.toFloat().coerceIn(1.0f, 200f) // 界面最大增益限制
-                            // 安全区：自动模式固定 10dB，手动模式使用滑块值（0=关闭安全区），每帧热生效
-                            val agcSafeZoneDb = if (menuAgcEnabled) 10.0 else Prefs.agcSafeZone.toDouble()
-
-                            if (menuAgcEnabled) {
-                                // A. 动态追踪底噪：当声音处于极低水平，或者连续多帧处于非突发状态时，让底噪基准咬合
-                                if (currentDb < agcNoiseFloorDb + 3.0 || currentDb < -45.0) {
-                                    agcNoiseFloorDb = agcNoiseFloorDb * (1.0 - alphaTrackNoise) + currentDb * alphaTrackNoise
-                                }
-
-                                // B. 核心智能控制：判定是否为“真人在说话区”
-                                val isRealVoice = currentDb > (agcNoiseFloorDb + agcSafeZoneDb)
-
-                                if (isRealVoice) {
-                                    // 理想人声目标设为 -18.0 dBFS
-                                    val targetVoiceDb = -18.0 
-                                    val dbDeficit = targetVoiceDb - currentDb // 距离目标的能量缺口
-                                    
-                                    if (dbDeficit > 0) {
-                                        // 计算理想放大倍数
-                                        val idealGain = Math.pow(10.0, dbDeficit / 20.0).toFloat()
-                                        // 受限于用户在界面设置的麦克风最大 AGC 增益限制
-                                        val targetGain = idealGain.coerceAtMost(userMaxGainLimit)
-                                        // 智能控制快进慢出：激活放大时，让增益温和跟进
-                                        agcCurrentGain = agcCurrentGain * 0.8f + targetGain * 0.2f
-                                    } else {
-                                        // 声音已经足够大或超标，快速向 1.0f 沉降（起到压限 Limiter 保护作用）
-                                        agcCurrentGain = agcCurrentGain * 0.5f + 1.0f * 0.5f
-                                    }
-                                } else {
-                                    // 【环境底噪区】锁死增益：低于安全范围，强制让 AGC 增益平滑沉降回 1.0f，不放大底噪
-                                    agcCurrentGain = agcCurrentGain * 0.7f + 1.0f * 0.3f
-                                }
-                            } else {
-                                // 【固定增益模式】如果关闭智能 AGC，退化为通过滑块平滑调节固定增益
-                                agcCurrentGain = agcCurrentGain * 0.7f + userMaxGainLimit * 0.3f
+                            // ── 音源模式变更检测（isVoiceMode 驱动 AudioRecord 重建）──
+                            val newIsVoiceMode = isVoiceMode()
+                            if (newIsVoiceMode != startIsVoiceMode) {
+                                Log.i(TAG, "🔄 Opus信号类型变更(isVoiceMode: $startIsVoiceMode→$newIsVoiceMode)，触发音频源重建")
+                                pendingRestart = CaptureParams(
+                                    sampleRateHz, bitrateKbps,
+                                    Prefs.targetIp, Prefs.targetPort, testTone
+                                )
+                                captureJob?.cancel()
+                                return@launch
                             }
-
-                            // C. 样点级线性插值：消除帧边界信号幅度断层导致的"咔哒"爆音
-                            val gStart = agcPreviousGain
-                            val gEnd = agcCurrentGain
-                            if (gStart != gEnd) {
-                                for (i in frame.indices) {
-                                    val t = i.toFloat() / frameSize.toFloat()
-                                    val gain = gStart + (gEnd - gStart) * t
-                                    val amplified = (frame[i] * gain).toInt().coerceIn(-32768, 32767)
-                                    frame[i] = amplified.toShort()
-                                }
-                            } else if (gEnd != 1.0f) {
-                                for (i in frame.indices) {
-                                    val amplified = (frame[i] * gEnd).toInt().coerceIn(-32768, 32767)
-                                    frame[i] = amplified.toShort()
-                                }
-                            }
-                            agcPreviousGain = agcCurrentGain // 滚动迭代增益历史
 
                             // ── Opus 编码参数毫秒级动态同步 ──
                             val curCplx = Prefs.opusComplexity
@@ -358,64 +335,32 @@ class CaptureService : Service() {
                             val curBw = Prefs.opusBandwidth
                             val curDtx = Prefs.opusDtx
                             val curVbr = if (curDtx == 1) 1 else Prefs.opusVbr
+                            // 自动码率：48000→512k（OPUS 立体声协议上限），24000→256k，16000→128k
                             val curBr = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else {
-                                when (sampleRateHz) { 48000 -> 64; 24000 -> 40; 16000 -> 32; else -> 24 }
+                                when (sampleRateHz) { 48000 -> 512; 24000 -> 256; 16000 -> 128; else -> 64 }
                             }
-                            val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr)
+                            val curFec = Prefs.opusFec
+                            val curPl = Prefs.opusPacketLoss
+                            val curVbrc = if (curVbr == 1) Prefs.opusVbrConstraint else 0
+                            val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc)
                             if (curHash != lastOpusConfigHash) {
-                                if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr) == true) {
+                                if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc) == true) {
                                     lastOpusConfigHash = curHash
-                                    _status.value = _status.value.copy(bitrateTargetKbps = curBr)
+                                    val mode = when {
+                                        curDtx == 1 -> "VBR(DTX)"
+                                        curVbr == 1 && curVbrc == 1 -> "VBR约束"
+                                        curVbr == 1 -> "VBR"
+                                        else -> "CBR"
+                                    }
+                                    _status.value = _status.value.copy(
+                                        bitrateTargetKbps = curBr,
+                                        vbrMode = mode,
+                                        opusMode = if (isVoiceMode()) "语音模式" else "全频模式"
+                                    )
                                 }
                             }
 
-                            // ── 步骤3: 自动/手动噪声门判定（此时操作的是经 AGC 放大后的音频） ──
-                            var shouldMuteFrame = false
-                            val ngManualThresholdDb = Prefs.noiseGateThreshold
-                            val ngAutoEnabled = Prefs.noiseGate
-
-                            if (ngAutoEnabled || ngManualThresholdDb > -60f) {
-                                var postSumSq = 0L
-                                for (s in frame) { val v = s.toInt(); postSumSq += (v * v).toLong() }
-                                val postRms = sqrt(postSumSq.toDouble() / frameSize)
-                                val postDb = if (postRms > 0.0) 20.0 * log10(postRms / 32768.0) else -100.0
-
-                                val targetDb = if (ngAutoEnabled) {
-                                    if (ambientEnergy <= 50.0 && postRms > 100.0) {
-                                        ambientEnergy = postRms
-                                    } else if (postRms > ambientEnergy * 4.0) {
-                                        highEnergyFrameCount++
-                                        if (highEnergyFrameCount > 6) { ambientEnergy = postRms }
-                                    } else {
-                                        highEnergyFrameCount = 0
-                                    }
-
-                                    if (postRms < ambientEnergy * 2.0) {
-                                        ambientEnergy = (1.0 - alphaTrack) * ambientEnergy + alphaTrack * postRms
-                                    }
-                                    20.0 * log10((ambientEnergy * 1.5) / 32768.0)
-                                } else {
-                                    ngManualThresholdDb.toDouble()
-                                }
-
-                                if (postDb > targetDb) {
-                                    silenceFrameCount = 0
-                                } else {
-                                    if (silenceFrameCount < HOLD_FRAMES) {
-                                        silenceFrameCount++
-                                    } else {
-                                        shouldMuteFrame = true
-                                    }
-                                }
-                            }
-
-                            // ── 步骤4: 最终裁决（噪声门平滑衰减 10%）+ 编码 + 发送 ──
-                            if (shouldMuteFrame) {
-                                for (i in frame.indices) {
-                                    frame[i] = (frame[i] * 0.1f).toInt().coerceIn(-32768, 32767).toShort()
-                                }
-                            }
-
+                            // ── 编码 + 发送 ──
                             val buf = sendBuffers[bufIndex]
                             bufIndex = (bufIndex + 1) % 2
                             val written = encoder?.encodeTo(frame, buf, 0) ?: -1
@@ -423,21 +368,16 @@ class CaptureService : Service() {
                                 if (udpSender?.send(buf, 0, written) == true) byteCount += written
                             }
 
-                            // ── 步骤5: 每秒状态汇报 ──
+                            // ── 每秒状态汇报 ──
                             val now = System.currentTimeMillis()
                             if (now - lastReport >= 1000) {
                                 val kbps = if (now - lastReport > 0) (byteCount * 8f) / (now - lastReport) else 0f
-                                _status.value = _status.value.copy(
-                                    bitrateKbps = kbps,
-                                    agcGainDb = 20f * log10(agcCurrentGain.toDouble().coerceAtLeast(1e-6)).toFloat(),
-                                    agcGainX = agcCurrentGain,
-                                    ngActive = Prefs.noiseGate
-                                )
+                                _status.value = _status.value.copy(bitrateKbps = kbps)
                                 byteCount = 0
                                 lastReport = now
                             }
 
-                            framePool.recycle(frame) // 完美的零内存分配闭环归还
+                            framePool.recycle(frame)
                         }
                     }
 
@@ -465,8 +405,11 @@ class CaptureService : Service() {
                 udpSender = null
                 try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception){}
 
-                // ✅ 熔断保护：硬件初始化硬故障（麦克风被占用/不支持）时拒绝无限重启，防止 ANR
-                if (_status.value.errorMsg.contains("麦克风初始化失败") || _status.value.errorMsg.contains("麦克风不支持")) {
+                // ✅ 熔断保护：硬件初始化硬故障（麦克风被占用/不支持/编码器失败）时拒绝无限重启，防止 ANR
+                if (_status.value.errorMsg.contains("麦克风初始化失败")
+                    || _status.value.errorMsg.contains("麦克风不支持")
+                    || _status.value.errorMsg.contains("编码器初始化失败")
+                    || _status.value.errorMsg.contains("编码器帧大小无效")) {
                     Log.e(TAG, "🚨 发生硬件初始化硬故障，清空挂起任务，实施安全熔断。")
                     pendingRestart = null
                 }
@@ -474,43 +417,11 @@ class CaptureService : Service() {
                 val restart = pendingRestart
                 pendingRestart = null
                 if (restart != null) {
-                    serviceScope.launch { doStartCapture(restart.sampleRateHz, restart.bitrateKbps, restart.targetIp, restart.targetPort, restart.testTone, restart.noiseGate) }
+                    serviceScope.launch { doStartCapture(restart.sampleRateHz, restart.bitrateKbps, restart.targetIp, restart.targetPort, restart.testTone) }
                 } else if (!hasNewCapture) {
-                    _status.value = _status.value.copy(isRunning = false, isConnected = false)
+                    _status.value = _status.value.copy(isRunning = false)
                     try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception){}
                     stopSelf()
-                }
-            }
-        }
-    }
-
-    /** 动态管理 Android 硬件级主动降噪（与自动噪声门联动） */
-    private fun updateHardwareNoiseCancellation(enabled: Boolean) {
-        val audioRecordInstance = audioRecord ?: return
-        if (!android.media.audiofx.NoiseSuppressor.isAvailable()) {
-            Log.w(TAG, "当前设备硬件不支持 NoiseSuppressor")
-            return
-        }
-        if (enabled) {
-            if (hardwareNoiseSuppressor == null) {
-                try {
-                    hardwareNoiseSuppressor = android.media.audiofx.NoiseSuppressor.create(audioRecordInstance.audioSessionId)
-                    hardwareNoiseSuppressor?.enabled = true
-                    Log.i(TAG, ">>> 联动成功：已启动 Android 硬件级主动降噪 <<<")
-                } catch (e: Exception) {
-                    Log.e(TAG, "创建硬件降噪器失败", e)
-                }
-            }
-        } else {
-            if (hardwareNoiseSuppressor != null) {
-                try {
-                    hardwareNoiseSuppressor?.enabled = false
-                    hardwareNoiseSuppressor?.release()
-                    Log.i(TAG, ">>> 已关闭 Android 硬件级主动降噪 <<<")
-                } catch (e: Exception) {
-                    Log.e(TAG, "释放硬件降噪器失败", e)
-                } finally {
-                    hardwareNoiseSuppressor = null
                 }
             }
         }
@@ -519,12 +430,6 @@ class CaptureService : Service() {
     fun stopCapture() {
         pendingRestart = null
         hasNewCapture = false
-        // 清理硬件降噪器
-        try {
-            hardwareNoiseSuppressor?.enabled = false
-            hardwareNoiseSuppressor?.release()
-        } catch (_: Exception) {}
-        hardwareNoiseSuppressor = null
         // 必须显式关闭 channel，防止消费者在 receive() 挂起无法退出
         audioChannel?.close()
         audioChannel = null

@@ -1,26 +1,47 @@
 @echo off
-chcp 65001 >nul
 setlocal enabledelayedexpansion
 
+echo.
 echo ========================================
-echo    UDP2Mic Android 构建脚本
+echo    UDP2Mic Android Build Script
+echo ========================================
+echo.
+echo Select target ABI:
+echo   [1] arm64-v8a   (64-bit)
+echo   [2] armeabi-v7a (32-bit)
+echo.
+
+CHOICE /C 12 /N /M "[1/2]: "
+if errorlevel 2 goto v7a
+goto v8a
+
+:v8a
+set ABI=arm64-v8a
+goto build
+
+:v7a
+set ABI=armeabi-v7a
+goto build
+
+:build
+echo.
+echo ========================================
+echo    ABI: %ABI%
 echo ========================================
 echo.
 
 cd /d "%~dp0android"
 
-echo [1/3] 前置条件检查...
-echo    需要: Android Studio + NDK 27+ + CMake 3.22+
-echo    需要: JDK 17
-echo.
-echo    Android SDK 路径: %ANDROID_HOME%
-echo    JAVA_HOME: %JAVA_HOME%
+echo [1/3] Prerequisites check...
+echo    SDK: %ANDROID_HOME%
+echo    JAVA: %JAVA_HOME%
 echo.
 
-echo [2/3] 编译 Release APK (含自动签名)...
-call gradlew assembleRelease 2>&1
+echo [2/3] Building Release APK (%ABI%)...
+call gradlew assembleRelease -PtargetAbi=%ABI% 2>&1
 if errorlevel 1 (
-    echo [错误] 编译失败，请检查错误信息
+    echo.
+    echo [ERROR] Build failed.
     pause
     exit /b 1
 )
@@ -29,23 +50,22 @@ echo.
 if exist "app\build\outputs\apk\release\app-release.apk" (
     for %%A in ("app\build\outputs\apk\release\app-release.apk") do set size=%%~zA
     set /a sizekb=!size!/1024
-    echo    APK: app\build\outputs\apk\release\app-release.apk (!sizekb! KB)
+    echo    APK built: !sizekb! KB
 
     echo.
-    echo [3/3] 复制到根目录...
-    copy /Y "app\build\outputs\apk\release\app-release.apk" "%~dp0udp2mic.apk" >nul
-    
-    if exist "%~dp0udp2mic-release.apk" (
-        for %%A in ("%~dp0udp2mic.apk") do set rootsize=%%~zA
-        set /a rootkb=!rootsize!/1024
-        echo    根目录: udp2mic.apk (!rootkb! KB)
-    )
+    echo [3/3] Moving APK to project root...
+    move /Y "app\build\outputs\apk\release\app-release.apk" "%~dp0udp2mic_%ABI%.apk" >nul
+    echo    -> udp2mic_%ABI%.apk
+
+    rmdir /s /q "app\build\outputs\apk\release" 2>nul
 
     echo.
     echo ========================================
-    echo    构建成功！
-    echo    APK: app\build\outputs\apk\release\app-release.apk (已签名)
-    echo    根目录: %~dp0udp2mic.apk
+    echo    BUILD SUCCESS  %ABI%
     echo ========================================
+) else (
+    echo.
+    echo [ERROR] APK not found.
+)
 
 pause

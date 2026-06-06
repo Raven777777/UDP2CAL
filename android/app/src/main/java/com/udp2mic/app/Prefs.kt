@@ -23,21 +23,13 @@ object Prefs {
         get() = prefs.getBoolean("test_tone", false)
         set(v) = prefs.edit().putBoolean("test_tone", v).apply()
 
-    var noiseGate: Boolean
-        get() = prefs.getBoolean("noise_gate", true)
-        set(v) = prefs.edit().putBoolean("noise_gate", v).apply()
-
-    var noiseGateThreshold: Float
-        get() = prefs.getFloat("noise_gate_threshold", -40f) // dBFS: -40dB = 典型底噪水平
-        set(v) = prefs.edit().putFloat("noise_gate_threshold", v).apply()
-
     // ── Opus 编码器设置 ──
     var opusComplexity: Int
         get() = prefs.getInt("opus_complexity", 10)
         set(v) = prefs.edit().putInt("opus_complexity", v.coerceIn(1, 10)).apply()
 
     var opusSignal: Int
-        get() = prefs.getInt("opus_signal", 3002) // OPUS_SIGNAL_MUSIC
+        get() = prefs.getInt("opus_signal", 3001) // OPUS_SIGNAL_VOICE (默认语音)
         set(v) = prefs.edit().putInt("opus_signal", v).apply()
 
     var opusBandwidth: Int
@@ -45,27 +37,32 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_bandwidth", v).apply()
 
     var opusDtx: Int
-        get() = prefs.getInt("opus_dtx", 0) // 0=OFF, 1=ON
+        get() = prefs.getInt("opus_dtx", 1) // 0=OFF, 1=ON
         set(v) = prefs.edit().putInt("opus_dtx", v).apply()
 
     var opusVbr: Int
-        get() = prefs.getInt("opus_vbr", 0) // 0=CBR, 1=VBR
+        get() = prefs.getInt("opus_vbr", 1) // 0=CBR, 1=VBR
         set(v) = prefs.edit().putInt("opus_vbr", v).apply()
 
     var opusBitrateKbps: Int
         get() = prefs.getInt("opus_bitrate_kbps", 0) // 0 = auto (根据采样率自动选择)
-        set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, 512)).apply()
+        set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, 512)).apply() // OPUS 协议上限 510kbps（立体声），单声道理论~255k；512 为未来双声道预留
 
-    // ── AGC 设置 ──
-    var agcEnabled: Boolean
-        get() = prefs.getBoolean("agc_enabled", true)
-        set(v) = prefs.edit().putBoolean("agc_enabled", v).apply()
+    var opusFec: Int
+        get() {
+            val v = prefs.getInt("opus_fec", 2)
+            // 自动迁移：旧值 1（强制 SILK）→ 2（允许 CELT + FEC）因为 1 会锁死 300k 码率上限
+            if (v == 1) { prefs.edit().putInt("opus_fec", 2).apply(); return 2 }
+            return v
+        }
+        set(v) = prefs.edit().putInt("opus_fec", v.coerceIn(0, 2)).apply()
 
-    var agcMaxGain: Int
-        get() = prefs.getInt("agc_max_gain", 40) // 0=1x .. 200=200x
-        set(v) = prefs.edit().putInt("agc_max_gain", v.coerceIn(0, 200)).apply()
+    var opusPacketLoss: Int
+        get() = prefs.getInt("opus_packet_loss", 5) // 0..100 预期丢包率（%）
+        set(v) = prefs.edit().putInt("opus_packet_loss", v.coerceIn(0, 100)).apply()
 
-    var agcSafeZone: Float
-        get() = prefs.getFloat("agc_safe_zone", 10f) // 0=关闭, 1~20=dB
-        set(v) = prefs.edit().putFloat("agc_safe_zone", v.coerceIn(0f, 20f)).apply()
+    var opusVbrConstraint: Int
+        get() = prefs.getInt("opus_vbr_constraint", 1) // 0=无约束, 1=约束（不超码率）
+        set(v) = prefs.edit().putInt("opus_vbr_constraint", v.coerceIn(0, 1)).apply()
+
 }

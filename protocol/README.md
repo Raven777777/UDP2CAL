@@ -1,4 +1,4 @@
-﻿# UDP2Mic UDP私有协议 v1
+# UDP2Mic UDP私有协议 v1
 
 ## 协议格式 (大端序)
 
@@ -25,33 +25,35 @@ Byte 6+:  [Opus 音频负载]
 
 ## 采样率-码率自动关联
 
-```
-采样率 | 默认码率
- 8kHz  |  16 kbps
-12kHz  |  20 kbps
-16kHz  |  24 kbps
-24kHz  |  28 kbps
-48kHz  |  32 kbps
-```
+当发送端码率字段设为 0（`BITRATE_AUTO`）时，接收端根据采样率自动匹配默认码率：
 
-发送端将码率设为 0 时，接收端自动使用采样率对应的默认码率显示。
+| 采样率 | Android 自动码率 | 协议编码字节 (kbps/2) |
+|--------|-----------------|---------------------|
+| 8kHz   | 64 kbps         | 32                  |
+| 12kHz  | 64 kbps         | 32                  |
+| 16kHz  | 128 kbps        | 64                  |
+| 24kHz  | 256 kbps        | 128                 |
+| 48kHz  | 512 kbps        | 255 (OPUS 510kbps 天花板) |
+
+> 协议字节 = `compute_bitrate_id(kbps)` = `(kbps/2).min(255).max(1)`。512→256→coerced 255→解码 510kbps。
 
 ## 常量
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
-| HEADER_SIZE | 6 | 包头固定字节数 |
-| MAX_PAYLOAD | 1472 | 最大负载 (MTU 安全) |
-| MAX_PACKET | 1478 | 最大完整包 = 6 + 1472 |
-| MAX_REORDER | 8 | 乱序重排窗口大小 |
+| `HEADER_SIZE` | 6 | 包头固定字节数 |
+| `MAX_PAYLOAD` | 1472 | 最大负载 (MTU 安全) |
+| `MAX_PACKET` | 1478 | 最大完整包 = 6 + 1472 |
+| `MAX_REORDER` | 8 | 乱序重排窗口大小 |
+| `BITRATE_AUTO` | 0 | 自动码率标记 |
 
 ## 实现
 
 | 平台 | 文件 | 语言 |
 |------|------|------|
-| Rust crate | `protocol/protocol.rs` | Rust (唯一协议源) |
+| Rust crate | `protocol/protocol.rs` | Rust (唯一协议真源) |
 | Windows 接收端 | `windows/src/protocol.rs` | 重导出 `udp2mic_protocol::*` |
-| Android 发送端 | `Udp2MicProtocol.kt` | Kotlin (手动对齐) |
+| Android 发送端 | `Udp2MicProtocol.kt` | Kotlin (手动对齐，基准) |
 
 ## 用法 (Rust)
 
@@ -59,7 +61,7 @@ Byte 6+:  [Opus 音频负载]
 use udp2mic_protocol::*;
 
 // 编码包
-let packet = build_packet(SAMPLE_RATE_48K, seq_num, &opus_frame);
+let packet = build_packet(SAMPLE_RATE_48K, seq_num, &opus_frame, BITRATE_AUTO);
 
 // 解码包
 let buf: [u8; HEADER_SIZE] = packet[..HEADER_SIZE].try_into().unwrap();
@@ -67,9 +69,13 @@ if let Some(header) = decode_header(&buf) {
     // header.sample_rate, header.seq_num, header.payload_len, header.bitrate
 }
 
-// 乱序重排
+// 乱序重排（零分配回调模式）
 let mut rb = ReorderBuffer::new();
-for frame in rb.insert(header.seq_num, payload) {
-    // 按序到达的完整帧
-}
+rb.insert_and_drain(header.seq_num, header.sample_rate, payload, |sr, data| {
+    // 按序到达的完整帧，sr=采样率ID, data=Opus负载
+});
+
+// 码率工具
+let id = compute_bitrate_id(512); // 255
+let br = resolve_bitrate(BITRATE_AUTO, SAMPLE_RATE_48K); // 255 (512kbps)
 ```

@@ -1,4 +1,4 @@
-﻿/// UDP2Mic UDP私有协议编解码 (Rust实现)
+/// UDP2Mic UDP私有协议编解码 (Rust实现)
 /// v1: 固定6字节包头 (4字节v0包头 + 码率 + 扩展标记) + Opus负载
 ///
 /// Byte 0: [1-bit ver:1][3-bit codec:1][4-bit sample_rate]
@@ -43,19 +43,34 @@ pub fn hz_to_sample_rate(hz: u32) -> u8 {
 
 // --- 码率助手 ---
 
-/// 根据采样率建议的默认码率
-pub fn default_bitrate_for_sr(sr: u8) -> u8 {
-    match sr {
-        SAMPLE_RATE_8K => 24,
-        SAMPLE_RATE_12K => 32,
-        SAMPLE_RATE_16K => 48,
-        SAMPLE_RATE_24K => 64,
-        SAMPLE_RATE_48K => 128,
-        _ => 128,
+/// 协议码率自动值（与 Kotlin BITRATE_AUTO 对齐）
+pub const BITRATE_AUTO: u8 = 0;
+
+/// 将 kbps 编码为协议头单字节：0→auto，1..255→(kbps/2)，支持 0–510kbps
+/// 与 Kotlin computeBitrateId 100%对齐
+pub fn compute_bitrate_id(kbps: u32) -> u8 {
+    if kbps == 0 {
+        BITRATE_AUTO
+    } else {
+        ((kbps / 2).min(255).max(1)) as u8
     }
 }
 
-/// bitrate=0 表示 auto/unknown，返回建议的默认码率
+/// 根据采样率建议的默认码率（协议编码字节，kbps/2）
+/// 与 Android CaptureService 自动码率策略对齐：
+///   48kHz→512kbps, 24kHz→256kbps, 16kHz→128kbps, ≤12kHz→64kbps
+pub fn default_bitrate_for_sr(sr: u8) -> u8 {
+    match sr {
+        SAMPLE_RATE_8K  => compute_bitrate_id(64),   // 64kbps → 32
+        SAMPLE_RATE_12K => compute_bitrate_id(64),   // 64kbps → 32
+        SAMPLE_RATE_16K => compute_bitrate_id(128),  // 128kbps → 64
+        SAMPLE_RATE_24K => compute_bitrate_id(256),  // 256kbps → 128
+        SAMPLE_RATE_48K => compute_bitrate_id(512),  // 512kbps → 255 (coerced from 256)
+        _ => compute_bitrate_id(64),                 // 64kbps 默认
+    }
+}
+
+/// bitrate=0 表示 auto/unknown，返回建议的默认码率（协议编码字节）
 pub fn resolve_bitrate(bitrate: u8, sample_rate: u8) -> u8 {
     if bitrate == 0 {
         default_bitrate_for_sr(sample_rate)
@@ -312,10 +327,24 @@ mod tests {
 
     #[test]
     fn test_resolve_bitrate() {
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_48K), 32);
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_16K), 24);
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_8K), 16);
+        // 自动码率 → 与 Android auto-bitrate 对齐 (kbps/2 协议编码)
+        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_48K), compute_bitrate_id(512)); // 255
+        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_24K), compute_bitrate_id(256)); // 128
+        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_16K), compute_bitrate_id(128)); // 64
+        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_12K), compute_bitrate_id(64));  // 32
+        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_8K),  compute_bitrate_id(64));  // 32
+        // 显式码率直接透传
         assert_eq!(resolve_bitrate(64, SAMPLE_RATE_48K), 64);
+        assert_eq!(resolve_bitrate(255, SAMPLE_RATE_48K), 255);
+    }
+
+    #[test]
+    fn test_compute_bitrate_id() {
+        assert_eq!(compute_bitrate_id(0), 0);     // auto
+        assert_eq!(compute_bitrate_id(64), 32);   // 64/2
+        assert_eq!(compute_bitrate_id(128), 64);  // 128/2
+        assert_eq!(compute_bitrate_id(256), 128); // 256/2
+        assert_eq!(compute_bitrate_id(512), 255); // 512/2=256, coerced to 255 (OPUS 510kbps ceiling)
     }
 
     #[test]

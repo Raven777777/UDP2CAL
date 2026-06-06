@@ -1,6 +1,6 @@
 [package]
 name = "udp2mic"
-version = "1.0.6"
+version = "1.0.8"
 edition = "2021"
 description = "UDP2Mic - 局域网麦克风Windows接收端"
 build = "build.rs"
@@ -18,7 +18,7 @@ image = "0.24"
 
 [dependencies]
 udp2mic-protocol = { path = "../protocol" }
-iced = { version = "0.13", default-features = false, features = ["tokio", "tiny-skia", "image"] }
+iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia", "image"] }
 tokio = { version = "1.40", features = ["net", "sync", "rt", "macros", "time"] }
 cpal = "0.15"
 windows = { version = "0.58", features = [
@@ -34,4 +34,6 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
 ] }
 winreg = "0.52"
-audiopus = { version = "0.3.0-rc.0", features = ["decoder"] }
+audiopus = "0.3.0-rc.0"
+tray-icon = "0.24.0"
+image = "0.24"
