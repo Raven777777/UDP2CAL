@@ -690,7 +690,7 @@ impl AppState {
                     text("广播地址: 255.255.255.255:44043").size(10).color(grey),
                     Space::new().width(Length::Fill),
                     if self.is_running {
-                        let bc_state = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { "● 广播中" } else { "● 已静音" };
+                        let bc_state = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { "● 广播中" } else { "● 未广播" };
                         let bc_color = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { accent } else { dim };
                         text(bc_state).size(10).color(bc_color)
                     } else {
