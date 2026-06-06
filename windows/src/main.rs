@@ -1,4 +1,5 @@
 ﻿// UDP2Mic Windows 接收端 - 局域网麦克风 
+// 双状态机架构 + P2P 独占通信系统
 #![windows_subsystem = "windows"] 
 
 mod audio; 
@@ -10,9 +11,9 @@ mod protocol;
 use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space}; 
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Color}; 
 use iced::futures::SinkExt; 
-use std::sync::atomic::{AtomicU32, Ordering}; 
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering}; 
 use std::sync::mpsc::{sync_channel, SyncSender}; 
-use std::sync::OnceLock; 
+use std::sync::{Mutex, OnceLock}; 
 use std::time::{Duration, Instant}; 
 use windows::Win32::System::Threading::CreateMutexW; 
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS}; 
@@ -53,9 +54,36 @@ fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
     } 
 } 
 
-// ========================================== 
-// 全局音频守护线程架构 (Audio Worker Backend) 
-// ========================================== 
+// ══════════════════════════════════════════════
+// P2P 独占通信 - 全局共享状态
+// ══════════════════════════════════════════════
+
+const DEVICE_READY: u8 = 0;
+const DEVICE_BUSY: u8 = 1;
+
+/// 全局设备状态 (DEVICE_READY / DEVICE_BUSY)
+static GLOBAL_DEVICE_STATE: AtomicU8 = AtomicU8::new(DEVICE_READY);
+
+/// 当前绑定手机的唯一设备 ID (8字节)
+static BOUND_DEVICE_ID: OnceLock<Mutex<[u8; protocol::DEVICE_ID_SIZE]>> = OnceLock::new();
+fn bound_device_id() -> &'static Mutex<[u8; protocol::DEVICE_ID_SIZE]> {
+    BOUND_DEVICE_ID.get_or_init(|| Mutex::new([0u8; protocol::DEVICE_ID_SIZE]))
+}
+
+/// 获取本机设备 ID 字节数组
+fn my_device_id() -> [u8; protocol::DEVICE_ID_SIZE] {
+    config::Config::load().get_device_id_bytes()
+}
+
+/// 获取本机设备名（系统主机名）
+fn my_device_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UDP2Mic".into())
+}
+
+// ══════════════════════════════════════════════
+// 全局音频守护线程架构
+// ══════════════════════════════════════════════
+
 enum AudioMessage { 
     Packet { seq_num: u8, sample_rate: u8, payload: Vec<u8> }, 
     Reset, 
@@ -128,9 +156,102 @@ fn init_audio_worker() {
     }); 
 } 
 
-// ========================================== 
-// UI 及主控逻辑 
-// ========================================== 
+// ══════════════════════════════════════════════
+// 广播状态机 (独立线程)
+// ══════════════════════════════════════════════
+// Ready 模式: 每1秒广播 TYPE_DISCOVER_REPLY 到 LAN (backward-compat)
+// Silent 模式: 全局DEVICE_BUSY时停止广播
+fn start_broadcast_state_machine() {
+    std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let _ = socket.set_broadcast(true);
+        loop {
+            if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY {
+                let device_id = my_device_id();
+                let my_name = my_device_name();
+                let mut payload = Vec::with_capacity(2 + my_name.len());
+                let port = config::Config::load().listen_port as u16;
+                payload.extend_from_slice(&port.to_be_bytes());
+                payload.extend_from_slice(my_name.as_bytes());
+                let packet = protocol::build_packet(
+                    false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
+                    &device_id, &payload, 0,
+                );
+                let _ = socket.send_to(&packet, "255.255.255.255:44043");
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// 重置全局状态到 DEVICE_READY
+fn reset_to_ready() {
+    GLOBAL_DEVICE_STATE.store(DEVICE_READY, Ordering::Relaxed);
+    if let Ok(mut id) = bound_device_id().lock() {
+        id.fill(0);
+    }
+}
+
+// ══════════════════════════════════════════════
+// v2 发现服务 (独立线程)
+// ══════════════════════════════════════════════
+pub fn start_broadcast_listener() { 
+    std::thread::spawn(move || { 
+        let socket = match std::net::UdpSocket::bind("0.0.0.0:44043") { 
+            Ok(s) => s, 
+            Err(e) => { 
+                eprintln!("[Discovery] 绑定广播端口失败: {}", e); 
+                return; 
+            } 
+        }; 
+        let mut buf = [0u8; 1024]; 
+        loop { 
+            match socket.recv_from(&mut buf) { 
+                Ok((amt, src)) => { 
+                    let data = &buf[..amt];
+                    // 尝试统一 v2 协议
+                    if amt >= protocol::HEADER_SIZE && protocol::is_v2_packet(data) {
+                        let hdr_buf: [u8; protocol::HEADER_SIZE] = 
+                            data[..protocol::HEADER_SIZE].try_into().unwrap_or_default();
+                        if let Some(hdr) = protocol::decode_header(&hdr_buf) {
+                            if hdr.msg_type == protocol::TYPE_DISCOVER_REQ {
+                                let cfg = config::Config::load();
+                                let port = cfg.listen_port as u16;
+                                let my_id = cfg.get_device_id_bytes();
+                                let my_name = my_device_name();
+                                let mut payload = Vec::with_capacity(2 + my_name.len());
+                                payload.extend_from_slice(&port.to_be_bytes());
+                                payload.extend_from_slice(my_name.as_bytes());
+                                let reply = protocol::build_packet(
+                                    false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
+                                    &my_id, &payload, 0,
+                                );
+                                let _ = socket.send_to(&reply, src);
+                                continue;
+                            }
+                        }
+                    }
+                    // 兼容旧版纯文本协议
+                    let msg = String::from_utf8_lossy(data).trim().to_string();
+                    if msg == "UDP2MIC_DISCOVER" { 
+                        let port = config::Config::load().listen_port; 
+                        let reply = format!("UDP2MIC_REPLY:{}", port); 
+                        let _ = socket.send_to(reply.as_bytes(), src); 
+                    } 
+                } 
+                Err(_) => {} 
+            } 
+        } 
+    }); 
+} 
+
+// ══════════════════════════════════════════════
+// UI 及主控逻辑
+// ══════════════════════════════════════════════
+
 #[derive(Debug, Clone)] 
 enum Message { 
     IpChanged(String), 
@@ -144,7 +265,6 @@ enum Message {
     Quit, 
 } 
 
-// 窗口关闭请求跟踪，用于拦截关闭按钮
 #[derive(Debug, Clone)] 
 struct StatusInfo { 
     bitrate_kbps: f32, 
@@ -165,34 +285,6 @@ struct AppState {
     vb_cable_installed: bool, 
     last_toggle_instant: Instant, 
     session_id: u32, 
-} 
-
-/// 广播发现服务：监听手机搜索请求，回复当前实际监听端口
-pub fn start_broadcast_listener() { 
-    std::thread::spawn(move || { 
-        let socket = match std::net::UdpSocket::bind("0.0.0.0:44043") { 
-            Ok(s) => s, 
-            Err(e) => { 
-                eprintln!("[Discovery] 绑定广播端口失败: {}", e); 
-                return; 
-            } 
-        }; 
-        let mut buf = [0u8; 1024]; 
-        loop { 
-            match socket.recv_from(&mut buf) { 
-                Ok((amt, src)) => { 
-                    let msg = String::from_utf8_lossy(&buf[..amt]); 
-                    if msg.trim() == "UDP2MIC_DISCOVER" { 
-                        // 每次搜索请求从注册表读取最新端口
-                        let port = config::Config::load().listen_port; 
-                        let reply = format!("UDP2MIC_REPLY:{}", port); 
-                        let _ = socket.send_to(reply.as_bytes(), src); 
-                    } 
-                } 
-                Err(_) => {} 
-            } 
-        } 
-    }); 
 } 
 
 fn main() -> Result<(), iced::Error> { 
@@ -216,13 +308,15 @@ fn main() -> Result<(), iced::Error> {
         let _ = firewall::add_firewall_rule(); 
     }); 
 
+    // P2P 系统初始化
     start_broadcast_listener(); 
+    start_broadcast_state_machine();
     init_audio_worker(); 
 
-    // 初始化图标 (加载 icon.png，失败时回退到程序绘制) 
+    // 初始化图标
     let (icon_rgba, w, h) = load_icon_rgba(); 
 
-    // 1. 初始化系统托盘 (适配 tray-icon 0.24.0) 
+    // 系统托盘
     let tray_menu = tray_icon::menu::Menu::new(); 
     let quit_item = tray_icon::menu::MenuItemBuilder::new() 
         .id("quit".into()) 
@@ -239,11 +333,9 @@ fn main() -> Result<(), iced::Error> {
         .with_menu_on_left_click(false) 
         .build() 
         .unwrap(); 
-
-    // 驻留托盘实例，防止生命周期结束导致托盘图标消失 
     Box::leak(Box::new(tray_icon)); 
 
-    // 2. 启动主窗体
+    // 主窗体
     iced::application(move || {
         let cfg = config::Config::load();
         let now = Instant::now();
@@ -268,7 +360,7 @@ fn main() -> Result<(), iced::Error> {
         .default_font(iced::Font::with_name("Microsoft YaHei"))
         .theme(Theme::Dark)
         .window(iced::window::Settings {
-            size: iced::Size::new(380.0, 300.0),
+            size: iced::Size::new(360.0, 300.0),
             position: iced::window::Position::Centered,
             resizable: false,
             exit_on_close_request: false,
@@ -303,6 +395,7 @@ impl AppState {
                 self.session_id = self.session_id.wrapping_add(1); 
 
                 if self.is_running { 
+                    reset_to_ready();
                     self.is_running = false; 
                     self.connected = false; 
                     self.last_bitrate = 0.0; 
@@ -324,6 +417,7 @@ impl AppState {
                     self.config.listen_port = port as u32; 
                     let _ = self.config.save(); 
 
+                    reset_to_ready();
                     self.is_running = true; 
                     self.connected = false; 
                     self.last_bitrate = 0.0; 
@@ -356,7 +450,6 @@ impl AppState {
                 Task::none() 
             } 
             Message::HideWindow => {
-                // 点击关闭按钮时隐藏窗口（不在任务栏显示） 
                 unsafe { 
                     let title: Vec<u16> = "UDP2Mic\0".encode_utf16().collect(); 
                     if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
@@ -368,7 +461,6 @@ impl AppState {
                 Task::none() 
             }
             Message::ShowWindow => {
-                // 双击托盘图标恢复并置顶窗口 
                 unsafe { 
                     let title: Vec<u16> = "UDP2Mic\0".encode_utf16().collect(); 
                     if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
@@ -401,25 +493,35 @@ impl AppState {
             (accent, "● 已连接") 
         } else { 
             (red, if self.status_text.contains("断开") { "● 已断开" } else { "● 等待连接" }) 
-        }; 
+        };
 
-        let vb: Element<_> = if self.vb_cable_installed { 
-            row![ 
-                text("●").color(Color::from_rgb(0.25, 0.80, 0.40)).size(9), 
-                text("VB-Cable").size(11).color(dim), 
-            ] 
-            .spacing(4) 
-            .align_y(Alignment::Center) 
-            .into() 
-        } else { 
-            row![ 
-                text("●").color(Color::from_rgb(0.90, 0.55, 0.15)).size(9), 
-                text("VB-Cable 未安装").size(11).color(Color::from_rgb(0.90, 0.55, 0.15)), 
-            ] 
-            .spacing(4) 
-            .align_y(Alignment::Center) 
-            .into() 
-        }; 
+        // P2P 状态: 独占绑定(仅v2 TYPE_CONNECT触发) / 音频流连接(v1) / 空闲
+        let gs = GLOBAL_DEVICE_STATE.load(Ordering::Relaxed);
+        let (p2p_state, p2p_color) = if !self.is_running {
+            (String::new(), dim)
+        } else if gs == DEVICE_BUSY {
+            // 独占绑定: 通过 v2 TYPE_CONNECT 建立, 显示设备 ID
+            let id_str = bound_device_id().lock().ok()
+                .map(|id| {
+                    let hex: String = id.iter().map(|b| format!("{:02x}", b)).collect();
+                    if hex.chars().all(|c| c == '0') { String::new() }
+                    else if hex.len() > 8 { hex[..8].to_string() } else { hex }
+                })
+                .unwrap_or_default();
+            if id_str.is_empty() {
+                ("● 已占用".to_string(), Color::from_rgb(0.95, 0.55, 0.15))
+            } else {
+                (format!("● 已占用 {}", id_str), Color::from_rgb(0.95, 0.55, 0.15))
+            }
+        } else if self.connected {
+            // v1 音频流连接: 有数据流但无独占绑定
+            ("● 已连接".to_string(), accent)
+        } else {
+            ("● 空闲".to_string(), accent)
+        };
+
+        let vb_str = if self.vb_cable_installed { "● VB-Cable" } else { "● VB-Cable 未安装" };
+        let vb_color = if self.vb_cable_installed { Color::from_rgb(0.25, 0.80, 0.40) } else { Color::from_rgb(0.90, 0.55, 0.15) };
 
         let mk = |label: &'static str, color: Color, msg: Message| { 
             button(text(label).size(13)) 
@@ -466,150 +568,148 @@ impl AppState {
                 row![ 
                     text("UDP2Mic").size(20), 
                     Space::new().width(Length::Fill), 
-                    text(st).color(sc).size(12), 
-                    Space::new().width(10.0), 
-                    vb, 
+                    text(st).color(sc).size(11),
+                    Space::new().width(8),
+                    text(vb_str).size(11).color(vb_color),
+                    Space::new().width(8),
+                    text(p2p_state).size(11).color(p2p_color),
                 ] 
                 .align_y(Alignment::Center), 
-                Space::new().height(14.0), 
-                container( 
-                    column![ 
-                        text(if self.is_running { "当前正在监听端口" } else { "配置局域网监听地址" }).size(11).color(dim), 
-                        Space::new().height(4.0), 
-                        if self.is_running { 
-                            let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port); 
-                            row![text(addr).size(14).color(Color::WHITE)] 
-                                .align_y(Alignment::Center) 
-                        } else { 
-                            row![ 
-                                text_input("0.0.0.0", &self.ip_input) 
-                                    .on_input(Message::IpChanged) 
-                                    .width(150) 
-                                    .padding([5, 8]) 
-                                    .style(move |_, status| { 
-                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status); 
-                                        iced::widget::text_input::Style { 
-                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)), 
-                                            border: iced::Border { radius: 5.0.into(), color: Color::from_rgb(0.25, 0.25, 0.30), width: 1.0 }, 
-                                            ..base 
-                                        } 
-                                    }), 
-                                text(" : ").size(16).color(dim), 
-                                text_input("44044", &self.port_input) 
-                                    .on_input(Message::PortChanged) 
-                                    .width(70) 
-                                    .padding([5, 8]) 
-                                    .style(move |_, status| { 
-                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status); 
-                                        iced::widget::text_input::Style { 
-                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)), 
-                                            border: iced::Border { 
-                                                radius: 5.0.into(), 
-                                                color: if self.port_valid { Color::from_rgb(0.25, 0.25, 0.30) } else { red }, 
-                                                width: 1.0 
-                                            }, 
-                                            ..base 
-                                        } 
-                                    }), 
-                            ] 
-                            .align_y(Alignment::Center) 
-                        }, 
-                    ] 
-                ) 
-                .padding(12) 
-                .width(Length::Fill) 
-                .style(move |_| container::Style { 
-                    background: Some(iced::Background::Color(card_bg)), 
-                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 }, 
-                    ..Default::default() 
-                }), 
-                Space::new().height(12.0), 
-                container( 
-                    column![ 
-                        row![ 
-                            column![ 
-                                text("传输码率").size(10).color(dim), 
-                                Space::new().height(2.0), 
-                                row![ 
-                                    text(format!("{:.0}", self.last_bitrate as u32)).size(24), 
-                                    Space::new().width(3.0), 
-                                    text("kbps").size(11).color(dim) 
-                                ].align_y(Alignment::End) 
-                            ].width(Length::FillPortion(1)), 
-                            column![ 
-                                text("声音电平").size(10).color(dim), 
-                                Space::new().height(2.0), 
-                                row![ 
-                                    text(format!("{:.0}", self.last_level_db as i32)).size(24), 
-                                    Space::new().width(3.0), 
-                                    text("dB").size(11).color(dim) 
-                                ].align_y(Alignment::End) 
-                            ].width(Length::FillPortion(1)), 
-                        ], 
-                        Space::new().height(8.0), 
-                        progress_bar(0.0..=1.0, frac as f32) 
-                            .girth(4) 
-                            .style(move |_| { 
-                                let bar_color = if db > -10.0 { 
-                                    red 
-                                } else if db > -25.0 { 
-                                    Color::from_rgb(0.90, 0.55, 0.15) 
-                                } else { 
-                                    accent 
-                                }; 
-                                iced::widget::progress_bar::Style { 
-                                    background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)), 
-                                    bar: iced::Background::Color(bar_color), 
-                                    border: iced::Border { radius: 2.0.into(), ..Default::default() }, 
-                                } 
-                            }), 
-                    ] 
-                ) 
-                .padding(12) 
-                .width(Length::Fill) 
-                .style(move |_| container::Style { 
-                    background: Some(iced::Background::Color(card_bg)), 
-                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 }, 
-                    ..Default::default() 
-                }), 
-                Space::new().height(14.0), 
-                row![ 
-                    mk( 
-                        if self.is_running { "停止" } else { "启动" }, 
-                        btn_c, 
-                        Message::ToggleRunning, 
-                    ).width(Length::FillPortion(1)), 
-                    Space::new().width(8.0), 
-                    mk( 
-                        "开机自启", 
-                        auto_c, 
-                        Message::ToggleAutoStart(!self.config.is_auto_start()), 
-                    ).width(Length::FillPortion(1)), 
-                ], 
                 Space::new().height(8.0), 
-                row![ 
-                    text("广播地址: 255.255.255.255:44043").size(10).color(grey), 
-                    Space::new().width(Length::Fill), 
-                    if !self.status_text.is_empty() { 
-                        text(&self.status_text).size(10).color(if self.status_text.contains("失败") { red } else { dim }) 
-                    } else { 
-                        text("") 
-                    } 
-                ].align_y(Alignment::Center) 
-            ] 
-            .padding(16), 
-        ) 
-        .width(Length::Fill) 
-        .height(Length::Fill) 
-        .style(move |_| container::Style { 
-            background: Some(iced::Background::Color(bg)), 
-            ..Default::default() 
-        }) 
-        .into() 
+                container(
+                    column![
+                        text(if self.is_running { "监听端口" } else { "目标地址" }).size(11).color(dim),
+                        Space::new().height(4),
+                        if self.is_running {
+                            let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
+                            row![text(addr).size(14).color(Color::WHITE)]
+                                .height(32).align_y(Alignment::Center)
+                        } else {
+                            row![
+                                text_input("0.0.0.0", &self.ip_input)
+                                    .on_input(Message::IpChanged)
+                                    .width(148)
+                                    .padding([5, 8])
+                                    .style(move |_, status| {
+                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status);
+                                        iced::widget::text_input::Style {
+                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
+                                            border: iced::Border { radius: 5.0.into(), color: Color::from_rgb(0.25, 0.25, 0.30), width: 1.0 },
+                                            ..base
+                                        }
+                                    }),
+                                text(" : ").size(16).color(dim),
+                                text_input("44044", &self.port_input)
+                                    .on_input(Message::PortChanged)
+                                    .width(68)
+                                    .padding([5, 8])
+                                    .style(move |_, status| {
+                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status);
+                                        iced::widget::text_input::Style {
+                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
+                                            border: iced::Border {
+                                                radius: 5.0.into(),
+                                                color: if self.port_valid { Color::from_rgb(0.25, 0.25, 0.30) } else { red },
+                                                width: 1.0
+                                            },
+                                            ..base
+                                        }
+                                    }),
+                            ].align_y(Alignment::Center)
+                        },
+                    ]
+                )
+                .padding(10)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(card_bg)),
+                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 },
+                    ..Default::default()
+                }),
+                Space::new().height(8.0),
+                container(
+                    column![
+                        row![
+                            column![
+                                text("码率").size(10).color(dim),
+                                Space::new().height(2),
+                                row![
+                                    text(format!("{:.0}", self.last_bitrate as u32)).size(22),
+                                    Space::new().width(3),
+                                    text("kbps").size(11).color(dim)
+                                ].align_y(Alignment::End)
+                            ].width(Length::FillPortion(1)),
+                            column![
+                                text("电平").size(10).color(dim),
+                                Space::new().height(2),
+                                row![
+                                    text(format!("{:.0}", self.last_level_db as i32)).size(22),
+                                    Space::new().width(3),
+                                    text("dB").size(11).color(dim)
+                                ].align_y(Alignment::End)
+                            ].width(Length::FillPortion(1)),
+                        ],
+                        Space::new().height(6),
+                        progress_bar(0.0..=1.0, frac as f32)
+                            .girth(3)
+                            .style(move |_| {
+                                let bar_color = if db > -10.0 { red }
+                                else if db > -25.0 { Color::from_rgb(0.90, 0.55, 0.15) }
+                                else { accent };
+                                iced::widget::progress_bar::Style {
+                                    background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
+                                    bar: iced::Background::Color(bar_color),
+                                    border: iced::Border { radius: 2.0.into(), ..Default::default() },
+                                }
+                            }),
+                    ]
+                )
+                .padding(10)
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(card_bg)),
+                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 },
+                    ..Default::default()
+                }),
+                Space::new().height(10),
+                row![
+                    mk(
+                        if self.is_running { "停止" } else { "启动" },
+                        btn_c,
+                        Message::ToggleRunning,
+                    ).width(Length::FillPortion(1)),
+                    Space::new().width(8),
+                    mk(
+                        "开机自启",
+                        auto_c,
+                        Message::ToggleAutoStart(!self.config.is_auto_start()),
+                    ).width(Length::FillPortion(1)),
+                ],
+                Space::new().height(6),
+                row![
+                    text("广播地址: 255.255.255.255:44043").size(10).color(grey),
+                    Space::new().width(Length::Fill),
+                    if self.is_running {
+                        let bc_state = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { "● 广播中" } else { "● 已静音" };
+                        let bc_color = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { accent } else { dim };
+                        text(bc_state).size(10).color(bc_color)
+                    } else {
+                        text("")
+                    },
+                ].align_y(Alignment::Center),
+            ]
+            .padding(14),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(bg)),
+            ..Default::default()
+        })
+        .into()
     } 
 
     fn subscription(&self) -> Subscription<Message> { 
-        // 捕获窗口关闭请求 
         let close_events = iced::event::listen_with(|event, _status, _id| { 
             if let iced::Event::Window(window_event) = event { 
                 if matches!(window_event, iced::window::Event::CloseRequested) { 
@@ -657,6 +757,49 @@ fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
+}
+
+/// 发送 CONNECT_ACK 到 Android 的源地址（端口来自 CONNECT 包的 src_addr）
+fn send_connect_ack(src_addr: &std::net::SocketAddr) {
+    if let Ok(ack_sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        let my_id = my_device_id();
+        let ack_packet = protocol::build_packet(
+            false, protocol::TYPE_CONNECT_ACK, 0, 0, &my_id, &[], 0,
+        );
+        let _ = ack_sock.send_to(&ack_packet, src_addr);
+    }
+}
+
+/// 处理控制消息（TYPE_CONNECT / TYPE_CONNECT_ACK / TYPE_DISCOVER_*）
+fn handle_control(header: &protocol::PacketHeader, _payload: &[u8], src_addr: &std::net::SocketAddr, output: &mut iced::futures::channel::mpsc::Sender<Message>) {
+    match header.msg_type {
+        protocol::TYPE_CONNECT => {
+            let current_state = GLOBAL_DEVICE_STATE.load(Ordering::Relaxed);
+            if current_state == DEVICE_BUSY {
+                if let Ok(bound) = bound_device_id().lock() {
+                    if *bound == header.device_id {
+                        // 同设备保活重连 → 回复 ACK 维持连接
+                        send_connect_ack(src_addr);
+                        return;
+                    }
+                }
+                let _ = output.try_send(Message::StatusUpdate(StatusInfo {
+                    bitrate_kbps: 0.0, level_db: -60.0, error_msg: Some("设备已被占用，拒绝新连接"),
+                }));
+                return;
+            }
+            if let Ok(mut bound) = bound_device_id().lock() {
+                *bound = header.device_id;
+            }
+            GLOBAL_DEVICE_STATE.store(DEVICE_BUSY, Ordering::Relaxed);
+            eprintln!("[P2P] 手机端 {} 已绑定连接", src_addr.ip());
+            let _ = output.try_send(Message::StatusUpdate(StatusInfo {
+                bitrate_kbps: 0.0, level_db: -60.0, error_msg: Some("已连接手机端"),
+            }));
+            send_connect_ack(src_addr);
+        }
+        _ => {}
+    }
 }
 
 fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::futures::Stream<Item = Message> { 
@@ -713,10 +856,11 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
                 socket.recv_from(&mut buf), 
             ).await; 
 
-            let (len, _src) = match result { 
+            let (len, src) = match result { 
                 Ok(Ok(v)) => v, 
                 _ => { 
-                    if !was_disconnected && last_packet.elapsed() > Duration::from_secs(3) { 
+                    if !was_disconnected && last_packet.elapsed() > Duration::from_secs(1) { 
+                        reset_to_ready();
                         let _ = output.send(Message::Disconnected).await; 
                         was_disconnected = true; 
                     } 
@@ -724,21 +868,44 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
                 } 
             }; 
 
-            if len < protocol::HEADER_SIZE { 
+            if len < protocol::HEADER_SIZE || !protocol::is_v2_packet(&buf) { 
                 continue; 
             } 
 
-            let hdr_array: [u8; protocol::HEADER_SIZE] = match buf[..protocol::HEADER_SIZE].try_into() { 
-                Ok(b) => b, 
-                Err(_) => continue, 
-            }; 
+            // 解析统一协议头
+            let hdr_buf: [u8; protocol::HEADER_SIZE] = match buf[..protocol::HEADER_SIZE].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let h = match protocol::decode_header(&hdr_buf) {
+                Some(h) => h,
+                None => continue,
+            };
 
-            let h = match protocol::decode_header(&hdr_array) { 
-                Some(h) => h, 
-                None => continue, 
-            }; 
+            // ═══ 控制消息 ═══
+            if !h.is_audio {
+                let payload_end = (protocol::HEADER_SIZE + h.payload_len as usize).min(len);
+                let payload = &buf[protocol::HEADER_SIZE..payload_end];
+                handle_control(&h, payload, &src, &mut output);
+                continue;
+            }
+
+            // ═══ 音频数据 (TYPE_DATA) ═══
+            // 安全准入: 仅 TYPE_CONNECT 可建连，READY 时拒绝所有音频
+            // 防止第三者恶意抢占——重启 Win 端即可清空非法绑定
+            if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY {
+                continue; // 无合法 TYPE_CONNECT，拒绝所有音频
+            }
+            // 1对1 过滤: BUSY 时只接受绑定设备的音频
+            let bound = bound_device_id().lock().ok()
+                .map(|id| *id == h.device_id)
+                .unwrap_or(false);
+            if !bound {
+                continue;
+            }
 
             last_packet = Instant::now(); 
+
             if was_disconnected { 
                 was_disconnected = false; 
                 let _ = output.send(Message::StatusUpdate(StatusInfo { 

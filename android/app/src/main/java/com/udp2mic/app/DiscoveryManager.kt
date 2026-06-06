@@ -5,49 +5,97 @@ import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.SocketTimeoutException
 
 object DiscoveryManager {
     private const val BROADCAST_PORT = 44043
-    private const val DISCOVER_REQ = "UDP2MIC_DISCOVER"
-    private const val REPLY_PREFIX = "UDP2MIC_REPLY:"
+
+    data class DiscoverResult(
+        val ip: String,
+        val port: Int,
+        val deviceId: ByteArray,
+        val deviceName: String
+    )
 
     /**
-     * 发起局域网广播搜索 PC 端
-     * @return 成功则返回 Pair(PC_IP, PC_PORT)，失败或超时返回 null
+     * 发起局域网广播搜索 PC 端，收集所有回复
      */
-    suspend fun discoverServer(): Pair<String, Int>? = withContext(Dispatchers.IO) {
+    suspend fun discoverServers(): List<DiscoverResult> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<DiscoverResult>()
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket()
-            socket.broadcast = true // 关键：允许发送广播包
-            socket.soTimeout = 2000 // 关键：设置2秒超时，防止协程无限挂起
+            socket.broadcast = true
+            socket.soTimeout = 500
 
-            // 1. 发送广播暗号到 255.255.255.255
-            val reqData = DISCOVER_REQ.toByteArray()
+            val deviceId = getOrCreateDeviceId()
+            val reqPacket = Udp2MicProtocol.buildPacket(
+                isAudio = false,
+                msgType = Udp2MicProtocol.TYPE_DISCOVER_REQ,
+                sampleRate = 0,
+                seqNum = 0,
+                deviceId = deviceId,
+                payload = ByteArray(0)
+            )
             val broadcastAddr = InetAddress.getByName("255.255.255.255")
-            val sendPacket = DatagramPacket(reqData, reqData.size, broadcastAddr, BROADCAST_PORT)
-            socket.send(sendPacket)
 
-            // 2. 准备接收 PC 的单播回复
-            val recvBuf = ByteArray(1024)
-            val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
+            repeat(3) {
+                val sendPacket = DatagramPacket(reqPacket, reqPacket.size, broadcastAddr, BROADCAST_PORT)
+                socket.send(sendPacket)
 
-            socket.receive(recvPacket) // 此处会阻塞，直到收到回复或2秒超时
-
-            val replyStr = String(recvPacket.data, 0, recvPacket.length).trim()
-            if (replyStr.startsWith(REPLY_PREFIX)) {
-                val pcIp = recvPacket.address.hostAddress ?: return@withContext null
-                val pcPort = replyStr.substring(REPLY_PREFIX.length).toIntOrNull() ?: 44044
-                return@withContext Pair(pcIp, pcPort)
+                val recvBuf = ByteArray(1024)
+                while (true) {
+                    try {
+                        val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
+                        socket.receive(recvPacket)
+                        val data = recvPacket.data.copyOfRange(0, recvPacket.length)
+                        val hdr = Udp2MicProtocol.decodeHeader(data)
+                        if (hdr != null && hdr.msgType == Udp2MicProtocol.TYPE_DISCOVER_REPLY) {
+                            val pcIp = recvPacket.address.hostAddress ?: continue
+                            if (results.any { it.ip == pcIp }) continue
+                            val payloadStart = Udp2MicProtocol.HEADER_SIZE
+                            val payloadEnd = payloadStart + hdr.payloadLen
+                            if (payloadEnd > data.size) continue
+                            val port = if (payloadEnd - payloadStart >= 2) {
+                                ((data[payloadStart].toInt() and 0xFF) shl 8) or (data[payloadStart + 1].toInt() and 0xFF)
+                            } else 44044
+                            val deviceName = if (payloadEnd - payloadStart > 2) {
+                                String(data, payloadStart + 2, payloadEnd - payloadStart - 2)
+                            } else "UDP2Mic PC"
+                            val resultDeviceId = ByteArray(Udp2MicProtocol.DEVICE_ID_SIZE)
+                            System.arraycopy(hdr.deviceId, 0, resultDeviceId, 0, Udp2MicProtocol.DEVICE_ID_SIZE)
+                            results.add(DiscoverResult(pcIp, port, resultDeviceId, deviceName))
+                        }
+                    } catch (_: java.net.SocketTimeoutException) {
+                        break
+                    }
+                }
             }
-        } catch (e: SocketTimeoutException) {
-            // 超时未搜到
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             socket?.close()
         }
-        return@withContext null
+        return@withContext results
+    }
+
+    fun getOrCreateDeviceId(): ByteArray {
+        val storedId = Prefs.deviceId
+        if (storedId.isNotEmpty() && storedId.length == Udp2MicProtocol.DEVICE_ID_SIZE * 2) {
+            try { return hexStringToByteArray(storedId) } catch (_: Exception) {}
+        }
+        val newId = Udp2MicProtocol.generateDeviceId()
+        Prefs.deviceId = Udp2MicProtocol.deviceIdToString(newId)
+        return newId
+    }
+
+    private fun hexStringToByteArray(s: String): ByteArray {
+        val len = s.length
+        val data = ByteArray(len / 2)
+        var i = 0
+        while (i < len) {
+            data[i / 2] = ((Character.digit(s[i], 16) shl 4) + Character.digit(s[i + 1], 16)).toByte()
+            i += 2
+        }
+        return data
     }
 }

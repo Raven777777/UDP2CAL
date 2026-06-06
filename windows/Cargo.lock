@@ -3700,7 +3700,7 @@ dependencies = [
 
 [[package]]
 name = "udp2mic"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "audiopus",
  "cpal",
@@ -3716,7 +3716,7 @@ dependencies = [
 
 [[package]]
 name = "udp2mic-protocol"
-version = "1.0.8"
+version = "1.0.9"
 
 [[package]]
 name = "unicode-bidi"

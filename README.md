@@ -1,6 +1,11 @@
 # UDP2Mic — 局域网麦克风
 
-> **当前版本: v1.0.8** — Opus信号类型驱动音源自适应切换（isVoiceMode），VOICE_COMMUNICATION/MIC双模式 + 异常回退MIC保底通路
+> **当前版本: v1.0.9** — P2P 独占通信系统 + 统一 v2 协议 + 1对1设备过滤 + 双向保活
+> * v2 控制协议: 二进制发现、独占连接(类型CONNECT/DISCONNECT/ACK)、8字节设备ID鉴权
+> * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
+> * 心跳熔断: 30秒超时自动释放独占连接，防碰撞防抢占
+> * 全链路生命周期: 主动断开(DISCONNECT)/超时断开/并发锁绑定，无需重启
+> * 向后兼容: v1 Opus 音频包继续使用，v2 控制协议零冲突共存
 >
 > ⚠️ **Android 端已完备**，除非遇到致命 bug 否则不再更新。后续开发重点为 Windows 接收端。
 
@@ -58,7 +63,10 @@ build_android.bat
 - **Opus CBR/VBR 热调节**：FEC=2（允许 CELT + FEC，不强制 SILK 模式）；码率 32~512kbps（OPUS 协议上限 510kbps）；5 种采样率自适应协商
 - **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
 - **网络无缝热重连**：改 IP 不重启录音流
-- **UDP 广播自动发现**：一键搜索局域网内的 Windows 接收端
+- **UDP 广播自动发现**：统一 v2 协议发现局域网内 Windows 接收端
+- **P2P 双向保活**：每 1s 发送 TYPE_CONNECT + 非阻塞 drainAck 收 CONNECT_ACK
+- **优雅断连重连**：断连不退出采集，停止发包 + 持续保活，收到 ACK 自动恢复
+- **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
 ### Windows 接收端
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
@@ -66,8 +74,14 @@ build_android.bat
 - **相位连续流式重采样**：EMA 自适应漂移补偿，±0.2% 区间防止变调
 - **VB-Cable 自动检测**：无虚拟声卡时回退到默认输出设备
 - **系统托盘集成**：关闭按钮隐藏到托盘，右键菜单退出，双击恢复窗口
-- **局域网广播发现服务**：监听 44043 端口，自动回复手机搜索请求
-- **注册表持久化配置**：开机自启、监听地址、端口
+- **P2P 独占通信系统**：
+  - 双状态机：广播(Ready 周期广播/Silent 停止) + 连接(Idle 监听/Busy 独占)
+  - TYPE_CONNECT 唯一准入，READY 时拒绝所有音频
+  - 设备 ID 1对1 过滤 + 并发互斥锁防抢占，重启 Win 即清空非法绑定
+- **双向保活**：CONNECT → CONNECT_ACK，1 秒保活周期
+- **统一 v2 协议**：15B 包头携带设备 ID，所有包同格式
+- **二进制发现服务**：监听 44043，DISCOVER_REQ/REPLY
+- **注册表持久化配置**：开机自启、监听地址、端口、设备 ID
 - **Windows 防火墙自动放行**
 - **单实例互斥锁检测**
 
@@ -88,6 +102,8 @@ udp2mic/
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
 ├─ protocol/       # UDP 协议编解码（Rust crate，唯一真源）
+│  │               #   v2 统一协议 (15B 包头，携带设备 ID)
+│  │               #   TYPE_DATA/CONNECT/DISCOVER_REQ/REPLY/CONNECT_ACK
 ├─ build_windows.bat
 ├─ build_android.bat
 └─ README.md
@@ -294,7 +310,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 版本 | 变更点 |
 |------|--------|
-| **v1.0.8** | 升级 iced 0.14 + tokio 1.52；系统托盘完整功能（右键菜单退出、双击恢复、左键不弹出）；`icon.png` 编译期内嵌 exe；`build_windows.bat` 交互式 x86/x64 选编译 + UPX 压缩；广播发现端口实时更新；`docs/` 合并入 README；代码清理（零警告） |
+| **v1.0.9** | **正式版**: 统一 v2 协议（v1+v2 合并，15B 包头携带设备 ID）；1对1 设备过滤（仅绑定设备音频可通过）；TYPE_CONNECT 唯一准入（READY 拒绝所有音频）；Android 非阻塞 drainAck + 优雅断连（不退出采集，持续保活重连）；Win 端 CONNECT_ACK 双向保活；1s 保活周期；安全加固（同设备 CONNECT 静默，异设备拒绝） |
 | **v1.0.6** | UI 卡片布局 + 动态 VU 色彩表 + 按钮交互反馈；全局单例音频守护线程根除反复启停泄漏；`udp_receiver_stream` 参数化消除跨线程注册表竞态；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验 |
 | **v1.0.5** | Windows 接收端初始架构，局域网广播发现服务 |
 

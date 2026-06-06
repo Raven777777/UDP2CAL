@@ -12,6 +12,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.udp2mic.app.DiscoveryManager
 import com.udp2mic.app.Prefs
 import com.udp2mic.app.Udp2MicProtocol
 import com.udp2mic.app.UdpSender
@@ -60,7 +61,9 @@ class CaptureService : Service() {
         val vbrMode: String = "",                // "CBR" / "VBR" / "VBR约束" / "VBR(DTX)"
         val audioSource: String = "",            // 当前音源描述
         val opusMode: String = "",               // "语音模式" / "全频模式"
-        val errorMsg: String = ""
+        val errorMsg: String = "",
+        val connected: Boolean = false,          // P2P 独占连接状态
+        val deviceId: String = ""                // 本机设备 ID
     )
 
     inner class LocalBinder : Binder() { fun getService(): CaptureService = this@CaptureService }
@@ -120,8 +123,9 @@ class CaptureService : Service() {
                     stopSelf()
                     return@launch
                 }
-
-                encoder = OpusEncoder(sampleRateHz, bitrateKbps)
+                encoder = OpusEncoder(sampleRateHz, bitrateKbps).also {
+                    it.deviceId = udpSender!!.getDeviceId() ?: DiscoveryManager.getOrCreateDeviceId()
+                }
                 if (!encoder!!.start()) {
                     _status.value = _status.value.copy(isRunning = false, errorMsg = "编码器初始化失败，已保留原始PCM通路")
                     stopSelf()
@@ -244,10 +248,12 @@ class CaptureService : Service() {
                     val readSize = frameSize * 2
                     audioRecord?.startRecording()
 
-                    _status.value = _status.value.copy(
-                        isRunning = true,
-                        audioSource = audioSourceLabel
-                    )
+                _status.value = _status.value.copy(
+                    isRunning = true,
+                    audioSource = audioSourceLabel,
+                    connected = true,
+                    deviceId = Udp2MicProtocol.deviceIdToString(DiscoveryManager.getOrCreateDeviceId())
+                )
 
                     // ── 音频帧通道（容量 3：无需无限增长，又提供足够并行度）──
                     val ch = Channel<ShortArray>(3)
@@ -292,15 +298,47 @@ class CaptureService : Service() {
                     }
 
                     // ═══ 消费者协程 ═══：编码参数同步 → 编码 → 发送
-                    // 与生产者在两个独立协程并行执行，流水线消除 IO 阻塞间隙
                     val consumerJob = launch {
                         var currentIp = targetIp
                         var currentPort = targetPort
                         var byteCount = 0L
                         var lastReport = System.currentTimeMillis()
                         var lastOpusConfigHash = 0
+                        var reconnectCounter = 0
+                        val RECONNECT_INTERVAL = 50 // ~1秒(20ms每帧)
+                        var p2pConnected = true // 连接状态，false时停止发包但保持保活
 
                         for (frame in ch) {
+                            // ── 非阻塞漏极: 每帧检查 ACK ──
+                            if (udpSender?.drainAck() == true && !p2pConnected) {
+                                p2pConnected = true
+                                _status.value = _status.value.copy(connected = true, errorMsg = "")
+                            }
+
+                            // ── 保活 CONNECT: 每5秒发送（无论连接状态）──
+                            reconnectCounter++
+                            if (reconnectCounter >= RECONNECT_INTERVAL) {
+                                reconnectCounter = 0
+                                try {
+                                    val devId = DiscoveryManager.getOrCreateDeviceId()
+                                    val ping = Udp2MicProtocol.buildPacket(
+                                        isAudio = false, msgType = Udp2MicProtocol.TYPE_CONNECT,
+                                        sampleRate = 0, seqNum = 0, deviceId = devId, payload = ByteArray(0)
+                                    )
+                                    udpSender?.send(ping, 0, ping.size)
+                                } catch (_: Exception) {}
+                            }
+
+                            // ── ACK 超时判定（优雅断连，不退出采集）──
+                            val ackTime = udpSender?.getLastAckTime() ?: 0L
+                            if (ackTime > 0 && p2pConnected) {
+                                val elapsed = System.currentTimeMillis() - ackTime
+                                if (elapsed > 3000) {
+                                    p2pConnected = false
+                                    _status.value = _status.value.copy(connected = false, errorMsg = "已断开（等待重连）")
+                                }
+                            }
+
                             // ── 网络目标动态热重连 ──
                             val targetIpFromPrefs = Prefs.targetIp
                             val targetPortFromPrefs = Prefs.targetPort
@@ -360,12 +398,16 @@ class CaptureService : Service() {
                                 }
                             }
 
-                            // ── 编码 + 发送 ──
-                            val buf = sendBuffers[bufIndex]
-                            bufIndex = (bufIndex + 1) % 2
-                            val written = encoder?.encodeTo(frame, buf, 0) ?: -1
-                            if (written > 0) {
-                                if (udpSender?.send(buf, 0, written) == true) byteCount += written
+                            // ── 编码 + 发送（断开时仅回收帧，不编不送）──
+                            if (p2pConnected) {
+                                val buf = sendBuffers[bufIndex]
+                                bufIndex = (bufIndex + 1) % 2
+                                val written = encoder?.encodeTo(frame, buf, 0) ?: -1
+                                if (written > 0) {
+                                    if (udpSender?.send(buf, 0, written) == true) {
+                                        byteCount += written
+                                    }
+                                }
                             }
 
                             // ── 每秒状态汇报 ──
@@ -381,7 +423,7 @@ class CaptureService : Service() {
                         }
                     }
 
-                    // 等待生产者完成（被取消时），然后清理消费者
+                    // 等待生产者完成（被取消时），然后清理
                     try {
                         producerJob.join()
                     } finally {
@@ -430,11 +472,13 @@ class CaptureService : Service() {
     fun stopCapture() {
         pendingRestart = null
         hasNewCapture = false
+        // 停止后接收端依赖 3 秒超时自动释放 P2P 独占连接
         // 必须显式关闭 channel，防止消费者在 receive() 挂起无法退出
         audioChannel?.close()
         audioChannel = null
         captureJob?.cancel()
         captureJob = null
+        _status.value = _status.value.copy(connected = false)
     }
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

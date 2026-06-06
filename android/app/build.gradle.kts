@@ -13,8 +13,8 @@ android {
         applicationId = "com.udp2mic.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0.8"
+        versionCode = 4
+        versionName = "1.0.9"
 
         ndk {
             // -PtargetAbi=armeabi-v7a | arm64-v8a (default)

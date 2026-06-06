@@ -9,6 +9,7 @@ pub struct Config {
     pub listen_ip: String,
     pub listen_port: u32,
     pub auto_start: u32,
+    pub device_id: u64, // 8字节设备ID, 存储为u64
 }
 
 impl Default for Config {
@@ -17,6 +18,7 @@ impl Default for Config {
             listen_ip: "0.0.0.0".into(),
             listen_port: 44044,
             auto_start: 0,
+            device_id: 0,
         }
     }
 }
@@ -24,6 +26,20 @@ impl Default for Config {
 impl Config {
     pub fn is_auto_start(&self) -> bool {
         self.auto_start != 0
+    }
+
+    pub fn get_device_id(&self) -> u64 {
+        if self.device_id == 0 {
+            // 首次运行，生成设备ID
+            let id_bytes = udp2mic_protocol::generate_device_id();
+            u64::from_be_bytes(id_bytes)
+        } else {
+            self.device_id
+        }
+    }
+
+    pub fn get_device_id_bytes(&self) -> [u8; 8] {
+        self.get_device_id().to_be_bytes()
     }
 
     pub fn load() -> Self {
@@ -36,6 +52,7 @@ impl Config {
             listen_ip: get_string(&path, "listen_ip", "0.0.0.0"),
             listen_port: get_dword(&path, "listen_port", 44044),
             auto_start: get_dword(&path, "auto_start", 0),
+            device_id: get_qword(&path, "device_id", 0),
         }
     }
 
@@ -45,6 +62,7 @@ impl Config {
         key.set_value("listen_ip", &self.listen_ip)?;
         key.set_value("listen_port", &self.listen_port)?;
         key.set_value("auto_start", &self.auto_start)?;
+        key.set_value("device_id", &self.get_device_id())?;
         Ok(())
     }
 
@@ -71,5 +89,9 @@ fn get_string(key: &RegKey, name: &str, default: &str) -> String {
 }
 
 fn get_dword(key: &RegKey, name: &str, default: u32) -> u32 {
+    key.get_value(name).unwrap_or(default)
+}
+
+fn get_qword(key: &RegKey, name: &str, default: u64) -> u64 {
     key.get_value(name).unwrap_or(default)
 }

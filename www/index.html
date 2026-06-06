@@ -34,11 +34,11 @@
       <h1>UDP2Mic</h1>
       <p class="hero-sub">工业级稳定 · 低延迟 · 局域网无线麦克风</p>
       <div class="hero-badges">
-        <span class="badge">v1.0.8</span>
-        <span class="badge">arm64-v8a / armeabi-v7a</span>
-        <span class="badge">音源自适应切换</span>
-        <span class="badge">纯直通无软件处理</span>
-        <span class="badge">Android 端已完备</span>
+        <span class="badge">v1.0.9</span>
+        <span class="badge">P2P 独占通信</span>
+        <span class="badge">统一 v2 协议</span>
+        <span class="badge">1对1 设备过滤</span>
+        <span class="badge">双向保活</span>
       </div>
       <div class="pipeline-card">
         <div class="step"><span class="step-icon">📱</span><span class="step-label">Android</span></div>
@@ -86,7 +86,9 @@
             <li>全链路零堆分配：ShortArrayPool 帧复用 + 乒乓缓冲区</li>
             <li><strong>纯直通无软件处理</strong>：PCM 直通→Opus 编码，硬件降噪由安卓系统全权托管</li>
             <li>Opus CBR/VBR 热调节，FEC=2 允许 CELT+FEC，5 采样率自适应协商</li>
-            <li>UDP 广播自动发现局域网内 Windows 接收端</li>
+            <li>UDP 广播自动发现局域网内 Windows 接收端（统一 v2 协议）</li>
+            <li><strong>P2P 双向保活</strong>：1s 保活 CONNECT，收不到 ACK 优雅断连，收到后自动恢复</li>
+            <li>持久化设备 ID，连接鉴权用</li>
             <li>网络无缝热重连，改 IP 不重启录音流</li>
           </ul>
         </div>
@@ -99,7 +101,9 @@
             <li>5 独立 Opus 解码器，支持所有采样率无缝切换</li>
             <li>相位连续流式重采样，EMA 自适应漂移补偿 (±0.2% 区间防变调)</li>
             <li>VB-Cable 自动检测，无虚拟声卡时回退默认设备</li>
-            <li>注册表持久化配置：开机自启、窗口位置记忆</li>
+            <li><strong>P2P 独占通信</strong>：双状态机、TYPE_CONNECT 唯一准入、设备 ID 1对1 过滤</li>
+            <li><strong>安全加固</strong>：READY 拒绝所有音频、同设备 CONNECT 静默、异设备抢占拒绝</li>
+            <li>注册表持久化配置：开机自启、设备 ID、监听地址端口</li>
             <li>Windows 防火墙自动放行 · 单实例互斥锁</li>
           </ul>
         </div>
@@ -206,8 +210,8 @@
         <img src="icon.png" alt="" class="footer-icon">
         <span>UDP2Mic</span>
       </div>
-      <p class="footer-version">v1.0.8 by love4z · 四折光曲</p>
-      <p class="footer-meta">Android Kotlin + JNI Opus (arm64-v8a / armeabi-v7a) · Windows Rust + iced + cpal · isVoiceMode 音源自适应 · 单例守护线程 · 纯直通架构</p>
+      <p class="footer-version">v1.0.9 by love4z · 四折光曲</p>
+      <p class="footer-meta">统一 v2 协议 · P2P 双向保活 · 1对1 设备过滤 · isVoiceMode 音源自适应 · 单例守护线程 · 纯直通架构</p>
     </div>
   </div>
 </footer>

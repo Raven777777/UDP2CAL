@@ -1,6 +1,6 @@
 [package]
 name = "udp2mic"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
 description = "UDP2Mic - 局域网麦克风Windows接收端"
 build = "build.rs"

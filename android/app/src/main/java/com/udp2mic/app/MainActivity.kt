@@ -15,6 +15,8 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.verticalScroll
@@ -140,6 +142,11 @@ fun MainScreen(
     var sampleRateHz by remember { mutableStateOf(0) }
     var targetKbps by remember { mutableStateOf(0) }
     var vbrMode by remember { mutableStateOf("") }
+    var connected by remember { mutableStateOf(false) }
+    var deviceId by remember { mutableStateOf("") }
+    // 设备发现列表
+    var showDeviceDialog by remember { mutableStateOf(false) }
+    var discoveredDevices by remember { mutableStateOf<List<DiscoveryManager.DiscoverResult>>(emptyList()) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(service) {
@@ -151,6 +158,8 @@ fun MainScreen(
             sampleRateHz = status.sampleRateHz
             targetKbps = status.bitrateTargetKbps
             vbrMode = status.vbrMode
+            connected = status.connected
+            deviceId = status.deviceId
         }
     }
 
@@ -167,19 +176,17 @@ fun MainScreen(
                 if (!fs.isFocused) { Prefs.targetIp = targetIp }
             },
             trailingIcon = {
-                Box(modifier = Modifier.clickable(enabled = !isSearching) {
+                Box(modifier = Modifier.clickable(enabled = !isSearching && !isRunning) {
                     scope.launch {
                         isSearching = true
                         errorMsg = "正在搜索局域网内的PC端..."
-                        val result = DiscoveryManager.discoverServer()
-                        if (result != null) {
-                            targetIp = result.first
-                            targetPort = result.second.toString()
-                            Prefs.targetIp = result.first
-                            Prefs.targetPort = result.second
-                            errorMsg = "已自动连接到 PC: ${result.first}:${result.second}"
-                        } else {
+                        val devices = DiscoveryManager.discoverServers()
+                        if (devices.isEmpty()) {
                             errorMsg = "未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下"
+                        } else {
+                            discoveredDevices = devices
+                            showDeviceDialog = true
+                            errorMsg = "找到 ${devices.size} 个设备，请选择"
                         }
                         isSearching = false
                     }
@@ -261,14 +268,19 @@ fun MainScreen(
                 }
             }
 
-            // ── Opus 编码状态卡片 ──
+            // ── Opus 编码状态卡片（含 P2P 独占连接状态）──
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
                 shape = MaterialTheme.shapes.medium
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Opus 编码状态", fontSize = 13.sp, color = Color(0xFF888888))
+                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                        Text("Opus 编码状态", fontSize = 13.sp, color = Color(0xFF888888))
+                        Text(if (connected) "● 独占连接" else "● 未连接",
+                            fontSize = 11.sp,
+                            color = if (connected) Color(0xFF00E676) else Color(0xFFFF5252))
+                    }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("模式", fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         Text(opusMode.ifEmpty { "—" }, fontSize = 13.sp,
@@ -295,6 +307,45 @@ fun MainScreen(
         }
 
         if (errorMsg.isNotEmpty()) Text(errorMsg, fontSize = 13.sp, color = Color(0xFFFF5252))
+    }
+
+    // ── 设备选择弹窗 ──
+    if (showDeviceDialog && discoveredDevices.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { showDeviceDialog = false },
+            title = { Text("选择接收端", color = Color.White) },
+            text = {
+                LazyColumn {
+                    items(discoveredDevices) { device ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
+                                targetIp = device.ip
+                                targetPort = device.port.toString()
+                                Prefs.targetIp = device.ip
+                                Prefs.targetPort = device.port
+                                errorMsg = "已选择: ${device.ip}:${device.port} (${device.deviceName})"
+                                showDeviceDialog = false
+                            },
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E))
+                        ) {
+                            Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(device.deviceName, fontSize = 15.sp, color = Color(0xFF00E676))
+                                    Text("${device.ip}:${device.port}", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                }
+                                Text("选择 →", fontSize = 12.sp, color = Color(0xFF00B0FF))
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showDeviceDialog = false }) {
+                    Text("取消", color = Color(0xFF888888))
+                }
+            },
+            containerColor = Color(0xFF0D0D1A)
+        )
     }
 }
 

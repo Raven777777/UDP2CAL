@@ -65,4 +65,12 @@ object Prefs {
         get() = prefs.getInt("opus_vbr_constraint", 1) // 0=无约束, 1=约束（不超码率）
         set(v) = prefs.edit().putInt("opus_vbr_constraint", v.coerceIn(0, 1)).apply()
 
+    // ═══ P2P 独占通信配置 ═══
+    var deviceId: String
+        get() = prefs.getString("device_id", "") ?: ""
+        set(v) = prefs.edit().putString("device_id", v).apply()
+
+    var connectedDeviceId: String
+        get() = prefs.getString("connected_device_id", "") ?: ""
+        set(v) = prefs.edit().putString("connected_device_id", v).apply()
 }
