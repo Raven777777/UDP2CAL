@@ -251,7 +251,7 @@ class CaptureService : Service() {
                 _status.value = _status.value.copy(
                     isRunning = true,
                     audioSource = audioSourceLabel,
-                    connected = true,
+                    connected = false,      // 尚未收到 CONNECT_ACK，不乐观标记连接
                     deviceId = Udp2MicProtocol.deviceIdToString(DiscoveryManager.getOrCreateDeviceId())
                 )
 
@@ -306,7 +306,7 @@ class CaptureService : Service() {
                         var lastOpusConfigHash = 0
                         var reconnectCounter = 0
                         val RECONNECT_INTERVAL = 50 // ~1秒(20ms每帧)
-                        var p2pConnected = true // 连接状态，false时停止发包但保持保活
+                        var p2pConnected = false // 初始未连接，收到 ACK 后方可发包
 
                         for (frame in ch) {
                             // ── 非阻塞漏极: 每帧检查 ACK ──
