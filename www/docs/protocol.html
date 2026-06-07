@@ -168,7 +168,7 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
           <li><strong>音频</strong>：Android → <code>DATA(device_id, Opus)</code> → Windows 校验 device_id → 播放</li>
           <li><strong>保活</strong>：每 1s Android CONNECT → Windows ACK，3s 无 ACK 标记断连</li>
           <li><strong>重连</strong>：Android 持续发 CONNECT → Windows 恢复后 ACK → 自动恢复</li>
-          <li><strong>抢占</strong>：异设备 CONNECT → DEVICE_BUSY 拒绝；重启 Win 即可清空非法绑定</li>
+          <li><strong>抢占（静默拒绝）</strong>：异设备 CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 drainAck() 永 false → p2pConnected 永 false → 不编不送音频；已有连接完全不受影响。释放独占：Win 端停止 / Android 1s 无包超时 / 重启程序</li>
         </ol>
 
         <hr>

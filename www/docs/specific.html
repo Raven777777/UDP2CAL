@@ -61,7 +61,7 @@
     <main class="main">
       <div class="content">
 
-        <div class="version-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议</div>
+        <div class="version-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议 + 防抢占静默拒绝</div>
 
         <h1>UDP2Mic<br><small>局域网麦克风 — 项目文档</small></h1>
 
@@ -142,7 +142,7 @@
           <li><strong>相位连续流式重采样</strong>：EMA 自适应漂移补偿，±0.2% 区间防止变调</li>
           <li><strong>VB-Cable 自动检测</strong>：无虚拟声卡时回退到默认输出设备</li>
           <li><strong>系统托盘集成</strong>：关闭按钮隐藏到托盘，右键菜单退出，双击恢复窗口</li>
-          <li><strong>P2P 独占通信系统</strong>：双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁防抢占</li>
+          <li><strong>P2P 独占通信系统</strong>：双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁防抢占 + <strong>防抢占静默拒绝</strong>（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频）</li>
           <li><strong>双向保活</strong>：CONNECT → CONNECT_ACK，1 秒保活周期；300ms 接收超时，1 秒无包标记断连</li>
           <li><strong>统一 v2 协议</strong>：15B 包头携带设备 ID，所有包同格式；兼容旧版纯文本发现协议</li>
           <li><strong>二进制发现服务</strong>：监听 44043，v2 DISCOVER_REQ/REPLY + 旧版兼容</li>
@@ -274,7 +274,7 @@
             <tr><th>指示器</th><th>含义</th></tr>
             <tr><td>● 等待连接 / ● 已断开</td><td>红色 — 正在监听但无数据流</td></tr>
             <tr><td>● 已连接</td><td>绿色 — 收到 v1/v2 音频数据</td></tr>
-            <tr><td>● 已占用 / ● 已占用 {device_id}</td><td>橙色 — v2 TYPE_CONNECT 独占绑定</td></tr>
+            <tr><td>● 已占用 / ● 已占用 {device_id}</td><td>橙色 — v2 TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝</td></tr>
             <tr><td>● 空闲</td><td>绿色 — 已启动但无可信连接</td></tr>
             <tr><td>● VB-Cable / ● VB-Cable 未安装</td><td>绿色/橙色 — 虚拟声卡检测状态</td></tr>
             <tr><td>● 广播中 / ● 已静音</td><td>绿色/灰色 — 广播状态机 Ready/Silent</td></tr>
@@ -345,7 +345,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <!-- Changelog -->
         <h2 id="changelog">历史重大变更（Windows 端）</h2>
         <ul class="card-list-doc">
-          <li><strong>v1.0.9</strong>：正式版 — 统一 v2 协议（15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入；Android 非阻塞 1ms drainAck + 优雅断连；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机；Opus 高级编码设置面板；1kHz 测试音模式</li>
+          <li><strong>v1.0.9</strong>：正式版 — 统一 v2 协议（15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入；<strong>防抢占静默拒绝</strong>（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响）；Android 非阻塞 1ms drainAck + 优雅断连；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机；Opus 高级编码设置面板；1kHz 测试音模式</li>
           <li><strong>v1.0.6</strong>：UI 卡片布局 + 动态 VU 色彩表；全局单例音频守护线程；参数化 <code>udp_receiver_stream</code>；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验</li>
           <li><strong>v1.0.5</strong>：Windows 接收端初始架构，局域网广播发现服务</li>
         </ul>

@@ -32,7 +32,7 @@
   <!-- Hero -->
   <section class="hero" id="hero">
     <div class="container">
-      <div class="hero-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议</div>
+      <div class="hero-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议 + 防抢占静默拒绝</div>
       <h1 class="hero-title">
         把你的手机变成<br>
         <span class="gradient-text">无线麦克风</span>
@@ -64,7 +64,7 @@
       <div class="section-header">
         <span class="section-tag">特性</span>
         <h2 class="section-title">全链路工业级设计</h2>
-        <p class="section-desc">从 Android 采集到 Windows 输出，每一环节都经过精心优化</p>
+        <p class="section-desc">从 Android端 采集到 Windows端 输出，每一环节都经过精心优化</p>
       </div>
 
       <div class="features-grid">
@@ -138,7 +138,7 @@
               <span class="card-icon">&#x1F4E1;</span>
               <div>
                 <strong>P2P 独占通信</strong>
-                <small>双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁</small>
+                <small>双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁 + 防抢占静默拒绝</small>
               </div>
             </li>
             <li>
@@ -184,6 +184,13 @@
               <div>
                 <strong>心跳熔断机制</strong>
                 <small>ACK 超时断连 / 无包超时释放 / 并发锁绑定，无需重启</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F504;</span>
+              <div>
+                <strong>防抢占静默拒绝</strong>
+                <small>BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响</small>
               </div>
             </li>
             <li>
@@ -277,7 +284,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
           <div class="step-number">1</div>
           <div class="step-content">
             <h4>安装 VB-Cable</h4>
-            <p>在 Windows PC 上安装 <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener">VB-Cable</a> 虚拟声卡。程序会自动检测，未安装时回退到默认输出设备。</p>
+            <p>在 Windows PC 上安装 <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener">VB-Cable</a> 虚拟声卡。程序会自动检测，未安装时回退到默认麦克风设备。</p>
           </div>
         </div>
         <div class="step">
@@ -297,8 +304,8 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <div class="step">
           <div class="step-number">4</div>
           <div class="step-content">
-            <h4>选择输出设备</h4>
-            <p>在 Windows 音频设置中将默认输出设备设为"VB-Cable"。微信、Zoom、OBS 等应用会自动通过 VB-Cable 接收手机音频。</p>
+            <h4>选择输入设备（MIC）</h4>
+            <p>在 Windows 音频设置中将默认输入设备设为"VB-Cable"。微信、Zoom、OBS 等应用会自动通过 VB-Cable 接收手机音频。</p>
           </div>
         </div>
       </div>
@@ -389,7 +396,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <div class="indicators">
           <div class="indicator"><span class="dot dot-red"></span> 等待连接 / 已断开</div>
           <div class="indicator"><span class="dot dot-green"></span> 已连接 / 空闲</div>
-          <div class="indicator"><span class="dot dot-orange"></span> 已占用 / VB-Cable 未安装</div>
+          <div class="indicator"><span class="dot dot-orange"></span> 已占用（异设备 CONNECT 静默拒） / VB-Cable 未安装</div>
           <div class="indicator"><span class="dot dot-gray"></span> 已静音</div>
         </div>
       </div>
