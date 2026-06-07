@@ -767,9 +767,23 @@ img {
 
 .indicators {
   display: flex;
-  flex-wrap: wrap;
-  gap: 16px;
+  flex-wrap: nowrap;
+  gap: 12px;
   justify-content: center;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 4px;
+}
+
+@media (max-width: 640px) {
+  .indicators {
+    gap: 8px;
+    justify-content: flex-start;
+  }
+  .indicator {
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
 }
 
 .indicator {

@@ -3,10 +3,49 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UDP2Mic — 局域网麦克风</title>
-  <meta name="description" content="工业级稳定、低延迟的局域网麦克风系统。Android 端采集音频 → Opus 编码 → UDP 发送到 Windows 接收端 → WASAPI 输出到虚拟声卡。">
+  <title>UDP2Mic — 手机变无线麦克风 | 局域网低延迟音频传输</title>
+  <meta name="description" content="UDP2Mic 将 Android 手机变为 Windows PC 的无线麦克风。Opus 编码、低延迟、零软件降噪处理，支持微信、Zoom、OBS 等任意应用。内存仅 10MB，CPU 低于 0.5%。">
+  <meta name="keywords" content="无线麦克风,手机麦克风,局域网麦克风,Android无线麦克风,Windows虚拟声卡,Opus编码,VB-Cable,低延迟音频,UDP音频传输">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://love4z.cn/udp2mic/">
   <link rel="icon" href="icon.png" type="image/png">
   <link rel="stylesheet" href="style.css">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="UDP2Mic — 手机变无线麦克风 | 局域网低延迟音频传输">
+  <meta property="og:description" content="将 Android 手机变为 Windows PC 的无线麦克风。Opus 编码、零堆分配、P2P 独占通信，支持微信/Zoom/OBS。">
+  <meta property="og:url" content="https://love4z.cn/udp2mic/">
+  <meta property="og:image" content="https://love4z.cn/udp2mic/icon.png">
+  <meta property="og:locale" content="zh_CN">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="UDP2Mic — 手机变无线麦克风">
+  <meta name="twitter:description" content="Android → Opus → UDP → Windows → VB-Cable → 任意应用。工业级稳定、低延迟的局域网麦克风系统。">
+
+  <!-- JSON-LD Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "UDP2Mic",
+    "description": "局域网麦克风系统。Android 端采集音频，经 Opus 编码通过 UDP 发送到 Windows 接收端，通过 WASAPI 输出到虚拟声卡。",
+    "applicationCategory": "Multimedia",
+    "operatingSystem": "Windows 10+, Android 10+",
+    "memoryRequirements": "10MB",
+    "cpuRequirements": "&lt;0.5%",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "CNY"
+    },
+    "author": {
+      "@type": "Person",
+      "name": "Raven777777"
+    }
+  }
+  </script>
 </head>
 <body>
 
@@ -42,7 +81,8 @@
       </p>
       <p class="hero-desc">
         工业级稳定、低延迟的局域网麦克风系统。零软件降噪处理，<br class="hide-mobile">
-        全链路零堆分配，生产-消费双协程消除阻塞饥饿。
+        全链路零堆分配，生产-消费双协程消除阻塞饥饿。<br class="hide-mobile">
+        <span style="color: var(--accent-cyan);">内存占用约 10MB，CPU 占用低于 0.5%。</span>
       </p>
       <div class="hero-actions">
         <a href="#download" class="btn btn-primary">
@@ -396,7 +436,8 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <div class="indicators">
           <div class="indicator"><span class="dot dot-red"></span> 等待连接 / 已断开</div>
           <div class="indicator"><span class="dot dot-green"></span> 已连接 / 空闲</div>
-          <div class="indicator"><span class="dot dot-orange"></span> 已占用（异设备 CONNECT 静默拒） / VB-Cable 未安装</div>
+          <div class="indicator"><span class="dot dot-orange"></span> 已占用（防抢占静默拒）</div>
+          <div class="indicator"><span class="dot dot-orange"></span> VB-Cable 未安装</div>
           <div class="indicator"><span class="dot dot-gray"></span> 已静音</div>
         </div>
       </div>
@@ -419,7 +460,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
           </div>
           <div class="download-info">
             <h4>Windows 接收端</h4>
-            <span class="download-meta">udp2mic_x64.exe &middot; ~4.8 MB</span>
+            <span class="download-meta">udp2mic_x64.exe &middot; ~5.98 MB &middot; 需 Windows 10+</span>
           </div>
           <span class="download-btn">下载</span>
         </a>
@@ -429,7 +470,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
           </div>
           <div class="download-info">
             <h4>Android 发送端</h4>
-            <span class="download-meta">udp2mic_arm64-v8a.apk &middot; ~2.4 MB</span>
+            <span class="download-meta">udp2mic_arm64-v8a.apk &middot; ~2.65 MB &middot; 需 Android 10+</span>
           </div>
           <span class="download-btn">下载</span>
         </a>

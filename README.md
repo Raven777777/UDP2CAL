@@ -52,6 +52,17 @@ build_android.bat
 
 ---
 
+## 系统要求
+
+| 平台 | 最低版本 | 架构 | 说明 |
+|------|---------|------|------|
+| **Android** | **Android 10 (API 29)+** | arm64-v8a (64-bit) / armeabi-v7a (32-bit) | minSdk=29, targetSdk=35, 需要 `RECORD_AUDIO` 权限 |
+| **Windows** | **Windows 10+** | x86_64 (64-bit) / i686 (32-bit) | 依赖 WASAPI 音频引擎 + VB-Cable 虚拟声卡；系统托盘和防火墙规则仅 Windows 可用 |
+
+> Android 编译要求 JDK 17、Android SDK 35、NDK 27.0.12077973；Windows 编译要求 Rust 1.96+、VS Build Tools 2022、CMake 3.22+。
+
+---
+
 ## 主要特性
 
 ### Android 发送端
@@ -121,9 +132,9 @@ udp2mic/
 
 | 文件 | 大小 | 说明 |
 | --- | --- | --- |
-| `udp2mic_{x64,x86}.exe` | ~4.8 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
-| `udp2mic_arm64-v8a.apk` | ~2.4 MB | Android 发送端 (64位，已签名) |
-| `udp2mic_armeabi-v7a.apk` | ~2.4 MB | Android 发送端 (32位，已签名) |
+| `udp2mic_{x64,x86}.exe` | ~5.98 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
+| `udp2mic_arm64-v8a.apk` | ~2.65 MB | Android 发送端 (64位，已签名) |
+| `udp2mic_armeabi-v7a.apk` | ~2.65 MB | Android 发送端 (32位，已签名) |
 
 ---
 

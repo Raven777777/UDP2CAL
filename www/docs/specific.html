@@ -3,10 +3,40 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UDP2Mic 文档 — 项目概述</title>
-  <meta name="description" content="UDP2Mic 项目完整技术文档 — 局域网麦克风系统">
+  <title>UDP2Mic 技术文档 — 项目概述 | 局域网麦克风</title>
+  <meta name="description" content="UDP2Mic 项目完整技术文档 — 局域网麦克风系统，涵盖 Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
+  <meta name="keywords" content="UDP2Mic文档,局域网麦克风技术,无线麦克风构建,Opus编码文档,WASAPI输出,VB-Cable设置">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://love4z.cn/udp2mic/docs/specific.html">
   <link rel="icon" href="../icon.png" type="image/png">
   <link rel="stylesheet" href="style.css">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="UDP2Mic 技术文档 — 项目概述">
+  <meta property="og:description" content="UDP2Mic 项目完整技术文档 — Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
+  <meta property="og:url" content="https://love4z.cn/udp2mic/docs/specific.html">
+  <meta property="og:image" content="https://love4z.cn/udp2mic/icon.png">
+  <meta property="og:locale" content="zh_CN">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="UDP2Mic 技术文档 — 项目概述">
+  <meta name="twitter:description" content="局域网麦克风系统完整技术文档。">
+
+  <!-- JSON-LD Structured Data -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "name": "UDP2Mic 项目概述",
+    "description": "UDP2Mic 局域网麦克风系统完整技术文档",
+    "author": {
+      "@type": "Person",
+      "name": "Raven777777"
+    }
+  }
+  </script>
 </head>
 <body>
 
@@ -14,7 +44,7 @@
   <nav class="navbar">
     <div class="nav-container">
       <a href="../" class="nav-logo">
-        <img src="../icon.png" alt="" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+        <img src="../icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
       </a>
       <ul class="nav-links">
         <li><a href="index.html" class="active">文档首页</a></li>
@@ -184,9 +214,20 @@
         <div class="table-wrap">
           <table>
             <tr><th>文件</th><th>大小</th><th>说明</th></tr>
-            <tr><td><code>udp2mic_{x64,x86}.exe</code></td><td>~4.8 MB</td><td>Windows 接收端（UPX 压缩后为 <code>.upx.exe</code>）</td></tr>
-            <tr><td><code>udp2mic_arm64-v8a.apk</code></td><td>~2.4 MB</td><td>Android 发送端 (64位，已签名)</td></tr>
-            <tr><td><code>udp2mic_armeabi-v7a.apk</code></td><td>~2.4 MB</td><td>Android 发送端 (32位，已签名)</td></tr>
+            <tr><td><code>udp2mic_{x64,x86}.exe</code></td><td>~5.98 MB</td><td>Windows 接收端（UPX 压缩后为 <code>.upx.exe</code>）</td></tr>
+            <tr><td><code>udp2mic_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (64位，已签名)</td></tr>
+            <tr><td><code>udp2mic_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (32位，已签名)</td></tr>
+          </table>
+        </div>
+
+        <hr>
+
+        <h2 id="system-requirements">系统要求</h2>
+        <div class="table-wrap">
+          <table>
+            <tr><th>平台</th><th>最低版本</th><th>架构</th><th>说明</th></tr>
+            <tr><td><strong>Android</strong></td><td>Android 10 (API 29)+</td><td>arm64-v8a / armeabi-v7a</td><td>minSdk=29, targetSdk=35, 需要 <code>RECORD_AUDIO</code> 权限</td></tr>
+            <tr><td><strong>Windows</strong></td><td>Windows 10+</td><td>x86_64 / i686</td><td>依赖 WASAPI 音频引擎 + VB-Cable 虚拟声卡</td></tr>
           </table>
         </div>
 
