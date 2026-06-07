@@ -25,7 +25,7 @@ object Prefs {
 
     // ── Opus 编码器设置 ──
     var opusComplexity: Int
-        get() = prefs.getInt("opus_complexity", 10)
+        get() = prefs.getInt("opus_complexity", 5)
         set(v) = prefs.edit().putInt("opus_complexity", v.coerceIn(1, 10)).apply()
 
     var opusSignal: Int
@@ -37,15 +37,15 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_bandwidth", v).apply()
 
     var opusDtx: Int
-        get() = prefs.getInt("opus_dtx", 1) // 0=OFF, 1=ON
+        get() = prefs.getInt("opus_dtx", 0) // 0=OFF, 1=ON
         set(v) = prefs.edit().putInt("opus_dtx", v).apply()
 
     var opusVbr: Int
-        get() = prefs.getInt("opus_vbr", 1) // 0=CBR, 1=VBR
+        get() = prefs.getInt("opus_vbr", 0) // 0=CBR, 1=VBR
         set(v) = prefs.edit().putInt("opus_vbr", v).apply()
 
     var opusBitrateKbps: Int
-        get() = prefs.getInt("opus_bitrate_kbps", 0) // 0 = auto (根据采样率自动选择)
+        get() = prefs.getInt("opus_bitrate_kbps", 256) // 0 = auto (根据采样率自动选择)
         set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, 512)).apply() // OPUS 协议上限 510kbps（立体声），单声道理论~255k；512 为未来双声道预留
 
     var opusFec: Int
@@ -62,7 +62,7 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_packet_loss", v.coerceIn(0, 100)).apply()
 
     var opusVbrConstraint: Int
-        get() = prefs.getInt("opus_vbr_constraint", 1) // 0=无约束, 1=约束（不超码率）
+        get() = prefs.getInt("opus_vbr_constraint", 0) // 0=无约束, 1=约束（不超码率）
         set(v) = prefs.edit().putInt("opus_vbr_constraint", v.coerceIn(0, 1)).apply()
 
     // ═══ P2P 独占通信配置 ═══
