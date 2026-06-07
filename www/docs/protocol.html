@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UDP2Mic 文档 — UDP 私有协议 v2</title>
+  <meta name="description" content="UDP2Mic UDP 私有协议 v2 规范 — 15B 包头、消息类型、P2P 生命周期">
+  <link rel="icon" href="../icon.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Navbar -->
+  <nav class="navbar">
+    <div class="nav-container">
+      <a href="../" class="nav-logo">
+        <img src="../icon.png" alt="" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+      </a>
+      <ul class="nav-links">
+        <li><a href="specific.html">文档首页</a></li>
+        <li><a href="protocol.html" class="active">协议规范</a></li>
+        <li><a href="../" class="nav-back">← 返回官网</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Layout -->
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-title">协议规范</div>
+        <a href="#overview" class="sidebar-link active">概述</a>
+        <a href="#packet-format" class="sidebar-link">包格式</a>
+        <a href="#msg-types" class="sidebar-link">消息类型</a>
+        <a href="#sample-rate" class="sidebar-link">采样率-码率关联</a>
+        <a href="#device-id" class="sidebar-link">设备 ID</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">P2P 独占通信</div>
+        <a href="#access-model" class="sidebar-link">安全准入模型</a>
+        <a href="#flow" class="sidebar-link">交互流程</a>
+        <a href="#constants" class="sidebar-link">常量</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">实现</div>
+        <a href="#implementation" class="sidebar-link">平台实现</a>
+        <a href="#usage" class="sidebar-link">用法 (Rust)</a>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">参考</div>
+        <a href="specific.html">← 项目文档</a>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <div class="content">
+
+        <div class="version-badge">UDP2Mic UDP 私有协议 v2</div>
+
+        <h1>UDP 私有协议 v2<br><small>统一协议：音频 + 控制共用 15 字节包头</small></h1>
+
+        <!-- Overview -->
+        <h2 id="overview">概述</h2>
+
+        <p>v2 统一协议替代了旧版分离的 v1（6B 音频头）和旧 v2（15B "UD2M" 控制头）。<strong>所有包使用同一 15 字节包头格式，携带设备 ID 实现 1对1 P2P 过滤。</strong></p>
+
+        <p>首字节 <code>0x02</code> 标识 v2 协议，与旧 v1（首字节 <code>0x80+</code>）永不冲突。</p>
+
+        <hr>
+
+        <!-- Packet Format -->
+        <h2 id="packet-format">包格式</h2>
+
+        <p>15 字节固定头 + 负载：</p>
+
+        <div class="code-block">
+          <pre><code>Byte 0:       PROTO_VERSION = 0x02
+Byte 1:       [1bit is_audio][3bit codec][4bit sample_rate]
+              is_audio=1 音频数据, =0 控制消息; codec=1 (Opus)
+Byte 2:       [8bit msg_type]
+              0=TYPE_DATA, 1=TYPE_CONNECT, 2=TYPE_DISCOVER_REQ,
+              3=TYPE_DISCOVER_REPLY, 4=TYPE_CONNECT_ACK
+Byte 3-4:     [16bit payload_len BE]
+Byte 5:       [8bit bitrate_kbps] (0=auto, 仅 TYPE_DATA 有效)
+Byte 6:       [8bit seq_num] (仅 TYPE_DATA 有效)
+Byte 7-14:    [8 bytes device_id] (发送端唯一标识)
+Byte 15+:     [payload]</code></pre>
+        </div>
+
+        <table>
+          <tr><th>字段</th><th>偏移</th><th>大小</th><th>说明</th></tr>
+          <tr><td>PROTO_VERSION</td><td>0</td><td>1B</td><td><code>0x02</code>，与 v1 首字节 <code>0x80+</code> 永不冲突</td></tr>
+          <tr><td>Flags</td><td>1</td><td>1B</td><td>[1bit is_audio][3bit codec][4bit sample_rate]</td></tr>
+          <tr><td>msg_type</td><td>2</td><td>1B</td><td>消息类型（0-4）</td></tr>
+          <tr><td>payload_len</td><td>3-4</td><td>2B</td><td>Big-Endian，负载长度</td></tr>
+          <tr><td>bitrate_kbps</td><td>5</td><td>1B</td><td>0=auto，仅 TYPE_DATA 有效</td></tr>
+          <tr><td>seq_num</td><td>6</td><td>1B</td><td>序列号，仅 TYPE_DATA 有效</td></tr>
+          <tr><td>device_id</td><td>7-14</td><td>8B</td><td>发送端唯一标识</td></tr>
+          <tr><td>payload</td><td>15+</td><td>可变</td><td>Opus 音频数据或空</td></tr>
+        </table>
+
+        <hr>
+
+        <!-- Message Types -->
+        <h2 id="msg-types">消息类型</h2>
+
+        <div class="table-wrap">
+          <table>
+            <tr><th>类型</th><th>值</th><th>方向</th><th>说明</th></tr>
+            <tr><td><code>TYPE_DATA</code></td><td>0</td><td>Android → Windows</td><td>Opus 音频数据</td></tr>
+            <tr><td><code>TYPE_CONNECT</code></td><td>1</td><td>Android → Windows</td><td>连接请求/保活</td></tr>
+            <tr><td><code>TYPE_DISCOVER_REQ</code></td><td>2</td><td>Android → 广播(44043)</td><td>发现请求</td></tr>
+            <tr><td><code>TYPE_DISCOVER_REPLY</code></td><td>3</td><td>单播回复</td><td>发现回复（携带端口+设备名）</td></tr>
+            <tr><td><code>TYPE_CONNECT_ACK</code></td><td>4</td><td>Windows → Android</td><td>连接确认（保活回复）</td></tr>
+          </table>
+        </div>
+
+        <hr>
+
+        <!-- Sample Rate -->
+        <h2 id="sample-rate">采样率-码率自动关联</h2>
+
+        <div class="table-wrap">
+          <table>
+            <tr><th>采样率 ID</th><th>采样率</th><th>自动码率</th><th>协议编码字节</th></tr>
+            <tr><td>0</td><td>8 kHz</td><td>64 kbps</td><td>32</td></tr>
+            <tr><td>1</td><td>12 kHz</td><td>64 kbps</td><td>32</td></tr>
+            <tr><td>2</td><td>16 kHz</td><td>128 kbps</td><td>64</td></tr>
+            <tr><td>3</td><td>24 kHz</td><td>256 kbps</td><td>128</td></tr>
+            <tr><td>4</td><td>48 kHz</td><td>512 kbps</td><td>255</td></tr>
+          </table>
+        </div>
+
+        <blockquote>协议字节 = <code>(kbps/2).min(255).max(1)</code></blockquote>
+
+        <hr>
+
+        <!-- Device ID -->
+        <h2 id="device-id">设备 ID</h2>
+
+        <ul>
+          <li>8 字节唯一标识，时间戳哈希 + 伪随机数</li>
+          <li>Android: <code>SharedPreferences</code> 持久化</li>
+          <li>Windows: 注册表 <code>HKCU\Software\UDP2Mic\device_id</code></li>
+          <li><strong>所有包均携带</strong>，音频包用于 1对1 过滤，控制包用于身份鉴权</li>
+        </ul>
+
+        <hr>
+
+        <!-- P2P -->
+        <h2 id="access-model">P2P 独占通信 — 安全准入模型</h2>
+
+        <div class="code-block">
+          <pre><code>TYPE_CONNECT 是唯一建连通道
+DEVICE_READY 时拒绝所有 TYPE_DATA（防止音频包绕过鉴权）
+DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
+        </div>
+
+        <hr>
+
+        <h2 id="flow">交互流程</h2>
+
+        <ol>
+          <li><strong>发现</strong>：Android → <code>DISCOVER_REQ</code>（广播 44043）→ Windows 回复 <code>DISCOVER_REPLY</code>（端口+名）</li>
+          <li><strong>连接</strong>：Android → <code>CONNECT(device_id)</code> → Windows 绑定 → 回复 <code>CONNECT_ACK</code></li>
+          <li><strong>音频</strong>：Android → <code>DATA(device_id, Opus)</code> → Windows 校验 device_id → 播放</li>
+          <li><strong>保活</strong>：每 1s Android CONNECT → Windows ACK，3s 无 ACK 标记断连</li>
+          <li><strong>重连</strong>：Android 持续发 CONNECT → Windows 恢复后 ACK → 自动恢复</li>
+          <li><strong>抢占</strong>：异设备 CONNECT → DEVICE_BUSY 拒绝；重启 Win 即可清空非法绑定</li>
+        </ol>
+
+        <hr>
+
+        <!-- Constants -->
+        <h2 id="constants">常量</h2>
+
+        <div class="table-wrap">
+          <table>
+            <tr><th>常量</th><th>值</th><th>说明</th></tr>
+            <tr><td><code>HEADER_SIZE</code></td><td>15</td><td>包头固定字节数</td></tr>
+            <tr><td><code>MAX_PAYLOAD</code></td><td>1472</td><td>最大负载（MTU 安全）</td></tr>
+            <tr><td><code>MAX_PACKET</code></td><td>1487</td><td>最大完整包</td></tr>
+            <tr><td><code>MAX_REORDER</code></td><td>8</td><td>乱序重排窗口大小</td></tr>
+            <tr><td><code>DEVICE_ID_SIZE</code></td><td>8</td><td>设备 ID 字节数</td></tr>
+            <tr><td><code>DISCOVER_PORT</code></td><td>44043</td><td>发现广播端口</td></tr>
+          </table>
+        </div>
+
+        <hr>
+
+        <!-- Implementation -->
+        <h2 id="implementation">平台实现</h2>
+
+        <div class="table-wrap">
+          <table>
+            <tr><th>平台</th><th>文件</th><th>语言</th></tr>
+            <tr><td>Rust crate</td><td><code>protocol/protocol.rs</code></td><td>Rust（唯一协议真源）</td></tr>
+            <tr><td>Windows 接收端</td><td><code>windows/src/protocol.rs</code></td><td>重导出</td></tr>
+            <tr><td>Android 发送端</td><td><code>Udp2MicProtocol.kt</code></td><td>Kotlin（手动对齐）</td></tr>
+          </table>
+        </div>
+
+        <hr>
+
+        <!-- Usage -->
+        <h2 id="usage">用法 (Rust)</h2>
+
+        <div class="code-block">
+          <button class="code-copy" data-copy="use udp2mic_protocol::*;">复制</button>
+          <pre><code>use udp2mic_protocol::*;
+
+// 构建音频包
+let dev_id = generate_device_id();
+let audio_packet = build_packet(true, TYPE_DATA, SAMPLE_RATE_48K, seq, &dev_id, &opus_frame, BITRATE_AUTO);
+
+// 构建连接请求
+let connect_packet = build_packet(false, TYPE_CONNECT, 0, 0, &dev_id, &[], 0);
+
+// 解码
+let buf: [u8; HEADER_SIZE] = packet[..HEADER_SIZE].try_into().unwrap();
+if let Some(h) = decode_header(&buf) {
+    // h.is_audio, h.msg_type, h.device_id, h.sample_rate, h.seq_num, ...
+}
+
+// 零分配重排序
+let mut rb = ReorderBuffer::new();
+rb.insert_and_drain(h.seq_num, h.sample_rate, &payload, |sr, data| {
+    // 按序到达的帧
+});</code></pre>
+        </div>
+
+        <hr>
+
+        <p style="text-align:center; color: var(--text-muted); font-size:0.85rem;">
+          GitHub: <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">Raven777777/UDP2Mic</a>
+        </p>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="footer-content">
+      <span>UDP2Mic v1.0.9 — 局域网麦克风</span>
+      <span class="footer-links">
+        <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">GitHub</a>
+        <a href="specific.html">项目文档</a>
+        <a href="../">返回官网</a>
+      </span>
+    </div>
+  </footer>
+
+  <script>
+    document.querySelectorAll('.code-copy').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const text = btn.dataset.copy || btn.nextElementSibling.textContent.trim();
+        navigator.clipboard.writeText(text).then(() => {
+          const orig = btn.textContent;
+          btn.textContent = '已复制';
+          btn.classList.add('copied');
+          setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 2000);
+        });
+      });
+    });
+
+    const links = document.querySelectorAll('.sidebar-link');
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const id = entry.target.id;
+          links.forEach(l => l.classList.remove('active'));
+          const match = document.querySelector(`.sidebar-link[href="#${id}"]`);
+          if (match) match.classList.add('active');
+        }
+      });
+    }, { threshold: 0.3, rootMargin: '-80px 0px -40% 0px' });
+    document.querySelectorAll('h2[id]').forEach(el => observer.observe(el));
+  </script>
+</body>
+</html>

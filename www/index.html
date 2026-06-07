@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UDP2Mic — 局域网麦克风</title>
+  <meta name="description" content="工业级稳定、低延迟的局域网麦克风系统。Android 端采集音频 → Opus 编码 → UDP 发送到 Windows 接收端 → WASAPI 输出到虚拟声卡。">
+  <link rel="icon" href="icon.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Navigation -->
+  <nav class="navbar">
+    <div class="container nav-container">
+      <a href="#" class="nav-logo">
+        <img src="icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+      </a>
+      <ul class="nav-links">
+        <li><a href="#features">特性</a></li>
+        <li><a href="#how-it-works">原理</a></li>
+        <li><a href="#quickstart">快速开始</a></li>
+        <li><a href="#specs">技术规格</a></li>
+        <li><a href="#download" class="nav-cta">下载</a></li>
+      </ul>
+      <button class="nav-toggle" aria-label="菜单">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <section class="hero" id="hero">
+    <div class="container">
+      <div class="hero-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议</div>
+      <h1 class="hero-title">
+        把你的手机变成<br>
+        <span class="gradient-text">无线麦克风</span>
+      </h1>
+      <p class="hero-subtitle">
+        Android → Opus 编码 → UDP → Windows → VB-Cable → 任意应用
+      </p>
+      <p class="hero-desc">
+        工业级稳定、低延迟的局域网麦克风系统。零软件降噪处理，<br class="hide-mobile">
+        全链路零堆分配，生产-消费双协程消除阻塞饥饿。
+      </p>
+      <div class="hero-actions">
+        <a href="#download" class="btn btn-primary">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          下载
+        </a>
+        <a href="#how-it-works" class="btn btn-secondary">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+          了解原理
+        </a>
+      </div>
+    </div>
+    <div class="hero-glow"></div>
+  </section>
+
+  <!-- Features -->
+  <section class="section" id="features">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">特性</span>
+        <h2 class="section-title">全链路工业级设计</h2>
+        <p class="section-desc">从 Android 采集到 Windows 输出，每一环节都经过精心优化</p>
+      </div>
+
+      <div class="features-grid">
+        <!-- Android -->
+        <div class="feature-card card-android">
+          <div class="card-header">
+            <span class="card-platform">Android</span>
+            <span class="card-role">发送端</span>
+          </div>
+          <ul class="card-list">
+            <li>
+              <span class="card-icon">&#x1F3A4;</span>
+              <div>
+                <strong>音源自适应切换</strong>
+                <small>语音模式→VOICE_COMMUNICATION（硬件降噪），全频模式→MIC（裸麦直出）</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x26A1;</span>
+              <div>
+                <strong>全链路零堆分配</strong>
+                <small>ShortArrayPool 帧复用 + 乒乓发送缓冲区，仅池热身期 3 次构造</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F504;</span>
+              <div>
+                <strong>网络无缝热重连</strong>
+                <small>改 IP 不重启录音流，断连不退出采集，持续保活自动恢复</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F3B5;</span>
+              <div>
+                <strong>1kHz 测试音模式</strong>
+                <small>内置正弦波发生器，无需麦克风即可调试端到端音频链路</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x2699;</span>
+              <div>
+                <strong>Opus 高级编码设置</strong>
+                <small>复杂度 1-10、VBR/CBR/约束 VBR、FEC、DTX、带宽、码率 32~512kbps</small>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <!-- Windows -->
+        <div class="feature-card card-windows">
+          <div class="card-header">
+            <span class="card-platform">Windows</span>
+            <span class="card-role">接收端</span>
+          </div>
+          <ul class="card-list">
+            <li>
+              <span class="card-icon">&#x1F578;</span>
+              <div>
+                <strong>系统托盘集成</strong>
+                <small>关闭隐藏到托盘、右键菜单退出、双击恢复窗口</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F4CA;</span>
+              <div>
+                <strong>实时音量电平</strong>
+                <small>暗色 UI + 动态 VU 色彩表（绿/橙/红）+ P2P 连接状态指示</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F4E1;</span>
+              <div>
+                <strong>P2P 独占通信</strong>
+                <small>双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F3B6;</span>
+              <div>
+                <strong>EMA 漂移补偿</strong>
+                <small>三分量 EMA 滤波器 + 缓冲区水位修正，±0.2% 硬限幅防变调</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F512;</span>
+              <div>
+                <strong>双向保活 &amp; 熔断</strong>
+                <small>CONNECT/CONNECT_ACK 心跳，3 秒 ACK 超时标记断连，1 秒无包自动释放</small>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <!-- Protocol -->
+        <div class="feature-card card-network">
+          <div class="card-header">
+            <span class="card-platform">协议</span>
+            <span class="card-role">网络层</span>
+          </div>
+          <ul class="card-list">
+            <li>
+              <span class="card-icon">&#x1F4E1;</span>
+              <div>
+                <strong>统一 v2 协议</strong>
+                <small>15B 包头携带设备 ID，二进制发现、独占连接、8 字节设备 ID 鉴权</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F4E2;</span>
+              <div>
+                <strong>广播自动发现</strong>
+                <small>监听 44043 端口，v2 二进制 + 旧版纯文本双协议兼容</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F6A8;</span>
+              <div>
+                <strong>心跳熔断机制</strong>
+                <small>ACK 超时断连 / 无包超时释放 / 并发锁绑定，无需重启</small>
+              </div>
+            </li>
+            <li>
+              <span class="card-icon">&#x1F504;</span>
+              <div>
+                <strong>广播状态机</strong>
+                <small>READY 时每秒广播 TYPE_DISCOVER_REPLY，BUSY 时自动静音</small>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- How It Works -->
+  <section class="section section-alt" id="how-it-works">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">原理</span>
+        <h2 class="section-title">如何工作</h2>
+        <p class="section-desc">一条端到端的无线音频链路</p>
+      </div>
+
+      <div class="flow">
+        <div class="flow-step">
+          <div class="flow-node flow-android">
+            <div class="flow-icon">&#x1F4F1;</div>
+            <strong>Android 手机</strong>
+            <small>Opus 编码<br>48kHz 采集</small>
+          </div>
+          <div class="flow-arrow">&#x2192;</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-node flow-udp">
+            <div class="flow-icon">&#x1F4E1;</div>
+            <strong>UDP 广播</strong>
+            <small>自动发现<br>P2P 独占通信</small>
+          </div>
+          <div class="flow-arrow">&#x2192;</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-node flow-windows">
+            <div class="flow-icon">&#x1F5A5;</div>
+            <strong>Windows PC</strong>
+            <small>WASAPI 解码<br>音频守护线程</small>
+          </div>
+          <div class="flow-arrow">&#x2192;</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-node flow-vbcable">
+            <div class="flow-icon">&#x1F509;</div>
+            <strong>VB-Cable</strong>
+            <small>虚拟声卡<br>零额外延迟</small>
+          </div>
+          <div class="flow-arrow">&#x2192;</div>
+        </div>
+        <div class="flow-step">
+          <div class="flow-node flow-app">
+            <div class="flow-icon">&#x1F4FA;</div>
+            <strong>任意应用</strong>
+            <small>微信 / Zoom<br>OBS / 游戏</small>
+          </div>
+        </div>
+      </div>
+
+      <div class="arch-section">
+        <h3>系统架构</h3>
+        <div class="arch-diagram">
+          <pre><code>[Android 手机] ──Opus 编码 UDP──→ [Windows PC]
+    ↓
+UDP 接收协程 → SyncChannel → 常驻 Audio Worker 线程（解码 + WASAPI 播放）
+    ↓
+VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quick Start -->
+  <section class="section" id="quickstart">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">快速开始</span>
+        <h2 class="section-title">几分钟内完成部署</h2>
+        <p class="section-desc">无需复杂配置，开箱即用</p>
+      </div>
+
+      <div class="steps">
+        <div class="step">
+          <div class="step-number">1</div>
+          <div class="step-content">
+            <h4>安装 VB-Cable</h4>
+            <p>在 Windows PC 上安装 <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener">VB-Cable</a> 虚拟声卡。程序会自动检测，未安装时回退到默认输出设备。</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <div class="step-content">
+            <h4>启动 Windows 接收端</h4>
+            <p>运行 <code>udp2mic_x64.exe</code>，点击"启动"按钮。程序会自动放行防火墙、常驻系统托盘。</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <div class="step-content">
+            <h4>安装 Android 发送端</h4>
+            <p>安装 <code>udp2mic_arm64-v8a.apk</code>，打开 App 后点击 IP 框右侧搜索图标，自动发现局域网 PC。</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">4</div>
+          <div class="step-content">
+            <h4>选择输出设备</h4>
+            <p>在 Windows 音频设置中将默认输出设备设为"VB-Cable"。微信、Zoom、OBS 等应用会自动通过 VB-Cable 接收手机音频。</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="build-section">
+        <h3>自行构建</h3>
+        <div class="build-tabs">
+          <button class="build-tab active" data-target="build-win">Windows</button>
+          <button class="build-tab" data-target="build-android">Android</button>
+        </div>
+        <div class="build-panel active" id="build-win">
+          <div class="build-content">
+            <p>需要 Rust 1.96+、VS Build Tools 2022、CMake 3.22+</p>
+            <div class="code-block">
+              <button class="code-copy" data-copy="build_windows.bat">复制</button>
+              <pre><code>build_windows.bat
+# [1] x86_64 (64-bit)  → udp2mic_x64.exe
+# [2] i686   (32-bit)  → udp2mic_x86.exe</code></pre>
+            </div>
+          </div>
+        </div>
+        <div class="build-panel" id="build-android">
+          <div class="build-content">
+            <p>需要 JDK 17 (Temurin)、Android SDK 35、NDK 27</p>
+            <div class="code-block">
+              <button class="code-copy" data-copy="build_android.bat">复制</button>
+              <pre><code>build_android.bat
+# [1] arm64-v8a (64位)
+# [2] armeabi-v7a (32位)</code></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Specs -->
+  <section class="section section-alt" id="specs">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">技术规格</span>
+        <h2 class="section-title">技术细节</h2>
+        <p class="section-desc">深入每一行代码的工程决策</p>
+      </div>
+
+      <div class="specs-grid">
+        <div class="spec-card">
+          <h4>音频采集</h4>
+          <table>
+            <tr><td>采样率</td><td>48kHz 固定采集</td></tr>
+            <tr><td>编码</td><td>Opus (CBR/VBR，32~512kbps)</td></tr>
+            <tr><td>音源模式</td><td>VOICE_COMMUNICATION / MIC</td></tr>
+            <tr><td>软件处理</td><td>无（纯直通，硬件降噪由系统托管）</td></tr>
+          </table>
+        </div>
+        <div class="spec-card">
+          <h4>网络</h4>
+          <table>
+            <tr><td>传输</td><td>UDP，15B 统一包头</td></tr>
+            <tr><td>发现端口</td><td>44043</td></tr>
+            <tr><td>协议</td><td>v2 二进制 + 旧版纯文本兼容</td></tr>
+            <tr><td>鉴权</td><td>8 字节设备 ID</td></tr>
+            <tr><td>保活</td><td>~1s CONNECT/CONNECT_ACK</td></tr>
+          </table>
+        </div>
+        <div class="spec-card">
+          <h4>接收端</h4>
+          <table>
+            <tr><td>解码器</td><td>5 独立 Opus 解码器</td></tr>
+            <tr><td>重采样</td><td>EMA 漂移补偿，±0.2% 硬限幅</td></tr>
+            <tr><td>输出</td><td>WASAPI → VB-Cable / 默认设备</td></tr>
+            <tr><td>UI</td><td>Iced (Rust) 暗色主题，360×300</td></tr>
+          </table>
+        </div>
+        <div class="spec-card">
+          <h4>工程特性</h4>
+          <table>
+            <tr><td>内存</td><td>全链路零堆分配</td></tr>
+            <tr><td>线程</td><td>双协程（生产-消费）+ 常驻音频守护线程</td></tr>
+            <tr><td>防抖</td><td>200ms 快速双击防抖</td></tr>
+            <tr><td>持久化</td><td>注册表 HKCU\Software\UDP2Mic</td></tr>
+          </table>
+        </div>
+      </div>
+
+      <div class="indicators-section">
+        <h3>状态指示器</h3>
+        <div class="indicators">
+          <div class="indicator"><span class="dot dot-red"></span> 等待连接 / 已断开</div>
+          <div class="indicator"><span class="dot dot-green"></span> 已连接 / 空闲</div>
+          <div class="indicator"><span class="dot dot-orange"></span> 已占用 / VB-Cable 未安装</div>
+          <div class="indicator"><span class="dot dot-gray"></span> 已静音</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Download -->
+  <section class="section" id="download">
+    <div class="container">
+      <div class="section-header">
+        <span class="section-tag">下载</span>
+        <h2 class="section-title">获取 UDP2Mic</h2>
+        <p class="section-desc">当前版本 v1.0.9</p>
+      </div>
+
+      <div class="download-grid">
+        <a href="https://github.com/Raven777777/UDP2Mic/releases/download/v1.0.9/udp2mic_x64.exe" class="download-card" download>
+          <div class="download-icon">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 8l3 3 3-3M12 11V5"/><path d="M8 16h8"/></svg>
+          </div>
+          <div class="download-info">
+            <h4>Windows 接收端</h4>
+            <span class="download-meta">udp2mic_x64.exe &middot; ~4.8 MB</span>
+          </div>
+          <span class="download-btn">下载</span>
+        </a>
+        <a href="https://github.com/Raven777777/UDP2Mic/releases/download/v1.0.9/udp2mic_arm64-v8a.apk" class="download-card" download>
+          <div class="download-icon">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="9" y1="18" x2="15" y2="18"/></svg>
+          </div>
+          <div class="download-info">
+            <h4>Android 发送端</h4>
+            <span class="download-meta">udp2mic_arm64-v8a.apk &middot; ~2.4 MB</span>
+          </div>
+          <span class="download-btn">下载</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-content">
+        <div class="footer-brand">
+          <img src="icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+          <span class="footer-version">v1.0.9</span>
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">GitHub</a>
+          <a href="docs/protocol.html">协议文档</a>
+          <a href="docs/specific.html">完整文档</a>
+        </div>
+        <p class="footer-copy">Android → Opus → UDP → Windows → VB-Cable → 任意应用</p>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
