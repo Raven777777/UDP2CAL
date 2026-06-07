@@ -1,9 +1,10 @@
 # UDP2Mic — 局域网麦克风
 
-> **当前版本: v1.0.9** — P2P 独占通信系统 + 统一 v2 协议 + 1对1设备过滤 + 双向保活
+> **当前版本: v1.0.9** — P2P 独占通信系统 + 统一 v2 协议 + 1对1设备过滤 + 双向保活 + 防抢占静默拒绝
 > * v2 控制协议: 二进制发现、独占连接(TYPE_CONNECT/ACK)、8字节设备ID鉴权
 > * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
 > * 心跳熔断: 3秒 ACK 超时标记断连，1秒无包自动释放独占，防碰撞防抢占
+> * 防抢占静默拒绝: BUSY 时异设备 TYPE_CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响
 > * 全链路生命周期: ACK 超时断连 / 无包超时释放 / 并发锁绑定，无需重启
 > * 向后兼容: v1 Opus 音频包继续使用，v2 控制协议零冲突共存
 
@@ -78,6 +79,7 @@ build_android.bat
   - 双状态机：广播(Ready 周期广播/Silent 停止) + 连接(Idle 监听/Busy 独占)
   - TYPE_CONNECT 唯一准入，READY 时拒绝所有音频
   - 设备 ID 1对1 过滤 + 并发互斥锁防抢占，重启 Win 即清空非法绑定
+  - **防抢占静默拒绝**：DEVICE_BUSY 时异设备 TYPE_CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 `drainAck()` 永 false → `p2pConnected` 永 false → 新设备不编不送音频，且每秒持续重试 CONNECT（无限循环）；已有设备保活和音频流完全不受影响
 - **双向保活**：CONNECT → CONNECT_ACK，1 秒保活周期；300ms 接收超时，1 秒无包标记断连
 - **统一 v2 协议**：15B 包头携带设备 ID，所有包同格式；兼容旧版纯文本发现协议
 - **二进制发现服务**：监听 44043，v2 DISCOVER_REQ/REPLY + 旧版 `UDP2MIC_DISCOVER` 兼容
@@ -222,7 +224,7 @@ windows = { version = "0.58", features = [
 |--------|------|
 | `● 等待连接 / ● 已断开` | 红色 — 正在监听但无数据流 |
 | `● 已连接` | 绿色 — 收到 v1/v2 音频数据 |
-| `● 已占用 / ● 已占用 {device_id}` | 橙色 — v2 TYPE_CONNECT 独占绑定 |
+| `● 已占用 / ● 已占用 {device_id}` | 橙色 — v2 TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝 |
 | `● 空闲` | 绿色 — 已启动但无可信连接 |
 | `● VB-Cable` / `● VB-Cable 未安装` | 绿色/橙色 — 虚拟声卡检测状态 |
 | `● 广播中` / `● 已静音` | 绿色/灰色 — 广播状态机 Ready/Silent |
@@ -245,6 +247,23 @@ windows = { version = "0.58", features = [
 - 同时用作窗口图标和托盘图标
 - `build.rs` 另将 `icon.png` 转为 ICO 嵌入 EXE 文件资源（资源管理器图标）
 - 若 `icon.png` 缺失或无法解码，回退到程序绘制的 32×32 绿色圆点
+
+**P2P 防抢占拒绝行为**：
+
+当 Windows 端处于 `DEVICE_BUSY`（已绑定一台 Android）时，第三方设备手动输入 IP:端口发送 `TYPE_CONNECT`：
+
+| 角色 | 行为 |
+|------|------|
+| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，仅 UI 显示"设备已被占用，拒绝新连接"；全局状态 `GLOBAL_DEVICE_STATE` 和 `BOUND_DEVICE_ID` **完全不变** |
+| **第三方 Android 端** | `drainAck()` 1ms 超时永不返回 true → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；每秒重试 `TYPE_CONNECT`（保活逻辑继续运行，无限循环） |
+| **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id 匹配保活分支），音频流正常解码播放，**完全不受影响** |
+
+> 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
+
+**释放独占的三种途径**：
+1. **Windows 端点击"停止"** → 调用 `reset_to_ready()` 清空 `BOUND_DEVICE_ID` + 恢复 `DEVICE_READY`
+2. **已有 Android 端 1 秒无包超时** → `reset_to_ready()` 自动释放
+3. **重启 Windows 程序** → 全局状态初始化回到 `DEVICE_READY`
 
 ---
 
@@ -347,7 +366,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 版本 | 变更点 |
 |------|--------|
-| **v1.0.9** | **正式版**: 统一 v2 协议（v1+v2 合并，15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入（READY 拒绝所有音频）；Android 非阻塞 1ms drainAck + 优雅断连（不退出采集，3s ACK 超时标记断连，持续保活重连）；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机（READY广播/Silent停止）；Android Opus 高级编码设置面板（全参数可调）；1kHz 测试音模式；`debug_adb.bat` 调试脚本（编译/安装/Logcat 监控） |
+| **v1.0.9** | **正式版**: 统一 v2 协议（v1+v2 合并，15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入（READY 拒绝所有音频）；**防抢占静默拒绝**（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响）；Android 非阻塞 1ms drainAck + 优雅断连（不退出采集，3s ACK 超时标记断连，持续保活重连）；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机（READY广播/Silent停止）；Android Opus 高级编码设置面板（全参数可调）；1kHz 测试音模式；`debug_adb.bat` 调试脚本（编译/安装/Logcat 监控） |
 | **v1.0.6** | UI 卡片布局 + 动态 VU 色彩表 + 按钮交互反馈；全局单例音频守护线程根除反复启停泄漏；`udp_receiver_stream` 参数化消除跨线程注册表竞态；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验 |
 | **v1.0.5** | Windows 接收端初始架构，局域网广播发现服务 |
 
