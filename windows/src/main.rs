@@ -247,7 +247,9 @@ pub fn start_broadcast_listener() {
                         let hdr_buf: [u8; protocol::HEADER_SIZE] = 
                             data[..protocol::HEADER_SIZE].try_into().unwrap_or_default();
                         if let Some(hdr) = protocol::decode_header(&hdr_buf) {
-                            if hdr.msg_type == protocol::TYPE_DISCOVER_REQ {
+                            if APP_RUNNING.load(Ordering::Relaxed) != 0
+                                && GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY
+                                && hdr.msg_type == protocol::TYPE_DISCOVER_REQ {
                                 let cfg = config::Config::load();
                                 let port = cfg.listen_port as u16;
                                 let my_id = cfg.get_device_id_bytes();

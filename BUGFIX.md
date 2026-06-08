@@ -5,6 +5,25 @@
 
 ---
 
+## 2026-06-09 — 全面改名 UDP2CAL + 广播控制 + 包名更新
+
+### 概述
+
+项目全面从 UDP2Mic 更名为 UDP2CAL，包名从 `com.udp2mic.app` 改为 `com.udp2cal.app`，清理所有残留旧引用。修复 UDP 广播在应用停止/已占用时仍响应的安全问题。
+
+### 修复清单
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | 停止后 UDP 广播仍响应 | `start_broadcast_listener` 未检查 `APP_RUNNING` | 监听线程加入 `APP_RUNNING` 判断 |
+| 2 | 已占用时仍可被搜索发现 | `start_broadcast_listener` 未检查 `DEVICE_READY` | 监听线程加入 `GLOBAL_DEVICE_STATE == DEVICE_READY` |
+| 3 | 停止后主动广播仍进行 | `start_broadcast_state_machine` 未检查 UI 状态 | 主动广播线程加入 `APP_RUNNING` 判断 |
+| 4 | android_old 闪退 | JNI 函数名未随包名更新 | 所有 C 文件 JNI 函数名 `com_udp2mic` → `com_udp2cal` |
+| 5 | 构建失败 Theme 引用错误 | `AndroidManifest.xml` 仍引用旧 `Theme.UDP2CALL` | 更新为 `Theme.UDP2CAL` |
+| 6 | 多文件遗留旧名 | 注释、Prefs、CMakeLists、布局等未更新 | 全面扫描清理 |
+
+---
+
 ## 2026-06-09 — 双向音频串流 + AEC 移植与修复
 
 ### 概述
