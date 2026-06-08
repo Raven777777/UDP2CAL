@@ -1,13 +1,13 @@
-﻿@echo off
+@echo off
 setlocal enabledelayedexpansion
-title UDP2Mic Windows Build
+title UDP2CAL Windows Build
 
 echo ========================================
-echo    UDP2Mic Windows Build Script
+echo    UDP2CAL Windows Build Script
 echo ========================================
 echo.
 
-:: ---- Target Architecture Selection ----
+::: ---- Target Architecture Selection ----
 echo Select target architecture:
 echo   [1] x86_64  (64-bit)
 echo   [2] i686    (32-bit)
@@ -16,11 +16,11 @@ CHOICE /C 12 /N /M "[1/2]: "
 if errorlevel 2 set TARGET=i686-pc-windows-msvc&set ARCH=_x86&goto select_upx
 set TARGET=x86_64-pc-windows-msvc&set ARCH=_x64
 
-:: ---- UPX Compression Option ----
+::: ---- UPX Compression Option ----
 :select_upx
 set USE_UPX=
-where upx >nul 2>&1
-if not errorlevel 1 (
+set UPX_PATH=%~dp0upx-5.1.1-win64\upx.exe
+if exist "%UPX_PATH%" (
     echo.
     echo UPX found. Compress executable?
     echo   [1] Yes
@@ -30,7 +30,7 @@ if not errorlevel 1 (
     if not errorlevel 2 set USE_UPX=1
 )
 
-:: ---- Build ----
+::: ---- Build ----
 echo.
 echo ========================================
 echo    Target: %TARGET%  (%ARCH%)
@@ -53,7 +53,7 @@ if errorlevel 1 (
 )
 echo   Rust: OK
 
-:: Ensure target is installed
+::: Ensure target is installed
 echo.
 echo [1.5/3] Ensuring target %TARGET%...
 rustup target add %TARGET% >nul 2>&1
@@ -64,10 +64,10 @@ if errorlevel 1 (
 )
 echo   Target: OK
 
-:: Clean stale artifacts from previous --target-less builds
-if exist "target\release\udp2mic.exe" (
-    echo   Clean: removed old target\release\udp2mic.exe
-    del "target\release\udp2mic.exe" 2>nul
+::: Clean stale artifacts from previous --target-less builds
+if exist "target\release\udp2cal.exe" (
+    echo   Clean: removed old target\release\udp2cal.exe
+    del "target\release\udp2cal.exe" 2>nul
 )
 
 echo.
@@ -81,21 +81,21 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set SRC="%cd%\target\%TARGET%\release\udp2mic.exe"
+set SRC="%cd%\target\%TARGET%\release\udp2cal.exe"
 
 echo.
 echo [3/3] Copying to project root...
 if exist %SRC% (
     for %%A in (%SRC%) do set size=%%~zA
     set /a sizekb=!size!/1024
-    echo   udp2mic%ARCH%.exe (!sizekb! KB^)
+    echo   udp2cal%ARCH%.exe (!sizekb! KB^)
 
     :: UPX compression
     set UPX_TAG=
     if defined USE_UPX (
         echo.
         echo   Compressing with UPX...
-        upx --best %SRC% >nul
+        "%UPX_PATH%" --best %SRC% >nul
         if not errorlevel 1 (
             for %%A in (%SRC%) do set size2=%%~zA
             set /a sizekb2=!size2!/1024
@@ -107,7 +107,7 @@ if exist %SRC% (
     )
 
     :: Copy final binary to project root
-    set OUT="%~dp0udp2mic%ARCH%!UPX_TAG!.exe"
+    set OUT="%~dp0udp2cal%ARCH%!UPX_TAG!.exe"
     copy /Y %SRC% !OUT! >nul
     for %%A in (!OUT!) do set finalsize=%%~zA
     set /a finalsizekb=!finalsize!/1024
@@ -115,7 +115,7 @@ if exist %SRC% (
     echo ========================================
     echo    BUILD SUCCESS
     echo    target: %TARGET%
-    echo    output: udp2mic%ARCH%!UPX_TAG!.exe
+    echo    output: udp2cal%ARCH%!UPX_TAG!.exe
     echo    size:   !finalsizekb! KB
     echo ========================================
 ) else (

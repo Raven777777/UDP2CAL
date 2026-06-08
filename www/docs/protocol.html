@@ -3,25 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UDP2Mic UDP 协议 v2 规范 — 15B 包头 | 局域网麦克风</title>
-  <meta name="description" content="UDP2Mic UDP 私有协议 v2 规范 — 15 字节包头格式、消息类型（TYPE_DATA/CONNECT/DISCOVER）、P2P 安全准入模型、设备 ID 鉴权。">
+  <title>UDP2CAL UDP 协议 v2 规范 — 15B 包头 | 局域网麦克风</title>
+  <meta name="description" content="UDP2CAL UDP 私有协议 v2 规范 — 15 字节包头格式、消息类型（TYPE_DATA/CONNECT/DISCOVER）、P2P 安全准入模型、设备 ID 鉴权。">
   <meta name="keywords" content="UDP协议,局域网协议,v2协议,15B包头,二进制协议,P2P独占通信,设备ID鉴权,Opus音频协议">
   <meta name="robots" content="index, follow">
-  <link rel="canonical" href="https://love4z.cn/udp2mic/docs/protocol.html">
+  <link rel="canonical" href="https://love4z.cn/UDP2CAL/docs/protocol.html">
   <link rel="icon" href="../icon.png" type="image/png">
   <link rel="stylesheet" href="style.css">
 
   <!-- Open Graph -->
   <meta property="og:type" content="article">
-  <meta property="og:title" content="UDP2Mic UDP 协议 v2 规范 — 15B 包头">
-  <meta property="og:description" content="UDP2Mic UDP 私有协议 v2 规范：15 字节包头格式、消息类型、P2P 安全准入模型与设备 ID 鉴权。">
-  <meta property="og:url" content="https://love4z.cn/udp2mic/docs/protocol.html">
-  <meta property="og:image" content="https://love4z.cn/udp2mic/icon.png">
+  <meta property="og:title" content="UDP2CAL UDP 协议 v2 规范 — 15B 包头">
+  <meta property="og:description" content="UDP2CAL UDP 私有协议 v2 规范：15 字节包头格式、消息类型、P2P 安全准入模型与设备 ID 鉴权。">
+  <meta property="og:url" content="https://love4z.cn/UDP2CAL/docs/protocol.html">
+  <meta property="og:image" content="https://love4z.cn/UDP2CAL/icon.png">
   <meta property="og:locale" content="zh_CN">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="UDP2Mic UDP 协议 v2 规范">
+  <meta name="twitter:title" content="UDP2CAL UDP 协议 v2 规范">
   <meta name="twitter:description" content="15B 包头、消息类型、P2P 安全准入模型。">
 
   <!-- JSON-LD Structured Data -->
@@ -29,8 +29,8 @@
   {
     "@context": "https://schema.org",
     "@type": "TechArticle",
-    "name": "UDP2Mic UDP 协议 v2 规范",
-    "description": "UDP2Mic 局域网麦克风系统 UDP 私有协议 v2 规范",
+    "name": "UDP2CAL UDP 协议 v2 规范",
+    "description": "UDP2CAL 局域网麦克风系统 UDP 私有协议 v2 规范",
     "author": {
       "@type": "Person",
       "name": "Raven777777"
@@ -44,7 +44,7 @@
   <nav class="navbar">
     <div class="nav-container">
       <a href="../" class="nav-logo">
-        <img src="../icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+        <img src="../icon.png" alt="UDP2CAL" class="logo-img"> UDP<span class="logo-highlight">2</span>CAL
       </a>
       <ul class="nav-links">
         <li><a href="specific.html">文档首页</a></li>
@@ -87,7 +87,7 @@
     <main class="main">
       <div class="content">
 
-        <div class="version-badge">UDP2Mic UDP 私有协议 v2</div>
+        <div class="version-badge">UDP2CAL UDP 私有协议 v2</div>
 
         <h1>UDP 私有协议 v2<br><small>统一协议：音频 + 控制共用 15 字节包头</small></h1>
 
@@ -173,7 +173,7 @@ Byte 15+:     [payload]</code></pre>
         <ul>
           <li>8 字节唯一标识，时间戳哈希 + 伪随机数</li>
           <li>Android: <code>SharedPreferences</code> 持久化</li>
-          <li>Windows: 注册表 <code>HKCU\Software\UDP2Mic\device_id</code></li>
+          <li>Windows: 注册表 <code>HKCU\Software\UDP2CAL\device_id</code></li>
           <li><strong>所有包均携带</strong>，音频包用于 1对1 过滤，控制包用于身份鉴权</li>
         </ul>
 
@@ -228,7 +228,7 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
             <tr><th>平台</th><th>文件</th><th>语言</th></tr>
             <tr><td>Rust crate</td><td><code>protocol/protocol.rs</code></td><td>Rust（唯一协议真源）</td></tr>
             <tr><td>Windows 接收端</td><td><code>windows/src/protocol.rs</code></td><td>重导出</td></tr>
-            <tr><td>Android 发送端</td><td><code>Udp2MicProtocol.kt</code></td><td>Kotlin（手动对齐）</td></tr>
+            <tr><td>Android 发送端</td><td><code>UDP2CALProtocol.kt</code></td><td>Kotlin（手动对齐）</td></tr>
           </table>
         </div>
 
@@ -238,8 +238,8 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
         <h2 id="usage">用法 (Rust)</h2>
 
         <div class="code-block">
-          <button class="code-copy" data-copy="use udp2mic_protocol::*;">复制</button>
-          <pre><code>use udp2mic_protocol::*;
+          <button class="code-copy" data-copy="use UDP2CAL_protocol::*;">复制</button>
+          <pre><code>use UDP2CAL_protocol::*;
 
 // 构建音频包
 let dev_id = generate_device_id();
@@ -264,7 +264,7 @@ rb.insert_and_drain(h.seq_num, h.sample_rate, &payload, |sr, data| {
         <hr>
 
         <p style="text-align:center; color: var(--text-muted); font-size:0.85rem;">
-          GitHub: <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">Raven777777/UDP2Mic</a>
+          GitHub: <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">Raven777777/UDP2CAL</a>
         </p>
 
       </div>
@@ -274,9 +274,9 @@ rb.insert_and_drain(h.seq_num, h.sample_rate, &payload, |sr, data| {
   <!-- Footer -->
   <footer class="footer">
     <div class="footer-content">
-      <span>UDP2Mic v1.0.9 — 局域网麦克风</span>
+      <span>UDP2CAL v1.1.0 — 局域网音频串流</span>
       <span class="footer-links">
-        <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">GitHub</a>
         <a href="specific.html">项目文档</a>
         <a href="../">返回官网</a>
       </span>

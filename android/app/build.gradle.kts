@@ -5,16 +5,16 @@ plugins {
 }
 
 android {
-    namespace = "com.udp2mic.app"
+    namespace = "com.udp2cal.app"
     compileSdk = 35
     ndkVersion = "27.0.12077973"
 
     defaultConfig {
-        applicationId = "com.udp2mic.app"
+        applicationId = "com.udp2cal.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.0.9"
+        versionCode = 5
+        versionName = "1.1.0"
 
         ndk {
             // -PtargetAbi=armeabi-v7a | arm64-v8a (default)

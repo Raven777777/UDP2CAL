@@ -1,8 +1,9 @@
-﻿// UDP2Mic Windows 接收端 - 局域网麦克风 
+﻿// UDP2CAL Windows 接收端 - 局域网音频串流
 // 双状态机架构 + P2P 独占通信系统
 #![windows_subsystem = "windows"] 
 
 mod audio; 
+mod capture; 
 mod config; 
 mod decoder; 
 mod firewall; 
@@ -11,6 +12,7 @@ mod protocol;
 use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space}; 
 use iced::{Alignment, Element, Length, Subscription, Task, Theme, Color}; 
 use iced::futures::SinkExt; 
+use std::net::SocketAddr; 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering}; 
 use std::sync::mpsc::{sync_channel, SyncSender}; 
 use std::sync::{Mutex, OnceLock}; 
@@ -70,6 +72,21 @@ fn bound_device_id() -> &'static Mutex<[u8; protocol::DEVICE_ID_SIZE]> {
     BOUND_DEVICE_ID.get_or_init(|| Mutex::new([0u8; protocol::DEVICE_ID_SIZE]))
 }
 
+/// Android 端地址和反向端口（用于反向音频发送）
+static ANDROID_ADDR: OnceLock<Mutex<Option<(SocketAddr, u16)>>> = OnceLock::new();
+fn android_addr() -> &'static Mutex<Option<(SocketAddr, u16)>> {
+    ANDROID_ADDR.get_or_init(|| Mutex::new(None))
+}
+
+/// 反向串流用户开关（全局，供 handle_control 读取）
+static REVERSE_ENABLED: AtomicU8 = AtomicU8::new(0);
+
+/// 反向音频发送器句柄
+static REVERSE_SENDER: OnceLock<Mutex<Option<crate::capture::ReverseSender>>> = OnceLock::new();
+fn reverse_sender() -> &'static Mutex<Option<crate::capture::ReverseSender>> {
+    REVERSE_SENDER.get_or_init(|| Mutex::new(None))
+}
+
 /// 获取本机设备 ID 字节数组
 fn my_device_id() -> [u8; protocol::DEVICE_ID_SIZE] {
     config::Config::load().get_device_id_bytes()
@@ -77,7 +94,7 @@ fn my_device_id() -> [u8; protocol::DEVICE_ID_SIZE] {
 
 /// 获取本机设备名（系统主机名）
 fn my_device_name() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UDP2Mic".into())
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UDP2CAL".into())
 }
 
 // ══════════════════════════════════════════════
@@ -193,6 +210,15 @@ fn reset_to_ready() {
     if let Ok(mut id) = bound_device_id().lock() {
         id.fill(0);
     }
+    // 清除 Android 地址并停止反向音频
+    if let Ok(mut addr) = android_addr().lock() {
+        *addr = None;
+    }
+    if let Ok(mut sender) = reverse_sender().lock() {
+        if let Some(s) = sender.take() {
+            s.stop();
+        }
+    }
 }
 
 // ══════════════════════════════════════════════
@@ -234,13 +260,7 @@ pub fn start_broadcast_listener() {
                             }
                         }
                     }
-                    // 兼容旧版纯文本协议
-                    let msg = String::from_utf8_lossy(data).trim().to_string();
-                    if msg == "UDP2MIC_DISCOVER" { 
-                        let port = config::Config::load().listen_port; 
-                        let reply = format!("UDP2MIC_REPLY:{}", port); 
-                        let _ = socket.send_to(reply.as_bytes(), src); 
-                    } 
+
                 } 
                 Err(_) => {} 
             } 
@@ -257,6 +277,7 @@ enum Message {
     IpChanged(String), 
     PortChanged(String), 
     ToggleRunning, 
+    ToggleReverse(bool),
     ToggleAutoStart(bool), 
     StatusUpdate(StatusInfo), 
     Disconnected, 
@@ -285,15 +306,17 @@ struct AppState {
     vb_cable_installed: bool, 
     last_toggle_instant: Instant, 
     session_id: u32, 
+    reverse_audio: bool,
+    reverse_enabled: bool,
 } 
 
 fn main() -> Result<(), iced::Error> { 
     unsafe { 
-        let name: Vec<u16> = "UDP2Mic_SingleInstance_Mutex\0".encode_utf16().collect(); 
+        let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect(); 
         let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr())); 
         if GetLastError() == ERROR_ALREADY_EXISTS { 
-            let title: Vec<u16> = "UDP2Mic\0".encode_utf16().collect(); 
-            let msg: Vec<u16> = "程序已在运行中\0".encode_utf16().collect(); 
+            let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect();
+            let msg: Vec<u16> = "程序已在运行中\0".encode_utf16().collect();
             MessageBoxW( 
                 None, 
                 PCWSTR::from_raw(msg.as_ptr()), 
@@ -328,7 +351,7 @@ fn main() -> Result<(), iced::Error> {
     let tray_icon_img = tray_icon::Icon::from_rgba(icon_rgba.clone(), w, h).unwrap(); 
     let tray_icon = tray_icon::TrayIconBuilder::new() 
         .with_menu(Box::new(tray_menu)) 
-        .with_tooltip("UDP2Mic") 
+        .with_tooltip("UDP2CAL") 
         .with_icon(tray_icon_img)
         .with_menu_on_left_click(false) 
         .build() 
@@ -338,6 +361,7 @@ fn main() -> Result<(), iced::Error> {
     // 主窗体
     iced::application(move || {
         let cfg = config::Config::load();
+        REVERSE_ENABLED.store(if cfg.reverse_enabled != 0 { 1 } else { 0 }, Ordering::Relaxed);
         let now = Instant::now();
         let state = AppState {
             ip_input: cfg.listen_ip.clone(),
@@ -349,13 +373,15 @@ fn main() -> Result<(), iced::Error> {
             last_level_db: -60.0,
             status_text: String::new(),
             vb_cable_installed: audio::detect_vb_cable().is_some(),
+            reverse_audio: false,
+            reverse_enabled: cfg.reverse_enabled != 0,
             config: cfg,
             last_toggle_instant: now,
             session_id: 0,
         };
         (state, Task::none())
     }, AppState::update, AppState::view)
-        .title("UDP2Mic")
+        .title("UDP2CAL")
         .subscription(AppState::subscription)
         .default_font(iced::Font::with_name("Microsoft YaHei"))
         .theme(Theme::Dark)
@@ -387,6 +413,15 @@ impl AppState {
                 let _ = self.config.save(); 
                 Task::none() 
             } 
+            Message::ToggleReverse(enabled) => {
+                // 运行中不可更改
+                if self.is_running { return Task::none(); }
+                self.reverse_enabled = enabled;
+                REVERSE_ENABLED.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
+                self.config.set_reverse_enabled(enabled);
+                let _ = self.config.save();
+                Task::none()
+            }
             Message::ToggleRunning => { 
                 if self.last_toggle_instant.elapsed() < Duration::from_millis(200) { 
                     return Task::none(); 
@@ -395,9 +430,11 @@ impl AppState {
                 self.session_id = self.session_id.wrapping_add(1); 
 
                 if self.is_running { 
+                    REVERSE_ENABLED.store(0, Ordering::Relaxed);
                     reset_to_ready();
                     self.is_running = false; 
                     self.connected = false; 
+                    self.reverse_audio = false; 
                     self.last_bitrate = 0.0; 
                     self.last_level_db = -60.0; 
                     self.status_text.clear(); 
@@ -424,6 +461,8 @@ impl AppState {
                     self.last_level_db = -60.0; 
                     self.status_text = "等待连接...".into(); 
                     self.vb_cable_installed = audio::detect_vb_cable().is_some(); 
+                    // 应用反向串流设置到全局
+                    REVERSE_ENABLED.store(if self.reverse_enabled { 1 } else { 0 }, Ordering::Relaxed);
                 } 
                 Task::none() 
             } 
@@ -451,7 +490,7 @@ impl AppState {
             } 
             Message::HideWindow => {
                 unsafe { 
-                    let title: Vec<u16> = "UDP2Mic\0".encode_utf16().collect(); 
+                    let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect(); 
                     if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
                         if !hwnd.is_invalid() { 
                             let _ = ShowWindow(hwnd, SW_HIDE); 
@@ -462,7 +501,7 @@ impl AppState {
             }
             Message::ShowWindow => {
                 unsafe { 
-                    let title: Vec<u16> = "UDP2Mic\0".encode_utf16().collect(); 
+                    let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect(); 
                     if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
                         if !hwnd.is_invalid() { 
                             let _ = ShowWindow(hwnd, SW_RESTORE); 
@@ -566,7 +605,7 @@ impl AppState {
         container( 
             column![ 
                 row![ 
-                    text("UDP2Mic").size(20), 
+                    text("UDP2CAL").size(20), 
                     Space::new().width(Length::Fill), 
                     text(st).color(sc).size(11),
                     Space::new().width(8),
@@ -684,6 +723,28 @@ impl AppState {
                         auto_c,
                         Message::ToggleAutoStart(!self.config.is_auto_start()),
                     ).width(Length::FillPortion(1)),
+                    Space::new().width(8),
+                    if self.is_running {
+                        let rev_c = if self.reverse_enabled { accent } else { dim };
+                        button(text(if self.reverse_enabled { "反向串流" } else { "未启用" }).size(11))
+                            .width(Length::FillPortion(1))
+                            .height(34)
+                            .style(move |_, _| iced::widget::button::Style {
+                                background: Some(iced::Background::Color(if rev_c == accent {
+                                    Color::from_rgb(0.05, 0.40, 0.25)
+                                } else {
+                                    Color::from_rgb(0.15, 0.15, 0.18)
+                                })),
+                                text_color: rev_c,
+                                border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                                shadow: Default::default(),
+                                snap: true,
+                            })
+                    } else {
+                        mk(if self.reverse_enabled { "反向串流" } else { "反向串流" },
+                           if self.reverse_enabled { accent } else { grey },
+                           Message::ToggleReverse(!self.reverse_enabled))
+                    },
                 ],
                 Space::new().height(6),
                 row![
@@ -697,6 +758,12 @@ impl AppState {
                         text("")
                     },
                 ].align_y(Alignment::Center),
+                if self.is_running && self.reverse_enabled {
+                    let rev_s = if self.connected { "● 反向串流已启用" } else { "○ 等待连接后启用" };
+                    text(rev_s).size(10).color(Color::from_rgb(0.25, 0.80, 0.40))
+                } else {
+                    text("")
+                },
             ]
             .padding(14),
         )
@@ -771,21 +838,52 @@ fn send_connect_ack(src_addr: &std::net::SocketAddr) {
 }
 
 /// 处理控制消息（TYPE_CONNECT / TYPE_CONNECT_ACK / TYPE_DISCOVER_*）
-fn handle_control(header: &protocol::PacketHeader, _payload: &[u8], src_addr: &std::net::SocketAddr, output: &mut iced::futures::channel::mpsc::Sender<Message>) {
+fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &std::net::SocketAddr, output: &mut iced::futures::channel::mpsc::Sender<Message>) {
     match header.msg_type {
         protocol::TYPE_CONNECT => {
+            // 提取反向端口（CONNECT payload 前2字节，big-endian）
+            let rev_port = if payload.len() >= 2 {
+                ((payload[0] as u16) << 8) | (payload[1] as u16)
+            } else {
+                0
+            };
+            // 提取低性能模式标志（payload 第3字节，0=高品质/1=低性能）
+            let low_perf = payload.len() >= 3 && payload[2] != 0;
+            let android_rev_addr = std::net::SocketAddr::new(
+                src_addr.ip(),
+                if rev_port > 0 { rev_port } else { src_addr.port() },
+            );
+
             let current_state = GLOBAL_DEVICE_STATE.load(Ordering::Relaxed);
             if current_state == DEVICE_BUSY {
                 if let Ok(bound) = bound_device_id().lock() {
                     if *bound == header.device_id {
-                        // 同设备保活重连 → 回复 ACK 维持连接
+                        // 同设备保活重连
+                        if rev_port > 0 {
+                            // 仅端口真正变化时才重启发送器（避免每秒保活都重启）
+                            let port_changed = android_addr().lock().ok()
+                                .map(|mut ad| {
+                                    let changed = ad.as_ref()
+                                        .map(|(_, p)| *p != rev_port)
+                                        .unwrap_or(true);
+                                    *ad = Some((android_rev_addr, rev_port));
+                                    changed
+                                })
+                                .unwrap_or(true);
+                            if port_changed && REVERSE_ENABLED.load(Ordering::Relaxed) != 0 {
+                                if let Ok(mut sender) = reverse_sender().lock() {
+                                    if let Some(s) = sender.take() { s.stop(); }
+                                    let my_id = my_device_id();
+                                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id, low_perf));
+                                    eprintln!("[P2P] 反向端口变化，已重启 -> {}:{} (low_perf={})", src_addr.ip(), android_rev_addr.port(), low_perf);
+                                }
+                            }
+                        }
                         send_connect_ack(src_addr);
                         return;
                     }
                 }
-                let _ = output.try_send(Message::StatusUpdate(StatusInfo {
-                    bitrate_kbps: 0.0, level_db: -60.0, error_msg: Some("设备已被占用，拒绝新连接"),
-                }));
+                // 异设备 CONNECT → 静默拒绝
                 return;
             }
             if let Ok(mut bound) = bound_device_id().lock() {
@@ -797,6 +895,21 @@ fn handle_control(header: &protocol::PacketHeader, _payload: &[u8], src_addr: &s
                 bitrate_kbps: 0.0, level_db: -60.0, error_msg: Some("已连接手机端"),
             }));
             send_connect_ack(src_addr);
+
+            // 存储 Android 地址+反向端口
+            if let Ok(mut ad) = android_addr().lock() {
+                *ad = Some((android_rev_addr, rev_port));
+            }
+            // 仅用户开启反向开关时才启动反向音频
+            if REVERSE_ENABLED.load(Ordering::Relaxed) != 0 {
+                let my_id = my_device_id();
+                if let Ok(mut sender) = reverse_sender().lock() {
+                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id, low_perf));
+                }
+                eprintln!("[P2P] 反向音频发送到 {}:{} (low_perf={})", src_addr.ip(), android_rev_addr.port(), low_perf);
+            } else {
+                eprintln!("[P2P] 反向音频开关未开启，跳过启动");
+            }
         }
         _ => {}
     }

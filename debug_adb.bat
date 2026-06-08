@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title UDP2Mic ADB 调试工具
+title udp2cal ADB 调试工具
 set ADB=C:\Android\sdk\platform-tools\adb.exe
 
 echo ========================================
-echo   UDP2Mic ADB 自动调试工具
+echo   udp2cal ADB 自动调试工具
 echo ========================================
 echo.
 
@@ -44,7 +44,7 @@ if %BUILD%==0 if %INSTALL%==0 if %CLEAR%==0 if %MONITOR%==0 if %WINLOG%==0 (
     echo   --install   安装 APK 到设备
     echo   --clear     清空 Logcat 缓冲
     echo   --monitor   启动 Logcat 监控 (过滤 OpusEncoder/CaptureService/MainActivity)
-    echo   --winlog    同时打开 Windows 调试日志 (udp2mic_debug.log)
+    echo   --winlog    同时打开 Windows 调试日志 (udp2cal_debug.log)
     echo   --all       执行全部上述操作
     echo.
     echo 示例:
@@ -78,7 +78,7 @@ if %INSTALL%==1 (
     "%ADB%" install -r "app\build\outputs\apk\debug\app-debug.apk" 2>&1
     if errorlevel 1 (
         echo [信息] 签名冲突，尝试卸载后重装...
-        "%ADB%" uninstall com.udp2mic.app >nul 2>&1
+        "%ADB%" uninstall com.udp2cal.app >nul 2>&1
         "%ADB%" install "app\build\outputs\apk\debug\app-debug.apk" 2>&1
         if errorlevel 1 (
             echo [错误] 安装失败
@@ -99,7 +99,7 @@ if %MONITOR%==1 (
     echo [4/5] 启动 Logcat 监控...
     echo.
     echo ========================================
-    echo   请在手机上打开 UDP2Mic APP
+    echo   请在手机上打开 udp2cal APP
     echo   开启"调试模式"开关
     echo   点击"开始采集"
     echo.
@@ -111,8 +111,8 @@ if %MONITOR%==1 (
 
 if %WINLOG%==1 (
     echo [5/5] 打开 Windows 调试日志...
-    if exist "%~dp0windows\udp2mic_debug.log" (
-        notepad "%~dp0windows\udp2mic_debug.log"
+    if exist "%~dp0windows\udp2cal_debug.log" (
+        notepad "%~dp0windows\udp2cal_debug.log"
     ) else (
         echo   Windows 调试日志尚未生成（需在 Windows 端开启调试模式）
     )

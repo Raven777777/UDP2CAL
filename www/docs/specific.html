@@ -3,25 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UDP2Mic 技术文档 — 项目概述 | 局域网麦克风</title>
-  <meta name="description" content="UDP2Mic 项目完整技术文档 — 局域网麦克风系统，涵盖 Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
-  <meta name="keywords" content="UDP2Mic文档,局域网麦克风技术,无线麦克风构建,Opus编码文档,WASAPI输出,VB-Cable设置">
+  <title>UDP2CAL 技术文档 — 项目概述 | 局域网麦克风</title>
+  <meta name="description" content="UDP2CAL 项目完整技术文档 — 局域网麦克风系统，涵盖 Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
+  <meta name="keywords" content="UDP2CAL文档,局域网麦克风技术,无线麦克风构建,Opus编码文档,WASAPI输出,VB-Cable设置">
   <meta name="robots" content="index, follow">
-  <link rel="canonical" href="https://love4z.cn/udp2mic/docs/specific.html">
+  <link rel="canonical" href="https://love4z.cn/UDP2CAL/docs/specific.html">
   <link rel="icon" href="../icon.png" type="image/png">
   <link rel="stylesheet" href="style.css">
 
   <!-- Open Graph -->
   <meta property="og:type" content="article">
-  <meta property="og:title" content="UDP2Mic 技术文档 — 项目概述">
-  <meta property="og:description" content="UDP2Mic 项目完整技术文档 — Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
-  <meta property="og:url" content="https://love4z.cn/udp2mic/docs/specific.html">
-  <meta property="og:image" content="https://love4z.cn/udp2mic/icon.png">
+  <meta property="og:title" content="UDP2CAL 技术文档 — 项目概述">
+  <meta property="og:description" content="UDP2CAL 项目完整技术文档 — Android 发送端与 Windows 接收端架构、协议规范、构建指南。">
+  <meta property="og:url" content="https://love4z.cn/UDP2CAL/docs/specific.html">
+  <meta property="og:image" content="https://love4z.cn/UDP2CAL/icon.png">
   <meta property="og:locale" content="zh_CN">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="UDP2Mic 技术文档 — 项目概述">
+  <meta name="twitter:title" content="UDP2CAL 技术文档 — 项目概述">
   <meta name="twitter:description" content="局域网麦克风系统完整技术文档。">
 
   <!-- JSON-LD Structured Data -->
@@ -29,8 +29,8 @@
   {
     "@context": "https://schema.org",
     "@type": "TechArticle",
-    "name": "UDP2Mic 项目概述",
-    "description": "UDP2Mic 局域网麦克风系统完整技术文档",
+    "name": "UDP2CAL 项目概述",
+    "description": "UDP2CAL 局域网麦克风系统完整技术文档",
     "author": {
       "@type": "Person",
       "name": "Raven777777"
@@ -44,7 +44,7 @@
   <nav class="navbar">
     <div class="nav-container">
       <a href="../" class="nav-logo">
-        <img src="../icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+        <img src="../icon.png" alt="UDP2CAL" class="logo-img"> UDP<span class="logo-highlight">2</span>CAL
       </a>
       <ul class="nav-links">
         <li><a href="index.html" class="active">文档首页</a></li>
@@ -91,9 +91,9 @@
     <main class="main">
       <div class="content">
 
-        <div class="version-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议 + 防抢占静默拒绝</div>
+        <div class="version-badge">v1.1.0 — 双向音频串流 + 声学回声消除 + P2P 独占通信系统</div>
 
-        <h1>UDP2Mic<br><small>局域网麦克风 — 项目文档</small></h1>
+        <h1>UDP2CAL<br><small>局域网麦克风 — 项目文档</small></h1>
 
         <p>Android 手机 → Opus 编码 → UDP → Windows PC → WASAPI → VB-Cable → 任意应用</p>
 
@@ -112,7 +112,7 @@
           <span class="flow-doc-node flow-doc-app">&#x1F4FA; 任意应用</span>
         </div>
 
-        <p>UDP2Mic 是一个 <strong>工业级稳定、低延迟</strong> 的局域网麦克风系统。Android 端采集音频——仅维护一个 <code>isVoiceMode</code> 状态变量，由 Opus 信号类型驱动音源自动切换，<strong>无任何软件降噪/AGC/音效处理代码</strong>——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。</p>
+        <p>UDP2CAL 是一个 <strong>工业级稳定、低延迟</strong> 的局域网麦克风系统。Android 端采集音频——仅维护一个 <code>isVoiceMode</code> 状态变量，由 Opus 信号类型驱动音源自动切换，<strong>无任何软件降噪/AGC/音效处理代码</strong>——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。</p>
 
         <p><strong>全链路零堆分配</strong>（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、<strong>生产-消费双协程</strong>消除阻塞饥饿、<strong>JNI 双重边界守卫</strong>防越界写穿。双端均已编译通过。</p>
 
@@ -124,9 +124,9 @@
           <button class="code-copy" data-copy="build_windows.bat">复制</button>
           <pre><code>build_windows.bat
 # 交互式选择:
-#   [1] x86_64 (64-bit)  → udp2mic_x64.exe
-#   [2] i686   (32-bit)  → udp2mic_x86.exe
-# 产物: udp2mic_{arch}.exe (项目根目录)</code></pre>
+#   [1] x86_64 (64-bit)  → UDP2CAL_x64.exe
+#   [2] i686   (32-bit)  → UDP2CAL_x86.exe
+# 产物: UDP2CAL_{arch}.exe (项目根目录)</code></pre>
         </div>
 
         <p><strong>先决条件</strong>：Rust 1.96+、VS Build Tools 2022 (C++桌面开发)、CMake 3.22+</p>
@@ -137,7 +137,7 @@
         <div class="code-block">
           <button class="code-copy" data-copy="build_android.bat">复制</button>
           <pre><code>build_android.bat
-# 产物: udp2mic_arm64-v8a.apk 或 udp2mic_armeabi-v7a.apk
+# 产物: UDP2CAL_arm64-v8a.apk 或 UDP2CAL_armeabi-v7a.apk
 # 运行后选择 [1] arm64-v8a (64位) 或 [2] armeabi-v7a (32位)</code></pre>
         </div>
 
@@ -186,7 +186,7 @@
         <!-- File Structure -->
         <h2 id="file-structure">文件结构</h2>
         <div class="code-block">
-          <pre><code>udp2mic/
+          <pre><code>UDP2CAL/
 ├- android/        # Android 发送端（Kotlin + JNI Opus）
 ├- windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├- src/
@@ -214,9 +214,9 @@
         <div class="table-wrap">
           <table>
             <tr><th>文件</th><th>大小</th><th>说明</th></tr>
-            <tr><td><code>udp2mic_{x64,x86}.exe</code></td><td>~5.98 MB</td><td>Windows 接收端（UPX 压缩后为 <code>.upx.exe</code>）</td></tr>
-            <tr><td><code>udp2mic_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (64位，已签名)</td></tr>
-            <tr><td><code>udp2mic_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (32位，已签名)</td></tr>
+            <tr><td><code>UDP2CAL_{x64,x86}.exe</code></td><td>~5.98 MB</td><td>Windows 接收端（UPX 压缩后为 <code>.upx.exe</code>）</td></tr>
+            <tr><td><code>UDP2CAL_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (64位，已签名)</td></tr>
+            <tr><td><code>UDP2CAL_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (32位，已签名)</td></tr>
           </table>
         </div>
 
@@ -251,7 +251,7 @@
         <div class="table-wrap">
           <table>
             <tr><th>Crate</th><th>版本</th><th>用途</th></tr>
-            <tr><td><code>udp2mic-protocol</code></td><td>local</td><td>局域网 UDP 协议</td></tr>
+            <tr><td><code>UDP2CAL-protocol</code></td><td>local</td><td>局域网 UDP 协议</td></tr>
             <tr><td><code>iced</code></td><td>0.14</td><td>GUI 框架（tiny-skia 软件渲染，tokio 运行时）</td></tr>
             <tr><td><code>tokio</code></td><td>1.40</td><td>异步 UDP 收发、超时控制</td></tr>
             <tr><td><code>cpal</code></td><td>0.15</td><td>WASAPI 音频播放</td></tr>
@@ -324,7 +324,7 @@
 
         <h3>配置持久化</h3>
         <ul>
-          <li>配置存储在注册表 <code>HKCU\Software\UDP2Mic</code></li>
+          <li>配置存储在注册表 <code>HKCU\Software\UDP2CAL</code></li>
           <li>监听 IP、端口在点击"启动"时保存；设备 ID 首次运行时自动生成（8 字节 u64）</li>
           <li>开机自启开关保存到 <code>HKCU\...\Run</code> 键 + 配置键</li>
           <li>每次启动均从停止状态开始</li>
@@ -386,6 +386,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <!-- Changelog -->
         <h2 id="changelog">历史重大变更（Windows 端）</h2>
         <ul class="card-list-doc">
+          <li><strong>v1.1.0</strong>：双向音频串流 + AEC — 全面改名 UDP2CAL；反向串流（PC→Phone，WASAPI Loopback + Opus 编码）；声学回声消除（AcousticEchoCanceler）；立体声/单声道自适应编码；低性能模式（android_old）；反向串流 UI 开关按钮；保活重连机制；通知栏动态更新</li>
           <li><strong>v1.0.9</strong>：正式版 — 统一 v2 协议（15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入；<strong>防抢占静默拒绝</strong>（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响）；Android 非阻塞 1ms drainAck + 优雅断连；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机；Opus 高级编码设置面板；1kHz 测试音模式</li>
           <li><strong>v1.0.6</strong>：UI 卡片布局 + 动态 VU 色彩表；全局单例音频守护线程；参数化 <code>udp_receiver_stream</code>；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验</li>
           <li><strong>v1.0.5</strong>：Windows 接收端初始架构，局域网广播发现服务</li>
@@ -398,21 +399,21 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <div class="table-wrap">
           <table>
             <tr><th>项目</th><th>值</th></tr>
-            <tr><td>项目/EXE/APK</td><td><code>UDP2Mic</code> / <code>udp2mic.exe</code></td></tr>
-            <tr><td>Rust crate</td><td><code>udp2mic</code> / <code>udp2mic-protocol</code></td></tr>
-            <tr><td>注册表</td><td><code>HKCU\Software\UDP2Mic</code></td></tr>
-            <tr><td>开机自启 Run 键</td><td><code>UDP2Mic</code></td></tr>
-            <tr><td>防火墙规则</td><td><code>UDP2Mic 局域网麦克风</code></td></tr>
-            <tr><td>单实例互斥锁</td><td><code>UDP2Mic_SingleInstance_Mutex</code></td></tr>
+            <tr><td>项目/EXE/APK</td><td><code>UDP2CAL</code> / <code>UDP2CAL.exe</code></td></tr>
+            <tr><td>Rust crate</td><td><code>UDP2CAL</code> / <code>UDP2CAL-protocol</code></td></tr>
+            <tr><td>注册表</td><td><code>HKCU\Software\UDP2CAL</code></td></tr>
+            <tr><td>开机自启 Run 键</td><td><code>UDP2CAL</code></td></tr>
+            <tr><td>防火墙规则</td><td><code>UDP2CAL 局域网麦克风</code></td></tr>
+            <tr><td>单实例互斥锁</td><td><code>UDP2CAL_SingleInstance_Mutex</code></td></tr>
             <tr><td>发现服务端口</td><td><code>44043</code></td></tr>
-            <tr><td>Android 包名</td><td><code>com.udp2mic.app</code></td></tr>
+            <tr><td>Android 包名</td><td><code>com.udp2cal.app</code></td></tr>
           </table>
         </div>
 
         <hr>
 
         <p style="text-align:center; color: var(--text-muted); font-size:0.85rem;">
-          GitHub: <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">Raven777777/UDP2Mic</a>
+          GitHub: <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">Raven777777/UDP2CAL</a>
         </p>
 
       </div>
@@ -422,9 +423,9 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
   <!-- Footer -->
   <footer class="footer">
     <div class="footer-content">
-      <span>UDP2Mic v1.0.9 — 局域网麦克风</span>
+      <span>UDP2CAL v1.1.0 — 局域网音频串流</span>
       <span class="footer-links">
-        <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">GitHub</a>
         <a href="protocol.html">协议规范</a>
         <a href="../">返回官网</a>
       </span>

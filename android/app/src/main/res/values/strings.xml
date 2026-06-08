@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">UDP2Mic</string>
+    <string name="app_name">UDP2CAL</string>
     <string name="channel_name">采集服务</string>
     <string name="channel_desc">音频采集服务运行中</string>
 </resources>

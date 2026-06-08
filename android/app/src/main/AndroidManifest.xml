@@ -14,10 +14,10 @@
 
     <application
         android:allowBackup="false"
-        android:label="UDP2Mic"
+        android:label="UDP2CAL"
         android:icon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.UDP2Mic">
+        android:theme="@style/Theme.UDP2CAL">
 
         <activity
             android:name=".MainActivity"

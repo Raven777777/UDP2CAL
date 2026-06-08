@@ -1,22 +1,28 @@
-# UDP2Mic — 局域网麦克风
+# UDP2CAL — 局域网音频串流
 
-> **当前版本: v1.0.9** — P2P 独占通信系统 + 统一 v2 协议 + 1对1设备过滤 + 双向保活 + 防抢占静默拒绝
+> **当前版本: v1.1.0** — 双向音频串流 + 声学回声消除 + 反向串流开关 + P2P 独占通信系统
+> * 双向音频：手机麦克风→PC (VB-Cable) + PC 扬声器→手机听筒/扬声器
+> * 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
+> * 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
+> * 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志）
 > * v2 控制协议: 二进制发现、独占连接(TYPE_CONNECT/ACK)、8字节设备ID鉴权
 > * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
 > * 心跳熔断: 3秒 ACK 超时标记断连，1秒无包自动释放独占，防碰撞防抢占
 > * 防抢占静默拒绝: BUSY 时异设备 TYPE_CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响
+> * 保活 CONNECT 携带反向端口：Win 重启后自动恢复反向串流
 > * 全链路生命周期: ACK 超时断连 / 无包超时释放 / 并发锁绑定，无需重启
-> * 向后兼容: v1 Opus 音频包继续使用，v2 控制协议零冲突共存
 
 ## 概述
 
 ```
-Android 手机 → isVoiceMode?→VOICE_COMMUNICATION(系统硬件降噪)/MIC(裸麦直出) → 直通无软件处理 → Opus 编码 → UDP (广播自动发现) → Windows PC → WASAPI → VB-Cable → 任意应用
+Android 手机 ↔ 双向音频 ↔ Windows PC
+  正向: 手机麦克风 → Opus 编码 → UDP → PC → WASAPI → VB-Cable → 任意应用
+  反向: PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器
 ```
 
-UDP2Mic 是一个**工业级稳定、低延迟**的局域网麦克风系统。Android 端采集音频——仅维护一个 `isVoiceMode` 状态变量，由 Opus 信号类型驱动音源自动切换，**无任何软件降噪/AGC/音效处理代码**——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。
+UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。Android 端采集音频——仅维护一个 `isVoiceMode` 状态变量，由 Opus 信号类型驱动音源自动切换，**无任何软件降噪/AGC/音效处理代码**——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。同时支持 PC 扬声器音频回传到手机播放，语音模式下启用硬件声学回声消除。
 
-**全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。双端均已编译通过。
+**全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。
 
 ---
 
@@ -27,22 +33,22 @@ UDP2Mic 是一个**工业级稳定、低延迟**的局域网麦克风系统。An
 ```
 build_windows.bat
 # 交互式选择:
-#   [1] x86_64 (64-bit)  → udp2mic_x64.exe
-#   [2] i686   (32-bit)  → udp2mic_x86.exe
-# 产物: udp2mic_{arch}.exe (项目根目录)
+#   [1] x86_64 (64-bit)  → udp2cal_x64.exe
+#   [2] i686   (32-bit)  → udp2cal_x86.exe
+# 产物: udp2cal_{arch}.exe (项目根目录)
 ```
 
 **先决条件**: Rust 1.96+、VS Build Tools 2022 (C++桌面开发)、CMake 3.22+
 
 > 若使用 CMake ≥ 4.0，编译前需设置 `$env:CMAKE_POLICY_VERSION_MINIMUM="3.5"`。
 >
-> 若系统中安装了 `upx.exe`，编译后会询问是否压缩 EXE；压缩后的产物后缀为 `.upx.exe`（如 `udp2mic_x64.upx.exe`）。
+> 若系统中安装了 `upx.exe`，编译后会询问是否压缩 EXE；压缩后的产物后缀为 `.upx.exe`（如 `udp2cal_x64.upx.exe`）。
 
 ### Android（项目根目录运行）
 
 ```
 build_android.bat
-# 产物: udp2mic_arm64-v8a.apk 或 udp2mic_armeabi-v7a.apk
+# 产物: udp2cal_arm64-v8a.apk 或 udp2cal_armeabi-v7a.apk
 # 运行后选择 [1] arm64-v8a (64位) 或 [2] armeabi-v7a (32位)
 ```
 
@@ -65,9 +71,17 @@ build_android.bat
 
 ## 主要特性
 
+### 双向音频串流（v1.1.0 新增）
+- **正向**：手机麦克风 → Opus 编码 → UDP → PC（VB-Cable 输出），逻辑不变
+- **反向**：PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器播放
+- **Windows 端开关控制**：UI 按钮（开机自启右侧）控制反向串流启停，运行中不可更改
+- **立体声编码**：高品质模式立体声最大码率全频带，手机端显示带宽+码率
+- **低性能模式**：单声道 64kbps 宽带，complexity=1，适配低端 Android 设备
+
 ### Android 发送端
-- **音源自适应切换**：仅一个 `isVoiceMode` 状态变量驱动全部音源决策。语音模式→VOICE_COMMUNICATION（安卓系统原生硬件降噪），全频模式→MIC（裸麦直出，硬件降噪关闭）；异常回退 MIC 保底通路
-- **生产-消费双协程**：独占线程 `AudioRecord.read()` + `Channel` 投递消费者，消除饥饿。信号类型变更时消费者循环检测→自动重建 AudioRecord
+- **音源自适应切换**：仅一个 `isVoiceMode` 状态变量驱动全部音源决策。语音模式→VOICE_COMMUNICATION（安卓系统原生硬件降噪+AEC），全频模式→MIC（裸麦直出，硬件降噪关闭）；异常回退 MIC 保底通路
+- **声学回声消除**：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION AudioTrack + 同音频 session 绑定
+- **生产-消费双协程**：独占线程 `AudioRecord.read()` + `Channel` 投递消费者，消除饥饿。信号类型变更时消费者循环检测→自动重建 AudioRecord，保留网络层和反向播放器
 - **全链路零堆分配**：`ShortArrayPool` 帧复用 + 乒乓发送缓冲区 + `encoderEncodeTo` 直接写入
 - **纯直通无软件处理**：AudioRecord 取 PCM → 直通拷贝 → Opus 编码输出，APP 端无任何降噪/AGC/音效代码，硬件降噪由安卓系统全权托管
 - **Opus CBR/VBR 热调节**：FEC=2（允许 CELT + FEC，不强制 SILK 模式）；码率 32~512kbps；固定 48kHz 采集，协议层支持 5 种采样率（8k/12k/16k/24k/48k）
@@ -76,26 +90,27 @@ build_android.bat
 - **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
 - **网络无缝热重连**：改 IP 不重启录音流
 - **UDP 广播自动发现**：统一 v2 协议发现局域网内 Windows 接收端
-- **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT + 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
-- **优雅断连重连**：断连不退出采集，停止发包 + 持续保活（每 ~1s CONNECT），收到 ACK 自动恢复；3 秒无 ACK 标记断连
+- **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT（携带反向端口+模式标志）+ 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
+- **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
 ### Windows 接收端
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
+- **反向串流按钮**：UI 按钮控制 PC→Phone 反向音频启停（开机自启右侧），设置持久化到注册表
 - **5 独立 Opus 解码器**：支持所有采样率无缝切换
 - **相位连续流式重采样**：EMA 自适应漂移补偿，±0.2% 区间防止变调
 - **VB-Cable 自动检测**：无虚拟声卡时回退到默认输出设备
-- **系统托盘集成**：关闭按钮隐藏到托盘，右键菜单退出，双击恢复窗口；UI 显示 VB-Cable 状态、P2P 连接状态（●已占用/●已连接/●空闲）
+- **系统托盘集成**：关闭按钮隐藏到托盘，右键菜单退出，双击恢复窗口；UI 显示 VB-Cable 状态、P2P 连接状态（●已占用/●已连接/●空闲）、反向串流状态
 - **P2P 独占通信系统**：
   - 双状态机：广播(Ready 周期广播/Silent 停止) + 连接(Idle 监听/Busy 独占)
   - TYPE_CONNECT 唯一准入，READY 时拒绝所有音频
   - 设备 ID 1对1 过滤 + 并发互斥锁防抢占，重启 Win 即清空非法绑定
-  - **防抢占静默拒绝**：DEVICE_BUSY 时异设备 TYPE_CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 `drainAck()` 永 false → `p2pConnected` 永 false → 新设备不编不送音频，且每秒持续重试 CONNECT（无限循环）；已有设备保活和音频流完全不受影响
+  - **防抢占静默拒绝**：DEVICE_BUSY 时异设备 TYPE_CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 `drainAck()` 永 false → `p2pConnected` 永 false → 新设备不编不送音频（但持续发 CONNECT 等待，由 Win 端静默丢弃）；已有设备保活和音频流完全不受影响
 - **双向保活**：CONNECT → CONNECT_ACK，1 秒保活周期；300ms 接收超时，1 秒无包标记断连
-- **统一 v2 协议**：15B 包头携带设备 ID，所有包同格式；兼容旧版纯文本发现协议
-- **二进制发现服务**：监听 44043，v2 DISCOVER_REQ/REPLY + 旧版 `UDP2MIC_DISCOVER` 兼容
+- **统一 v2 协议**：15B 包头携带设备 ID，所有包同格式
+- **二进制发现服务**：监听 44043，v2 DISCOVER_REQ/REPLY
 - **广播状态机**：READY 时每秒广播 TYPE_DISCOVER_REPLY 到 255.255.255.255:44043；BUSY 时自动静音
-- **注册表持久化配置**：开机自启、监听地址、端口、设备 ID（8 字节 u64 存档）
+- **注册表持久化配置**：开机自启、监听地址、端口、设备 ID（8 字节 u64 存档）、反向串流开关
 - **初始化状态检测**：Opus 解码器 / WASAPI 音频引擎初始化失败时实时反馈到 UI
 - **Windows 防火墙自动放行**（静默 `NETSH`，无 CMD 窗口）
 - **单实例互斥锁检测**：`CreateMutexW` 防止重复启动
@@ -106,11 +121,13 @@ build_android.bat
 
 ```
 udp2mic/
-├─ android/        # Android 发送端（Kotlin + JNI Opus）
+├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备）
+├─ android_old/    # Android 发送端（Kotlin + JNI Opus，面向低端设备，无 Compose）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
 │  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
 │  │  ├─ audio.rs      # WASAPI 输出 + 流式重采样
+│  │  ├─ capture.rs    # WASAPI Loopback + Opus 编码 + 反向 UDP 发送
 │  │  ├─ config.rs     # 注册表配置读写
 │  │  ├─ decoder.rs    # Opus 解码器封装
 │  │  ├─ firewall.rs   # 防火墙规则
@@ -132,9 +149,9 @@ udp2mic/
 
 | 文件 | 大小 | 说明 |
 | --- | --- | --- |
-| `udp2mic_{x64,x86}.exe` | ~5.98 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
-| `udp2mic_arm64-v8a.apk` | ~2.65 MB | Android 发送端 (64位，已签名) |
-| `udp2mic_armeabi-v7a.apk` | ~2.65 MB | Android 发送端 (32位，已签名) |
+| `udp2cal_{x64,x86}.exe` | ~5.98 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
+| `udp2cal_arm64-v8a.apk` | ~2.65 MB | Android 发送端 (64位，已签名) |
+| `udp2cal_armeabi-v7a.apk` | ~2.65 MB | Android 发送端 (32位，已签名) |
 
 ---
 
@@ -155,12 +172,12 @@ udp2mic/
 
 | Crate | 版本 | 用途 |
 |-------|------|------|
-| `udp2mic-protocol` | local | 局域网 UDP 协议（包头编解码、重排序缓冲区） |
+| `udp2cal-protocol` | local | 局域网 UDP 协议（包头编解码、重排序缓冲区） |
 | `iced` | 0.14 | GUI 框架（tiny-skia 软件渲染，tokio 运行时） |
 | `tokio` | 1.40 | 异步 UDP 收发、超时控制、事件流 |
 | `cpal` | 0.15 | WASAPI 音频播放 |
-| `audiopus` | 0.3.0-rc.0 | Opus 音频解码 |
-| `windows` | 0.58 | Win32 API（单实例互斥、窗口控制） |
+| `audiopus` | 0.3.0-rc.0 | Opus 音频编解码 |
+| `windows` | 0.58 | Win32 API（单实例互斥、窗口控制、COM/WASAPI） |
 | `winreg` | 0.52 | 注册表配置持久化 |
 | `tray-icon` | 0.24 | 系统托盘图标、右键菜单、双击恢复 |
 | `image` | 0.24 | 运行时解码内嵌 `icon.png` 为 RGBA |
@@ -183,7 +200,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading", "Win32_System_Registry",
     "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi",
-    "Win32_Foundation",
+    "Win32_Foundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming",
 ] }
 ```
 
@@ -197,9 +214,9 @@ windows = { version = "0.58", features = [
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
 | **UI 层（Android）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
-| **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态；`run_with(session_id)` 强制状态隔离 |
-| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。支持 v2 二进制 + 旧版纯文本双协议广播自动发现 |
-| **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord |
+| **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
+| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
+| **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord，保留网络层 |
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
@@ -215,8 +232,10 @@ windows = { version = "0.58", features = [
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()`/`default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
 | 传输机制 | 15 字节包头（v2 统一协议，Big-Endian）实时携带码率、采样率、8 字节设备 ID |
 | 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 相位连续重采样 |
-| **局域网自动发现** | Windows 监听 44043，支持 v2 二进制协议 + 旧版纯文本 `"UDP2MIC_DISCOVER"` 双协议兼容。Android 端 IP 框右侧图标一键搜索 |
-| **心跳与保活** | Android 每 ~1s（50 帧）发 CONNECT；Win 端 300ms 接收超时 + 1s 无包标记断连；Android 3s 无 ACK 标记断连 |
+| **局域网自动发现** | Windows 监听 44043，v2 二进制协议。Android 端 IP 框右侧图标一键搜索 |
+| **心跳与保活** | Android 每 ~1s（50 帧）发 CONNECT（携带反向端口+模式标志）；Win 端 300ms 接收超时 + 1s 无包标记断连；Android 3s 无 ACK 标记断连 |
+| **反向串流保活** | 保活 CONNECT 携带反向端口，Win 重启后自动恢复反向串流。仅端口真正变化时重启发送器，防止每秒卡顿 |
+| **模式切换** | 语音↔音乐模式切换时保留 UdpSender(网络层) 和 reverseDecoder，重建 AudioPlayer(路由/声道)，零网络中断 |
 
 ---
 
@@ -234,22 +253,23 @@ windows = { version = "0.58", features = [
 | 指示器 | 含义 |
 |--------|------|
 | `● 等待连接 / ● 已断开` | 红色 — 正在监听但无数据流 |
-| `● 已连接` | 绿色 — 收到 v1/v2 音频数据 |
+| `● 已连接` | 绿色 — 收到音频数据 |
 | `● 已占用 / ● 已占用 {device_id}` | 橙色 — v2 TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝 |
 | `● 空闲` | 绿色 — 已启动但无可信连接 |
 | `● VB-Cable` / `● VB-Cable 未安装` | 绿色/橙色 — 虚拟声卡检测状态 |
 | `● 广播中` / `● 已静音` | 绿色/灰色 — 广播状态机 Ready/Silent |
+| `[停止] [开机自启] [反向串流]` | 反向串流按钮 — 停止时可用点击切换，运行时锁定。开启后显示 `● 反向串流已启用` |
 
 **配置持久化**：
-- 配置存储在注册表 `HKCU\Software\UDP2Mic`
+- 配置存储在注册表 `HKCU\Software\UDP2CAL`
 - 监听 IP、端口在点击"启动"时保存；设备 ID 首次运行时自动生成（8 字节 u64）
 - 开机自启开关保存到 `HKCU\...\Run` 键 + 配置键
+- 反向串流开关在停止时切换并保存到注册表，Win 重启后自动恢复
 - 每次启动均从停止状态开始（`is_running` 为运行时状态，不持久化）
 
 **局域网自动发现**：
 - Windows 端常驻监听 UDP 端口 44043（独立线程 `start_broadcast_listener`）
 - **v2 二进制协议**：手机端 `TYPE_DISCOVER_REQ` → PC 回复 `TYPE_DISCOVER_REPLY`（含端口 + 设备名）
-- **旧版兼容**：文本 `"UDP2MIC_DISCOVER"` → `"UDP2MIC_REPLY:{port}"` 纯文本回复
 - **广播状态机**（`start_broadcast_state_machine`）：READY 时每秒向 `255.255.255.255:44043` 广播 `TYPE_DISCOVER_REPLY`；BUSY 时自动静音
 - 端口随用户修改实时更新（每次发现请求从注册表读取最新值）
 
@@ -265,8 +285,8 @@ windows = { version = "0.58", features = [
 
 | 角色 | 行为 |
 |------|------|
-| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，仅 UI 显示"设备已被占用，拒绝新连接"；全局状态 `GLOBAL_DEVICE_STATE` 和 `BOUND_DEVICE_ID` **完全不变** |
-| **第三方 Android 端** | `drainAck()` 1ms 超时永不返回 true → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；每秒重试 `TYPE_CONNECT`（保活逻辑继续运行，无限循环） |
+| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；全局状态 `GLOBAL_DEVICE_STATE` 和 `BOUND_DEVICE_ID` **完全不变** |
+| **第三方 Android 端** | `drainAck()` 1ms 超时永不返回 true → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
 | **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id 匹配保活分支），音频流正常解码播放，**完全不受影响** |
 
 > 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
@@ -288,6 +308,10 @@ windows = { version = "0.58", features = [
 UDP 接收协程 → SyncChannel → 常驻 Audio Worker 线程（解码 + WASAPI 播放）
     ↓
 VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏
+                                     ↑
+[Windows PC] ──反向 WASAPI Loopback──┘
+    ↓
+WASAPI 捕获 → Opus 编码 → UDP → [Android 手机]
 ```
 
 #### 全局单例音频守护线程
@@ -377,7 +401,8 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 版本 | 变更点 |
 |------|--------|
-| **v1.0.9** | **正式版**: 统一 v2 协议（v1+v2 合并，15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入（READY 拒绝所有音频）；**防抢占静默拒绝**（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响）；Android 非阻塞 1ms drainAck + 优雅断连（不退出采集，3s ACK 超时标记断连，持续保活重连）；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机（READY广播/Silent停止）；Android Opus 高级编码设置面板（全参数可调）；1kHz 测试音模式；`debug_adb.bat` 调试脚本（编译/安装/Logcat 监控） |
+| **v1.1.0** | 2026-06-09: 全面改名 UDP2CAL（原 UDP2Mic）；双向音频串流 + AEC 移植成功；反向串流开关按钮；立体声/单声道自适应编码；低性能模式(android_old)；保活重连机制；通知栏动态更新；WASAPI 缓冲 100→30ms；AudioTrack 缓冲 300→80ms；移除旧版纯文本发现协议 |
+| **v1.0.9.2** | 2026-06-08: P2P 独占增强——Win 端异设备 CONNECT 静默拒绝（不推送 StatusUpdate，消除码率/电平跳动）；Android 端保活恢复持续发送；新增 `android_old/` 适配 Android 6~8 旧设备（无 Compose，低性能默认配置 + VOICE_COMMUNICATION 回退 + 一键自动连接）；`build_android.bat` 支持 4 选项同时编译新旧版本 |
 | **v1.0.6** | UI 卡片布局 + 动态 VU 色彩表 + 按钮交互反馈；全局单例音频守护线程根除反复启停泄漏；`udp_receiver_stream` 参数化消除跨线程注册表竞态；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验 |
 | **v1.0.5** | Windows 接收端初始架构，局域网广播发现服务 |
 
@@ -387,14 +412,15 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 项目 | 值 |
 | --- | --- |
-| 项目/EXE/APK | `UDP2Mic` / `udp2mic.exe` |
-| Rust crate | `udp2mic` / `udp2mic-protocol` |
-| 注册表 | `HKCU\Software\UDP2Mic` |
-| 开机自启 Run 键 | `UDP2Mic` |
-| 防火墙规则 | `UDP2Mic 局域网麦克风` |
-| 单实例互斥锁 | `UDP2Mic_SingleInstance_Mutex` |
+| 项目/EXE/APK | `UDP2CAL` / `udp2cal.exe` / `udp2cal.apk` |
+| Rust crate | `udp2cal` / `udp2cal-protocol` |
+| 协议 lib 名 | `udp2cal_protocol` |
+| 注册表 | `HKCU\Software\UDP2CAL` |
+| 开机自启 Run 键 | `UDP2CAL` |
+| 防火墙规则 | `UDP2CAL 局域网音频串流` |
+| 单实例互斥锁 | `UDP2CAL_SingleInstance_Mutex` |
 | 发现服务端口 | `44043` |
-| Android 包名 | `com.udp2mic.app` |
+| Android 包名 | `com.udp2cal.app` |
 
 ## 更多文档
 
@@ -408,11 +434,11 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 ## 发布产物
 
 ```
-udp2mic_x64.exe               # Windows 接收端 64-bit
-udp2mic_x64.upx.exe           # UPX 压缩版（额外产物）
-udp2mic_x86.exe               # Windows 接收端 32-bit
-udp2mic_x86.upx.exe           # UPX 压缩版（额外产物）
-udp2mic_arm64-v8a.apk         # Android 发送端 64-bit（已签名，ProGuard 缩减）
-udp2mic_armeabi-v7a.apk       # Android 发送端 32-bit（已签名，ProGuard 缩减）
+udp2cal_x64.exe               # Windows 接收端 64-bit
+udp2cal_x64.upx.exe           # UPX 压缩版（额外产物）
+udp2cal_x86.exe               # Windows 接收端 32-bit
+udp2cal_x86.upx.exe           # UPX 压缩版（额外产物）
+udp2cal_arm64-v8a.apk         # Android 发送端 64-bit（已签名，ProGuard 缩减）
+udp2cal_armeabi-v7a.apk       # Android 发送端 32-bit（已签名，ProGuard 缩减）
 icon.png                      # 图标源文件（已内嵌到 exe，分发时可选附带）
 ```

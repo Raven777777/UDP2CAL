@@ -1,8 +1,8 @@
 [package]
-name = "udp2mic"
-version = "1.0.9"
+name = "udp2cal"
+version = "1.1.0"
 edition = "2021"
-description = "UDP2Mic - 局域网麦克风Windows接收端"
+description = "UDP2CAL - 局域网音频串流Windows接收端"
 build = "build.rs"
 
 [profile.release]
@@ -17,7 +17,7 @@ winres = "0.1"
 image = "0.24"
 
 [dependencies]
-udp2mic-protocol = { path = "../protocol" }
+udp2cal-protocol = { path = "../protocol" }
 iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia", "image"] }
 tokio = { version = "1.40", features = ["net", "sync", "rt", "macros", "time"] }
 cpal = "0.15"
@@ -32,6 +32,8 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
 ] }
 winreg = "0.52"
 audiopus = "0.3.0-rc.0"

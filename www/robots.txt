@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://love4z.cn/udp2mic/sitemap.xml
+Sitemap: https://love4z.cn/UDP2CAL/sitemap.xml

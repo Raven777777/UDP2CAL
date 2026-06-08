@@ -3,25 +3,25 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>UDP2Mic — 手机变无线麦克风 | 局域网低延迟音频传输</title>
-  <meta name="description" content="UDP2Mic 将 Android 手机变为 Windows PC 的无线麦克风。Opus 编码、低延迟、零软件降噪处理，支持微信、Zoom、OBS 等任意应用。内存仅 10MB，CPU 低于 0.5%。">
+  <title>UDP2CAL — 手机变无线麦克风 | 局域网低延迟音频传输</title>
+  <meta name="description" content="UDP2CAL 将 Android 手机变为 Windows PC 的无线麦克风。Opus 编码、低延迟、零软件降噪处理，支持微信、Zoom、OBS 等任意应用。内存仅 10MB，CPU 低于 0.5%。">
   <meta name="keywords" content="无线麦克风,手机麦克风,局域网麦克风,Android无线麦克风,Windows虚拟声卡,Opus编码,VB-Cable,低延迟音频,UDP音频传输">
   <meta name="robots" content="index, follow">
-  <link rel="canonical" href="https://love4z.cn/udp2mic/">
+  <link rel="canonical" href="https://love4z.cn/UDP2CAL/">
   <link rel="icon" href="icon.png" type="image/png">
   <link rel="stylesheet" href="style.css">
 
   <!-- Open Graph -->
   <meta property="og:type" content="website">
-  <meta property="og:title" content="UDP2Mic — 手机变无线麦克风 | 局域网低延迟音频传输">
+  <meta property="og:title" content="UDP2CAL — 手机变无线麦克风 | 局域网低延迟音频传输">
   <meta property="og:description" content="将 Android 手机变为 Windows PC 的无线麦克风。Opus 编码、零堆分配、P2P 独占通信，支持微信/Zoom/OBS。">
-  <meta property="og:url" content="https://love4z.cn/udp2mic/">
-  <meta property="og:image" content="https://love4z.cn/udp2mic/icon.png">
+  <meta property="og:url" content="https://love4z.cn/UDP2CAL/">
+  <meta property="og:image" content="https://love4z.cn/UDP2CAL/icon.png">
   <meta property="og:locale" content="zh_CN">
 
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary">
-  <meta name="twitter:title" content="UDP2Mic — 手机变无线麦克风">
+  <meta name="twitter:title" content="UDP2CAL — 手机变无线麦克风">
   <meta name="twitter:description" content="Android → Opus → UDP → Windows → VB-Cable → 任意应用。工业级稳定、低延迟的局域网麦克风系统。">
 
   <!-- JSON-LD Structured Data -->
@@ -29,7 +29,7 @@
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
-    "name": "UDP2Mic",
+    "name": "UDP2CAL",
     "description": "局域网麦克风系统。Android 端采集音频，经 Opus 编码通过 UDP 发送到 Windows 接收端，通过 WASAPI 输出到虚拟声卡。",
     "applicationCategory": "Multimedia",
     "operatingSystem": "Windows 10+, Android 10+",
@@ -53,7 +53,7 @@
   <nav class="navbar">
     <div class="container nav-container">
       <a href="#" class="nav-logo">
-        <img src="icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
+        <img src="icon.png" alt="UDP2CAL" class="logo-img"> UDP<span class="logo-highlight">2</span>CAL
       </a>
       <ul class="nav-links">
         <li><a href="#features">特性</a></li>
@@ -71,7 +71,7 @@
   <!-- Hero -->
   <section class="hero" id="hero">
     <div class="container">
-      <div class="hero-badge">v1.0.9 — P2P 独占通信系统 + 统一 v2 协议 + 防抢占静默拒绝</div>
+      <div class="hero-badge">v1.1.0 — 双向音频串流 + 声学回声消除 + P2P 独占通信系统</div>
       <h1 class="hero-title">
         把你的手机变成<br>
         <span class="gradient-text">无线麦克风</span>
@@ -137,6 +137,13 @@
               </div>
             </li>
             <li>
+              <span class="card-icon">&#x1F50A;</span>
+              <div>
+                <strong>双向音频串流 + AEC</strong>
+                <small>PC 扬声器→手机播放，语音模式启用声学回声消除（AcousticEchoCanceler）</small>
+              </div>
+            </li>
+            <li>
               <span class="card-icon">&#x1F3B5;</span>
               <div>
                 <strong>1kHz 测试音模式</strong>
@@ -189,6 +196,13 @@
               </div>
             </li>
             <li>
+              <span class="card-icon">&#x1F509;</span>
+              <div>
+                <strong>反向串流（立体声）</strong>
+                <small>WASAPI Loopback → Opus 编码 → UDP 发送到手机，UI 按钮开关控制</small>
+              </div>
+            </li>
+            <li>
               <span class="card-icon">&#x1F512;</span>
               <div>
                 <strong>双向保活 &amp; 熔断</strong>
@@ -216,7 +230,7 @@
               <span class="card-icon">&#x1F4E2;</span>
               <div>
                 <strong>广播自动发现</strong>
-                <small>监听 44043 端口，v2 二进制 + 旧版纯文本双协议兼容</small>
+                <small>监听 44043 端口，二进制 v2 协议自动发现</small>
               </div>
             </li>
             <li>
@@ -331,14 +345,14 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
           <div class="step-number">2</div>
           <div class="step-content">
             <h4>启动 Windows 接收端</h4>
-            <p>运行 <code>udp2mic_x64.exe</code>，点击"启动"按钮。程序会自动放行防火墙、常驻系统托盘。</p>
+            <p>运行 <code>UDP2CAL_x64.exe</code>，点击"启动"按钮。程序会自动放行防火墙、常驻系统托盘。</p>
           </div>
         </div>
         <div class="step">
           <div class="step-number">3</div>
           <div class="step-content">
             <h4>安装 Android 发送端</h4>
-            <p>安装 <code>udp2mic_arm64-v8a.apk</code>，打开 App 后点击 IP 框右侧搜索图标，自动发现局域网 PC。</p>
+            <p>安装 <code>UDP2CAL_arm64-v8a.apk</code>，打开 App 后点击 IP 框右侧搜索图标，自动发现局域网 PC。</p>
           </div>
         </div>
         <div class="step">
@@ -362,8 +376,8 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
             <div class="code-block">
               <button class="code-copy" data-copy="build_windows.bat">复制</button>
               <pre><code>build_windows.bat
-# [1] x86_64 (64-bit)  → udp2mic_x64.exe
-# [2] i686   (32-bit)  → udp2mic_x86.exe</code></pre>
+# [1] x86_64 (64-bit)  → UDP2CAL_x64.exe
+# [2] i686   (32-bit)  → UDP2CAL_x86.exe</code></pre>
             </div>
           </div>
         </div>
@@ -406,7 +420,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
           <table>
             <tr><td>传输</td><td>UDP，15B 统一包头</td></tr>
             <tr><td>发现端口</td><td>44043</td></tr>
-            <tr><td>协议</td><td>v2 二进制 + 旧版纯文本兼容</td></tr>
+            <tr><td>协议</td><td>v2 二进制统一协议</td></tr>
             <tr><td>鉴权</td><td>8 字节设备 ID</td></tr>
             <tr><td>保活</td><td>~1s CONNECT/CONNECT_ACK</td></tr>
           </table>
@@ -426,7 +440,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
             <tr><td>内存</td><td>全链路零堆分配</td></tr>
             <tr><td>线程</td><td>双协程（生产-消费）+ 常驻音频守护线程</td></tr>
             <tr><td>防抖</td><td>200ms 快速双击防抖</td></tr>
-            <tr><td>持久化</td><td>注册表 HKCU\Software\UDP2Mic</td></tr>
+            <tr><td>持久化</td><td>注册表 HKCU\Software\UDP2CAL</td></tr>
           </table>
         </div>
       </div>
@@ -449,28 +463,28 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
     <div class="container">
       <div class="section-header">
         <span class="section-tag">下载</span>
-        <h2 class="section-title">获取 UDP2Mic</h2>
-        <p class="section-desc">当前版本 v1.0.9</p>
+        <h2 class="section-title">获取 UDP2CAL</h2>
+        <p class="section-desc">当前版本 v1.1.0</p>
       </div>
 
       <div class="download-grid">
-        <a href="https://github.com/Raven777777/UDP2Mic/releases/download/v1.0.9/udp2mic_x64.exe" class="download-card" download>
+        <a href="https://github.com/Raven777777/UDP2CAL/releases/download/v1.1.0/UDP2CAL_x64.exe" class="download-card" download>
           <div class="download-icon">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 8l3 3 3-3M12 11V5"/><path d="M8 16h8"/></svg>
           </div>
           <div class="download-info">
             <h4>Windows 接收端</h4>
-            <span class="download-meta">udp2mic_x64.exe &middot; ~5.98 MB &middot; 需 Windows 10+</span>
+            <span class="download-meta">UDP2CAL_x64.exe &middot; ~5.98 MB &middot; 需 Windows 10+</span>
           </div>
           <span class="download-btn">下载</span>
         </a>
-        <a href="https://github.com/Raven777777/UDP2Mic/releases/download/v1.0.9/udp2mic_arm64-v8a.apk" class="download-card" download>
+        <a href="https://github.com/Raven777777/UDP2CAL/releases/download/v1.1.0/UDP2CAL_arm64-v8a.apk" class="download-card" download>
           <div class="download-icon">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="9" y1="18" x2="15" y2="18"/></svg>
           </div>
           <div class="download-info">
             <h4>Android 发送端</h4>
-            <span class="download-meta">udp2mic_arm64-v8a.apk &middot; ~2.65 MB &middot; 需 Android 10+</span>
+            <span class="download-meta">UDP2CAL_arm64-v8a.apk &middot; ~2.65 MB &middot; 需 Android 10+</span>
           </div>
           <span class="download-btn">下载</span>
         </a>
@@ -498,11 +512,11 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
     <div class="container">
       <div class="footer-content">
         <div class="footer-brand">
-          <img src="icon.png" alt="UDP2Mic" class="logo-img"> UDP<span class="logo-highlight">2</span>Mic
-          <span class="footer-version">v1.0.9</span>
+          <img src="icon.png" alt="UDP2CAL" class="logo-img"> UDP<span class="logo-highlight">2</span>CAL
+          <span class="footer-version">v1.1.0</span>
         </div>
         <div class="footer-links">
-          <a href="https://github.com/Raven777777/UDP2Mic" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">GitHub</a>
           <a href="docs/protocol.html">协议文档</a>
           <a href="docs/specific.html">完整文档</a>
         </div>

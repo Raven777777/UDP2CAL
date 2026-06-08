@@ -3699,8 +3699,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "udp2mic"
-version = "1.0.9"
+name = "udp2cal"
+version = "1.1.0"
 dependencies = [
  "audiopus",
  "cpal",
@@ -3708,15 +3708,15 @@ dependencies = [
  "image 0.24.9",
  "tokio",
  "tray-icon",
- "udp2mic-protocol",
+ "udp2cal-protocol",
  "windows 0.58.0",
  "winreg",
  "winres",
 ]
 
 [[package]]
-name = "udp2mic-protocol"
-version = "1.0.9"
+name = "udp2cal-protocol"
+version = "1.1.0"
 
 [[package]]
 name = "unicode-bidi"

@@ -1,7 +1,7 @@
 ﻿// Windows防火墙自动放行 (静默，无CMD窗口)
 use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const RULE_NAME: &str = "UDP2Mic 局域网麦克风";
+const RULE_NAME: &str = "UDP2CAL 局域网音频串流";
 
 pub fn add_firewall_rule() -> Result<(), String> {
     // 先删除旧规则（忽略失败，可能本来就不存在）

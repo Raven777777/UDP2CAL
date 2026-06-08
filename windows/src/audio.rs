@@ -163,7 +163,7 @@ pub fn start_audio() -> Result<AudioWriter, String> {
     let underrun_weak_cb = underrun_weak.clone();
 
     std::thread::Builder::new()
-        .name("udp2mic-audio".into())
+        .name("udp2cal-audio".into())
         .spawn(move || {
             let err_fn = |_| {};
             let stream = match device.build_output_stream(

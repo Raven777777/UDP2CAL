@@ -1,4 +1,4 @@
-# UDP2Mic UDP私有协议 v2
+# UDP2CAL UDP私有协议 v2
 
 ## 统一协议 (音频 + 控制共用)
 
@@ -48,7 +48,7 @@ Byte 15+:     [payload]
 
 - 8 字节唯一标识，时间戳哈希 + 伪随机数
 - Android: `SharedPreferences` 持久化
-- Windows: 注册表 `HKCU\Software\UDP2Mic\device_id`
+- Windows: 注册表 `HKCU\Software\UDP2CAL\device_id`
 - **所有包均携带**，音频包用于 1对1 过滤，控制包用于身份鉴权
 
 ## P2P 独占通信生命周期
@@ -89,12 +89,12 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA
 |------|------|------|
 | Rust crate | `protocol/protocol.rs` | Rust (唯一协议真源) |
 | Windows 接收端 | `windows/src/protocol.rs` | 重导出 |
-| Android 发送端 | `Udp2MicProtocol.kt` | Kotlin (手动对齐) |
+| Android 发送端 | `Udp2CalProtocol.kt` | Kotlin (手动对齐) |
 
 ### 用法 (Rust)
 
 ```rust
-use udp2mic_protocol::*;
+use udp2cal_protocol::*;
 
 // 构建音频包
 let dev_id = generate_device_id();

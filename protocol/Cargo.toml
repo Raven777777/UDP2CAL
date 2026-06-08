@@ -1,9 +1,9 @@
 [package]
-name = "udp2mic-protocol"
-version = "1.0.9"
+name = "udp2cal-protocol"
+version = "1.1.0"
 edition = "2021"
-description = "UDP2Mic 私有协议编解码 (Rust实现)"
+description = "UDP2CAL 私有协议编解码 (Rust实现)"
 
 [lib]
-name = "udp2mic_protocol"
+name = "udp2cal_protocol"
 path = "protocol.rs"
