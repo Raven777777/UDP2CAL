@@ -16,7 +16,8 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-const FRAME_SIZE: usize = 960;  // 48000 * 20ms 帧
+const FRAME_SIZE: usize = 960;      // 48000 * 20ms 帧（单声道）
+const FRAME_SIZE_16K: usize = 320;  // 16000 * 20ms 帧（单声道，低性能）
 const CODEC_MONO: u8 = 1;      // 协议 codec=1: Opus单声道（低性能模式）
 const CODEC_STEREO: u8 = 2;    // 协议 codec=2: Opus立体声（高品质模式）
 
@@ -53,22 +54,19 @@ impl ReverseSender {
 
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
-        // 低性能模式: 单声道 64kbps 宽带; 高性能: 立体声最大码率全频带
-        let (channels, codec, frame_samps, bitrate, bandwidth) = if low_perf {
-            eprintln!("[Reverse] 低性能模式: 单声道 64kbps");
-            (audiopus::Channels::Mono, CODEC_MONO, FRAME_SIZE,
-             audiopus::Bitrate::BitsPerSecond(64000), audiopus::Bandwidth::Wideband)
+        // 低性能模式: 单声道 64kbps 宽带 (16kHz); 高性能: 立体声最大码率全频带
+        let (channels, codec, frame_samps, bitrate, bandwidth, sample_rate_id) = if low_perf {
+            eprintln!("[Reverse] 低性能模式: 单声道 64kbps 16kHz 宽带");
+            (audiopus::Channels::Mono, CODEC_MONO, FRAME_SIZE_16K,
+             audiopus::Bitrate::BitsPerSecond(64000), audiopus::Bandwidth::Wideband, 2u8) // sr=16kHz
         } else {
             eprintln!("[Reverse] 高品质模式: 立体声 最大码率 全频带");
             (audiopus::Channels::Stereo, CODEC_STEREO, FRAME_SIZE * 2,
-             audiopus::Bitrate::Max, audiopus::Bandwidth::Fullband)
+             audiopus::Bitrate::Max, audiopus::Bandwidth::Fullband, 4u8) // sr=48kHz
         };
 
-        let mut encoder = match audiopus::coder::Encoder::new(
-            audiopus::SampleRate::Hz48000,
-            channels,
-            audiopus::Application::Audio,
-        ) {
+        let sr = if low_perf { audiopus::SampleRate::Hz16000 } else { audiopus::SampleRate::Hz48000 };
+        let mut encoder = match audiopus::coder::Encoder::new(sr, channels, audiopus::Application::Audio) {
             Ok(e) => e,
             Err(err) => { eprintln!("[Reverse] Opus 编码器失败: {:?}", err); return; }
         };
@@ -108,20 +106,24 @@ impl ReverseSender {
                     let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(s);
                 }
-                // 下混所有完好的立体声对
+                // 下混所有完好的立体声对 → 48kHz 单声道
                 while pcm_buf.len() >= 2 {
                     let l = pcm_buf[0] as i32;
                     let r = pcm_buf[1] as i32;
                     mono_buf.push(((l + r) / 2) as i16);
                     pcm_buf.drain(0..2);
                 }
-                // 编码满帧
-                while mono_buf.len() >= FRAME_SIZE {
-                    let n = encoder.encode(&mono_buf[..FRAME_SIZE], &mut encode_out).unwrap_or(0);
+                // 降采样 48kHz→16kHz (每3个取1个) 后编码满帧
+                while mono_buf.len() >= FRAME_SIZE {  // 960 mono samples = 20ms @48kHz
+                    let mut decimated = [0i16; FRAME_SIZE_16K];  // 320 samples = 20ms @16kHz
+                    for i in 0..FRAME_SIZE_16K {
+                        decimated[i] = mono_buf[i * 3];
+                    }
+                    let n = encoder.encode(&decimated[..FRAME_SIZE_16K], &mut encode_out).unwrap_or(0);
                     let plen = n.min(1472);
                     if plen > 0 {
                         hdr[0] = 2;
-                        hdr[1] = (1u8 << 7) | (codec << 4) | 4u8; // codec=1, sr=48kHz
+                        hdr[1] = (1u8 << 7) | (codec << 4) | sample_rate_id; // codec=1, sr=16kHz
                         hdr[2] = 0;
                         hdr[3] = (plen >> 8) as u8;
                         hdr[4] = plen as u8;
@@ -148,7 +150,7 @@ impl ReverseSender {
                     if let Ok(n) = encoder.encode(&accum_buf[..frame_samps], &mut encode_out) {
                         let plen = n.min(1472);
                         hdr[0] = 2;
-                        hdr[1] = (1u8 << 7) | (codec << 4) | 4u8; // codec=2, sr=48kHz
+                        hdr[1] = (1u8 << 7) | (codec << 4) | sample_rate_id; // codec=2, sr=48kHz
                         hdr[2] = 0;
                         hdr[3] = (plen >> 8) as u8;
                         hdr[4] = plen as u8;
