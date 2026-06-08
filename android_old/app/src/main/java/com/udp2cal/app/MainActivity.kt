@@ -7,8 +7,10 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.IBinder
+import android.view.KeyEvent
 import android.widget.Button
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -30,6 +32,8 @@ class MainActivity : ComponentActivity() {
 
     private var isRunning = false
     private var scanScope: CoroutineScope? = null
+    /** 当前音源，用于音量键路由 */
+    private var currentAudioSource: String = ""
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -124,6 +128,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 十字键上下：语音模式调通话音量，其他调媒体音量 */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if ((keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN) && isRunning) {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return super.onKeyDown(keyCode, event)
+            val isVoice = currentAudioSource.contains("系统硬件降噪") || currentAudioSource.contains("AEC")
+            val streamType = if (isVoice) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
+            val direction = if (keyCode == KeyEvent.KEYCODE_DPAD_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+            audioManager.adjustStreamVolume(streamType, direction, AudioManager.FLAG_SHOW_UI)
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     private fun buildStatusMsg(line1: String, src: String): String =
         if (src.isNotEmpty()) "$line1\n$src" else line1
 
@@ -131,6 +148,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             captureService?.status?.collect { status ->
                 isRunning = status.isRunning
+                currentAudioSource = status.audioSource
                 runOnUiThread {
                     when {
                         status.isRunning && status.connected -> {
