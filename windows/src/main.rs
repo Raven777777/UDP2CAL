@@ -66,6 +66,9 @@ const DEVICE_BUSY: u8 = 1;
 /// 全局设备状态 (DEVICE_READY / DEVICE_BUSY)
 static GLOBAL_DEVICE_STATE: AtomicU8 = AtomicU8::new(DEVICE_READY);
 
+/// UI 是否已启动（停止时禁止广播）
+static APP_RUNNING: AtomicU8 = AtomicU8::new(0);
+
 /// 当前绑定手机的唯一设备 ID (8字节)
 static BOUND_DEVICE_ID: OnceLock<Mutex<[u8; protocol::DEVICE_ID_SIZE]>> = OnceLock::new();
 fn bound_device_id() -> &'static Mutex<[u8; protocol::DEVICE_ID_SIZE]> {
@@ -176,8 +179,8 @@ fn init_audio_worker() {
 // ══════════════════════════════════════════════
 // 广播状态机 (独立线程)
 // ══════════════════════════════════════════════
-// Ready 模式: 每1秒广播 TYPE_DISCOVER_REPLY 到 LAN (backward-compat)
-// Silent 模式: 全局DEVICE_BUSY时停止广播
+// Ready 模式: 每1秒广播 TYPE_DISCOVER_REPLY 到 LAN
+// Silent 模式: APP 停止或 DEVICE_BUSY 时停止广播
 fn start_broadcast_state_machine() {
     std::thread::spawn(move || {
         let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -186,7 +189,8 @@ fn start_broadcast_state_machine() {
         };
         let _ = socket.set_broadcast(true);
         loop {
-            if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY {
+            if APP_RUNNING.load(Ordering::Relaxed) != 0
+                && GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY {
                 let device_id = my_device_id();
                 let my_name = my_device_name();
                 let mut payload = Vec::with_capacity(2 + my_name.len());
@@ -430,6 +434,7 @@ impl AppState {
                 self.session_id = self.session_id.wrapping_add(1); 
 
                 if self.is_running { 
+                    APP_RUNNING.store(0, Ordering::Relaxed);
                     REVERSE_ENABLED.store(0, Ordering::Relaxed);
                     reset_to_ready();
                     self.is_running = false; 
@@ -454,6 +459,7 @@ impl AppState {
                     self.config.listen_port = port as u32; 
                     let _ = self.config.save(); 
 
+                    APP_RUNNING.store(1, Ordering::Relaxed);
                     reset_to_ready();
                     self.is_running = true; 
                     self.connected = false; 
@@ -751,8 +757,10 @@ impl AppState {
                     text("广播地址: 255.255.255.255:44043").size(10).color(grey),
                     Space::new().width(Length::Fill),
                     if self.is_running {
-                        let bc_state = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { "● 广播中" } else { "● 未广播" };
-                        let bc_color = if GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY { accent } else { dim };
+                        let bc_on = APP_RUNNING.load(Ordering::Relaxed) != 0
+                            && GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY;
+                        let bc_state = if bc_on { "● 广播中" } else { "● 已静音" };
+                        let bc_color = if bc_on { accent } else { dim };
                         text(bc_state).size(10).color(bc_color)
                     } else {
                         text("")
