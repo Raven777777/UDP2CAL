@@ -96,7 +96,7 @@ class CaptureService : Service() {
     ) {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UDP2CAL:Capture")
-        try { wakeLock.acquire(10 * 60 * 1000L) } catch (_: Exception) {}
+        try { wakeLock.acquire() } catch (_: Exception) {}
 
         hasNewCapture = true
 
@@ -184,11 +184,12 @@ class CaptureService : Service() {
                 }
                 audioSourceLabel += aecState
 
-                val readSize = frameSize * 2
+                val COMBINE_FRAMES = 2  // 合并 2 帧（40ms）打包编码，降低 50% 编码频率
+                val readSize = frameSize * 2 * COMBINE_FRAMES
                 audioRecord?.startRecording()
 
-                // 初始化反向音频（PC→Phone 解码+播放）
-                reverseDecoder = ReverseOpusDecoder(sampleRateHz).also {
+                // 初始化反向音频（PC→Phone 解码+播放），低性能模式 PC 端以 16000Hz 编码
+                reverseDecoder = ReverseOpusDecoder(16000).also {
                     if (!it.start()) {
                         Log.w(TAG, "反向音频解码器初始化失败，继续运行")
                     }
@@ -221,7 +222,7 @@ class CaptureService : Service() {
                 )
                 var bufIndex = 0
 
-                val framePool = ShortArrayPool(frameSize, 5)
+                val framePool = ShortArrayPool(frameSize * COMBINE_FRAMES, 5)
 
                 val producerJob = launch(Dispatchers.IO) {
                     val pcmBuffer = ShortArray(readSize)
@@ -230,15 +231,18 @@ class CaptureService : Service() {
 
                     while (isActive) {
                         val read = audioRecord?.read(pcmBuffer, 0, readSize) ?: -1
-                        if (read <= 0) continue
+                        if (read <= 0) {
+                            delay(1)  // read 失败时让出 CPU，避免忙等发热
+                            continue
+                        }
 
                         var srcPos = 0
                         while (srcPos < read) {
-                            val n = minOf(read - srcPos, frameSize - accumPos)
+                            val n = minOf(read - srcPos, frameSize * COMBINE_FRAMES - accumPos)
                             pcmBuffer.copyInto(accumBuf, accumPos, srcPos, srcPos + n)
                             accumPos += n
                             srcPos += n
-                            if (accumPos == frameSize) {
+                            if (accumPos >= frameSize * COMBINE_FRAMES) {
                                 ch.send(accumBuf)
                                 accumBuf = framePool.borrow()
                                 accumPos = 0
@@ -249,14 +253,19 @@ class CaptureService : Service() {
 
                 val consumerJob = launch {
                     var reconnectCounter = 0
+                    var ackCheckCounter = 0
+                    val ACK_CHECK_INTERVAL = 10  // 每 10 帧(~5Hz) 才检查一次 ACK，降低空轮询
                     val RECONNECT_INTERVAL = 50
                     var p2pConnected = false
 
                     var reverseJob: Job? = null
 
                     for (frame in ch) {
-                        // 只读 ACK（不读音频——反向音频走独立 socket）
-                        if (udpSender?.drainAck() == true && !p2pConnected) {
+                        // 限频检查 ACK
+                        ackCheckCounter++
+                        val checkAck = ackCheckCounter >= ACK_CHECK_INTERVAL
+                        if (checkAck) ackCheckCounter = 0
+                        if (checkAck && udpSender?.drainAck() == true && !p2pConnected) {
                             p2pConnected = true
                             _status.value = _status.value.copy(connected = true, errorMsg = "")
                             // 连接确认后启动反向音频协程（独立 socket，不干扰正向）
@@ -365,7 +374,7 @@ class CaptureService : Service() {
             var hasAudio = false
             var lastAudioTime = 0L
 
-            Log.i(TAG, "反向音频接收器已启动")
+            Log.i(TAG, "反向音频接收器已启动（低性能 16kHz）")
 
             while (isActive) {
                 try {

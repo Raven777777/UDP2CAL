@@ -11,7 +11,9 @@ import android.media.AudioManager
 import android.os.Bundle
 import android.os.IBinder
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -29,11 +31,16 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var connectButton: Button
     private lateinit var statusText: TextView
+    private lateinit var mainPanel: LinearLayout
+    private lateinit var aboutPanel: LinearLayout
 
     private var isRunning = false
     private var scanScope: CoroutineScope? = null
     /** 当前音源，用于音量键路由 */
     private var currentAudioSource: String = ""
+    private var showAbout = false
+    /** 手势滑动起点 */
+    private var touchStartX = 0f
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -59,6 +66,8 @@ class MainActivity : ComponentActivity() {
 
         connectButton = findViewById(R.id.connectButton)
         statusText = findViewById(R.id.statusText)
+        mainPanel = findViewById(R.id.mainPanel)
+        aboutPanel = findViewById(R.id.aboutPanel)
 
         connectButton.setOnClickListener { onConnectClick() }
 
@@ -101,7 +110,7 @@ class MainActivity : ComponentActivity() {
 
     private fun doStart(ip: String, port: Int) {
         Prefs.targetIp = ip; Prefs.targetPort = port
-        val sampleRateHz = 48000
+        val sampleRateHz = 16000  // 低性能版固定 16kHz，与 PC 低性能接口对齐
         val bitrateKbps = 0  // 自动码率
 
         val action = {
@@ -128,21 +137,54 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 十字键上下：语音模式调通话音量，其他调媒体音量 */
+    private fun toggleAbout() {
+        showAbout = !showAbout
+        mainPanel.visibility = if (showAbout) android.view.View.GONE else android.view.View.VISIBLE
+        aboutPanel.visibility = if (showAbout) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    override fun onTouchEvent(event: MotionEvent?): Boolean {
+        event ?: return super.onTouchEvent(event)
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> touchStartX = event.x
+            MotionEvent.ACTION_UP -> {
+                val dx = event.x - touchStartX
+                if (kotlin.math.abs(dx) > 80) { toggleAbout(); return true }
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    /** 十字键上下：调音量；左右：切换关于页 */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if ((keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN) && isRunning) {
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return super.onKeyDown(keyCode, event)
-            val isVoice = currentAudioSource.contains("系统硬件降噪") || currentAudioSource.contains("AEC")
-            val streamType = if (isVoice) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
-            val direction = if (keyCode == KeyEvent.KEYCODE_DPAD_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
-            audioManager.adjustStreamVolume(streamType, direction, AudioManager.FLAG_SHOW_UI)
-            return true
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                toggleAbout(); return true
+            }
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (showAbout) { toggleAbout(); return true }
+                if (isRunning) {
+                    val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return super.onKeyDown(keyCode, event)
+                    val isVoice = currentAudioSource.contains("系统硬件降噪") || currentAudioSource.contains("AEC")
+                    val streamType = if (isVoice) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
+                    val direction = if (keyCode == KeyEvent.KEYCODE_DPAD_UP) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+                    audioManager.adjustStreamVolume(streamType, direction, AudioManager.FLAG_SHOW_UI)
+                    return true
+                }
+            }
         }
         return super.onKeyDown(keyCode, event)
     }
 
-    private fun buildStatusMsg(line1: String, src: String): String =
-        if (src.isNotEmpty()) "$line1\n$src" else line1
+    private fun buildStatusMsg(line1: String, src: String): String {
+        val simple = when {
+            src.contains("AEC已启用") -> "NS + AGC + AEC"
+            src.contains("系统硬件降噪") -> "NS + AGC"
+            src.contains("裸麦克风") -> "MIC"
+            else -> src
+        }
+        return if (simple.isNotEmpty()) "$line1\n$simple" else line1
+    }
 
     private fun collectStatus() {
         lifecycleScope.launch {

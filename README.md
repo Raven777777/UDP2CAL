@@ -1,10 +1,11 @@
 # UDP2CAL — 局域网音频串流
 
-> **当前版本: v1.1.0** — 双向音频串流 + 声学回声消除 + 反向串流开关 + P2P 独占通信系统
+> **当前版本: v1.1.0-hotfix** — 双向音频串流 + 声学回声消除 + 反向串流开关 + P2P 独占通信系统 + android_old 发热优化 (CPU 120%→9%)
 > * 双向音频：手机麦克风→PC (VB-Cable) + PC 扬声器→手机听筒/扬声器
 > * 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 > * 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
 > * 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志）
+> * **android_old 发热优化**：全线 16kHz + 40ms 帧合并编码，CPU 占用从 120% 降至 9%，温度稳定 36°C
 > * v2 控制协议: 二进制发现、独占连接(TYPE_CONNECT/ACK)、8字节设备ID鉴权
 > * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
 > * 心跳熔断: 3秒 ACK 超时标记断连，1秒无包自动释放独占，防碰撞防抢占
@@ -20,7 +21,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
   反向: PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器
 ```
 
-UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。Android 端采集音频——仅维护一个 `isVoiceMode` 状态变量，由 Opus 信号类型驱动音源自动切换，**无任何软件降噪/AGC/音效处理代码**——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。同时支持 PC 扬声器音频回传到手机播放，语音模式下启用硬件声学回声消除。
+UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供两个 Android 客户端版本：**`android/`（现代版）** 面向 Jetpack Compose 设备，固定 48kHz 采集，支持全参数 Opus 调节；**`android_old/`（低性能版）** 面向 Android 6~8 低端/翻盖机，全线 16kHz + 40ms 帧合并编码，CPU 仅 ~9%。
 
 **全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。
 
@@ -48,13 +49,20 @@ build_windows.bat
 
 ```
 build_android.bat
-# 产物: udp2cal_arm64-v8a.apk 或 udp2cal_armeabi-v7a.apk
-# 运行后选择 [1] arm64-v8a (64位) 或 [2] armeabi-v7a (32位)
+# 交互式选择:
+#   [1] arm64-v8a (64-bit) — android/
+#   [2] armeabi-v7a (32-bit) — android/
+#   [3] arm64-v8a (64-bit) — android_old/
+#   [4] armeabi-v7a (32-bit) — android_old/
+# 产物: udp2cal_arm64-v8a.apk / udp2cal_armeabi-v7a.apk
+# 低端设备推荐 armeabi-v7a + android_old
 ```
 
 **先决条件**: JDK 17 (Temurin)、Android SDK 35、NDK 27.0.12077973
 
-> 构建脚本交互式选择目标 ABI，产物自动移动到项目根目录并清理构建缓存。
+> 构建脚本交互式选择目标版本和 ABI，产物自动移动到项目根目录并清理构建缓存。
+
+> `android_old/` 也可单独构建：`cd android_old && gradlew assembleRelease -PtargetAbi=armeabi-v7a`
 
 ---
 
@@ -62,7 +70,8 @@ build_android.bat
 
 | 平台 | 最低版本 | 架构 | 说明 |
 |------|---------|------|------|
-| **Android** | **Android 10 (API 29)+** | arm64-v8a (64-bit) / armeabi-v7a (32-bit) | minSdk=29, targetSdk=35, 需要 `RECORD_AUDIO` 权限 |
+| **Android (android_new)** | **Android 10 (API 29)+** | arm64-v8a (64-bit) / armeabi-v7a (32-bit) | minSdk=29, targetSdk=35, 需要 `RECORD_AUDIO` 权限。面向现代设备，Jetpack Compose UI |
+| **Android (android_old)** | **Android 6~8 (API 21~26)** | armeabi-v7a (32-bit 推荐) / arm64-v8a | minSdk=21, targetSdk=26, 无 Compose。专为低端/翻盖机定制的低性能版本 |
 | **Windows** | **Windows 10+** | x86_64 (64-bit) / i686 (32-bit) | 依赖 WASAPI 音频引擎 + VB-Cable 虚拟声卡；系统托盘和防火墙规则仅 Windows 可用 |
 
 > Android 编译要求 JDK 17、Android SDK 35、NDK 27.0.12077973；Windows 编译要求 Rust 1.96+、VS Build Tools 2022、CMake 3.22+。
@@ -78,7 +87,7 @@ build_android.bat
 - **立体声编码**：高品质模式立体声最大码率全频带，手机端显示带宽+码率
 - **低性能模式**：单声道 64kbps 宽带，complexity=1，适配低端 Android 设备
 
-### Android 发送端
+### Android 发送端（现代版，`android/`）
 - **音源自适应切换**：仅一个 `isVoiceMode` 状态变量驱动全部音源决策。语音模式→VOICE_COMMUNICATION（安卓系统原生硬件降噪+AEC），全频模式→MIC（裸麦直出，硬件降噪关闭）；异常回退 MIC 保底通路
 - **声学回声消除**：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION AudioTrack + 同音频 session 绑定
 - **生产-消费双协程**：独占线程 `AudioRecord.read()` + `Channel` 投递消费者，消除饥饿。信号类型变更时消费者循环检测→自动重建 AudioRecord，保留网络层和反向播放器
@@ -93,6 +102,19 @@ build_android.bat
 - **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT（携带反向端口+模式标志）+ 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
 - **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
+
+### Android Old 低性能版（`android_old/`）
+专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本，与 Windows 端低性能接口固定对接。
+
+- **全线 16kHz 优化**：正向采集 16kHz Opus 编码，PC 端反向 16kHz Opus 编码+48→16k 降采样，Android 端 16kHz 解码+播放
+- **40ms 帧合并编码**：合并 2 帧打包编码，编码频率从 50 帧/秒降至 25 帧/秒，CPU 占用从 120% 降至 ~9%
+- **ACK 限频轮询**：每 10 帧检查一次 ACK，`soTimeout` 5ms，drainAck CPU 开销降为原来的 1/50
+- **传统 View 布局**：无 Jetpack Compose，minSdk=21，targetSdk=26
+- **一键自动连接**：UDP 广播发现局域网 PC 端，自动连接无需手动输入
+- **低性能默认配置**：Opus 复杂度 1、DTX 开启、VBR 自动码率
+- **强制低性能标志**：CONNECT 包固定设置 `low_perf=1`，要求 Windows 端使用单声道 64kbps 宽带编码
+- **十字键交互**：上下调音量，左右切换关于页，适配物理键盘翻盖机
+- **音源回退**：优先 VOICE_COMMUNICATION（系统硬件降噪），失败回退 MIC 裸采集
 
 ### Windows 接收端
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
@@ -122,7 +144,13 @@ build_android.bat
 ```
 udp2mic/
 ├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备）
-├─ android_old/    # Android 发送端（Kotlin + JNI Opus，面向低端设备，无 Compose）
+├─ android_old/    # Android 发送端低性能版（Kotlin + JNI Opus，16kHz 全链路优化，面向低端/翻盖机）
+│  └─ app/src/main/java/com/udp2cal/app/
+│     ├─ service/CaptureService.kt  # 采集服务（16kHz、40ms帧、ACK限频）
+│     ├─ AudioPlayer.kt             # 反向音频播放器（16kHz）
+│     ├─ UdpSender.kt               # UDP 发送器（drainAck 5ms超时）
+│     ├─ MainActivity.kt            # 一键连接 + 十字键交互
+│     └─ native/Opus*.kt            # Opus 编码器/解码器 JNI 封装
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
 │  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
@@ -150,8 +178,9 @@ udp2mic/
 | 文件 | 大小 | 说明 |
 | --- | --- | --- |
 | `udp2cal_{x64,x86}.exe` | ~5.98 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
-| `udp2cal_arm64-v8a.apk` | ~2.65 MB | Android 发送端 (64位，已签名) |
-| `udp2cal_armeabi-v7a.apk` | ~2.65 MB | Android 发送端 (32位，已签名) |
+| `udp2cal_arm64-v8a.apk` | ~2.65 MB | Android 现代版 (64位，已签名) |
+| `udp2cal_armeabi-v7a.apk` | ~2.65 MB | Android 现代版 (32位，已签名) |
+| `android_old/app/build/outputs/apk/release/app-release.apk` | ~2.65 MB | Android Old 低性能版（推荐低端/翻盖机使用）|
 
 ---
 
@@ -213,10 +242,12 @@ windows = { version = "0.58", features = [
 
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
-| **UI 层（Android）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
+| **UI 层（Android 现代版）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
+| **UI 层（Android Old）** | 传统 View + AppCompat | 十字键交互、一键自动连接、关于页滑动切换；无 Compose，兼容 API 21+ |
 | **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
-| **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord，保留网络层 |
+| **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord，保留网络层 |
+| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，固定 16kHz） | **生产-消费双协程** + **40ms帧合并编码**（2帧打包，编码频率25帧/秒）；ACK限频检查（每10帧）；`delay(1)`防忙等 |
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
@@ -228,7 +259,9 @@ windows = { version = "0.58", features = [
 
 | 协商项 | 策略 |
 | --- | --- |
-| 采样率 | Android 端固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
+| 采样率（现代版） | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
+| 采样率（Old 低性能版） | Android 固定 16kHz 采集编码；PC 反向 16kHz 编码（48→16k 降采样）；Android 16kHz 解码+播放。CONNECT `low_perf=1` 驱动全线 16kHz |
+| 帧长（Old 低性能版） | 合并 2 帧（40ms）打包编码，编码频率 25 帧/秒，CPU 占用 ~9% |
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()`/`default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
 | 传输机制 | 15 字节包头（v2 统一协议，Big-Endian）实时携带码率、采样率、8 字节设备 ID |
 | 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 相位连续重采样 |
@@ -402,6 +435,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 | 版本 | 变更点 |
 |------|--------|
 | **v1.1.0** | 2026-06-09: 全面改名 UDP2CAL（原 UDP2Mic）；双向音频串流 + AEC 移植成功；反向串流开关按钮；立体声/单声道自适应编码；低性能模式(android_old)；保活重连机制；通知栏动态更新；WASAPI 缓冲 100→30ms；AudioTrack 缓冲 300→80ms；移除旧版纯文本发现协议 |
+| **v1.1.0-hotfix** | 2026-06-09: android_old 发热优化。全面降采样 48kHz→16kHz；PC 反向编码器 48→16kHz 降采样；40ms 帧合并编码（CPU 120%→9%）；ACK 限频轮询（soTimeout 1→5ms，每10帧检查）；AudioPlayer 采样率匹配（48000→16000Hz）；WakeLock 无限期持有 |
 | **v1.0.9.2** | 2026-06-08: P2P 独占增强——Win 端异设备 CONNECT 静默拒绝（不推送 StatusUpdate，消除码率/电平跳动）；Android 端保活恢复持续发送；新增 `android_old/` 适配 Android 6~8 旧设备（无 Compose，低性能默认配置 + VOICE_COMMUNICATION 回退 + 一键自动连接）；`build_android.bat` 支持 4 选项同时编译新旧版本 |
 | **v1.0.6** | UI 卡片布局 + 动态 VU 色彩表 + 按钮交互反馈；全局单例音频守护线程根除反复启停泄漏；`udp_receiver_stream` 参数化消除跨线程注册表竞态；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验 |
 | **v1.0.5** | Windows 接收端初始架构，局域网广播发现服务 |

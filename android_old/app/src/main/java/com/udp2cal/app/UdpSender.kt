@@ -60,11 +60,11 @@ class UdpSender(
         } catch (_: Exception) { false }
     }
 
-    /** 只读 ACK（不读音频），设一次 timeout */
+    /** 只读 ACK（不读音频），用 5ms 超时降低空轮询 CPU */
     fun drainAck(): Boolean {
         val sock = socket ?: return false
         return try {
-            sock.soTimeout = 1
+            sock.soTimeout = 5
             val buf = ByteArray(Udp2CalProtocol.HEADER_SIZE)
             val pkt = DatagramPacket(buf, buf.size)
             sock.receive(pkt)

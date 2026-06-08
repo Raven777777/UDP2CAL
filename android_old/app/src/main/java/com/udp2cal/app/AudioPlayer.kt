@@ -16,7 +16,7 @@ import android.util.Log
 class AudioPlayer(private val context: Context) {
     companion object {
         private const val TAG = "AudioPlayer"
-        private const val SAMPLE_RATE = 48000
+        private const val SAMPLE_RATE = 16000  // 低性能版固定 16kHz，匹配 PC 低性能接口
         private const val BUFFER_MS = 300
     }
 
