@@ -9,33 +9,118 @@
     android:background="@android:color/black"
     tools:context=".MainActivity">
 
-    <TextView
-        android:id="@+id/titleText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="UDP2CAL"
-        android:textSize="28sp"
-        android:textColor="#00E676"
-        android:layout_marginTop="60dp"
-        android:layout_marginBottom="24dp" />
-
-    <Button
-        android:id="@+id/connectButton"
+    <!-- 主界面 -->
+    <LinearLayout
+        android:id="@+id/mainPanel"
         android:layout_width="match_parent"
-        android:layout_height="56dp"
-        android:text="自动连接"
-        android:textSize="18sp"
-        android:textStyle="bold"
-        android:layout_marginBottom="32dp" />
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center_horizontal|top">
 
-    <TextView
-        android:id="@+id/statusText"
+        <TextView
+            android:id="@+id/titleText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="UDP2CAL"
+            android:textSize="28sp"
+            android:textColor="#00E676"
+            android:layout_marginTop="60dp"
+            android:layout_marginBottom="24dp" />
+
+        <Button
+            android:id="@+id/connectButton"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:text="自动连接"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="32dp" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="15sp"
+            android:gravity="center"
+            android:lineSpacingExtra="4dp"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+    <!-- 关于页面 -->
+    <LinearLayout
+        android:id="@+id/aboutPanel"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text=""
-        android:textSize="15sp"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
         android:gravity="center"
-        android:lineSpacingExtra="4dp"
-        android:visibility="gone" />
+        android:visibility="gone">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="UDP2CAL"
+            android:textSize="24sp"
+            android:textColor="#00E676"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="v1.1.0"
+            android:textSize="13sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="作者：四折光曲 &amp; 井水玉藻"
+            android:textSize="14sp"
+            android:textColor="#CCCCCC"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="未经授权 禁止转载 修改 二次发布"
+            android:textSize="12sp"
+            android:textColor="#666666"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="双向局域网音频串流"
+            android:textSize="14sp"
+            android:textColor="#00B0FF"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="手机麦克风→PC + PC扬声器→手机"
+            android:textSize="12sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Opus编码 · 声学回声消除 · 低延迟"
+            android:textSize="12sp"
+            android:textColor="#888888"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/github_url"
+            android:textSize="12sp"
+            android:textColor="#00E676"
+            android:gravity="center" />
+
+    </LinearLayout>
 
 </LinearLayout>
