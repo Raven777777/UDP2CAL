@@ -29,7 +29,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     jint dtx, jint vbr, jint fec, jint packetLoss, jint vbrConstraint) {
 
     int err = 0;
-    int frame_size = (sampleRate * 20) / 1000;
+    int frame_size = (sampleRate * 10) / 1000;  // 低延迟：10ms 帧
 
     OpusEncoder* enc = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_AUDIO, &err);
     if (err != OPUS_OK || enc == NULL) return 0;
@@ -106,7 +106,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     }
 
     state->encode_count++;
-    if (state->encode_count % 50 == 0) {
+    if (state->encode_count % 100 == 0) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
             "Audit: frame=%d in=%d out=%d ratio=%d%%",
             state->encode_count, state->frame_size * 2, nbBytes,
@@ -143,7 +143,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncode(
     if (nbBytes < 0) return NULL;
 
     state->encode_count++;
-    if (state->encode_count % 50 == 0) {
+    if (state->encode_count % 100 == 0) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
             "Audit: frame=%d in=%d out=%d ratio=%d%%",
             state->encode_count, state->frame_size * 2, nbBytes,

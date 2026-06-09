@@ -91,7 +91,7 @@
     <main class="main">
       <div class="content">
 
-        <div class="version-badge">v1.1.0 — 双向音频串流 + 声学回声消除 + P2P 独占通信系统</div>
+        <div class="version-badge">v1.1.0-hotfix2 — 全链路低延迟优化 + Opus 正反向编码实时同步 + 高级设置面板重构</div>
 
         <h1>UDP2CAL<br><small>局域网麦克风 — 项目文档</small></h1>
 
@@ -160,7 +160,7 @@
           <li><strong>全链路零堆分配</strong>：<code>ShortArrayPool</code> 帧复用 + 乒乓发送缓冲区 + <code>encoderEncodeTo</code> 直接写入</li>
           <li><strong>纯直通无软件处理</strong>：AudioRecord 取 PCM → 直通拷贝 → Opus 编码输出，APP 端无任何降噪/AGC/音效代码</li>
           <li><strong>Opus CBR/VBR 热调节</strong>：FEC=2（允许 CELT + FEC，不强制 SILK 模式）；码率 32~512kbps；协议层支持 5 种采样率（8k/12k/16k/24k/48k）</li>
-          <li><strong>Opus 高级编码设置</strong>：现代版 Jetpack Compose 全参数调节面板（复杂度 1-10、VBR/CBR、FEC、DTX、带宽、码率）</li>
+          <li><strong>Opus 高级编码设置</strong>：现代版 Jetpack Compose 全参数调节面板（复杂度 1-10、VBR/CBR、FEC、DTX、带宽、码率）。面板内含运行时状态卡片（音源/Opus编码/反向串流）和1kHz测试音开关。手机调参实时同步到 PC 反向编码器</li>
           <li><strong>低性能版发热优化+CPU自动降级</strong>：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%；>40% 自动渐进降级（FB→SWB→WB→MB），通过 <code>encoder.update()</code> 热切换</li>
           <li><strong>1kHz 测试音模式</strong>：内置正弦波发生器，无需麦克风即可调试端到端音频链路</li>
           <li><strong>JNI <code>@Synchronized</code> 互斥锁</strong>：杜绝多线程并发闪退</li>
@@ -439,7 +439,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
   <!-- Footer -->
   <footer class="footer">
     <div class="footer-content">
-      <span>UDP2CAL v1.1.0 — 双向音频串流 + AEC + 低性能模式</span>
+      <span>UDP2CAL v1.1.0-hotfix2 — 全链路低延迟 + 正反向编码同步</span>
       <span class="footer-links">
         <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">GitHub</a>
         <a href="protocol.html">协议规范</a>

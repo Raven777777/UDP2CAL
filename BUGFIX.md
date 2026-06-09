@@ -5,6 +5,42 @@
 
 ---
 
+## 2026-06-09 — 全链路低延迟优化（500ms → <100ms 局域网端到端）
+
+### 概述
+
+端到端延迟约 500ms，经分析为多个缓冲叠加：20ms 帧长 + 160ms 抖动缓冲 + 200ms 初始音频缓冲 + 系统缓冲。实施多项低延迟优化。
+
+### 修复清单
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | ReorderBuffer 抖动缓冲 160ms | `MAX_REORDER=8` × 20ms 帧，8帧缓冲区 | `MAX_REORDER=2`（最大抖动缓冲 40ms）|
+| 2 | AudioWriter 初始缓冲 200ms | `initial_fill = actual_rate / 5` | `initial_fill = actual_rate / 25`（40ms）|
+| 3 | AudioWriter 最大缓冲 1s | 缓冲上限 48000 样本 | 上限 12000 样本（250ms）|
+| 4 | AudioMessage 通道过大 | `SyncChannel(200)` | `SyncChannel(50)` |
+| 5 | 正向编码帧长 20ms | `opus_jni.c` 硬编码 20ms 帧 | 改为 10ms 帧（`(sampleRate * 10) / 1000`）|
+| 6 | 反向编码帧长 20ms | `capture.rs` FRAME_SIZE=960（20ms × 48kHz） | 改为 10ms（FRAME_SIZE=480，FRAME_SIZE_16K=160）|
+| 7 | WASAPI 环回缓冲 30ms | `init_loopback` 初始化参数 | 改为 20ms |
+| 8 | 反向 AudioTrack 缓冲 80ms | `AudioPlayer.kt` BUFFER_MS=80 | 改为 40ms |
+| 9 | Opus 默认复杂度 5 | `Prefs.kt opusComplexity=5` | 改为 3（更低编码延迟）|
+| 10 | 默认 FEC=2（开启）| `Prefs.kt opusFec=2` | 改为 0（局域网无需FEC）|
+| 11 | 默认丢包率 5% | `Prefs.kt opusPacketLoss=5` | 改为 0（局域网无丢包）|
+| 12 | AudioTrack 缓冲加倍 | `finalBufSize = bufferSize.coerceAtLeast(minBufSize * 2)`，强制 2×minBufSize ≈80ms | 改为 `minBufSize`（仅保底不翻倍，降至 ~40ms）|
+| 13 | AudioTrack 未启用低延迟模式 | 未设置 `PERFORMANCE_MODE_LOW_LATENCY`，系统默认高延迟缓冲 | 添加 `setPerformanceMode(LOW_LATENCY)`（API 29+）|
+| 13 | AudioTrack 未启用低延迟模式 | 未设置 `PERFORMANCE_MODE_LOW_LATENCY`，系统默认高延迟缓冲 | 添加 `setPerformanceMode(LOW_LATENCY)`（API 29+）|
+| 14 | 反向串流状态仅在收到音频时才更新 | WASAPI LOOPBACK 静音时不产生数据 → PC 不发包 → Android `hasAudio` 永为 false | `launchReverseAudio()` 启动即设 `reverseAudio=true`，不等首帧音频 |
+| 15 | 手机 Opus 设置不同步到 PC 反向编码 | PC 反向编码器固定参数，手机调参后反向串流仍用旧设置 | 扩展 CONNECT 保活包（10 字节）携带手机端全部 Opus 参数（码率/带宽/复杂度/VBR/DTX/FEC/丢包率）；PC 端 `capture.rs` 每 1s 检查配置并热应用 `opus_encoder_ctl` 运行时调参 |
+
+### 预期延迟（更新）
+
+| 路径 | 优化前 | 优化后 |
+|:----|:------:|:------:|
+| 正向（Android→PC）| ~500ms | 50–80ms |
+| 反向（PC→Android）| ~500ms | 50–80ms |
+
+---
+
 ## 2026-06-09 — android_old 发热优化（CPU 120% → 14%，测试设备 Sharp NP805SH）
 
 ### 概述

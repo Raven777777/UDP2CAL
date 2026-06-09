@@ -17,7 +17,7 @@ class AudioPlayer(private val context: Context) {
     companion object {
         private const val TAG = "AudioPlayer"
         private const val SAMPLE_RATE = 48000
-        private const val BUFFER_MS = 80
+        private const val BUFFER_MS = 40
         private const val CHANNELS = 2 // 立体声
     }
 
@@ -36,7 +36,7 @@ class AudioPlayer(private val context: Context) {
             AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val finalBufSize = bufferSize.coerceAtLeast(minBufSize * 2)
+        val finalBufSize = bufferSize.coerceAtLeast(minBufSize)
 
         if (voiceMode) {
             // 语音模式：VOICE_COMMUNICATION + 听筒路由（启用 AEC 管线）
@@ -96,7 +96,12 @@ class AudioPlayer(private val context: Context) {
                     .setAudioFormat(format)
                     .setBufferSizeInBytes(bufSize)
                     .setTransferMode(AudioTrack.MODE_STREAM)
-                    .apply { if (sessionId > 0) setSessionId(sessionId) }
+                    .apply {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                        }
+                        if (sessionId > 0) setSessionId(sessionId)
+                    }
                     .build()
             } else {
                 @Suppress("DEPRECATION")

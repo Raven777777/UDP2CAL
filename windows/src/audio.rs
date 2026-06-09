@@ -105,8 +105,8 @@ impl AudioWriter {
         if let Ok(mut buf) = self.buf.lock() {
             buf.extend(&self.resample_buf);
             
-            // 最大缓冲限制，防止内存泄漏 (限制为 1 秒)
-            let max = self.device_rate as usize;
+            // 最大缓冲限制，低延迟模式 (限制为 250ms)
+            let max = self.device_rate as usize / 4;
             if buf.len() > max {
                 let excess = buf.len() - max;
                 buf.drain(..excess);
@@ -148,7 +148,7 @@ pub fn start_audio() -> Result<AudioWriter, String> {
     let channels = stream_config.channels as usize; 
     
     let buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let initial_fill = actual_rate as usize / 5; // 200ms 初始缓冲
+    let initial_fill = actual_rate as usize / 25; // 40ms 初始缓冲（低延迟优化）
     buf.lock().unwrap().resize(initial_fill, 0.0);
 
     // 【修复】使用 Weak 弱引用，当 AudioWriter 被 Drop 时，后台线程不再强持有 VecDeque 内存

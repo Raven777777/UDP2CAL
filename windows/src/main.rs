@@ -115,7 +115,7 @@ static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
 static AUDIO_INIT_STATE: AtomicU32 = AtomicU32::new(0); 
 
 fn init_audio_worker() { 
-    let (tx, rx) = sync_channel::<AudioMessage>(200); 
+    let (tx, rx) = sync_channel::<AudioMessage>(50); 
     let _ = AUDIO_TX.set(tx); 
 
     std::thread::spawn(move || { 
@@ -849,6 +849,25 @@ fn send_connect_ack(src_addr: &std::net::SocketAddr) {
 
 /// 处理控制消息（TYPE_CONNECT / TYPE_CONNECT_ACK / TYPE_DISCOVER_*）
 fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &std::net::SocketAddr, output: &mut iced::futures::channel::mpsc::Sender<Message>) {
+    /// 从扩展 CONNECT payload 中解析 Opus 编码参数（字节 3~9）
+    fn parse_opus_cfg(payload: &[u8]) -> Option<capture::OpusReverseConfig> {
+        if payload.len() < 10 || (payload[2] & 0x02) == 0 {
+            return None; // 无扩展配置字段
+        }
+        let flags = payload[6];
+        Some(capture::OpusReverseConfig {
+            bitrate_kbps: u16::from_be_bytes([payload[7], payload[8]]),
+            bandwidth: payload[5],           // 0-4
+            complexity: payload[3],           // 1-10
+            signal: payload[4],               // 0=auto, 1=voice, 2=music
+            vbr: (flags & 0x01) != 0,
+            dtx: (flags & 0x02) != 0,
+            vbr_constraint: (flags & 0x04) != 0,
+            fec: (flags & 0x08) != 0,
+            packet_loss: payload[9],          // 0-100
+        })
+    }
+
     match header.msg_type {
         protocol::TYPE_CONNECT => {
             // 提取反向端口（CONNECT payload 前2字节，big-endian）
@@ -857,8 +876,12 @@ fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &st
             } else {
                 0
             };
-            // 提取低性能模式标志（payload 第3字节，0=高品质/1=低性能）
-            let low_perf = payload.len() >= 3 && payload[2] != 0;
+            // 提取低性能模式标志（payload 第3字节 bit0，0=高品质/1=低性能）
+            let low_perf = payload.len() >= 3 && (payload[2] & 0x01) != 0;
+            // 同步 Opus 编码设置
+            if let Some(cfg) = parse_opus_cfg(payload) {
+                capture::update_reverse_config(cfg);
+            }
             let android_rev_addr = std::net::SocketAddr::new(
                 src_addr.ip(),
                 if rev_port > 0 { rev_port } else { src_addr.port() },

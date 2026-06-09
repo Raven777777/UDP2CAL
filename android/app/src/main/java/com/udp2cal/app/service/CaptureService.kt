@@ -73,6 +73,7 @@ class CaptureService : Service() {
         val vbrMode: String = "",                // "CBR" / "VBR" / "VBR约束" / "VBR(DTX)"
         val audioSource: String = "",            // 当前音源描述
         val opusMode: String = "",               // "语音模式" / "全频模式"
+        val opusBandwidth: Int = 0,              // Opus带宽JNI常量 (1101=NB..1105=FB)
         val errorMsg: String = "",
         val connected: Boolean = false,          // P2P 独占连接状态
         val deviceId: String = "",               // 本机设备 ID
@@ -374,7 +375,7 @@ class CaptureService : Service() {
                         var lastReport = System.currentTimeMillis()
                         var lastOpusConfigHash = 0
                         var reconnectCounter = 0
-                        val RECONNECT_INTERVAL = 50 // ~1秒(20ms每帧)
+                        val RECONNECT_INTERVAL = 100 // ~1秒(10ms每帧)
                         var p2pConnected = false // 初始未连接，收到 ACK 后方可发包
                         var reverseJob: Job? = null
 
@@ -397,14 +398,43 @@ class CaptureService : Service() {
                             }
 
                             // ── 保活 CONNECT：持续发送（Win 端对异设备静默拒绝，不影响已有连接）──
+                            // 同时携带手机端 Opus 编码设置，PC 端反向编码实时同步
                             reconnectCounter++
                             if (reconnectCounter >= RECONNECT_INTERVAL) {
                                 reconnectCounter = 0
                                 try {
                                     val devId = DiscoveryManager.getOrCreateDeviceId()
-                                    // 保活 CONNECT 携带反向端口，使 Win 重启后能正确恢复反向串流
                                     val revPort = udpSender?.reversePort ?: 0
-                                    val payload = byteArrayOf((revPort shr 8).toByte(), revPort.toByte())
+                                    // Opus JNI 常量→协议值映射
+                                    fun mapSignal(sig: Int): Byte = when (sig) {
+                                        3001 -> 1   // OPUS_SIGNAL_VOICE
+                                        3002 -> 2   // OPUS_SIGNAL_MUSIC
+                                        else -> 0   // auto
+                                    }
+                                    fun mapBandwidth(bw: Int): Byte = when (bw) {
+                                        1101 -> 0   // NARROWBAND
+                                        1102 -> 1   // MEDIUMBAND
+                                        1103 -> 2   // WIDEBAND
+                                        1104 -> 3   // SUPERWIDEBAND
+                                        else -> 4   // FULLBAND
+                                    }
+                                    val opusFlags = (
+                                        (if (Prefs.opusVbr == 1) 1 else 0) shl 0
+                                        or (if (Prefs.opusDtx == 1) 1 else 0) shl 1
+                                        or (if (Prefs.opusVbrConstraint == 1) 1 else 0) shl 2
+                                        or (if (Prefs.opusFec > 0) 1 else 0) shl 3
+                                    ).toByte()
+                                    val br = Prefs.opusBitrateKbps
+                                    val payload = byteArrayOf(
+                                        (revPort shr 8).toByte(), revPort.toByte(),
+                                        0x03.toByte(), // bit0=low_perf(0), bit1=has_opus_cfg(1)
+                                        Prefs.opusComplexity.toByte(),
+                                        mapSignal(Prefs.opusSignal),
+                                        mapBandwidth(Prefs.opusBandwidth),
+                                        opusFlags,
+                                        (br shr 8).toByte(), br.toByte(),
+                                        Prefs.opusPacketLoss.toByte()
+                                    )
                                     val ping = Udp2CalProtocol.buildPacket(
                                         isAudio = false, msgType = Udp2CalProtocol.TYPE_CONNECT,
                                         sampleRate = 0, seqNum = 0, deviceId = devId, payload = payload
@@ -480,7 +510,8 @@ class CaptureService : Service() {
                                     _status.value = _status.value.copy(
                                         bitrateTargetKbps = curBr,
                                         vbrMode = mode,
-                                        opusMode = if (isVoiceMode()) "语音模式" else "全频模式"
+                                        opusMode = if (isVoiceMode()) "语音模式" else "全频模式",
+                                        opusBandwidth = curBw
                                     )
                                 }
                             }
@@ -577,6 +608,9 @@ class CaptureService : Service() {
             val player = audioPlayer ?: return@launch
             if (dec.frameSize <= 0) return@launch
 
+            // 立即标记反向串流已连接（不等待首帧音频）
+            _status.value = _status.value.copy(reverseAudio = true)
+
             val recvBuf = ByteArray(Udp2CalProtocol.MAX_PACKET)
             val pkt = DatagramPacket(recvBuf, recvBuf.size)
             val pcmBuf = ShortArray(dec.pcmBufferSize)
@@ -611,7 +645,6 @@ class CaptureService : Service() {
 
                         if (!hasAudio) {
                             hasAudio = true
-                            // 从 header 估算带宽
                             bandwidthLabel = estimateBandwidth(hdr.sampleRate)
                             _status.value = _status.value.copy(
                                 reverseAudio = true,

@@ -196,10 +196,10 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
           <li><strong>发现</strong>：Android → <code>DISCOVER_REQ</code>（广播 44043）→ Windows 回复 <code>DISCOVER_REPLY</code>（端口+名）</li>
           <li><strong>连接</strong>：Android → <code>CONNECT(device_id)</code> → Windows 绑定 → 回复 <code>CONNECT_ACK</code></li>
           <li><strong>音频</strong>：Android → <code>DATA(device_id, Opus)</code> → Windows 校验 device_id → 播放</li>
-          <li><strong>保活</strong>：每 1s Android CONNECT → Windows ACK，3s 无 ACK 标记断连</li>
+          <li><strong>保活</strong>：每 1s Android CONNECT（携带反向端口+模式标志+Opus 编码设置）→ Windows ACK，3s 无 ACK 标记断连</li>
           <li><strong>重连</strong>：Android 持续发 CONNECT → Windows 恢复后 ACK → 自动恢复</li>
           <li><strong>抢占（静默拒绝）</strong>：异设备 CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 drainAck() 永 false → p2pConnected 永 false → 不编不送音频；已有连接完全不受影响。释放独占：Win 端停止 / Android 1s 无包超时 / 重启程序</li>
-          <li><strong>CONNECT payload 格式</strong>：3 字节——2 字节反向端口(BE) + 1 字节模式标志（0=高品质/1=低性能）。Android Old 固定设置 1，要求 Windows 端使用单声道 64kbps 宽带 16kHz 编码</li>
+          <li><strong>CONNECT payload 格式</strong>：3~10 字节——2 字节反向端口(BE) + 1 字节标志（bit0=low_perf, bit1=has_opus_cfg）+ 可选 7 字节 Opus 编码参数（复杂度/信号类型/带宽/flag/码率/丢包率）。当 has_opus_cfg=1 时，PC 反向编码器同步手机端设置</li>
         </ol>
 
         <hr>
@@ -213,7 +213,7 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA</code></pre>
             <tr><td><code>HEADER_SIZE</code></td><td>15</td><td>包头固定字节数</td></tr>
             <tr><td><code>MAX_PAYLOAD</code></td><td>1472</td><td>最大负载（MTU 安全）</td></tr>
             <tr><td><code>MAX_PACKET</code></td><td>1487</td><td>最大完整包</td></tr>
-            <tr><td><code>MAX_REORDER</code></td><td>8</td><td>乱序重排窗口大小</td></tr>
+            <tr><td><code>MAX_REORDER</code></td><td>2</td><td>乱序重排窗口大小（低延迟优化，原 8→2）</td></tr>
             <tr><td><code>DEVICE_ID_SIZE</code></td><td>8</td><td>设备 ID 字节数</td></tr>
             <tr><td><code>DISCOVER_PORT</code></td><td>44043</td><td>发现广播端口</td></tr>
           </table>

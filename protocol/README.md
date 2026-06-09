@@ -79,7 +79,7 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA
 | `HEADER_SIZE` | 15 | 包头固定字节数 |
 | `MAX_PAYLOAD` | 1472 | 最大负载 (MTU 安全) |
 | `MAX_PACKET` | 1487 | 最大完整包 |
-| `MAX_REORDER` | 8 | 乱序重排窗口大小 |
+| `MAX_REORDER` | 2 | 乱序重排窗口大小（低延迟优化，原 8→2） |
 | `DEVICE_ID_SIZE` | 8 | 设备 ID 字节数 |
 | `DISCOVER_PORT` | 44043 | 发现广播端口 |
 

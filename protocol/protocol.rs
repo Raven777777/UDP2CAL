@@ -21,7 +21,7 @@
 pub const HEADER_SIZE: usize = 15;
 pub const MAX_PAYLOAD: usize = 1472;
 pub const MAX_PACKET: usize = HEADER_SIZE + MAX_PAYLOAD;
-pub const MAX_REORDER: usize = 8;
+pub const MAX_REORDER: usize = 2;
 pub const PROTO_VERSION: u8 = 2;
 pub const DEVICE_ID_SIZE: usize = 8;
 pub const DISCOVER_PORT: u16 = 44043;
