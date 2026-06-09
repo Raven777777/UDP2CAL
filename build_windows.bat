@@ -13,7 +13,15 @@ echo   [1] Release  (optimized, ~5.98 MB)
 echo   [2] Debug    (unoptimized, with debug info)
 echo.
 CHOICE /C 12 /N /M "[1/2]: "
-if errorlevel 2 (set BUILD_MODE=debug&set BUILD_TARGET=debug&set BUILD_TAG=-debug) else (set BUILD_MODE=release&set BUILD_TARGET=release&set BUILD_TAG=)
+if errorlevel 2 (
+    set BUILD_MODE=debug
+    set BUILD_TARGET=debug
+    set BUILD_TAG=-debug
+) else (
+    set BUILD_MODE=release
+    set BUILD_TARGET=release
+    set BUILD_TAG=
+)
 echo.
 
 :::: ---- Target Architecture Selection ----
@@ -22,11 +30,16 @@ echo   [1] x86_64  (64-bit)
 echo   [2] i686    (32-bit)
 echo.
 CHOICE /C 12 /N /M "[1/2]: "
-if errorlevel 2 set TARGET=i686-pc-windows-msvc&set ARCH=_x86&goto select_upx
-set TARGET=x86_64-pc-windows-msvc&set ARCH=_x64
+if errorlevel 2 (
+    set TARGET=i686-pc-windows-msvc
+    set ARCH=_x86
+) else (
+    set TARGET=x86_64-pc-windows-msvc
+    set ARCH=_x64
+)
 
+:select_upx
 :::: ---- UPX Compression Option ----
-::select_upx
 set USE_UPX=
 set UPX_PATH=%~dp0upx-5.1.1-win64\upx.exe
 if exist "%UPX_PATH%" (
@@ -131,7 +144,7 @@ if exist %SRC% (
     echo    BUILD SUCCESS
     echo    mode:   %BUILD_MODE%
     echo    target: %TARGET%
-    echo    output: udp2cal%ARCH%%BUILD_TAG%.exe
+    echo    output: udp2cal%ARCH%%BUILD_TAG%%UPX_TAG%.exe
     echo    size:   !finalsizekb! KB
     echo ========================================
 ) else (

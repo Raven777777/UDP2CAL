@@ -5,7 +5,7 @@
 > * 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 > * 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
 > * 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志）
-> * **android_old 发热优化**：全线 16kHz + 40ms 帧合并编码，CPU 占用从 120% 降至 9%，温度稳定 36°C
+> * **android_old 发热优化**：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%（实测 Sharp NP805SH / 骁龙210 / 1GB RAM）
 > * v2 控制协议: 二进制发现、独占连接(TYPE_CONNECT/ACK)、8字节设备ID鉴权
 > * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
 > * 心跳熔断: 3秒 ACK 超时标记断连，1秒无包自动释放独占，防碰撞防抢占
@@ -21,7 +21,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
   反向: PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器
 ```
 
-UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供两个 Android 客户端版本：**`android/`（现代版）** 面向 Jetpack Compose 设备，固定 48kHz 采集，支持全参数 Opus 调节；**`android_old/`（低性能版）** 面向 Android 6~8 低端/翻盖机，全线 16kHz + 40ms 帧合并编码，CPU 仅 ~9%。
+UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供两个 Android 客户端版本：**`android/`（现代版）** 面向 Jetpack Compose 设备，固定 48kHz 采集，支持全参数 Opus 调节；**`android_old/`（低性能版）** 面向 Android 6~8 低端/翻盖机，48kHz 全频带 + 40ms 帧合并编码 + JNI 动态帧长 + CPU 自动降级保护，CPU ~14%（实测 Sharp NP805SH / 骁龙210 / 1GB RAM）。
 
 **全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。
 
@@ -104,17 +104,41 @@ build_android.bat
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
 ### Android Old 低性能版（`android_old/`）
-专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本，与 Windows 端低性能接口固定对接。
+专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本。
 
-- **全线 16kHz 优化**：正向采集 16kHz Opus 编码，PC 端反向 16kHz Opus 编码+48→16k 降采样，Android 端 16kHz 解码+播放
-- **40ms 帧合并编码**：合并 2 帧打包编码，编码频率从 50 帧/秒降至 25 帧/秒，CPU 占用从 120% 降至 ~9%
-- **ACK 限频轮询**：每 10 帧检查一次 ACK，`soTimeout` 5ms，drainAck CPU 开销降为原来的 1/50
+- **48kHz 全频带编码**：正向 48kHz Opus 编码，FB 全频带，256kbps VBR；反向 48kHz 立体声最大码率（PC 高品质模式）
+- **40ms 帧合并编码**：合并 2 帧打包编码，编码频率 50→25 帧/秒，CPU 占用从 120% 降至 ~14%
+- **JNI 动态帧长**：`opus_jni.c` 硬编码 `state->frame_size` → 改用实际数组长度，支持 20ms/40ms/60ms 灵活帧，修复 40ms 帧降调问题
+- **CPU 自动降级**：读取 `/proc/self/stat` 进程 CPU 时间，每 2s 检测；>40% 时渐进降级（FB→SWB→WB→MB，码率 256→128→64→32kbps），通过 `encoder.update()` 热切换，无需重启采集流
+- **ACK 限频轮询**：每 10 帧检查一次 ACK，`soTimeout` 5ms，drainAck CPU 开销降为 1/50
 - **传统 View 布局**：无 Jetpack Compose，minSdk=21，targetSdk=26
 - **一键自动连接**：UDP 广播发现局域网 PC 端，自动连接无需手动输入
-- **低性能默认配置**：Opus 复杂度 1、DTX 开启、VBR 自动码率
-- **强制低性能标志**：CONNECT 包固定设置 `low_perf=1`，要求 Windows 端使用单声道 64kbps 宽带编码
+- **均衡配置**：Opus 复杂度 1、DTX 开启、VBR 256kbps、全频带 FB
 - **十字键交互**：上下调音量，左右切换关于页，适配物理键盘翻盖机
 - **音源回退**：优先 VOICE_COMMUNICATION（系统硬件降噪），失败回退 MIC 裸采集
+
+> 测试设备：SHARP NP805SH（翻盖机）— Snapdragon 210 (MSM8909) / 4×Cortex-A7 @1.1GHz / 1GB RAM / Android 8.1。优化后 CPU ~14%，温度 37°C 稳定。
+
+---
+
+### Opus 编码器参数说明（现代版 `android/` 设置面板）
+
+现代版 Android App 内置 Opus 高级编码设置面板，以下为各参数详解：
+
+| 参数 | 默认值 | 可选值 | 说明 |
+|------|--------|--------|------|
+| **编码复杂度** | 5 | 1~10 (滑动条) | 1=最快速(省CPU)，10=最佳质量(费CPU)。实时串流推荐 1~3 |
+| **信号类型** | 语音 | 语音 / 音乐 | 语音模式启用系统硬件降噪(NS+AGC)+AEC；音乐模式裸麦直出 |
+| **音频带宽** | 全频带(FB) | NB 8k / MB 12k / WB 16k / SWB 24k / FB 48k | 限制编码频率范围，越低越省码率。语音推荐 WB 或 SWB |
+| **VBR (可变码率)** | 关闭(CBR) | 开启(VBR) / 关闭(CBR) | VBR 在静音时自动降低码率节省带宽；开启 DTX 时强制 VBR |
+| **VBR 码率约束** | 无约束 | 无约束 / 约束 | 约束时 VBR 不超过目标码率；无约束时允许临时突增 |
+| **DTX (不连续传输)** | 关闭 | 开启 / 关闭 | 开启后静音段停止传输数据，大幅节省带宽。开启后强制 VBR |
+| **FEC (前向纠错)** | 开启(值2) | 关闭(0) / 开启(2) | 开启后丢包容忍度提高，适合弱网环境。值2允许CELT+FEC |
+| **预期丢包率** | 5% | 0~30% (滑动条) | 告知编码器预期丢包率，FEC 开启时按此比例插入冗余数据 |
+| **码率** | 256 kbps (自动) | 自动(0) / 32~512 kbps (手动) | 自动模式下：48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k |
+| **采样率** | 48000 Hz | 固定不可调 | 采集固定 48kHz，协议层支持动态切换(8k/12k/16k/24k/48k) |
+
+> 所有参数在编码运行中可热修改，无需重启采集流（通过 `encoder.update()` 每帧检测变更毫秒级同步）。
 
 ### Windows 接收端
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
@@ -247,7 +271,7 @@ windows = { version = "0.58", features = [
 | **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
 | **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord，保留网络层 |
-| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，固定 16kHz） | **生产-消费双协程** + **40ms帧合并编码**（2帧打包，编码频率25帧/秒）；ACK限频检查（每10帧）；`delay(1)`防忙等 |
+| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | **生产-消费双协程** + **40ms帧合并编码**（2帧打包，JNI动态帧长，25帧/秒）；ACK限频检查（每10帧）；`delay(1)`防忙等 |
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
@@ -260,8 +284,8 @@ windows = { version = "0.58", features = [
 | 协商项 | 策略 |
 | --- | --- |
 | 采样率（现代版） | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
-| 采样率（Old 低性能版） | Android 固定 16kHz 采集编码；PC 反向 16kHz 编码（48→16k 降采样）；Android 16kHz 解码+播放。CONNECT `low_perf=1` 驱动全线 16kHz |
-| 帧长（Old 低性能版） | 合并 2 帧（40ms）打包编码，编码频率 25 帧/秒，CPU 占用 ~9% |
+| 采样率（Old 低性能版） | Android 48kHz FB 全频带编码；PC 反向 48kHz 立体声最大码率（高品质模式）；Android 48kHz 解码+播放 |
+| 帧长（Old 低性能版） | 合并 2 帧（40ms）打包编码，JNI 动态帧长，编码频率 25 帧/秒，CPU ~14%（实测 Sharp NP805SH） |
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()`/`default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
 | 传输机制 | 15 字节包头（v2 统一协议，Big-Endian）实时携带码率、采样率、8 字节设备 ID |
 | 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 相位连续重采样 |
@@ -435,7 +459,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 | 版本 | 变更点 |
 |------|--------|
 | **v1.1.0** | 2026-06-09: 全面改名 UDP2CAL（原 UDP2Mic）；双向音频串流 + AEC 移植成功；反向串流开关按钮；立体声/单声道自适应编码；低性能模式(android_old)；保活重连机制；通知栏动态更新；WASAPI 缓冲 100→30ms；AudioTrack 缓冲 300→80ms；移除旧版纯文本发现协议 |
-| **v1.1.0-hotfix** | 2026-06-09: android_old 发热优化。全面降采样 48kHz→16kHz；PC 反向编码器 48→16kHz 降采样；40ms 帧合并编码（CPU 120%→9%）；ACK 限频轮询（soTimeout 1→5ms，每10帧检查）；AudioPlayer 采样率匹配（48000→16000Hz）；WakeLock 无限期持有 |
+| **v1.1.0-hotfix** | 2026-06-09: android_old 发热优化。JNI 动态帧长修复 40ms 帧降调；48kHz FB+256kbps 最终定型（CPU 120%→14%，测试设备 Sharp NP805SH/骁龙210/1GB）；ACK 限频轮询（soTimeout 1→5ms，每10帧）；WakeLock 无限期持有 |
 | **v1.0.9.2** | 2026-06-08: P2P 独占增强——Win 端异设备 CONNECT 静默拒绝（不推送 StatusUpdate，消除码率/电平跳动）；Android 端保活恢复持续发送；新增 `android_old/` 适配 Android 6~8 旧设备（无 Compose，低性能默认配置 + VOICE_COMMUNICATION 回退 + 一键自动连接）；`build_android.bat` 支持 4 选项同时编译新旧版本 |
 | **v1.0.6** | UI 卡片布局 + 动态 VU 色彩表 + 按钮交互反馈；全局单例音频守护线程根除反复启停泄漏；`udp_receiver_stream` 参数化消除跨线程注册表竞态；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验 |
 | **v1.0.5** | Windows 接收端初始架构，局域网广播发现服务 |

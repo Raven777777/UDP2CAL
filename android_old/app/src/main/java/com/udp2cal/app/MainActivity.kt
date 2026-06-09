@@ -110,8 +110,8 @@ class MainActivity : ComponentActivity() {
 
     private fun doStart(ip: String, port: Int) {
         Prefs.targetIp = ip; Prefs.targetPort = port
-        val sampleRateHz = 16000  // 低性能版固定 16kHz，与 PC 低性能接口对齐
-        val bitrateKbps = 0  // 自动码率
+        val sampleRateHz = 48000  // 测试：48kHz 验证编码性能
+        val bitrateKbps = 256  // 均衡：256kbps，CPU 20%以内
 
         val action = {
             startService(Intent(this, CaptureService::class.java))

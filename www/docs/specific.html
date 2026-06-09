@@ -114,7 +114,7 @@
 
         <p>UDP2CAL 是一个 <strong>工业级稳定、低延迟</strong> 的局域网麦克风系统。Android 端采集音频——仅维护一个 <code>isVoiceMode</code> 状态变量，由 Opus 信号类型驱动音源自动切换，<strong>无任何软件降噪/AGC/音效处理代码</strong>——经 Opus 编码通过 UDP 发送到 Windows 接收端，接收端通过 WASAPI 输出到虚拟声卡（VB-Cable），可供微信、Zoom、OBS、游戏等任意应用使用。</p>
 
-        <p><strong>全链路零堆分配</strong>（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、<strong>生产-消费双协程</strong>消除阻塞饥饿、<strong>JNI 双重边界守卫</strong>防越界写穿。双端均已编译通过。</p>
+        <p><strong>全链路零堆分配</strong>（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、<strong>生产-消费双协程</strong>消除阻塞饥饿、<strong>JNI 双重边界守卫</strong>防越界写穿。提供现代版（Android 10+，Compose）和低性能版（Android 6~8，传统 View）两个客户端。</p>
 
         <!-- Quick Start -->
         <h2 id="quickstart">快速开始</h2>
@@ -137,8 +137,12 @@
         <div class="code-block">
           <button class="code-copy" data-copy="build_android.bat">复制</button>
           <pre><code>build_android.bat
-# 产物: UDP2CAL_arm64-v8a.apk 或 UDP2CAL_armeabi-v7a.apk
-# 运行后选择 [1] arm64-v8a (64位) 或 [2] armeabi-v7a (32位)</code></pre>
+# 交互式选择:
+#   [1] arm64-v8a (64位) — 现代版
+#   [2] armeabi-v7a (32位) — 现代版
+#   [3] arm64-v8a (64位) — 低性能版
+#   [4] armeabi-v7a (32位) — 低性能版
+# 低端/翻盖机推荐 armeabi-v7a + 低性能版</code></pre>
         </div>
 
         <p><strong>先决条件</strong>：JDK 17 (Temurin)、Android SDK 35、NDK 27.0.12077973</p>
@@ -149,18 +153,20 @@
         <h2 id="features">主要特性</h2>
 
         <h3 id="android-sender">Android 发送端</h3>
+        <p><strong>双版本支持</strong>：现代版 <code>android/</code>（Jetpack Compose，Android 10+，48kHz 全参数面板）和低性能版 <code>android_old/</code>（传统 View，Android 6~8，48kHz FB + 40ms 帧 + CPU 自动降级）。</p>
         <ul>
           <li><strong>音源自适应切换</strong>：仅一个 <code>isVoiceMode</code> 状态变量驱动全部音源决策。语音模式→VOICE_COMMUNICATION（安卓系统原生硬件降噪），全频模式→MIC（裸麦直出，硬件降噪关闭）；异常回退 MIC 保底通路</li>
-          <li><strong>生产-消费双协程</strong>：独占线程 <code>AudioRecord.read()</code> + <code>Channel</code> 投递消费者，消除饥饿。信号类型变更时消费者循环检测→自动重建 AudioRecord</li>
+          <li><strong>生产-消费双协程</strong>：独占线程 <code>AudioRecord.read()</code> + <code>Channel</code> 投递消费者，消除饥饿。低性能版额外使用 40ms 帧合并编码（25 帧/秒）</li>
           <li><strong>全链路零堆分配</strong>：<code>ShortArrayPool</code> 帧复用 + 乒乓发送缓冲区 + <code>encoderEncodeTo</code> 直接写入</li>
           <li><strong>纯直通无软件处理</strong>：AudioRecord 取 PCM → 直通拷贝 → Opus 编码输出，APP 端无任何降噪/AGC/音效代码</li>
-          <li><strong>Opus CBR/VBR 热调节</strong>：FEC=2（允许 CELT + FEC，不强制 SILK 模式）；码率 32~512kbps；固定 48kHz 采集，协议层支持 5 种采样率</li>
-          <li><strong>Opus 高级编码设置</strong>：Jetpack Compose 全参数调节面板</li>
+          <li><strong>Opus CBR/VBR 热调节</strong>：FEC=2（允许 CELT + FEC，不强制 SILK 模式）；码率 32~512kbps；协议层支持 5 种采样率（8k/12k/16k/24k/48k）</li>
+          <li><strong>Opus 高级编码设置</strong>：现代版 Jetpack Compose 全参数调节面板（复杂度 1-10、VBR/CBR、FEC、DTX、带宽、码率）</li>
+          <li><strong>低性能版发热优化+CPU自动降级</strong>：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%；>40% 自动渐进降级（FB→SWB→WB→MB），通过 <code>encoder.update()</code> 热切换</li>
           <li><strong>1kHz 测试音模式</strong>：内置正弦波发生器，无需麦克风即可调试端到端音频链路</li>
           <li><strong>JNI <code>@Synchronized</code> 互斥锁</strong>：杜绝多线程并发闪退</li>
           <li><strong>网络无缝热重连</strong>：改 IP 不重启录音流</li>
           <li><strong>UDP 广播自动发现</strong>：统一 v2 协议发现局域网内 Windows 接收端</li>
-          <li><strong>P2P 双向保活</strong>：每 ~1s 发送 TYPE_CONNECT + 非阻塞 1ms 超时 drainAck</li>
+          <li><strong>P2P 双向保活</strong>：每 ~1s 发送 TYPE_CONNECT（携带反向端口+模式标志）+ 非阻塞 drainAck（低性能版每 10 帧检查）</li>
           <li><strong>优雅断连重连</strong>：断连不退出采集，3 秒无 ACK 标记断连，持续保活自动恢复</li>
           <li><strong>持久化设备 ID</strong>：8 字节唯一标识，SharedPreferences 存储</li>
         </ul>
@@ -174,8 +180,8 @@
           <li><strong>系统托盘集成</strong>：关闭按钮隐藏到托盘，右键菜单退出，双击恢复窗口</li>
           <li><strong>P2P 独占通信系统</strong>：双状态机 + TYPE_CONNECT 唯一准入 + 设备 ID 1对1 过滤 + 并发互斥锁防抢占 + <strong>防抢占静默拒绝</strong>（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频）</li>
           <li><strong>双向保活</strong>：CONNECT → CONNECT_ACK，1 秒保活周期；300ms 接收超时，1 秒无包标记断连</li>
-          <li><strong>统一 v2 协议</strong>：15B 包头携带设备 ID，所有包同格式；兼容旧版纯文本发现协议</li>
-          <li><strong>二进制发现服务</strong>：监听 44043，v2 DISCOVER_REQ/REPLY + 旧版兼容</li>
+          <li><strong>统一 v2 协议</strong>：15B 包头携带设备 ID，所有包同格式；旧版纯文本发现协议已移除</li>
+          <li><strong>二进制发现服务</strong>：监听 44043，v2 DISCOVER_REQ/REPLY</li>
           <li><strong>注册表持久化配置</strong>：开机自启、监听地址、端口、设备 ID</li>
           <li><strong>Windows 防火墙自动放行</strong>（静默 NETSH）</li>
           <li><strong>单实例互斥锁检测</strong>：<code>CreateMutexW</code> 防止重复启动</li>
@@ -187,13 +193,15 @@
         <h2 id="file-structure">文件结构</h2>
         <div class="code-block">
           <pre><code>UDP2CAL/
-├- android/        # Android 发送端（Kotlin + JNI Opus）
+├- android/        # Android 发送端（Kotlin + JNI Opus，现代版）
+├- android_old/    # Android 发送端（Kotlin + JNI Opus，低性能版，16kHz 优化）
 ├- windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├- src/
 │  │  ├- main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
 │  │  ├- audio.rs      # WASAPI 输出 + 流式重采样
+│  │  ├- capture.rs    # WASAPI Loopback + Opus 编码 + 反向 UDP 发送（16kHz 低性能）
 │  │  ├- config.rs     # 注册表配置读写
-│  │  ├- decoder.rs    # Opus 解码器封装
+│  │  ├- decoder.rs    # Opus 解码器封装（5 独立解码器）
 │  │  ├- firewall.rs   # 防火墙规则
 │  │  └- protocol.rs   # 协议重新导出
 │  └- Cargo.toml
@@ -215,8 +223,10 @@
           <table>
             <tr><th>文件</th><th>大小</th><th>说明</th></tr>
             <tr><td><code>UDP2CAL_{x64,x86}.exe</code></td><td>~5.98 MB</td><td>Windows 接收端（UPX 压缩后为 <code>.upx.exe</code>）</td></tr>
-            <tr><td><code>UDP2CAL_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (64位，已签名)</td></tr>
-            <tr><td><code>UDP2CAL_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 发送端 (32位，已签名)</td></tr>
+            <tr><td><code>UDP2CAL_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 发送端现代版 (64位，已签名)</td></tr>
+            <tr><td><code>UDP2CAL_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 发送端现代版 (32位，已签名)</td></tr>
+            <tr><td><code>UDP2CAL_old_arm64-v8a.apk</code></td><td>~2.65 MB</td><td>Android 低性能版 (64位，Android 6+ 翻盖/低端机)</td></tr>
+            <tr><td><code>UDP2CAL_old_armeabi-v7a.apk</code></td><td>~2.65 MB</td><td>Android 低性能版 (32位，Android 6+ 翻盖/低端机)</td></tr>
           </table>
         </div>
 
@@ -226,7 +236,8 @@
         <div class="table-wrap">
           <table>
             <tr><th>平台</th><th>最低版本</th><th>架构</th><th>说明</th></tr>
-            <tr><td><strong>Android</strong></td><td>Android 10 (API 29)+</td><td>arm64-v8a / armeabi-v7a</td><td>minSdk=29, targetSdk=35, 需要 <code>RECORD_AUDIO</code> 权限</td></tr>
+            <tr><td><strong>Android（现代版）</strong></td><td>Android 10 (API 29)+</td><td>arm64-v8a / armeabi-v7a</td><td>minSdk=29, targetSdk=35, Compose UI</td></tr>
+            <tr><td><strong>Android（低性能版）</strong></td><td>Android 6~8 (API 21~26)</td><td>armeabi-v7a 推荐</td><td>minSdk=21, targetSdk=26, 传统 View。16kHz 全线优化，CPU ~9%</td></tr>
             <tr><td><strong>Windows</strong></td><td>Windows 10+</td><td>x86_64 / i686</td><td>依赖 WASAPI 音频引擎 + VB-Cable 虚拟声卡</td></tr>
           </table>
         </div>
@@ -270,10 +281,12 @@
         <div class="table-wrap">
           <table>
             <tr><th>层级</th><th>技术选型</th><th>运行时更新策略（免重启）</th></tr>
-            <tr><td><strong>UI 层（Android）</strong></td><td>Jetpack Compose + Material 3</td><td><code>Flow</code> 细粒度订阅；Opus 全参数面板</td></tr>
+            <tr><td><strong>UI 层（Android 现代版）</strong></td><td>Jetpack Compose + Material 3</td><td><code>Flow</code> 细粒度订阅；Opus 全参数面板</td></tr>
+            <tr><td><strong>UI 层（Android 低性能版）</strong></td><td>传统 View + AppCompat</td><td>十字键交互、一键自动连接；minSdk=21</td></tr>
             <tr><td><strong>UI 层（Windows）</strong></td><td>Iced (Rust) 360×300 固定窗口</td><td>模块化深色卡片；<code>run_with(session_id)</code> 状态隔离</td></tr>
             <tr><td><strong>网络层</strong></td><td>Kotlin Coroutines + UDP / Rust async</td><td>动态比对 Prefs，静默热重连不断流</td></tr>
-            <tr><td><strong>音频采集</strong></td><td>AudioRecord（VOICE_COMMUNICATION / MIC，48kHz）</td><td>双协程 + ShortArrayPool 零分配帧复用</td></tr>
+            <tr><td><strong>音频采集（现代版）</strong></td><td>AudioRecord（48kHz，全参数 Opus 面板）</td><td>双协程 + ShortArrayPool 零分配帧复用</td></tr>
+            <tr><td><strong>音频采集（低性能版）</strong></td><td>AudioRecord（16kHz 固定，40ms 帧合并编码）</td><td>双协程 + 40ms 帧（编码 25 帧/秒）+ ACK 限频每 10 帧检查</td></tr>
             <tr><td><strong>编码层</strong></td><td>libopus (JNI)</td><td>encoderEncodeTo 直接写入；FEC=2</td></tr>
             <tr><td><strong>发送层</strong></td><td>UDP DatagramSocket</td><td>双缓冲乒乓 + send(offset,length) 零拷贝</td></tr>
             <tr><td><strong>Windows 音频引擎</strong></td><td>cpal / WASAPI</td><td>全局单例 Audio Worker 守护线程</td></tr>
@@ -287,11 +300,13 @@
         <div class="table-wrap">
           <table>
             <tr><th>协商项</th><th>策略</th></tr>
-            <tr><td>采样率</td><td>Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配</td></tr>
+            <tr><td>采样率（现代版）</td><td>Android 48kHz 采集；PC 端 5 独立 Opus 解码器自动匹配</td></tr>
+            <tr><td>采样率（低性能版）</td><td>Android 16kHz 全线固定；PC 反向 48→16k 降采样后 16kHz 编码</td></tr>
+            <tr><td>帧长（低性能版）</td><td>40ms 帧合并编码（2帧打包），编码频率 25 帧/秒，CPU ~9%</td></tr>
             <tr><td>自动码率</td><td>Prefs 码率 0 时根据采样率动态分配默认值</td></tr>
             <tr><td>传输机制</td><td>15 字节包头（v2 统一协议，Big-Endian）携带码率、采样率、设备 ID</td></tr>
-            <tr><td>局域网自动发现</td><td>Windows 监听 44043，v2 二进制 + 旧版纯文本双协议兼容</td></tr>
-            <tr><td>心跳与保活</td><td>Android 每 ~1s 发 CONNECT；Win 端 300ms 接收超时 + 1s 无包标记断连</td></tr>
+            <tr><td>局域网自动发现</td><td>Windows 监听 44043，v2 二进制协议（旧版纯文本已移除）</td></tr>
+            <tr><td>心跳与保活</td><td>Android 每 ~1s 发 CONNECT（携带反向端口+模式标志）；Win 端 300ms 接收超时 + 1s 无包标记断连</td></tr>
           </table>
         </div>
 
@@ -386,6 +401,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
         <!-- Changelog -->
         <h2 id="changelog">历史重大变更（Windows 端）</h2>
         <ul class="card-list-doc">
+          <li><strong>v1.1.0-hotfix</strong>：android_old 发热优化 — 最终定型 48kHz FB+256kbps（CPU 120%→14%），JNI 动态帧长修复 40ms 帧降调，CPU 自动降级（>40% 渐进降级至 low_perf=1），OpusEncoder 添加 runtime update</li>
           <li><strong>v1.1.0</strong>：双向音频串流 + AEC — 全面改名 UDP2CAL；反向串流（PC→Phone，WASAPI Loopback + Opus 编码）；声学回声消除（AcousticEchoCanceler）；立体声/单声道自适应编码；低性能模式（android_old）；反向串流 UI 开关按钮；保活重连机制；通知栏动态更新</li>
           <li><strong>v1.0.9</strong>：正式版 — 统一 v2 协议（15B 包头携带设备 ID）；1对1 设备过滤 + 并发互斥锁防抢占；TYPE_CONNECT 唯一准入；<strong>防抢占静默拒绝</strong>（BUSY 时异设备 CONNECT 不回复 ACK，新设备永无法发送音频，已有连接完全不受影响）；Android 非阻塞 1ms drainAck + 优雅断连；Win 端 CONNECT_ACK 双向保活 + 1s 无包自动释放；广播状态机；Opus 高级编码设置面板；1kHz 测试音模式</li>
           <li><strong>v1.0.6</strong>：UI 卡片布局 + 动态 VU 色彩表；全局单例音频守护线程；参数化 <code>udp_receiver_stream</code>；EMA NaN/Infinity 防线；200ms 防抖 + 实时端口校验</li>
@@ -423,7 +439,7 @@ VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏</code></pre>
   <!-- Footer -->
   <footer class="footer">
     <div class="footer-content">
-      <span>UDP2CAL v1.1.0 — 局域网音频串流</span>
+      <span>UDP2CAL v1.1.0 — 双向音频串流 + AEC + 低性能模式</span>
       <span class="footer-links">
         <a href="https://github.com/Raven777777/UDP2CAL" target="_blank" rel="noopener">GitHub</a>
         <a href="protocol.html">协议规范</a>

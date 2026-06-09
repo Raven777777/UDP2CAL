@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.FileInputStream
 import java.net.DatagramPacket
 import com.udp2cal.app.AudioPlayer
 import com.udp2cal.app.DiscoveryManager
@@ -188,8 +189,8 @@ class CaptureService : Service() {
                 val readSize = frameSize * 2 * COMBINE_FRAMES
                 audioRecord?.startRecording()
 
-                // 初始化反向音频（PC→Phone 解码+播放），低性能模式 PC 端以 16000Hz 编码
-                reverseDecoder = ReverseOpusDecoder(16000).also {
+                // 测试：反向解码 48kHz（PC 高品质模式立体声最大码率全频带）
+                reverseDecoder = ReverseOpusDecoder(48000).also {
                     if (!it.start()) {
                         Log.w(TAG, "反向音频解码器初始化失败，继续运行")
                     }
@@ -258,6 +259,58 @@ class CaptureService : Service() {
                     val RECONNECT_INTERVAL = 50
                     var p2pConnected = false
 
+                    // CPU 监控 & 自动降级
+                    val CPU_CHECK_INTERVAL = 50  // 每 50 帧(~2s) 检查 CPU
+                    var cpuCheckCounter = 0
+                    var prevCpuTime = 0L
+                    var prevWallMs = 0L
+                    var downgradeLevel = 0  // 0=FB, 1=SWB, 2=WB, 3=MB, 4=low_perf
+                    var useLowPerf = false  // 级别 4 时切换 low_perf=1
+
+                    fun readCpuTime(): Long {
+                        return try {
+                            val stat = FileInputStream("/proc/self/stat").bufferedReader().use { it.readText() }
+                            val end = stat.lastIndexOf(')')
+                            if (end < 0) return -1L
+                            val parts = stat.substring(end + 2).split(' ')
+                            parts[11].toLong() + parts[12].toLong()  // utime + stime (jiffies)
+                        } catch (_: Exception) { -1L }
+                    }
+
+                    fun doAutoDowngrade() {
+                        val enc = encoder ?: return
+                        // 级别 0-3：渐降带宽和码率
+                        if (downgradeLevel < 3) {
+                            val curBw = when (downgradeLevel) {
+                                0 -> 1105  // FB
+                                1 -> 1104  // SWB
+                                2 -> 1103  // WB
+                                else -> 1102  // MB
+                            }
+                            val nextBw = when (downgradeLevel) {
+                                0 -> 1104  // FB→SWB
+                                1 -> 1103  // SWB→WB
+                                2 -> 1102  // WB→MB
+                                else -> 1102
+                            }
+                            val newBitrate = when (downgradeLevel) {
+                                0 -> 128  // 256→128
+                                1 -> 64   // 128→64
+                                else -> 32 // 64→32
+                            }
+                            enc.update(1, 3001, nextBw, 1, 1, newBitrate, 0, 0, 0)
+                            downgradeLevel++
+                            Log.w(TAG, "CPU 超限 → 自动降级(${downgradeLevel}): 带宽 ${curBw}→${nextBw}, 码率 ${newBitrate}kbps")
+                            _status.value = _status.value.copy(errorMsg = "自动降级(${downgradeLevel}/4)")
+                        } else if (downgradeLevel == 3) {
+                            // 级别 4：仍卡则切换 low_perf=1，PC 发 16kHz 单声道
+                            Log.w(TAG, "CPU 持续超限 → 切换 low_perf=1 低性能模式")
+                            useLowPerf = true
+                            downgradeLevel = 4
+                            _status.value = _status.value.copy(errorMsg = "低性能模式")
+                        }
+                    }
+
                     var reverseJob: Job? = null
 
                     for (frame in ch) {
@@ -277,11 +330,11 @@ class CaptureService : Service() {
                             reconnectCounter = 0
                             try {
                                 val devId = DiscoveryManager.getOrCreateDeviceId()
-                                // 保活 CONNECT 携带反向端口 + 低性能标志
+                                // 保活 CONNECT 携带反向端口 + 模式标志
                                 val revPort = udpSender?.reversePort ?: 0
                                 val payload = byteArrayOf(
                                     (revPort shr 8).toByte(), revPort.toByte(),
-                                    1 // 低性能模式
+                                    if (useLowPerf) 1 else 0 // 自动降级后切 low_perf=1
                                 )
                                 val ping = Udp2CalProtocol.buildPacket(
                                     isAudio = false, msgType = Udp2CalProtocol.TYPE_CONNECT,
@@ -308,6 +361,25 @@ class CaptureService : Service() {
                             val written = encoder?.encodeTo(frame, buf, 0) ?: -1
                             if (written > 0) {
                                 udpSender?.send(buf, 0, written)
+                            }
+
+                            // CPU 监控：每 CPU_CHECK_INTERVAL 帧检查一次
+                            cpuCheckCounter++
+                            if (cpuCheckCounter >= CPU_CHECK_INTERVAL) {
+                                cpuCheckCounter = 0
+                                val now = System.currentTimeMillis()
+                                val cpuTime = readCpuTime()
+                                if (cpuTime > 0 && prevCpuTime > 0) {
+                                    val dt = (now - prevWallMs) / 1000.0
+                                    if (dt > 0.5) {
+                                        val cpuPct = ((cpuTime - prevCpuTime).toDouble()) / dt
+                                        if (cpuPct > 40.0) {
+                                            doAutoDowngrade()
+                                        }
+                                    }
+                                }
+                                prevCpuTime = cpuTime
+                                prevWallMs = now
                             }
                         }
 

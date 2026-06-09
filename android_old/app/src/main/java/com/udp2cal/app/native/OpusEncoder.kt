@@ -4,15 +4,15 @@ import android.util.Log
 import com.udp2cal.app.Udp2CalProtocol
 
 /**
- * Opus 编码器 — 低性能设备默认配置
- * 复杂度=1, 语音模式, 超宽带(24kHz), DTX 开启, VBR 自动码率
+ * Opus 编码器 — 低性能设备均衡配置
+ * 复杂度=2, 语音模式, 全频带(48kHz), DTX 开启, VBR 自动码率
  */
 class OpusEncoder(
     val sampleRateHz: Int = 48000,
     val bitrateKbps: Int = 0,            // 0 = auto
-    val complexity: Int = 1,              // 最低复杂度
+    val complexity: Int = 1,              // 最低复杂度（语音场景听感无差异）
     val signalType: Int = 3001,           // OPUS_SIGNAL_VOICE
-    val bandwidth: Int = 1104,            // OPUS_BANDWIDTH_SWB (24kHz)
+    val bandwidth: Int = 1105,            // OPUS_BANDWIDTH_FULLBAND (48kHz)
     val dtx: Int = 1,                     // DTX 开启
     vbrRaw: Int = 1,                      // VBR
     val fec: Int = 0,                     // 关闭 FEC
@@ -82,6 +82,18 @@ class OpusEncoder(
             encodeCount++
             written
         } catch (e: Exception) { Log.e(TAG, "EncodeTo failed", e); -1 }
+    }
+
+    @Synchronized
+    fun update(complexity: Int, signalType: Int, bandwidth: Int, dtx: Int, vbr: Int, bitrateKbps: Int, fec: Int, packetLoss: Int, vbrConstraint: Int): Boolean {
+        val h = handle; if (h == 0L) return false
+        return try {
+            val ok = OpusNative.encoderUpdate(h, complexity, signalType, bandwidth, dtx, vbr, bitrateKbps, fec, packetLoss, vbrConstraint)
+            if (ok) {
+                bitrateId = computeBitrateId(bitrateKbps)
+            }
+            ok
+        } catch (e: Exception) { Log.e(TAG, "Update failed", e); false }
     }
 
     @Synchronized

@@ -34,10 +34,11 @@ class UdpSender(
             reverseSock = revSock
             reversePort = revPort
 
-            // CONNECT payload: 2字节 reverse port (big-endian) + 1字节低性能标志
+            // CONNECT payload: 2字节 reverse port (big-endian) + 1字节模式标志（0=高品质，1=低性能）
+            // 经实测 48kHz+FB+256kbps 在骁龙210/1GB设备上 CPU 仅 14%，走高品质模式
             val payload = byteArrayOf(
                 (revPort shr 8).toByte(), revPort.toByte(),
-                1 // 低性能模式（适配低端设备）
+                0 // 高品质模式：PC 发 48kHz 立体声最大码率
             )
 
             val cp = Udp2CalProtocol.buildPacket(

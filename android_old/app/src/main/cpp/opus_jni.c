@@ -91,9 +91,14 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     jshort* pcm = (*env)->GetShortArrayElements(env, pcmData, NULL);
     if (pcm == NULL) return -1;
 
+    // 使用实际数组长度作为帧大小，支持 20ms/40ms/60ms 帧（必须是 frame_size 整数倍）
+    int frameSize = len;
+    if (frameSize % state->frame_size != 0) {
+        frameSize = state->frame_size;
+    }
     unsigned char packet[4096];
     int nbBytes = opus_encode(state->encoder, (const opus_int16*)pcm,
-                               state->frame_size, packet, sizeof(packet));
+                               frameSize, packet, sizeof(packet));
     (*env)->ReleaseShortArrayElements(env, pcmData, pcm, JNI_ABORT);
 
     if (nbBytes < 0) return -1;
@@ -109,8 +114,8 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     if (state->encode_count % 50 == 0) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
             "Audit: frame=%d in=%d out=%d ratio=%d%%",
-            state->encode_count, state->frame_size * 2, nbBytes,
-            (nbBytes * 100) / (state->frame_size * 2));
+            state->encode_count, frameSize * 2, nbBytes,
+            (nbBytes * 100) / (frameSize * 2));
     }
 
     // 写入预分配的 dest 缓冲区，零分配
@@ -135,9 +140,14 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncode(
     jshort* pcm = (*env)->GetShortArrayElements(env, pcmData, NULL);
     if (pcm == NULL) return NULL;
 
+    // 使用实际数组长度作为帧大小，必须是 frame_size 整数倍
+    int frameSize = len;
+    if (frameSize % state->frame_size != 0) {
+        frameSize = state->frame_size;
+    }
     unsigned char packet[4096];
     int nbBytes = opus_encode(state->encoder, (const opus_int16*)pcm,
-                               state->frame_size, packet, sizeof(packet));
+                               frameSize, packet, sizeof(packet));
     (*env)->ReleaseShortArrayElements(env, pcmData, pcm, JNI_ABORT);
 
     if (nbBytes < 0) return NULL;
@@ -146,8 +156,8 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncode(
     if (state->encode_count % 50 == 0) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
             "Audit: frame=%d in=%d out=%d ratio=%d%%",
-            state->encode_count, state->frame_size * 2, nbBytes,
-            (nbBytes * 100) / (state->frame_size * 2));
+            state->encode_count, frameSize * 2, nbBytes,
+            (nbBytes * 100) / (frameSize * 2));
     }
 
     jbyteArray result = (*env)->NewByteArray(env, nbBytes);

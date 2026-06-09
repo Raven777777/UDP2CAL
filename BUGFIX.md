@@ -5,11 +5,23 @@
 
 ---
 
-## 2026-06-09 — android_old 发热优化（CPU 120% → 9%）
+## 2026-06-09 — android_old 发热优化（CPU 120% → 14%，测试设备 Sharp NP805SH）
 
 ### 概述
 
-android_old 在低端 Sharp 设备上运行 CPU 占用 117-120%（Opus 编码线程 97.9% R 状态），电池温度持续上升。ADB 诊断定位到多处问题叠加导致发热。
+android_old 在低端设备上运行严重发热。CPU 占用 117-120%（Opus 编码线程 97.9% R 状态），电池温度持续上升。ADB 诊断定位到多处问题叠加导致发热。
+
+### 测试设备
+
+| 项目 | 值 |
+|------|------|
+| 制造商 | SHARP |
+| 型号 | NP805SH（翻盖机） |
+| SoC | Qualcomm Snapdragon 210 (MSM8909) |
+| CPU | 4× Cortex-A7 @ 1.1GHz (ARMv7, 32-bit) |
+| RAM | 1GB (914 MB 可用) |
+| Android | 8.1.0 (API 27) |
+| ABI | armeabi-v7a |
 
 ### 修复清单
 
@@ -24,14 +36,17 @@ android_old 在低端 Sharp 设备上运行 CPU 占用 117-120%（Opus 编码线
 | 7 | WakeLock 10 分钟超时 | `acquire(10 * 60 * 1000L)` 超时后自动释放 | 改为 `acquire()` 无限期保持，finally 释放 |
 | 8 | PC 反向编码器采样率过高 | 低性能模式仍然用 48000Hz 编码，仅带宽限幅 | PC `capture.rs` 改为 16000Hz 编码器 + 48kHz→16kHz 3:1 降采样 |
 | 9 | 包头采样率不实 | PC 低性能模式包头仍标 `sample_rate=4`(48kHz) | 包头正确标注 `sample_rate=2`(16kHz) |
+| 10 | 40ms 帧合并导致降调 | JNI `opus_jni.c` 硬编码 `state->frame_size`（320=20ms）传给 `opus_encode()`，640 采样数组只编前 320，后 320 被丢 → PC 每 40ms 只收到 20ms 音频 → 半速降调 | JNI 改用实际数组长度 `len` 作为帧大小，校验 `len % frame_size == 0` 后传入 `opus_encode()` |
+| 11 | CPU 自动降级 (新增功能) | 低端设备负载波动时无自动保护机制 | 读取 `/proc/self/stat` 进程 CPU 时间，每 2s 检测；>40% 时渐进降级：FB→SWB→WB→MB + 码率 256→128→64→32kbps；级别 4 自动切 `low_perf=1` |
+| 12 | OpusEncoder 缺少 runtime update | android_old 的 `OpusEncoder.kt` 未暴露 `update()` 方法，无法运行时调参 | 添加 `update()` 方法调用 `OpusNative.encoderUpdate()` JNI 接口，热切换带宽/码率等参数 |
 
-### 性能对比
+### 性能演进
 
-| 指标 | 优化前 (48000Hz / 20ms帧) | 优化后 (16000Hz / 40ms帧) |
-|------|:-:|:-:|
-| CPU 总占用 | 117-120% | **~9%** |
-| 编码线程状态 | **R(运行) 97.9%** | **S(睡眠) 4.4%** |
-| 电池温度 | 35→37°C（上升） | **36°C（稳定）** |
+| 阶段 | 配置 | CPU | 编码线程 | 温度 |
+|:----|------|:--:|:--------:|:----:|
+| 🔴 原始 | 48kHz / complexity=5? / 20ms帧 / 每帧ACK | **117-120%** | R 97.9% | 35→37°C↑ |
+| 🟡 首次优化 | 16kHz / complexity=1 / 40ms帧 / ACK限频 | **~9%** | S 4.4% | 36°C稳定 |
+| 🟢 **最终定型** | **48kHz / complexity=1 / Fullband / 256kbps / 40ms帧 / JNI修复** | **~14%** | **S 13.9%** | **37°C稳定** |
 
 ---
 
