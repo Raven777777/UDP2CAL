@@ -201,6 +201,8 @@ impl ReverseSender {
         let mut encode_out = [0u8; 1500];
         let mut seq_num: u8 = 0;
         let mut hdr = [0u8; 15];
+        // 【复用】预分配发送缓冲区，避免每次循环都 new Vec
+        let mut send_packet = Vec::with_capacity(15 + 1472);
         let mut last_cfg_check = std::time::Instant::now();
 
         while running.load(Ordering::Relaxed) {
@@ -246,10 +248,10 @@ impl ReverseSender {
                         hdr[6] = seq_num;
                         seq_num = seq_num.wrapping_add(1);
                         hdr[7..15].copy_from_slice(&device_id);
-                        let mut packet = Vec::with_capacity(15 + plen);
-                        packet.extend_from_slice(&hdr[..15]);
-                        packet.extend_from_slice(&encode_out[..plen]);
-                        let _ = send_sock.send_to(&packet, android_addr);
+                        send_packet.clear();
+                        send_packet.extend_from_slice(&hdr[..15]);
+                        send_packet.extend_from_slice(&encode_out[..plen]);
+                        let _ = send_sock.send_to(&send_packet, android_addr);
                     }
                     mono_buf.drain(..FRAME_SIZE.min(mono_buf.len()));
                 }
@@ -274,10 +276,10 @@ impl ReverseSender {
                             hdr[6] = seq_num;
                             seq_num = seq_num.wrapping_add(1);
                             hdr[7..15].copy_from_slice(&device_id);
-                            let mut packet = Vec::with_capacity(15 + plen);
-                            packet.extend_from_slice(&hdr[..15]);
-                            packet.extend_from_slice(&encode_out[..plen]);
-                            let _ = send_sock.send_to(&packet, android_addr);
+                            send_packet.clear();
+                            send_packet.extend_from_slice(&hdr[..15]);
+                            send_packet.extend_from_slice(&encode_out[..plen]);
+                            let _ = send_sock.send_to(&send_packet, android_addr);
                         }
                     }
                 }

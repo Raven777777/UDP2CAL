@@ -49,10 +49,13 @@ class CaptureService : Service() {
     /** 反向音频（PC→Phone） */
     private var reverseDecoder: ReverseOpusDecoder? = null
     private var audioPlayer: AudioPlayer? = null
+    /** AEC 实例，finally 中释放 */
+    private var aecInstance: AcousticEchoCanceler? = null
 
     private data class CaptureParams(
         val sampleRateHz: Int, val bitrateKbps: Int, val targetIp: String, val targetPort: Int,
-        val testTone: Boolean
+        val testTone: Boolean,
+        val isModeRestart: Boolean = false
     )
     private var pendingRestart: CaptureParams? = null
 
@@ -132,7 +135,7 @@ class CaptureService : Service() {
     ) {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UDP2CAL:Capture")
-        try { wakeLock.acquire(10 * 60 * 1000L) } catch (_: Exception) {}
+        try { wakeLock.acquire() } catch (_: Exception) {}
 
         hasNewCapture = true
         // 捕获启动时的 isVoiceMode，用于消费者协程检测变更
@@ -284,6 +287,7 @@ class CaptureService : Service() {
                             val aec = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
                             if (aec != null) {
                                 aec.enabled = true
+                                aecInstance = aec
                                 audioSourceLabel += AudioSourceLabel.AEC_ENABLED
                                 Log.i(TAG, "AEC 已启用")
                             } else {
@@ -478,7 +482,8 @@ class CaptureService : Service() {
                                 isModeRestart = true
                                 pendingRestart = CaptureParams(
                                     sampleRateHz, bitrateKbps,
-                                    Prefs.targetIp, Prefs.targetPort, testTone
+                                    Prefs.targetIp, Prefs.targetPort, testTone,
+                                    isModeRestart = true
                                 )
                                 captureJob?.cancel()
                                 return@launch
@@ -561,6 +566,8 @@ class CaptureService : Service() {
                 audioRecord = null
                 encoder?.stop()
                 encoder = null
+                try { aecInstance?.release() } catch (_: Exception) {}
+                aecInstance = null
                 if (isModeRestart) {
                     // 模式切换：保留UdpSender和reverseDecoder，audioPlayer由doStartCapture重建
                     Log.i(TAG, "🔄 模式切换，保留UdpSender/reverseDecoder")
@@ -575,7 +582,7 @@ class CaptureService : Service() {
                     reverseDecoder = null
                     audioPlayer = null
                 }
-                isModeRestart = false
+
                 try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception){}
 
                 // ✅ 熔断保护：硬件初始化硬故障（麦克风被占用/不支持/编码器失败）时拒绝无限重启，防止 ANR
@@ -589,6 +596,7 @@ class CaptureService : Service() {
 
                 val restart = pendingRestart
                 pendingRestart = null
+                isModeRestart = restart?.isModeRestart ?: false
                 if (restart != null) {
                     serviceScope.launch { doStartCapture(restart.sampleRateHz, restart.bitrateKbps, restart.targetIp, restart.targetPort, restart.testTone) }
                 } else if (!hasNewCapture) {

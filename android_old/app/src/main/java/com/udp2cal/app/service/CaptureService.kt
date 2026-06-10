@@ -189,8 +189,8 @@ class CaptureService : Service() {
                 val readSize = frameSize * 2 * COMBINE_FRAMES
                 audioRecord?.startRecording()
 
-                // 测试：反向解码 48kHz（PC 高品质模式立体声最大码率全频带）
-                reverseDecoder = ReverseOpusDecoder(48000).also {
+                // 反向解码 48kHz 立体声（PC 高品质模式立体声最大码率全频带）
+                reverseDecoder = ReverseOpusDecoder(48000, channels = 2).also {
                     if (!it.start()) {
                         Log.w(TAG, "反向音频解码器初始化失败，继续运行")
                     }
@@ -442,11 +442,11 @@ class CaptureService : Service() {
 
             val recvBuf = ByteArray(Udp2CalProtocol.MAX_PACKET)
             val pkt = DatagramPacket(recvBuf, recvBuf.size)
-            val pcmBuf = ShortArray(dec.frameSize)
+            val pcmBuf = ShortArray(dec.pcmBufferSize)
             var hasAudio = false
             var lastAudioTime = 0L
 
-            Log.i(TAG, "反向音频接收器已启动（低性能 16kHz）")
+            Log.i(TAG, "反向音频接收器已启动（sr=${dec.sampleRateHz} ch=${dec.channels}）")
 
             while (isActive) {
                 try {
@@ -465,7 +465,16 @@ class CaptureService : Service() {
                     val plen = hdr.payloadLen.coerceAtMost(len - Udp2CalProtocol.HEADER_SIZE)
                     val ns = dec.decode(recvBuf, Udp2CalProtocol.HEADER_SIZE, plen, pcmBuf)
                     if (ns > 0) {
-                        player.write(pcmBuf, 0, ns)
+                        // 解码器为立体声(2ch)，但 AudioPlayer 为单声道输出
+                        // 立体声交错 → 单声道下混：(L+R)/2
+                        if (dec.channels == 2 && ns >= 2) {
+                            for (i in 0 until ns / 2) {
+                                pcmBuf[i] = ((pcmBuf[i * 2].toInt() + pcmBuf[i * 2 + 1].toInt()) / 2).toShort()
+                            }
+                            player.write(pcmBuf, 0, ns / 2)
+                        } else {
+                            player.write(pcmBuf, 0, ns)
+                        }
                         lastAudioTime = System.currentTimeMillis()
                         if (!hasAudio) {
                             hasAudio = true
@@ -497,6 +506,10 @@ class CaptureService : Service() {
         captureJob = null
         reverseAudioJob?.cancel()
         reverseAudioJob = null
+        reverseDecoder?.stop()
+        reverseDecoder = null
+        audioPlayer?.stop()
+        audioPlayer = null
         _status.value = CaptureStatus(connected = false)
     }
 

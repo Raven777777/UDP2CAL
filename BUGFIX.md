@@ -5,6 +5,45 @@
 
 ---
 
+## 2026-06-10 — 三端代码审查修复（android / android_old / windows / protocol）
+
+### 概述
+
+对 android（现代版）、android_old（低性能版）、windows（Rust 接收端）、protocol 四组代码进行审查，发现并修复 7 个 Bug / 隐患。
+
+### 审查范围
+
+| 代码库 | 文件数 | 涉及语言 |
+|--------|:------:|----------|
+| `android/` | 12 | Kotlin + C (JNI) |
+| `android_old/` | 11 | Kotlin + C (JNI) |
+| `windows/` | 6 | Rust |
+| `protocol/` | 1 | Rust, Kotlin (双端) |
+
+### 修复清单
+
+| # | 代码库 | 问题 | 根因 | 修复 |
+|---|--------|------|------|------|
+| 1 | `android/` | WakeLock 10 分钟超时 | `wakeLock.acquire(10 * 60 * 1000L)` 10分钟后自动释放，手机熄屏断连 | 改为 `wakeLock.acquire()` 无限期持有，finally 释放（同步 android_old）|
+| 2 | `android/` | AEC 对象泄漏 | `AcousticEchoCanceler.create()` 创建后仅设置 `enabled=true`，句柄丢弃无法释放 | 保存引用为成员变量 `aecInstance`，finally 中 `aecInstance?.release()` |
+| 3 | `android/` | 模式切换 UdpSender 重建 | `isModeRestart = false` 在 finally 中早于 `pendingRestart` 执行，新协程读不到标志 | `CaptureParams` 增加 `isModeRestart` 字段，finally 中 `isModeRestart = restart?.isModeRestart ?: false` |
+| 4 | `windows/` | 编码循环 Vec 高频分配 | 低性能/高品质分支每次 10ms 循环都 `Vec::with_capacity(15+plen)`，每秒数百次堆分配 | 预声明 `send_packet` 并 `clear() + extend_from_slice()` 复用 |
+| 5 | `protocol/`（Kotlin）| sampleRateToHz 默认值与 Rust 不一致 | Kotlin 版 `else -> 16000`，Rust 版 `else -> 48000`，采样率推断跨平台不一致 | Kotlin 两版均改为 `else -> 48000` 对齐 Rust |
+| 6 | `android_old/` | stopCapture 未清理反向资源 | `reverseDecoder`/`audioPlayer` 仅在 `doStartCapture` finally 中释放，外部 `stopCapture()` 无清理 | `stopCapture()` 中加入显式 `stop()` 和置 null |
+| 7 | `android_old/` | **反向解码器单声道→立体声** | `opus_jni_decoder.c` 硬编码 `opus_decoder_create(sr, 1, &err)` 单声道，PC 高品质模式发立体声帧时 `opus_decode()` 失败→反向静音 | 增加 `channels` 参数传入 JNI，解码器创建 `opus_decoder_create(sr, ch, &err)`；Kotlin 层 `OpusDecoder` 加 `channels` + `pcmBufferSize`；接收循环加立体声→单声道下混 `(L+R)/2`，适配旧版单声道 AudioPlayer |
+
+### 影响范围
+
+| 问题 | 触发条件 | 严重度 |
+|:----|---------|:------:|
+| WakeLock 超时 | 采集运行 >10 分钟，手机熄屏 | **高** — 断连静音 |
+| AEC 泄漏 | 每次启动/停止采集 | 中 — 累积内存占用 |
+| 模式切换重建 | 语音↔音乐切换 | 中 — 短暂网络中断~50ms |
+| Vec 高频分配 | 反向串流运行 | 低 — 微性能损耗 |
+| sampleRateToHz 不一致 | 未知采样率 | 低 — 仅边界 case |
+| stopCapture 清理 | 手动停止采集 | 低 — 资源稍晚释放 |
+| 反向解码单声道 | PC 高品质模式（默认） | **高** — 反向**完全无声** |
+
 ## 2026-06-09 — 全链路低延迟优化（500ms → <100ms 局域网端到端）
 
 ### 概述

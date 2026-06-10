@@ -1,11 +1,12 @@
 # UDP2CAL — 局域网音频串流
 
-> **当前版本: v1.1.0-hotfix2** — 全链路低延迟优化 + Opus 正反向编码实时同步 + 高级设置面板重构
+> **当前版本: v1.1.0-hotfix3** — 三端代码审查 + 立体声解码修复 + 多 Bug 修复
 > * 双向音频：手机麦克风→PC (VB-Cable) + PC 扬声器→手机听筒/扬声器
 > * 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 > * 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
 > * 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志）
 > * **android_old 发热优化**：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%（实测 Sharp NP805SH / 骁龙210 / 1GB RAM）
+> * **android_old 反向解码立体声修复**：opus_jni_decoder.c 单声道解码器→立体声，修复 PC 高品质模式反向无声
 > * v2 控制协议: 二进制发现、独占连接(TYPE_CONNECT/ACK)、8字节设备ID鉴权
 > * 双状态机: 广播状态机(Ready/Silent) + 连接状态机(Idle/Busy)，全局原子状态同步
 > * 心跳熔断: 3秒 ACK 超时标记断连，1秒无包自动释放独占，防碰撞防抢占
@@ -168,13 +169,13 @@ build_android.bat
 ```
 udp2mic/
 ├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备）
-├─ android_old/    # Android 发送端低性能版（Kotlin + JNI Opus，16kHz 全链路优化，面向低端/翻盖机）
+├─ android_old/    # Android 发送端低性能版（Kotlin + JNI Opus，48kHz FB 全频带，面向低端/翻盖机）
 │  └─ app/src/main/java/com/udp2cal/app/
-│     ├─ service/CaptureService.kt  # 采集服务（16kHz、40ms帧、ACK限频）
-│     ├─ AudioPlayer.kt             # 反向音频播放器（16kHz）
+│     ├─ service/CaptureService.kt  # 采集服务（48kHz、40ms帧合并、ACK限频、CPU自动降级）
+│     ├─ AudioPlayer.kt             # 反向音频播放器（48kHz 单声道输出）
 │     ├─ UdpSender.kt               # UDP 发送器（drainAck 5ms超时）
 │     ├─ MainActivity.kt            # 一键连接 + 十字键交互
-│     └─ native/Opus*.kt            # Opus 编码器/解码器 JNI 封装
+│     └─ native/Opus*.kt            # Opus 编码器/解码器 JNI 封装（立体声解码）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
 │  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
@@ -271,7 +272,7 @@ windows = { version = "0.58", features = [
 | **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
 | **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus信号类型变更时自动重建AudioRecord，保留网络层 |
-| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | **生产-消费双协程** + **40ms帧合并编码**（2帧打包，JNI动态帧长，25帧/秒）；ACK限频检查（每10帧）；`delay(1)`防忙等 |
+| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | **生产-消费双协程** + **40ms帧合并编码**（2帧打包，JNI动态帧长，25帧/秒）；ACK限频检查（每10帧）；`delay(1)`防忙等；CPU自动降级（/proc/self/stat 每2s检测）|
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
@@ -458,6 +459,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 版本 | 变更点 |
 |------|--------|
+| **v1.1.0-hotfix3** | 2026-06-10: 三端代码审查修复。android WakeLock 无限期持有 + AEC 释放 + 模式切换时序修正；android_old 反向解码器立体声支持（修复高品质模式反向无声）+ 下混至单声道；windows capture.rs 编码循环 Vec 复用消除高频分配；Kotlin Protocol sampleRateToHz 对齐 Rust 48000 |
 | **v1.1.0-hotfix2** | 2026-06-10: 全链路低延迟优化（500ms→50ms）；Opus 正反向编码实时同步；UI 重构（状态卡片/测试音/关于移入高级设置）；默认复杂度 10 + 自动码率；高刷新率屏幕适配；android_old 低延迟适配（AudioTrack 300→80ms） |
 | **v1.1.0-hotfix** | 2026-06-09: android_old 发热优化。JNI 动态帧长修复 40ms 帧降调；48kHz FB+256kbps 最终定型（CPU 120%→14%，测试设备 Sharp NP805SH/骁龙210/1GB）；ACK 限频轮询（soTimeout 1→5ms，每10帧）；WakeLock 无限期持有 |
 | **v1.0.9.2** | 2026-06-08: P2P 独占增强——Win 端异设备 CONNECT 静默拒绝（不推送 StatusUpdate，消除码率/电平跳动）；Android 端保活恢复持续发送；新增 `android_old/` 适配 Android 6~8 旧设备（无 Compose，低性能默认配置 + VOICE_COMMUNICATION 回退 + 一键自动连接）；`build_android.bat` 支持 4 选项同时编译新旧版本 |

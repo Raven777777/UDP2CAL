@@ -11,20 +11,22 @@
 typedef struct {
     OpusDecoder* decoder;
     int sample_rate;
-    int frame_size;
+    int channels;
+    int frame_size;  // 每通道采样数（20ms）
 } DecoderState;
 
 JNIEXPORT jlong JNICALL
 Java_com_udp2cal_app_native_OpusDecodeNative_decoderCreate(
-    JNIEnv* env, jclass clazz, jint sampleRate) {
+    JNIEnv* env, jclass clazz, jint sampleRate, jint channels) {
 
     int err = 0;
+    int ch = (channels > 0) ? channels : 1;
     int frame_size = (sampleRate * 20) / 1000;
 
-    OpusDecoder* dec = opus_decoder_create(sampleRate, 1, &err);
+    OpusDecoder* dec = opus_decoder_create(sampleRate, ch, &err);
     if (err != OPUS_OK || dec == NULL) {
         __android_log_print(ANDROID_LOG_ERROR, TAG,
-            "decoderCreate failed: err=%d sr=%d", err, sampleRate);
+            "decoderCreate failed: err=%d sr=%d ch=%d", err, sampleRate, ch);
         return 0;
     }
 
@@ -32,10 +34,11 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderCreate(
     if (state == NULL) { opus_decoder_destroy(dec); return 0; }
     state->decoder     = dec;
     state->sample_rate = sampleRate;
+    state->channels    = ch;
     state->frame_size  = frame_size;
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
-        "Decoder created: sr=%d frame=%d", sampleRate, frame_size);
+        "Decoder created: sr=%d ch=%d frame=%d", sampleRate, ch, frame_size);
 
     return (jlong)(uintptr_t)state;
 }
@@ -68,7 +71,8 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecode(
         __android_log_print(ANDROID_LOG_WARN, TAG, "decode error: %d", nb_samples);
         return -1;
     }
-    return nb_samples;
+    // 返回实际解码的总采样数（nb_samples × channels）
+    return nb_samples * state->channels;
 }
 
 JNIEXPORT void JNICALL

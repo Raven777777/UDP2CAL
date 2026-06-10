@@ -6,7 +6,7 @@ object OpusDecodeNative {
     }
 
     /** 创建 Opus 解码器，返回 handle */
-    external fun decoderCreate(sampleRate: Int): Long
+    external fun decoderCreate(sampleRate: Int, channels: Int): Long
 
     /**
      * 解码 Opus 包为 PCM

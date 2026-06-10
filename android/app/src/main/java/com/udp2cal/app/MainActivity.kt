@@ -596,7 +596,7 @@ fun OpusSettingsScreen(
                 Text("手机麦克风→PC + PC扬声器→手机", fontSize = 12.sp, color = Color(0xFF888888))
                 Text("Opus编码 · 声学回声消除 · 低延迟", fontSize = 12.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(8.dp))
-                Text("github.com/sizheguangqu/udp2cal", fontSize = 12.sp, color = Color(0xFF00E676), textAlign = TextAlign.Center)
+                Text("https://github.com/Raven777777/UDP2CAL", fontSize = 12.sp, color = Color(0xFF00E676), textAlign = TextAlign.Center)
             }
         }
     }
