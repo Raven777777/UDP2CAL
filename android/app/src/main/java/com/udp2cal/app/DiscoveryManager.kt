@@ -9,6 +9,7 @@ import java.net.InetAddress
 object DiscoveryManager {
     private const val BROADCAST_PORT = 44043
 
+    @Suppress("ArrayInDataClass")
     data class DiscoverResult(
         val ip: String,
         val port: Int,

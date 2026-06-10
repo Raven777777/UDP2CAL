@@ -5,11 +5,28 @@
 > *Copyright (C) 2026 UDP2CAL Contributors*
 > *This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3.*
 >
+> **开源软件声明**
+>
+> 本程序使用了以下开源软件（按功能分类）：
+>
+> | 库/项目 | 许可证 | 用途 |
+> |---------|--------|------|
+> | [**libopus**](https://opus-codec.org/) (1.5.2) | BSD-3-Clause | Opus 音频编解码核心 |
+> | [**iced**](https://iced.rs/) (0.14) | MIT | Windows 端 GUI 框架 |
+> | [**tokio**](https://tokio.rs/) (1.40) | MIT | 异步 UDP 收发与超时控制 |
+> | [**cpal**](https://github.com/RustAudio/cpal) (0.15) | MIT/Apache-2.0 | WASAPI 音频播放 |
+> | [**audiopus**](https://github.com/djg/audiopus-rs) (0.3.0-rc.0) | MIT | Rust Opus 编解码封装 |
+> | [**windows-rs**](https://github.com/microsoft/windows-rs) (0.58) | MIT | Windows Win32/COM API |
+> | [**Jetpack Compose**](https://developer.android.com/jetpack/compose) + **Material 3** | Apache-2.0 | Android 端现代 UI |
+> | [**Kotlin Coroutines**](https://kotlinlang.org/docs/coroutines-overview.html) | Apache-2.0 | Android 异步编程 |
+>
+> 本程序以 GPL-3.0 整体发布，上述库作为独立作品各自受其原始许可证保护，以目标代码形式动态/静态链接。
+>
 ---
 
 # UDP2CAL — 局域网音频串流
 
-> **当前版本: v1.1.0-hotfix3** — 三端代码审查 + 立体声解码修复 + 多 Bug 修复
+> **当前版本: v1.1.0** — 正式版发布：三端代码审查 + 许可证合规 + GPL-3.0 开源
 > * 双向音频：手机麦克风→PC (VB-Cable) + PC 扬声器→手机听筒/扬声器
 > * 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 > * 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
@@ -490,6 +507,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 版本 | 变更点 |
 |------|--------|
+| **v1.1.0** | 2026-06-10: **正式版发布**。GPL-3.0 许可证规范化（LICENSE 文件 + README 声明 + Android 关于页 GPL 合规文字）；build.rs 硬编码 Windows Kits SDK 路径改为动态检测；所有 Kotlin data class 标注 `@Suppress("ArrayInDataClass")`；全链路最终代码审查确认。 |
 | **v1.1.0-hotfix3** | 2026-06-10: 三端代码审查修复。android WakeLock 无限期持有 + AEC 释放 + 模式切换时序修正；android_old 反向解码器立体声支持（修复高品质模式反向无声）+ 下混至单声道；windows capture.rs 编码循环 Vec 复用消除高频分配；Kotlin Protocol sampleRateToHz 对齐 Rust 48000 |
 | **v1.1.0-hotfix2** | 2026-06-10: 全链路低延迟优化（500ms→50ms）；Opus 正反向编码实时同步；UI 重构（状态卡片/测试音/关于移入高级设置）；默认复杂度 10 + 自动码率；高刷新率屏幕适配；android_old 低延迟适配（AudioTrack 300→80ms） |
 | **v1.1.0-hotfix** | 2026-06-09: android_old 发热优化。JNI 动态帧长修复 40ms 帧降调；48kHz FB+256kbps 最终定型（CPU 120%→14%，测试设备 Sharp NP805SH/骁龙210/1GB）；ACK 限频轮询（soTimeout 1→5ms，每10帧）；WakeLock 无限期持有 |

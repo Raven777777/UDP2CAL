@@ -5,7 +5,18 @@
 
 ---
 
-## 2026-06-10 — 三端代码审查修复（android / android_old / windows / protocol）
+## 2026-06-10 — 正式版发布：GPL 许可证合规 + 最终代码审查
+
+### 概述
+
+v1.1.0 正式版发布前进行最终代码审查，发现并修复 4 个问题：
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | `android/`, `android_old/` | **GPL v3 许可证与 About 页文字矛盾** | About 页显示「未经授权 禁止转载 修改 二次发布」，违反 GPL v3 允许复制/分发/修改的规定 | 统一改为「本程序为自由软件，以 GPL v3 许可证发布」|
+| 2 | `windows/build.rs` | **SDK 路径硬编码** | `r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"` | 改为 `find_rc_path()` 函数：优先环境变量 `WindowsSdkDir`+`WindowsSDKVersion`，回退扫描默认安装目录取最新版本 |
+| 3 | `android/`, `android_old/` | **Kotlin data class 的 ByteArray 字段** | `PacketHeader` 和 `DiscoverResult` 的 `ByteArray` 字段导致自动生成的 `equals()` 使用引用比较 | 标注 `@Suppress("ArrayInDataClass")` |
+| 4 | `LICENSE`, `README.md` | **缺少开源许可证文件** | 项目无正式许可证 | 添加 GPL-3.0 `LICENSE` 文件，README 顶部插入许可证声明 |
 
 ### 概述
 

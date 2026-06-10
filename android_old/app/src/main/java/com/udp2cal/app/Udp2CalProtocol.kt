@@ -40,6 +40,7 @@ object Udp2CalProtocol {
     const val SAMPLE_RATE_48K: Byte = 4
     const val BITRATE_AUTO: Byte = 0
 
+    @Suppress("ArrayInDataClass")
     data class PacketHeader(
         val version: Byte = PROTO_VERSION,
         val isAudio: Boolean = false,

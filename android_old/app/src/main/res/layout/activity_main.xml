@@ -84,7 +84,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="未经授权 禁止转载 修改 二次发布"
+            android:text="本程序为自由软件，以 GPL v3 许可证发布"
             android:textSize="12sp"
             android:textColor="#666666"
             android:layout_marginBottom="24dp" />

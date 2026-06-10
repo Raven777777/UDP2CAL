@@ -590,7 +590,7 @@ fun OpusSettingsScreen(
                 Text("v1.1.0", fontSize = 13.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(4.dp))
                 Text("作者：四折光曲 & 井水玉藻", fontSize = 14.sp, color = Color(0xFFCCCCCC))
-                Text("未经授权 禁止转载 修改 二次发布", fontSize = 12.sp, color = Color(0xFF666666))
+                Text("本程序为自由软件，以 GPL v3 许可证发布", fontSize = 12.sp, color = Color(0xFF666666))
                 Spacer(Modifier.height(8.dp))
                 Text("双向局域网音频串流", fontSize = 14.sp, color = Color(0xFF00B0FF))
                 Text("手机麦克风→PC + PC扬声器→手机", fontSize = 12.sp, color = Color(0xFF888888))
