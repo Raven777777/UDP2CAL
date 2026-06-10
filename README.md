@@ -104,6 +104,11 @@ build_android.bat
 - **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
+
+<img src="src/Android_现代UI.webp" alt="Android 现代版主界面">
+
+
+
 ### Android Old 低性能版（`android_old/`）
 专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本。
 
@@ -119,6 +124,15 @@ build_android.bat
 - **音源回退**：优先 VOICE_COMMUNICATION（系统硬件降噪），失败回退 MIC 裸采集
 
 > 测试设备：SHARP NP805SH（翻盖机）— Snapdragon 210 (MSM8909) / 4×Cortex-A7 @1.1GHz / 1GB RAM / Android 8.1。优化后 CPU ~14%，温度 37°C 稳定。
+
+
+<img src="src/Android_Old_UI.webp" alt="Android Old 主界面">
+&nbsp;&nbsp;
+<img src="src/Android_Old_UI_ABOUT.webp" alt="Android Old 关于页">
+
+<img src="src/Android_Old耗电示意.webp" alt="Android Old CPU + 温度优化前后对比">
+<br>
+<em>android_old 发热优化：CPU 120% → 14%，温度 35→37°C 稳定</em>
 
 ---
 
@@ -141,6 +155,10 @@ build_android.bat
 
 > 所有参数在编码运行中可热修改，无需重启采集流（通过 `encoder.update()` 每帧检测变更毫秒级同步）。
 
+
+<img src="src/Android_现代设置UI.webp" alt="Android 现代版高级设置面板">
+
+
 ### Windows 接收端
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
 - **反向串流按钮**：UI 按钮控制 PC→Phone 反向音频启停（开机自启右侧），设置持久化到注册表
@@ -161,6 +179,10 @@ build_android.bat
 - **初始化状态检测**：Opus 解码器 / WASAPI 音频引擎初始化失败时实时反馈到 UI
 - **Windows 防火墙自动放行**（静默 `NETSH`，无 CMD 窗口）
 - **单实例互斥锁检测**：`CreateMutexW` 防止重复启动
+
+
+<img src="src/WIN_UI.webp" alt="Windows 接收端 UI">
+
 
 ---
 
