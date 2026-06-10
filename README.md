@@ -1,3 +1,12 @@
+> **© 2026 UDP2CAL Contributors.**
+> 本程序为自由软件，以 **GNU General Public License v3.0** 发布。
+> 详情请参阅项目根目录的 [`LICENSE`](LICENSE) 文件。
+>
+> *Copyright (C) 2026 UDP2CAL Contributors*
+> *This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 3.*
+>
+---
+
 # UDP2CAL — 局域网音频串流
 
 > **当前版本: v1.1.0-hotfix3** — 三端代码审查 + 立体声解码修复 + 多 Bug 修复
