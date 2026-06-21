@@ -649,7 +649,7 @@ class CaptureService : Service() {
                     if (ns > 0) {
                         player.write(pcmBuf, 0, ns)
                         lastAudioTime = System.currentTimeMillis()
-                        byteCount += len
+                        byteCount += plen
 
                         if (!hasAudio) {
                             hasAudio = true

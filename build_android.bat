@@ -7,14 +7,22 @@ echo    UDP2CAL Android Build Script
 echo ========================================
 echo.
 echo Select project and ABI:
-echo   [1] Modern - arm64-v8a   (64-bit)
-echo   [2] Modern - armeabi-v7a (32-bit)
-echo   [3] Old - arm64-v8a   (64-bit, Android 6~8)
-echo   [4] Old - armeabi-v7a (32-bit, Android 6~8)
+echo   [1] Modern - arm64-v8a   (64-bit, Release)
+echo   [2] Modern - armeabi-v7a (32-bit, Release)
+echo   [3] Old - arm64-v8a   (64-bit, Android 6~8, Release)
+echo   [4] Old - armeabi-v7a (32-bit, Android 6~8, Release)
+echo   [5] Modern - arm64-v8a   (64-bit, Debug)
+echo   [6] Modern - armeabi-v7a (32-bit, Debug)
+echo   [7] Old - arm64-v8a   (64-bit, Android 6~8, Debug)
+echo   [8] Old - armeabi-v7a (32-bit, Android 6~8, Debug)
 echo.
 
-choice /c 1234 /n /m "Pick [1/2/3/4]: "
+choice /c 12345678 /n /m "Pick [1-8]: "
 
+if errorlevel 8 goto old_v7a_d
+if errorlevel 7 goto old_v8a_d
+if errorlevel 6 goto v7a_d
+if errorlevel 5 goto v8a_d
 if errorlevel 4 goto old_v7a
 if errorlevel 3 goto old_v8a
 if errorlevel 2 goto v7a
@@ -24,24 +32,56 @@ goto v8a
 set ABI=arm64-v8a
 set PROJ=android
 set PREFIX=udp2cal
+set BUILD_TYPE=Release
 goto build
 
 :v7a
 set ABI=armeabi-v7a
 set PROJ=android
 set PREFIX=udp2cal
+set BUILD_TYPE=Release
 goto build
 
 :old_v8a
 set ABI=arm64-v8a
 set PROJ=android_old
 set PREFIX=udp2cal_old
+set BUILD_TYPE=Release
 goto build
 
 :old_v7a
 set ABI=armeabi-v7a
 set PROJ=android_old
 set PREFIX=udp2cal_old
+set BUILD_TYPE=Release
+goto build
+
+:v8a_d
+set ABI=arm64-v8a
+set PROJ=android
+set PREFIX=udp2cal
+set BUILD_TYPE=Debug
+goto build
+
+:v7a_d
+set ABI=armeabi-v7a
+set PROJ=android
+set PREFIX=udp2cal
+set BUILD_TYPE=Debug
+goto build
+
+:old_v8a_d
+set ABI=arm64-v8a
+set PROJ=android_old
+set PREFIX=udp2cal_old
+set BUILD_TYPE=Debug
+goto build
+
+:old_v7a_d
+set ABI=armeabi-v7a
+set PROJ=android_old
+set PREFIX=udp2cal_old
+set BUILD_TYPE=Debug
 goto build
 
 :build
@@ -49,6 +89,7 @@ echo.
 echo ========================================
 echo    Project: %PROJ%
 echo    ABI:     %ABI%
+echo    Type:    %BUILD_TYPE%
 echo ========================================
 echo.
 
@@ -59,8 +100,8 @@ echo    SDK: %ANDROID_HOME%
 echo    JAVA: %JAVA_HOME%
 echo.
 
-echo [2/3] Building Release APK (%ABI%)...
-call gradlew assembleRelease -PtargetAbi=%ABI% 2>&1
+echo [2/3] Building %BUILD_TYPE% APK (%ABI%)...
+call gradlew assemble%BUILD_TYPE% -PtargetAbi=%ABI% 2>&1
 if errorlevel 1 (
     echo.
     echo [ERROR] Build failed.
@@ -69,7 +110,7 @@ if errorlevel 1 (
 )
 
 echo.
-set APK_SRC=app\build\outputs\apk\release\app-release.apk
+set APK_SRC=app\build\outputs\apk\%BUILD_TYPE%\app-%BUILD_TYPE%.apk
 if exist "%APK_SRC%" (
     for %%A in ("%APK_SRC%") do set size=%%~zA
     set /a sizekb=!size!/1024
@@ -77,14 +118,14 @@ if exist "%APK_SRC%" (
 
     echo.
     echo [3/3] Moving APK to project root...
-    move /Y "%APK_SRC%" "%~dp0%PREFIX%_%ABI%.apk" >nul
-    echo    -^> %PREFIX%_%ABI%.apk
+    move /Y "%APK_SRC%" "%~dp0%PREFIX%_%ABI%_%BUILD_TYPE%.apk" >nul
+    echo    -^> %PREFIX%_%ABI%_%BUILD_TYPE%.apk
 
-    rmdir /s /q "app\build\outputs\apk\release" 2>nul
+    rmdir /s /q "app\build\outputs\apk\%BUILD_TYPE%" 2>nul
 
     echo.
     echo ========================================
-    echo    BUILD SUCCESS  %PREFIX%_%ABI%.apk
+    echo    BUILD SUCCESS  %PREFIX%_%ABI%_%BUILD_TYPE%.apk
     echo ========================================
 ) else (
     echo.
