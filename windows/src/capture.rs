@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::protocol;
+
 use windows::Win32::Media::Audio::{
     eConsole, eRender, AUDCLNT_STREAMFLAGS_LOOPBACK,
     IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
@@ -158,7 +160,7 @@ impl ReverseSender {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // 低性能模式: 单声道 64kbps 宽带 (16kHz); 高性能: 立体声最大码率全频带
-        let (channels, codec, frame_samps, bitrate, bandwidth, sample_rate_id) = if low_perf {
+        let (channels, _codec, frame_samps, bitrate, bandwidth, sample_rate_id) = if low_perf {
             eprintln!("[Reverse] 低性能模式: 单声道 64kbps 16kHz 宽带");
             (audiopus::Channels::Mono, CODEC_MONO, FRAME_SIZE_16K,
              audiopus::Bitrate::BitsPerSecond(64000), audiopus::Bandwidth::Wideband, 2u8)
@@ -196,13 +198,15 @@ impl ReverseSender {
         };
 
         let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_samps);
-        let mut accum_buf = [0i16; 960];  // 10ms stereo: 480 * 2chs
+        // ponytail: accum_buf 改用 vec! 使大小跟随 frame_samps (480×ch)，消除魔法数字
+        let mut accum_buf = vec![0i16; frame_samps];
         let mut mono_buf: Vec<i16> = Vec::with_capacity(FRAME_SIZE * 2);
         let mut encode_out = [0u8; 1500];
         let mut seq_num: u8 = 0;
-        let mut hdr = [0u8; 15];
-        // 【复用】预分配发送缓冲区，避免每次循环都 new Vec
-        let mut send_packet = Vec::with_capacity(15 + 1472);
+        // ponytail: 栈上发送缓冲区，build_packet_to 直接写入，消除 Vec 分配
+        let mut pkt_buf = [0u8; 1500];
+        // ponytail: 复用 loopback 读取缓冲区，消除高频 Vec 分配
+        let mut loopback_samples: Vec<f32> = Vec::with_capacity(960);
         let mut last_cfg_check = std::time::Instant::now();
 
         while running.load(Ordering::Relaxed) {
@@ -214,16 +218,21 @@ impl ReverseSender {
                 last_cfg_check = std::time::Instant::now();
             }
 
-            let samples = match read_loopback_stereo(&capture_client) {
-                Some(s) => s,
-                None => { std::thread::sleep(Duration::from_millis(5)); continue; }
-            };
+            if read_loopback_stereo(&capture_client, &mut loopback_samples).is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
 
             if low_perf {
                 // 低性能模式不需要运行时调参（android_old 不支持同步）
-                for sample_f32 in samples {
+                for &sample_f32 in &*loopback_samples {
                     let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(s);
+                }
+                // ponytail: pcm_buf 硬上限 ~3 秒，异常情况下丢弃旧数据避免 OOM
+                const MAX_PCM: usize = 96000;
+                if pcm_buf.len() > MAX_PCM {
+                    pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
                 }
                 while pcm_buf.len() >= 2 {
                     let l = pcm_buf[0] as i32;
@@ -239,27 +248,26 @@ impl ReverseSender {
                     let n = encoder.encode(&decimated[..FRAME_SIZE_16K], &mut encode_out).unwrap_or(0);
                     let plen = n.min(1472);
                     if plen > 0 {
-                        hdr[0] = 2;
-                        hdr[1] = (1u8 << 7) | (codec << 4) | sample_rate_id;
-                        hdr[2] = 0;
-                        hdr[3] = (plen >> 8) as u8;
-                        hdr[4] = plen as u8;
-                        hdr[5] = 0;
-                        hdr[6] = seq_num;
                         seq_num = seq_num.wrapping_add(1);
-                        hdr[7..15].copy_from_slice(&device_id);
-                        send_packet.clear();
-                        send_packet.extend_from_slice(&hdr[..15]);
-                        send_packet.extend_from_slice(&encode_out[..plen]);
-                        let _ = send_sock.send_to(&send_packet, android_addr);
+                        if let Some(total) = protocol::build_packet_to(
+                            &mut pkt_buf, 0, true, 0, sample_rate_id, seq_num,
+                            &device_id, &encode_out[..plen], 0,
+                        ) {
+                            let _ = send_sock.send_to(&pkt_buf[..total], android_addr);
+                        }
                     }
                     mono_buf.drain(..FRAME_SIZE.min(mono_buf.len()));
                 }
             } else {
                 // 高品质模式: 立体声直通编码
-                for sample_f32 in samples {
+                for &sample_f32 in &*loopback_samples {
                     let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(s);
+                }
+                // ponytail: pcm_buf 硬上限 ~3 秒
+                const MAX_PCM: usize = 288000;
+                if pcm_buf.len() > MAX_PCM {
+                    pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
                 }
                 while pcm_buf.len() >= frame_samps {
                     accum_buf[..frame_samps].copy_from_slice(&pcm_buf[..frame_samps]);
@@ -267,19 +275,13 @@ impl ReverseSender {
                     if let Ok(n) = encoder.encode(&accum_buf[..frame_samps], &mut encode_out) {
                         let plen = n.min(1472);
                         if plen > 0 {
-                            hdr[0] = 2;
-                            hdr[1] = (1u8 << 7) | (codec << 4) | sample_rate_id;
-                            hdr[2] = 0;
-                            hdr[3] = (plen >> 8) as u8;
-                            hdr[4] = plen as u8;
-                            hdr[5] = 0;
-                            hdr[6] = seq_num;
                             seq_num = seq_num.wrapping_add(1);
-                            hdr[7..15].copy_from_slice(&device_id);
-                            send_packet.clear();
-                            send_packet.extend_from_slice(&hdr[..15]);
-                            send_packet.extend_from_slice(&encode_out[..plen]);
-                            let _ = send_sock.send_to(&send_packet, android_addr);
+                            if let Some(total) = protocol::build_packet_to(
+                                &mut pkt_buf, 0, true, 0, sample_rate_id, seq_num,
+                                &device_id, &encode_out[..plen], 0,
+                            ) {
+                                let _ = send_sock.send_to(&pkt_buf[..total], android_addr);
+                            }
                         }
                     }
                 }
@@ -333,7 +335,8 @@ fn init_loopback() -> Option<IAudioCaptureClient> {
 }
 
 /// 从环回捕获读取一帧 32 位浮点 PCM，输出立体声交错（L,R,L,R,...）
-fn read_loopback_stereo(capture: &IAudioCaptureClient) -> Option<Vec<f32>> {
+/// ponytail: 复用调用方传入的 `out` 缓冲区，消除每次调用的 Vec 分配
+fn read_loopback_stereo(capture: &IAudioCaptureClient, out: &mut Vec<f32>) -> Option<()> {
     unsafe {
         let mut data_ptr: *mut u8 = std::ptr::null_mut();
         let mut packet_size: u32 = 0;
@@ -354,10 +357,10 @@ fn read_loopback_stereo(capture: &IAudioCaptureClient) -> Option<Vec<f32>> {
         let total_samples = num_frames * 2;
         let src = std::slice::from_raw_parts(data_ptr as *const f32, total_samples);
 
-        let mut stereo = Vec::with_capacity(total_samples);
-        stereo.extend_from_slice(src);
+        out.clear();
+        out.extend_from_slice(src);
 
         let _ = capture.ReleaseBuffer(packet_size);
-        Some(stereo)
+        Some(())
     }
 }

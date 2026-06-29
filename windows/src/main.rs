@@ -193,15 +193,22 @@ fn start_broadcast_state_machine() {
                 && GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY {
                 let device_id = my_device_id();
                 let my_name = my_device_name();
-                let mut payload = Vec::with_capacity(2 + my_name.len());
                 let port = config::Config::load().listen_port as u16;
-                payload.extend_from_slice(&port.to_be_bytes());
-                payload.extend_from_slice(my_name.as_bytes());
-                let packet = protocol::build_packet(
-                    false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
-                    &device_id, &payload, 0,
-                );
-                let _ = socket.send_to(&packet, "255.255.255.255:44043");
+                // ponytail: 独立 payload 缓冲区避免与 pkt_buf 可变借用冲突
+                let mut payload_buf = [0u8; 256];
+                let name_bytes = my_name.as_bytes();
+                let payload_len = 2 + name_bytes.len();
+                if payload_len + protocol::HEADER_SIZE <= 1500 && payload_len <= payload_buf.len() {
+                    let mut pkt_buf = [0u8; 1500];
+                    payload_buf[..2].copy_from_slice(&port.to_be_bytes());
+                    payload_buf[2..payload_len].copy_from_slice(name_bytes);
+                    if let Some(total) = protocol::build_packet_to(
+                        &mut pkt_buf, 0, false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
+                        &device_id, &payload_buf[..payload_len], 0,
+                    ) {
+                        let _ = socket.send_to(&pkt_buf[..total], "255.255.255.255:44043");
+                    }
+                }
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -254,14 +261,21 @@ pub fn start_broadcast_listener() {
                                 let port = cfg.listen_port as u16;
                                 let my_id = cfg.get_device_id_bytes();
                                 let my_name = my_device_name();
-                                let mut payload = Vec::with_capacity(2 + my_name.len());
-                                payload.extend_from_slice(&port.to_be_bytes());
-                                payload.extend_from_slice(my_name.as_bytes());
-                                let reply = protocol::build_packet(
-                                    false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
-                                    &my_id, &payload, 0,
-                                );
-                                let _ = socket.send_to(&reply, src);
+                                // ponytail: 独立 payload 缓冲区避免借用冲突
+                                let mut payload_buf = [0u8; 256];
+                                let name_bytes = my_name.as_bytes();
+                                let payload_len = 2 + name_bytes.len();
+                                if payload_len + protocol::HEADER_SIZE <= 1500 && payload_len <= payload_buf.len() {
+                                    let mut pkt_buf = [0u8; 1500];
+                                    payload_buf[..2].copy_from_slice(&port.to_be_bytes());
+                                    payload_buf[2..payload_len].copy_from_slice(name_bytes);
+                                    if let Some(total) = protocol::build_packet_to(
+                                        &mut pkt_buf, 0, false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
+                                        &my_id, &payload_buf[..payload_len], 0,
+                                    ) {
+                                        let _ = socket.send_to(&pkt_buf[..total], src);
+                                    }
+                                }
                                 continue;
                             }
                         }
