@@ -76,6 +76,19 @@ if errorlevel 1 (
 )
 echo   Rust: OK
 
+echo.
+echo [1.25/3] Checking CMake...
+cmake --version >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] CMake not found in PATH.
+    echo         Install CMake 3.22+ and enable "Add CMake to the system PATH",
+    echo         or install it with: winget install Kitware.CMake
+    echo         Then open a new Command Prompt and run this script again.
+    pause
+    exit /b 1
+)
+echo   CMake: OK
+
 :::: Ensure target is installed
 echo.
 echo [1.5/3] Ensuring target %TARGET%...
