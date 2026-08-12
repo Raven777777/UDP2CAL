@@ -18,11 +18,12 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Mutex, OnceLock}; 
 use std::time::{Duration, Instant}; 
 use windows::Win32::System::Threading::CreateMutexW; 
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS}; 
+use windows::Win32::Foundation::{BOOL, GetLastError, HWND, LPARAM, ERROR_ALREADY_EXISTS};
 use windows::Win32::UI::WindowsAndMessaging::{ 
-    MessageBoxW, FindWindowW, ShowWindow, SetForegroundWindow, MB_OK, MB_ICONINFORMATION, SW_HIDE, SW_RESTORE 
+    EnumWindows, GetWindowThreadProcessId, MessageBoxW, SetForegroundWindow, ShowWindow, MB_OK,
+    MB_ICONINFORMATION, SW_RESTORE,
 }; 
-use windows::core::PCWSTR; 
+use windows::core::PCWSTR;
 
 // ========================================== 
 // 图标加载 (编译期嵌入 icon.png) 
@@ -55,6 +56,15 @@ fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
         (rgba, width, height) 
     } 
 } 
+
+#[derive(Debug, Clone, Copy)]
+enum TrayCommand {
+    Restore,
+    Quit,
+}
+
+static TRAY_COMMANDS: OnceLock<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<TrayCommand>>> =
+    OnceLock::new();
 
 // ══════════════════════════════════════════════
 // P2P 独占通信 - 全局共享状态
@@ -360,26 +370,10 @@ fn main() -> Result<(), iced::Error> {
     let (icon_rgba, w, h) = load_icon_rgba(); 
 
     // 系统托盘
-    let tray_menu = tray_icon::menu::Menu::new(); 
-    let quit_item = tray_icon::menu::MenuItemBuilder::new() 
-        .id("quit".into()) 
-        .text("退出") 
-        .enabled(true) 
-        .build(); 
-    let _ = tray_menu.append(&quit_item); 
-
-    let tray_icon_img = tray_icon::Icon::from_rgba(icon_rgba.clone(), w, h).unwrap(); 
-    let tray_icon = tray_icon::TrayIconBuilder::new() 
-        .with_menu(Box::new(tray_menu)) 
-        .with_tooltip("UDP2CAL") 
-        .with_icon(tray_icon_img)
-        .with_menu_on_left_click(false) 
-        .build() 
-        .unwrap(); 
-    Box::leak(Box::new(tray_icon)); 
+    let tray_icon = install_tray(icon_rgba.clone(), w, h);
 
     // 主窗体
-    iced::application(move || {
+    let result = iced::application(move || {
         let cfg = config::Config::load();
         REVERSE_ENABLED.store(if cfg.reverse_enabled != 0 { 1 } else { 0 }, Ordering::Relaxed);
         let now = Instant::now();
@@ -413,7 +407,10 @@ fn main() -> Result<(), iced::Error> {
             icon: Some(iced::window::icon::from_rgba(icon_rgba, w, h).unwrap()),
             ..Default::default()
         })
-        .run() 
+        .run();
+
+    drop(tray_icon);
+    result
 } 
 
 impl AppState { 
@@ -509,32 +506,20 @@ impl AppState {
                     self.status_text = "已断开".into(); 
                 } 
                 Task::none() 
-            } 
+            }
             Message::HideWindow => {
-                unsafe { 
-                    let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect(); 
-                    if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
-                        if !hwnd.is_invalid() { 
-                            let _ = ShowWindow(hwnd, SW_HIDE); 
-                        } 
-                    } 
-                } 
-                Task::none() 
+                latest_window_task(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
             }
             Message::ShowWindow => {
-                unsafe { 
-                    let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect(); 
-                    if let Ok(hwnd) = FindWindowW(None, PCWSTR::from_raw(title.as_ptr())) { 
-                        if !hwnd.is_invalid() { 
-                            let _ = ShowWindow(hwnd, SW_RESTORE); 
-                            let _ = SetForegroundWindow(hwnd); 
-                        } 
-                    } 
-                } 
-                Task::none() 
+                latest_window_task(|id| {
+                    Task::batch([
+                        iced::window::set_mode(id, iced::window::Mode::Windowed),
+                        iced::window::gain_focus(id),
+                    ])
+                })
             }
             Message::Quit => { 
-                std::process::exit(0); 
+                iced::exit()
             } 
         } 
     } 
@@ -827,27 +812,112 @@ impl AppState {
         }
 
         Subscription::batch(subs)
-    } 
+    }
 } 
 
-fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(10, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-        let tray_rx = tray_icon::TrayIconEvent::receiver();
-        let menu_rx = tray_icon::menu::MenuEvent::receiver();
-        loop {
-            if let Ok(event) = tray_rx.try_recv() {
-                if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
-                    let _ = output.send(Message::ShowWindow).await;
-                }
-            }
-            if let Ok(event) = menu_rx.try_recv() {
-                if event.id == "quit" {
-                    let _ = output.send(Message::Quit).await;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+fn latest_window_task<F>(mut operation: F) -> Task<Message>
+where
+    F: FnMut(iced::window::Id) -> Task<Message> + Send + 'static,
+{
+    iced::window::latest().then(move |id| match id {
+        Some(id) => operation(id),
+        None => Task::none(),
     })
+}
+
+fn install_tray(icon_rgba: Vec<u8>, width: u32, height: u32) -> tray_icon::TrayIcon {
+    let (sender, receiver) = tokio::sync::mpsc::channel(16);
+    let _ = TRAY_COMMANDS.set(tokio::sync::Mutex::new(receiver));
+
+    let restore_sender = sender.clone();
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+            let _ = restore_sender.try_send(TrayCommand::Restore);
+        }
+    }));
+    tray_icon::menu::MenuEvent::set_event_handler(Some(
+        move |event: tray_icon::menu::MenuEvent| {
+            if event.id == "quit" {
+                let _ = sender.try_send(TrayCommand::Quit);
+            }
+        },
+    ));
+
+    let tray_menu = tray_icon::menu::Menu::new();
+    let quit_item = tray_icon::menu::MenuItemBuilder::new()
+        .id("quit".into())
+        .text("退出")
+        .enabled(true)
+        .build();
+    let _ = tray_menu.append(&quit_item);
+
+    let tray_icon_img = tray_icon::Icon::from_rgba(icon_rgba, width, height)
+        .expect("embedded tray icon must be valid");
+    tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("UDP2CAL")
+        .with_icon(tray_icon_img)
+        .with_menu_on_left_click(false)
+        .build()
+        .expect("tray icon must be created")
+}
+
+fn restore_native_window() {
+    let mut search = WindowSearch {
+        process_id: std::process::id(),
+        window: HWND(std::ptr::null_mut()),
+    };
+    unsafe {
+        let _ = EnumWindows(
+            Some(find_window_for_process),
+            LPARAM((&mut search as *mut WindowSearch) as isize),
+        );
+        if !search.window.0.is_null() {
+            let _ = ShowWindow(search.window, SW_RESTORE);
+            let _ = SetForegroundWindow(search.window);
+        }
+    }
+}
+
+struct WindowSearch {
+    process_id: u32,
+    window: HWND,
+}
+
+unsafe extern "system" fn find_window_for_process(hwnd: HWND, data: LPARAM) -> BOOL {
+    let search = &mut *(data.0 as *mut WindowSearch);
+    let mut process_id = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    if process_id == search.process_id {
+        search.window = hwnd;
+        BOOL(0)
+    } else {
+        BOOL(1)
+    }
+}
+
+fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        10,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let Some(commands) = TRAY_COMMANDS.get() else {
+                return;
+            };
+            let mut commands = commands.lock().await;
+            while let Some(command) = commands.recv().await {
+                let message = match command {
+                    TrayCommand::Restore => {
+                        restore_native_window();
+                        Message::ShowWindow
+                    }
+                    TrayCommand::Quit => Message::Quit,
+                };
+                if output.send(message).await.is_err() {
+                    break;
+                }
+            }
+        }
+    )
 }
 
 /// 发送 CONNECT_ACK 到 Android 的源地址（端口来自 CONNECT 包的 src_addr）
