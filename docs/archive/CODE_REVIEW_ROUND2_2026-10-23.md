@@ -175,7 +175,7 @@ tray_icon::TrayIconBuilder::new()
 | P2-7 | `CaptureService.kt:660-718` | 反向接收无序号处理、无去重、不校验 `hdr.deviceId`，仅按源 IP 过滤 | 与 PC 端 `ReorderBuffer` 能力不对称；乱序/重复包直接进 `opus_decode`，弱网下产生爆音 | 复用协议层的重排语义（Kotlin 侧补一个等价的 `ReorderBuffer`），并校验发送端设备 ID |
 | P2-8 | `main.rs:1256-1264`、`protocol.rs:97-130` | P2P 准入只比对明文 `device_id`，而 `device_id` 每秒随 `DISCOVER_REPLY` 广播 | 同网段任意主机可嗅探 ID 后冒充"同设备保活"占用 PC；READY 时先到先得的 `TYPE_CONNECT` 可被恶意长期占用 | 属设计级限制：至少在 `docs/PROTOCOL.md` 写明威胁模型（"防误连，不防伪造"）；后续可加一次性 nonce 或 PSK HMAC |
 | P2-9 | `main.rs:298-344` | `TYPE_DISCOVER_REQ` 无速率限制、无源地址校验，每请求必回包 | 可被用于 UDP 反射放大（请求 15 B → 回包 ~15+2+主机名，放大约 1.5×） | 加简单令牌桶（每源 IP ≤5 次/秒） |
-| P2-10 | 仓库根 | `android_old/lanmic-debug.keystore` **仍被 Git 跟踪**（口令为 `android`，与上一轮 P0-3 同源） | 虽已不被构建引用，但历史密钥留在公开仓库，任何曾用它签名的 APK 都可被同签名覆盖安装 | 从索引与历史中移除（`git filter-repo`），并在 Release 说明中声明历史包不再受信 |
+| P2-10 | 仓库根 | 调试密钥库 `lanmic-debug.keystore` **仍被 Git 跟踪**（口令为 `android`，与上一轮 P0-3 同源） | 虽已不被构建引用，但历史密钥留在公开仓库，任何曾用它签名的 APK 都可被同签名覆盖安装 | 从索引与历史中移除（`git filter-repo`），并在 Release 说明中声明历史包不再受信 |
 | P2-11 | `android/app/build.gradle.kts` | `NotificationCompat` / `ContextCompat` 来自 `androidx.core`，但依赖块未显式声明（仅靠 Compose 传递）；`lint.abortOnError = false` | 上游一旦裁剪传递依赖即编译失败；lint 门禁形同虚设 | 显式 `implementation("androidx.core:core-ktx:<ver>")`；lint 全绿后把 `abortOnError` 改 `true` |
 | P2-12 | `CaptureService.kt:37`、`Prefs.kt:8-14` | `hasNewCapture` 为普通 `Boolean`，跨主线程/IO 协程读写；`Prefs.prefs` 为 `lateinit`，同样无同步 | JMM 下可见性不保证，理论上出现"停止后仍被判定为新启动"的偶发行为 | `@Volatile private var hasNewCapture`；`@Volatile` 修饰 `prefs` 或在 `init` 后不再变更（当前实践可用，补注解即可） |
 
@@ -206,8 +206,6 @@ tray_icon::TrayIconBuilder::new()
 | 2 | `docs/ARCHITECTURE.md` §四 | "Android 每 ~1s（**50 帧**）发 CONNECT" | `CaptureService.kt` 的 `RECONNECT_INTERVAL = 100`（10 ms/帧 → 1 s） |
 | 3 | `docs/ARCHITECTURE.md` §五 | 引用 `GLOBAL_DEVICE_STATE` / `BOUND_DEVICE_ID` 两个全局 | 已重构为单把锁 `P2P_STATE: Mutex<P2pState>`（代码方向正确，文档未跟进） |
 | 4 | `docs/ARCHITECTURE.md` §五、`FEATURES.md` | 第三方端 `drainAck()` 1 ms 超时；保活周期 50 帧 | 已改为独立 ACK 线程 + 500 ms `soTimeout`；保活 100 帧 |
-
-另：`docs/ARCHITECTURE.md` 的项目结构树只列了 `android_old/` 的内部文件，未列 `android/`，容易被误读为"当前实现就是下面这些"。
 
 ---
 

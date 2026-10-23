@@ -11,11 +11,6 @@ __pycache__/
 /android/build/
 /android/app/build/
 /android/app/.cxx/
-/android_old/.gradle/
-/android_old/.kotlin/
-/android_old/build/
-/android_old/app/build/
-/android_old/app/.cxx/
 */target
 
 # 根目录发布产物

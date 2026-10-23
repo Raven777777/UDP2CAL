@@ -8,7 +8,7 @@
 
 ```
 udp2cal/
-├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备，当前维护）
+├─ android/        # Android 发送端（Kotlin + JNI Opus，Android 10+）
 │  └─ app/src/main/
 │     ├─ java/com/udp2cal/app/
 │     │  ├─ MainActivity.kt          # Compose UI + 运行时权限申请
@@ -20,13 +20,6 @@ udp2cal/
 │     │  ├─ service/CaptureService.kt# 前台采集服务（生产-消费双协程 + ShortArrayPool）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
 │     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c + vendored libopus
-├─ android_old/    # 【仅存档】低性能版，v1.1.2 起与 PC 端不互通，以下描述不代表当前实现
-│  └─ app/src/main/java/com/udp2cal/app/
-│     ├─ service/CaptureService.kt  # 采集服务（48kHz、40ms帧合并、ACK限频、CPU自动降级）
-│     ├─ AudioPlayer.kt             # 反向音频播放器（48kHz 单声道输出）
-│     ├─ UdpSender.kt               # UDP 发送器（drainAck 5ms超时）
-│     ├─ MainActivity.kt            # 一键连接 + 十字键交互
-│     └─ native/Opus*.kt            # Opus 编码器/解码器 JNI 封装（立体声解码）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
 │  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
@@ -54,12 +47,10 @@ udp2cal/
 
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
-| **UI 层（Android 现代版）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
-| **UI 层（Android Old）** | 传统 View + AppCompat | 已归档；v1.1.2 起与当前 PC 端不互通 |
+| **UI 层（Android）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
 | **UI 层（Windows）** | Iced (Rust) 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
-| **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
-| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | 已归档；**生产-消费双协程** + **40ms 帧合并编码**（2 帧打包，JNI 动态帧长，25 帧/秒）；ACK 限频检查（每 10 帧）；CPU 自动降级（`/proc/self/stat` 每 2s 检测）|
+| **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；**独立 ACK 接收线程**（500ms `soTimeout`，收到 `CONNECT_ACK` 即刷新 `lastAckTime`），音频流水线不再被 1ms 超时轮询干扰 |
@@ -124,7 +115,7 @@ windows = { version = "0.58", features = [
 
 | 协商项 | 策略 |
 | --- | --- |
-| 采样率（现代版） | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
+| 采样率 | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
 | 反向串流编码 | PC 固定 48kHz 立体声全频带，码率与复杂度由手机端 CONNECT 携带的 Opus 参数同步 |
 | 反向捕获采样率 | 读取端点共享模式混音格式的 `nSamplesPerSec`；非 48 kHz（如 44.1 kHz HDMI/USB 设备）在编码前用相位连续线性插值归一到 48 kHz |
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()` / `default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |

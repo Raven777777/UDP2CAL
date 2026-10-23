@@ -136,8 +136,6 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA
 
 > Kotlin 端为手动对齐实现，任何协议字段变更必须同步修改 `protocol/protocol.rs`、`windows/src/protocol.rs`（若涉及重导出）以及 `android/app/src/main/java/com/udp2cal/app/Udp2CalProtocol.kt`。
 >
-> `android_old/` 的 `Udp2CalProtocol.kt` 自 v1.1.2 起已脱离协议兼容链，不再随协议同步。
->
 > 历史教训：Kotlin 版 `sampleRateToHz` 默认值曾为 `16000`，与 Rust 版 `48000` 不一致，已修正对齐（见 [BUGFIX.md](BUGFIX.md)）。
 
 ---

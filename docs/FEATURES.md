@@ -1,6 +1,6 @@
 # 功能特性
 
-> 相关文档：[构建说明](BUILD.md) · [架构说明](ARCHITECTURE.md) · [低性能版专项](ANDROID_OLD.md)
+> 相关文档：[构建说明](BUILD.md) · [架构说明](ARCHITECTURE.md)
 
 ---
 
@@ -12,10 +12,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
   反向: PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器
 ```
 
-UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供两个 Android 客户端版本：
-
-- **`android/`（现代版）** — 面向 Jetpack Compose 设备，固定 48kHz 采集，支持全参数 Opus 调节 + 反向编码实时同步；
-- **`android_old/`（低性能版，已归档）** — 面向 Android 6~8 低端/翻盖机，源码仅作归档；**v1.1.2 起 PC 端已删除低性能适配，旧 APK 与当前 PC 端不互通**。
+UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。Android 客户端为 `android/`：面向 Jetpack Compose 设备（Android 10+），固定 48kHz 采集，支持全参数 Opus 调节 + 反向编码实时同步。
 
 **全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。
 
@@ -27,8 +24,6 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 - 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
 - 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志，v1.1.2 已移除）
-- **android_old 发热优化**：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%
-- **android_old 反向解码立体声修复**：`opus_jni_decoder.c` 单声道解码器→立体声，修复 PC 高品质模式反向无声
 - v2 控制协议：二进制发现、独占连接（TYPE_CONNECT/ACK）、8 字节设备 ID 鉴权
 - 双状态机：广播状态机（Ready/Silent）+ 连接状态机（Idle/Busy），全局原子状态同步
 - 心跳熔断：3 秒 ACK 超时标记断连，1 秒无包自动释放独占，防碰撞防抢占
@@ -48,7 +43,7 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 
 ---
 
-## 四、Android 发送端（现代版，`android/`）
+## 四、Android 发送端（`android/`）
 
 - **音源自适应切换**：仅一个 `isVoiceMode` 状态变量驱动全部音源决策。语音模式→VOICE_COMMUNICATION（安卓系统原生硬件降噪+AEC），全频模式→MIC（裸麦直出，硬件降噪关闭）；异常回退 MIC 保底通路
 - **声学回声消除**：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION AudioTrack + 同音频 session 绑定
@@ -65,38 +60,11 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
-![Android 现代版主界面](assets/android-modern-main.webp)
+![Android 主界面](assets/android-modern-main.webp)
 
 ---
 
-## 五、Android Old 低性能版（`android_old/`）— 已停止开发
-
-> ⚠️ 该版本自 v1.1.1 起停止开发，v1.1.2 起 PC 端已删除全部低性能适配代码，与当前 PC 端**不互通**。以下特性描述对应其最终状态，源码仅归档。旧设备请成对使用 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)。
-
-专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本。详见 [ANDROID_OLD.md](ANDROID_OLD.md)。
-
-- **48kHz 全频带编码**：正向 48kHz Opus 编码，FB 全频带，256kbps VBR；反向 48kHz 立体声最大码率（PC 高品质模式）
-- **40ms 帧合并编码**：合并 2 帧打包编码，编码频率 50→25 帧/秒，CPU 占用从 120% 降至 ~14%
-- **JNI 动态帧长**：`opus_jni.c` 硬编码 `state->frame_size` → 改用实际数组长度，支持 20ms/40ms/60ms 灵活帧，修复 40ms 帧降调问题
-- **CPU 自动降级**：读取 `/proc/self/stat` 进程 CPU 时间，每 2s 检测；>40% 时渐进降级（FB→SWB→WB→MB，码率 256→128→64→32kbps），通过 `encoder.update()` 热切换，无需重启采集流
-- **ACK 限频轮询**：每 10 帧检查一次 ACK，`soTimeout` 5ms，drainAck CPU 开销降为 1/50
-- **传统 View 布局**：无 Jetpack Compose，minSdk=21，targetSdk=26
-- **一键自动连接**：UDP 广播发现局域网 PC 端，自动连接无需手动输入
-- **均衡配置**：Opus 复杂度 1、DTX 开启、VBR 256kbps、全频带 FB
-- **十字键交互**：上下调音量，左右切换关于页，适配物理键盘翻盖机
-- **音源回退**：优先 VOICE_COMMUNICATION（系统硬件降噪），失败回退 MIC 裸采集
-
-> 测试设备：SHARP NP805SH（翻盖机）— Snapdragon 210 (MSM8909) / 4×Cortex-A7 @1.1GHz / 1GB RAM / Android 8.1。优化后 CPU ~14%，温度 37°C 稳定。
-
-![Android Old 主界面](assets/android-old-main.webp)&nbsp;&nbsp;![Android Old 关于页](assets/android-old-about.webp)
-
-![Android Old CPU + 温度优化前后对比](assets/android-old-cpu-power.webp)
-
-*android_old 发热优化：CPU 120% → 14%，温度 35→37°C 稳定*
-
----
-
-## 六、Windows 接收端
+## 五、Windows 接收端
 
 - **Rust + iced 原生 UI**：暗色主题，实时音量电平显示
 - **反向串流按钮**：UI 按钮控制 PC→Phone 反向音频启停（开机自启右侧），设置持久化到注册表
@@ -122,9 +90,9 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 
 ---
 
-## 七、Opus 编码器参数说明（现代版 `android/` 设置面板）
+## 六、Opus 编码器参数说明（`android/` 设置面板）
 
-现代版 Android App 内置 Opus 高级编码设置面板，以下为各参数详解：
+Android App 内置 Opus 高级编码设置面板，以下为各参数详解：
 
 | 参数 | 默认值 | 可选值 | 说明 |
 |------|--------|--------|------|
@@ -141,4 +109,4 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 
 > 所有参数在编码运行中可热修改，无需重启采集流（通过 `encoder.update()` 每帧检测变更毫秒级同步）。
 
-![Android 现代版高级设置面板](assets/android-modern-settings.webp)
+![Android 高级设置面板](assets/android-modern-settings.webp)

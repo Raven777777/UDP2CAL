@@ -205,7 +205,7 @@ def cmd_android(args) -> int:
     logger = make_logger("android", getattr(args, "verbose", False))
     ctx = Ctx()
     _apply_common(ctx, args)
-    ctx.target = "old" if getattr(args, "old", False) else "modern"
+    ctx.target = "modern"
     ctx.abi = getattr(args, "abi", None) or "arm64-v8a"
     ctx.build_type = "Debug" if getattr(args, "debug", False) else "Release"
     try:
@@ -218,7 +218,7 @@ def cmd_adb(args) -> int:
     logger = make_logger("adb", getattr(args, "verbose", False))
     ctx = Ctx()
     _apply_common(ctx, args)
-    ctx.target = "old" if getattr(args, "old", False) else "modern"
+    ctx.target = "modern"
     ctx.abi = getattr(args, "abi", None) or "arm64-v8a"
     ctx.adb_build = getattr(args, "build", False)
     ctx.adb_install = getattr(args, "install", False)
@@ -323,27 +323,19 @@ def _menu_windows() -> int:
 
 def _menu_android() -> int:
     print()
-    print("选择项目与 ABI:")
-    print("  [1] Modern - arm64-v8a   (64 位, Release)")
-    print("  [2] Modern - armeabi-v7a (32 位, Release)")
-    print("  [3] Old    - arm64-v8a   (64 位, Android 6~8, Release)")
-    print("  [4] Old    - armeabi-v7a (32 位, Android 6~8, Release)")
-    print("  [5] Modern - arm64-v8a   (64 位, Debug)")
-    print("  [6] Modern - armeabi-v7a (32 位, Debug)")
-    print("  [7] Old    - arm64-v8a   (64 位, Android 6~8, Debug)")
-    print("  [8] Old    - armeabi-v7a (32 位, Android 6~8, Debug)")
+    print("选择 ABI 与构建类型:")
+    print("  [1] arm64-v8a   (64 位, Release)")
+    print("  [2] armeabi-v7a (32 位, Release)")
+    print("  [3] arm64-v8a   (64 位, Debug)")
+    print("  [4] armeabi-v7a (32 位, Debug)")
     print()
     mapping = {
         "1": ("modern", "arm64-v8a", "Release"),
         "2": ("modern", "armeabi-v7a", "Release"),
-        "3": ("old", "arm64-v8a", "Release"),
-        "4": ("old", "armeabi-v7a", "Release"),
-        "5": ("modern", "arm64-v8a", "Debug"),
-        "6": ("modern", "armeabi-v7a", "Debug"),
-        "7": ("old", "arm64-v8a", "Debug"),
-        "8": ("old", "armeabi-v7a", "Debug"),
+        "3": ("modern", "arm64-v8a", "Debug"),
+        "4": ("modern", "armeabi-v7a", "Debug"),
     }
-    choice = _ask("选择 [1-8]: ", tuple(mapping), default="1")
+    choice = _ask("选择 [1-4]: ", tuple(mapping), default="1")
     target, abi, build_type = mapping[choice]
 
     ctx = Ctx(target=target, abi=abi, build_type=build_type)
@@ -448,9 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_win.set_defaults(func=cmd_win)
 
     p_android = sub.add_parser("android", aliases=["apk"], help="构建 Android APK")
-    android_target = p_android.add_mutually_exclusive_group()
-    android_target.add_argument("--modern", action="store_true", help="使用 android（Android 10+，默认）")
-    android_target.add_argument("--old", action="store_true", help="使用 android_old（Android 6~8）")
+    p_android.add_argument("--modern", action="store_true", help="使用 android（Android 10+，默认且唯一目标）")
     p_android.add_argument("--abi", default="arm64-v8a", choices=config.ANDROID_ABIS, help="目标 ABI")
     android_mode = p_android.add_mutually_exclusive_group()
     android_mode.add_argument("--release", action="store_true", help="Release 构建（默认）")
@@ -465,9 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_adb.add_argument("--monitor", action="store_true", help="Logcat 监控")
     p_adb.add_argument("--winlog", action="store_true", help="打开 Windows 调试日志")
     p_adb.add_argument("--all", action="store_true", help="执行全部操作")
-    adb_target = p_adb.add_mutually_exclusive_group()
-    adb_target.add_argument("--modern", action="store_true", help="调试 android（默认）")
-    adb_target.add_argument("--old", action="store_true", help="调试 android_old")
+    p_adb.add_argument("--modern", action="store_true", help="调试 android（默认且唯一目标）")
     p_adb.add_argument("--abi", default="arm64-v8a", choices=config.ANDROID_ABIS)
     p_adb.add_argument("--adb", help="指定 adb.exe 路径")
     add_common(p_adb)

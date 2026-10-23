@@ -30,8 +30,7 @@
 
 | 平台 | 最低版本 | 架构 | 说明 |
 |------|---------|------|------|
-| **Android (android)** | **Android 10 (API 29)+** | arm64-v8a (64-bit) / armeabi-v7a (32-bit) | minSdk=29, targetSdk=35, 需要 `RECORD_AUDIO` 权限。面向现代设备，Jetpack Compose UI |
-| **Android (android_old)** ⚠️ 已停止开发 | **Android 6~8 (API 21~26)** | armeabi-v7a (32-bit 推荐) / arm64-v8a | minSdk=21, targetSdk=26, 无 Compose。仅归档；v1.1.2 起 PC 端不再兼容，需成对使用 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1) |
+| **Android** | **Android 10 (API 29)+** | arm64-v8a (64-bit) / armeabi-v7a (32-bit) | minSdk=29, targetSdk=35, 需要 `RECORD_AUDIO` 权限。Jetpack Compose UI |
 | **Windows** | **Windows 10+** | x86_64 (64-bit) / i686 (32-bit) | 依赖 WASAPI 音频引擎 + VB-Cable 虚拟声卡；系统托盘和防火墙规则仅 Windows 可用 |
 
 ---
@@ -60,20 +59,7 @@ build.bat android --modern --abi arm64-v8a --release
 build.bat android --modern --abi armeabi-v7a --release
 ```
 
-> **`android_old/` 已停止开发**，自 v1.1.1 起不再提供构建支持；自 v1.1.2 起 `windows/` 与 `protocol/` 已删除低性能适配，产物与当前 PC 端不互通。下述旧命令仅作历史归档保留，不保证可用。需要旧版配对产物请从 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1) 下载。
-
-```bat
-:: 归档命令，不再维护
-build.bat android --old    --abi arm64-v8a --release
-build.bat android --old    --abi armeabi-v7a --debug
-```
-
-`android_old/` 已停止开发；旧版源码若需自行尝试构建，方式为：
-
-```bat
-cd android_old
-gradlew assembleRelease -PtargetAbi=armeabi-v7a
-```
+`--modern` 为默认且唯一目标（`android/`）。
 
 ### 环境体检 / ADB 调试
 
@@ -93,9 +79,8 @@ build.bat adb --all         :: 编译 + 安装 + 清缓冲 + 监控 + 打开 Win
 | --- | --- | --- |
 | `udp2cal_{x64,x86}.exe` | ~6.3 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
 | `udp2cal_{x64,x86}-debug.exe` | ~22 MB | Windows 调试版 |
-| `udp2cal_arm64-v8a_Release.apk` | ~2.7 MB | Android 现代版 (64位，已签名；签名来源见下) |
-| `udp2cal_armeabi-v7a_Release.apk` | ~2.7 MB | Android 现代版 (32位，已签名；签名来源见下) |
-| `udp2cal_old_{arm64-v8a,armeabi-v7a}_Release.apk` | ~2.65 MB | Android Old 低性能版（**已停止开发**，历史产物，见 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)）|
+| `udp2cal_arm64-v8a_Release.apk` | ~2.7 MB | Android 客户端 (64位，已签名；签名来源见下) |
+| `udp2cal_armeabi-v7a_Release.apk` | ~2.7 MB | Android 客户端 (32位，已签名；签名来源见下) |
 
 ### 发布签名
 

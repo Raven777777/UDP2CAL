@@ -24,14 +24,6 @@ ANDROID_TARGETS = {
         "prefix": "udp2cal",
         "label": "Modern (minSdk 29 / Android 10+)",
         "compile_sdk": "android-35",
-        "ndk": "27.0.12077973",
-    },
-    "old": {
-        "key": "old",
-        "dir": ROOT / "android_old",
-        "prefix": "udp2cal_old",
-        "label": "Old (minSdk 21 / Android 6~8)",
-        "compile_sdk": "android-34",
         # AGP 8.7 的默认 NDK 版本；项目启用了 externalNativeBuild，必须存在
         "ndk": "27.0.12077973",
     },

@@ -187,7 +187,6 @@ def _print_usage(logger) -> None:
     logger.info("  --monitor   启动 Logcat 监控 (OpusEncoder / CaptureService / MainActivity)")
     logger.info("  --winlog    打开 Windows 调试日志 (udp2cal_debug.log)")
     logger.info("  --all       执行全部上述操作")
-    logger.info("  --old       调试 android_old（默认 android）")
     logger.info("  --abi ABI   目标 ABI: arm64-v8a(默认) | armeabi-v7a")
     logger.blank()
     logger.info("示例:")

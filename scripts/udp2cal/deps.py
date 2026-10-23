@@ -1,8 +1,8 @@
 """依赖补装与项目文件自修复。
 
 处理三类实际存在的不一致：
-1. android_old 缺少 gradle/wrapper（只有 gradlew 脚本，无 wrapper jar）；
-2. android_old/local.properties 里的 sdk.dir 指向不存在的目录；
+1. gradle wrapper 不完整（缺 wrapper jar 或 properties）；
+2. local.properties 里的 sdk.dir 缺失或指向不存在的目录；
 3. 构建所需 SDK 组件（platform / build-tools / ndk / cmake）缺失。
 
 所有对已有文件的修改都会先写 `<file>.bak` 备份。
