@@ -24,11 +24,16 @@ class UdpSender(
 ) {
     private companion object {
         const val TAG = "UdpSender"
+
+        /** ACK 有效期：超过该窗口未收到新 ACK 即视为断连（与 CaptureService 的超时判定一致） */
+        const val ACK_WINDOW_MS = 3000L
     }
 
-    private var socket: DatagramSocket? = null
-    private var deviceId: ByteArray? = null
-    private var remoteAddr: InetSocketAddress? = null
+    // 跨线程访问：connect()/close() 在 IO 线程，send() 在音频消费者线程，
+    // ACK 线程回调 lastAckTime。全部加 @Volatile 保证可见性。
+    @Volatile private var socket: DatagramSocket? = null
+    @Volatile private var deviceId: ByteArray? = null
+    @Volatile private var remoteAddr: InetSocketAddress? = null
     private var ackThread: Thread? = null
 
     @Volatile private var running = false
@@ -69,20 +74,32 @@ class UdpSender(
         }
     }
 
-    suspend fun send(data: ByteArray, offset: Int, length: Int): Boolean =
-        withContext(Dispatchers.IO) {
-            try {
-                val sock = socket ?: return@withContext false
-                val addr = remoteAddr ?: return@withContext false
-                sock.send(DatagramPacket(data, offset, length, addr))
-                true
-            } catch (_: Exception) {
-                false
-            }
+    /**
+     * 发送一帧。刻意**不做** `withContext(Dispatchers.IO)`：
+     * 该方法由音频消费者协程（后台线程）直接调用，UDP `send` 是微秒级非阻塞系统调用，
+     * 每帧额外一次协程调度只会在 10ms 预算里平白引入抖动。
+     */
+    fun send(data: ByteArray, offset: Int, length: Int): Boolean {
+        return try {
+            val sock = socket ?: return false
+            val addr = remoteAddr ?: return false
+            sock.send(DatagramPacket(data, offset, length, addr))
+            true
+        } catch (_: Exception) {
+            false
         }
+    }
 
-    /** 是否已收到过 CONNECT_ACK */
-    fun hasAck(): Boolean = lastAckTime > 0L
+    /**
+     * ACK 是否"新鲜"。
+     *
+     * 历史实现是 `lastAckTime > 0`——只表示"历史上收到过 ACK"，永不复位。
+     * 一旦超时把 p2pConnected 置 false，下一帧又会被它判成 true，形成 100Hz 抖动。
+     */
+    fun isAckFresh(nowMs: Long = System.currentTimeMillis(), windowMs: Long = ACK_WINDOW_MS): Boolean {
+        val t = lastAckTime
+        return t > 0L && nowMs - t <= windowMs
+    }
 
     fun getLastAckTime(): Long = lastAckTime
 

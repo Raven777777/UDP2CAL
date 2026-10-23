@@ -54,8 +54,8 @@ object Udp2CalProtocol {
     )
 
     // ═══════ 检测 ═══════
-
-    fun isV2Packet(buf: ByteArray): Boolean = buf.isNotEmpty() && buf[0] == PROTO_VERSION
+    // （v1.1.2 起协议只有单一版本：首字节 != PROTO_VERSION 即丢弃，
+    //   历史上用于兼容旧包的 isV2Packet() 已删除）
 
     // ═══════ 编解码 ═══════
 
@@ -123,26 +123,6 @@ object Udp2CalProtocol {
         return packet
     }
 
-    /** 构建音频数据包（写入预分配缓冲区，零分配）*/
-    fun buildAudioPacketTo(
-        dest: ByteArray, offset: Int,
-        sampleRate: Byte, seqNum: Byte, deviceId: ByteArray,
-        payload: ByteArray, bitrate: Byte = BITRATE_AUTO
-    ): Int {
-        val len = minOf(payload.size, MAX_PAYLOAD)
-        require(offset + HEADER_SIZE + len <= dest.size) { "目标缓冲区不足" }
-        dest[offset] = PROTO_VERSION
-        dest[offset + 1] = ((1 shl 7) or ((1 and 0x07) shl 4) or (sampleRate.toInt() and 0x0F)).toByte()
-        dest[offset + 2] = TYPE_DATA
-        dest[offset + 3] = (len shr 8).toByte()
-        dest[offset + 4] = len.toByte()
-        dest[offset + 5] = bitrate
-        dest[offset + 6] = seqNum
-        System.arraycopy(deviceId, 0, dest, offset + 7, DEVICE_ID_SIZE)
-        System.arraycopy(payload, 0, dest, offset + HEADER_SIZE, len)
-        return HEADER_SIZE + len
-    }
-
     /** 在预分配缓冲区写入音频数据协议头（与 encoderEncodeTo 搭配使用，完全零分配）*/
     fun writeAudioHeader(dest: ByteArray, headerOffset: Int, payloadLen: Int, sampleRate: Byte, seqNum: Byte, deviceId: ByteArray, bitrate: Byte = BITRATE_AUTO): Int {
         require(headerOffset + HEADER_SIZE + payloadLen <= dest.size) { "目标缓冲区不足" }
@@ -171,19 +151,127 @@ object Udp2CalProtocol {
         48000 -> SAMPLE_RATE_48K; else -> SAMPLE_RATE_48K
     }
 
+    /**
+     * 生成 8 字节设备 ID。
+     *
+     * 设备 ID 是 P2P 独占唯一的准入凭据，必须使用系统 CSPRNG。
+     * 历史实现用 `System.nanoTime()` 位运算拼凑，同网段主机可推算候选区间。
+     */
     fun generateDeviceId(): ByteArray {
         val id = ByteArray(DEVICE_ID_SIZE)
-        val nanos = System.nanoTime()
-        for (i in 0 until DEVICE_ID_SIZE) {
-            val shift = (i * 8) % 128
-            id[i] = ((nanos shr shift) xor (nanos shl (3 + i) shr (i * 3))).toByte()
-        }
-        id[0] = (id[0].toInt() xor 0xA5).toByte()
-        id[4] = (id[4].toInt() xor 0x5A).toByte()
+        java.security.SecureRandom().nextBytes(id)
+        if (id.all { it == 0.toByte() }) id[0] = 1 // 全零视为无效 ID
         return id
     }
 
     fun deviceIdToString(id: ByteArray): String =
         if (id.size < DEVICE_ID_SIZE) "invalid"
         else id.joinToString("") { "%02x".format(it) }
+
+    // ═══════ 重排缓冲 ═══════
+
+    /**
+     * 轻量重排缓冲，语义与 Rust 端 `protocol.rs::ReorderBuffer` 对齐：
+     * - 首包作为基准（发送端从 seq=1 起步时不会被误判为乱序）
+     * - 落后 `nextSeq` 不超过 `maxLate` 视为迟到/重复，直接丢弃
+     * - 窗口内乱序先入槽，等 expected 到达后统一排空
+     * - 大步超前视为跳变（丢包/发送端重启），重置基准并立即输出
+     *
+     * PC → 手机的返回流此前完全没有序号处理：乱序包会被直接解码成噪音。
+     *
+     * @param sink `(sampleRate, buffer, offset, length)`；入槽后的包会拷贝到独立数组，
+     *             连序包直接引用原始接收缓冲，不产生拷贝。
+     */
+    class ReorderBuffer(
+        private val maxLate: Int = 8,
+        private val window: Int = 2,
+        private val sink: (Byte, ByteArray, Int, Int) -> Unit,
+    ) {
+        private val slotSeq = IntArray(window) { -1 }
+        private val slotRate = ByteArray(window)
+        private val slotData = arrayOfNulls<ByteArray>(window)
+        private var writeIdx = 0
+        private var nextSeq = 0
+        private var lateStreak = 0
+        private var started = false
+
+        fun reset() {
+            for (i in 0 until window) {
+                slotSeq[i] = -1
+                slotData[i] = null
+            }
+            writeIdx = 0
+            nextSeq = 0
+            lateStreak = 0
+            started = false
+        }
+
+        fun insert(seq: Int, sampleRate: Byte, buf: ByteArray, offset: Int, length: Int) {
+            if (length <= 0) return
+            val s = seq and 0xFF
+
+            if (!started) {
+                started = true
+                nextSeq = (s + 1) and 0xFF
+                sink(sampleRate, buf, offset, length)
+                return
+            }
+
+            val dist = (s - nextSeq) and 0xFF
+            if (dist >= 256 - maxLate) {
+                lateStreak++
+                if (lateStreak < maxLate * 4) return
+                // 连续迟到 → 实为发送端大跨度回退，强制重同步
+                lateStreak = 0
+                clearSlots()
+                nextSeq = (s + 1) and 0xFF
+                sink(sampleRate, buf, offset, length)
+                return
+            }
+            lateStreak = 0
+
+            when {
+                dist == 0 -> {
+                    sink(sampleRate, buf, offset, length)
+                    nextSeq = (nextSeq + 1) and 0xFF
+                }
+                dist < window -> {
+                    slotSeq[writeIdx] = s
+                    slotRate[writeIdx] = sampleRate
+                    slotData[writeIdx] = buf.copyOfRange(offset, offset + length)
+                    writeIdx = (writeIdx + 1) % window
+                }
+                else -> {
+                    clearSlots()
+                    nextSeq = (s + 1) and 0xFF
+                    sink(sampleRate, buf, offset, length)
+                    return
+                }
+            }
+
+            var progressed = true
+            while (progressed) {
+                progressed = false
+                for (i in 0 until window) {
+                    if (slotSeq[i] == nextSeq) {
+                        val data = slotData[i] ?: continue
+                        sink(slotRate[i], data, 0, data.size)
+                        slotSeq[i] = -1
+                        slotData[i] = null
+                        nextSeq = (nextSeq + 1) and 0xFF
+                        progressed = true
+                        break
+                    }
+                }
+            }
+        }
+
+        private fun clearSlots() {
+            for (i in 0 until window) {
+                slotSeq[i] = -1
+                slotData[i] = null
+            }
+            writeIdx = 0
+        }
+    }
 }

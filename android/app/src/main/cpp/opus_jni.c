@@ -122,40 +122,6 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     return nbBytes;
 }
 
-JNIEXPORT jbyteArray JNICALL
-Java_com_udp2cal_app_native_OpusNative_encoderEncode(
-    JNIEnv* env, jclass clazz, jlong handle, jshortArray pcmData) {
-
-    if (handle == 0) return NULL;
-    EncoderState* state = (EncoderState*)(uintptr_t)handle;
-
-    jsize len = (*env)->GetArrayLength(env, pcmData);
-    if (len < state->frame_size) return NULL;
-
-    jshort* pcm = (*env)->GetShortArrayElements(env, pcmData, NULL);
-    if (pcm == NULL) return NULL;
-
-    unsigned char packet[4096];
-    int nbBytes = opus_encode(state->encoder, (const opus_int16*)pcm,
-                               state->frame_size, packet, sizeof(packet));
-    (*env)->ReleaseShortArrayElements(env, pcmData, pcm, JNI_ABORT);
-
-    if (nbBytes < 0) return NULL;
-
-    state->encode_count++;
-    if (state->encode_count % 100 == 0) {
-        __android_log_print(ANDROID_LOG_DEBUG, TAG,
-            "Audit: frame=%d in=%d out=%d ratio=%d%%",
-            state->encode_count, state->frame_size * 2, nbBytes,
-            (nbBytes * 100) / (state->frame_size * 2));
-    }
-
-    jbyteArray result = (*env)->NewByteArray(env, nbBytes);
-    if (result != NULL)
-        (*env)->SetByteArrayRegion(env, result, 0, nbBytes, (const jbyte*)packet);
-    return result;
-}
-
 JNIEXPORT jint JNICALL
 Java_com_udp2cal_app_native_OpusNative_encoderGetFrameSize(
     JNIEnv* env, jclass clazz, jlong handle) {

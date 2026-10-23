@@ -7,6 +7,7 @@ mod capture;
 mod config; 
 mod decoder; 
 mod firewall; 
+mod logger; 
 mod protocol; 
 
 use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space}; 
@@ -15,7 +16,7 @@ use iced::futures::SinkExt;
 use std::net::SocketAddr; 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering}; 
 use std::sync::mpsc::{sync_channel, SyncSender}; 
-use std::sync::{Mutex, OnceLock}; 
+use std::sync::{Arc, Mutex, OnceLock}; 
 use std::time::{Duration, Instant}; 
 use windows::Win32::System::Threading::CreateMutexW; 
 use windows::Win32::Foundation::{BOOL, GetLastError, HWND, LPARAM, ERROR_ALREADY_EXISTS};
@@ -148,8 +149,44 @@ enum AudioMessage {
 
 static AUDIO_TX: OnceLock<Mutex<Option<SyncSender<AudioMessage>>>> = OnceLock::new();
 static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits()); 
-// 0=加载中, 1=解码器错误, 2=音频初始化错误, 3=初始化成功 
-static AUDIO_INIT_STATE: AtomicU32 = AtomicU32::new(0); 
+
+/// 音频初始化状态。
+/// 历史实现用裸 u32 + 魔数 0/1/2/3 表达四态，读写点分散在三个函数里，
+/// 新增状态时极易漏改。改为枚举后编译器可覆盖穷举检查。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum AudioInitState {
+    /// 初始化中（含冷启动等待）
+    Pending = 0,
+    /// Opus 解码器创建失败
+    DecoderFailed = 1,
+    /// WASAPI 输出设备打开失败
+    DeviceFailed = 2,
+    /// 就绪
+    Ready = 3,
+}
+
+impl AudioInitState {
+    fn load() -> Self {
+        match AUDIO_INIT_STATE.load(Ordering::Acquire) {
+            1 => Self::DecoderFailed,
+            2 => Self::DeviceFailed,
+            3 => Self::Ready,
+            _ => Self::Pending,
+        }
+    }
+    fn store(self) {
+        AUDIO_INIT_STATE.store(self as u8, Ordering::Release);
+    }
+}
+
+static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8); 
+
+/// 音频诊断计数器（进程级单例，UI 展示 + 落盘日志共用）
+static AUDIO_STATS: OnceLock<Arc<audio::AudioStats>> = OnceLock::new();
+fn audio_stats() -> &'static Arc<audio::AudioStats> {
+    AUDIO_STATS.get_or_init(|| Arc::new(audio::AudioStats::default()))
+}
 
 fn audio_tx() -> &'static Mutex<Option<SyncSender<AudioMessage>>> {
     AUDIO_TX.get_or_init(|| Mutex::new(None))
@@ -164,6 +201,40 @@ fn send_audio(message: AudioMessage) {
     }
 }
 
+// ══════════════════════════════════════════════
+// 接收路径载荷缓冲池
+// 历史实现每包 `buf[..].to_vec()`，即 100 次/秒的小对象分配。这里复用一组
+// 固定容量的缓冲：接收侧取出、音频线程用完归还。池有界（64 个），拿不到就新分配。
+// 注意：锁只出现在"网络 → 音频线程"的交接处，cpal 回调路径仍然完全无锁。
+// ══════════════════════════════════════════════
+
+const PAYLOAD_POOL_MAX: usize = 64;
+
+static PAYLOAD_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+fn payload_pool() -> &'static Mutex<Vec<Vec<u8>>> {
+    PAYLOAD_POOL.get_or_init(|| Mutex::new(Vec::with_capacity(PAYLOAD_POOL_MAX)))
+}
+
+fn take_payload() -> Vec<u8> {
+    payload_pool()
+        .lock()
+        .ok()
+        .and_then(|mut pool| pool.pop())
+        .unwrap_or_else(|| Vec::with_capacity(protocol::MAX_PAYLOAD))
+}
+
+fn recycle_payload(mut buf: Vec<u8>) {
+    if buf.capacity() < protocol::MAX_PAYLOAD {
+        return; // 容量不足的缓冲不值得复用
+    }
+    if let Ok(mut pool) = payload_pool().lock() {
+        if pool.len() < PAYLOAD_POOL_MAX {
+            buf.clear();
+            pool.push(buf);
+        }
+    }
+}
+
 /// 启动（或重启）音频守护线程。
 /// 允许在初始化失败后再次调用：旧线程已退出，通道被替换后其接收端会关闭。
 fn init_audio_worker() { 
@@ -171,25 +242,30 @@ fn init_audio_worker() {
     if let Ok(mut slot) = audio_tx().lock() {
         *slot = Some(tx);
     }
-    AUDIO_INIT_STATE.store(0, Ordering::Release);
+    AudioInitState::Pending.store();
 
-    std::thread::spawn(move || { 
+    let stats = audio_stats().clone();
+    let _ = std::thread::Builder::new()
+        .name("udp2cal-worker".into())
+        .spawn(move || { 
         let mut dec = match decoder::OpusDecoder::new() { 
             Ok(d) => d, 
-            Err(_) => { 
-                AUDIO_INIT_STATE.store(1, Ordering::Release); 
+            Err(e) => { 
+                logf!("[Audio] Opus 解码器初始化失败: {e:?}");
+                AudioInitState::DecoderFailed.store(); 
                 return; 
             } 
         }; 
-        let mut aw = match audio::start_audio() { 
+        let mut aw = match audio::start_audio(stats) { 
             Ok(a) => a, 
             Err(e) => { 
-                eprintln!("[Audio] 初始化失败: {e}");
-                AUDIO_INIT_STATE.store(2, Ordering::Release); 
+                logf!("[Audio] 初始化失败: {e}");
+                AudioInitState::DeviceFailed.store(); 
                 return; 
             } 
         }; 
-        AUDIO_INIT_STATE.store(3, Ordering::Release); 
+        AudioInitState::Ready.store(); 
+        logf!("[Audio] 就绪：输出设备 {} Hz", aw.device_rate);
 
         let mut rb = protocol::ReorderBuffer::new(); 
         let mut rms_sum: f64 = 0.0; 
@@ -214,6 +290,7 @@ fn init_audio_worker() {
                             aw.write(samples, sr_hz); 
                         } 
                     }); 
+                    recycle_payload(payload);
                 } 
             } 
             if last_stats.elapsed() > Duration::from_millis(100) { 
@@ -287,7 +364,7 @@ fn reset_to_ready() {
     }
     if let Ok(mut sender) = reverse_sender().lock() {
         if let Some(s) = sender.take() {
-            s.stop_and_join();
+            s.stop();
         }
     }
 }
@@ -300,15 +377,35 @@ pub fn start_broadcast_listener() {
         let socket = match std::net::UdpSocket::bind("0.0.0.0:44043") { 
             Ok(s) => s, 
             Err(e) => { 
-                eprintln!("[Discovery] 绑定广播端口失败: {}", e); 
+                logf!("[Discovery] 绑定广播端口失败: {}", e); 
                 return; 
             } 
         }; 
         let mut buf = [0u8; 1024]; 
         let my_id = my_device_id();
         let my_name = my_device_name();
+        // 简单令牌桶：同一源 IP 每秒最多应答 MAX_PER_SEC 次。
+        // 发现请求 15B、应答 ~15B+主机名，无限制时可被用于 UDP 反射放大。
+        const MAX_PER_SEC: u32 = 5;
+        let mut bucket: std::collections::HashMap<std::net::IpAddr, (u32, Instant)> =
+            std::collections::HashMap::new();
+        let mut last_cleanup = Instant::now();
         loop { 
             if let Ok((amt, src)) = socket.recv_from(&mut buf) { 
+                    if last_cleanup.elapsed() > Duration::from_secs(30) {
+                        bucket.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(5));
+                        last_cleanup = Instant::now();
+                    }
+                    {
+                        let entry = bucket.entry(src.ip()).or_insert((0, Instant::now()));
+                        if entry.1.elapsed() >= Duration::from_secs(1) {
+                            *entry = (0, Instant::now());
+                        }
+                        if entry.0 >= MAX_PER_SEC {
+                            continue;
+                        }
+                        entry.0 += 1;
+                    }
                     let data = &buf[..amt];
                     if amt >= protocol::HEADER_SIZE {
                         let mut hdr_buf = [0u8; protocol::HEADER_SIZE];
@@ -358,6 +455,9 @@ enum Message {
     Disconnected, 
     /// 引擎级失败（监听失败 / 音频初始化失败）：必须回到停止态并把原因显示出来
     EngineError(String),
+    /// P2P 绑定/重连状态变化：只触发一次重绘，不携带也不修改任何遥测数据。
+    /// （历史实现用 bitrate=0 的 StatusUpdate 充当重绘信号，导致码率显示每秒闪一次 0）
+    PeerStateChanged,
     HideWindow, 
     ShowWindow, 
     Quit, 
@@ -367,8 +467,16 @@ enum Message {
 struct StatusInfo { 
     bitrate_kbps: f32, 
     level_db: f32, 
-    error_msg: Option<&'static str>, 
 } 
+
+/// 提示行的语义级别。
+/// 历史实现靠中文子串（"失败/无效/不能/断开/不是合法"）猜测配色，
+/// 任何文案调整都会让颜色错位；改为在写入处显式声明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeLevel {
+    Info,
+    Error,
+}
 
 struct AppState { 
     config: config::Config, 
@@ -382,14 +490,25 @@ struct AppState {
     status_text: String, 
     /// 需要直接展示给用户的提示（错误 / 警告 / 断开原因）
     notice: String,
+    /// 提示级别，决定配色
+    notice_level: NoticeLevel,
     vb_cable_installed: bool, 
     last_toggle_instant: Instant, 
+    /// 上次写音频诊断日志的时间（30s 一次，避免刷盘）
+    last_stats_log: Instant,
     session_id: u32, 
     reverse_audio: bool,
     reverse_enabled: bool,
 } 
 
 fn main() -> Result<(), iced::Error> { 
+    // 尽早初始化落盘日志：后续所有失败路径都要能留下证据
+    logger::init();
+    logf!("[App] 启动 v{}", env!("CARGO_PKG_VERSION"));
+    if let Some(p) = logger::path() {
+        logf!("[App] 日志文件: {}", p.display());
+    }
+
     unsafe { 
         let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect(); 
         let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr())); 
@@ -414,6 +533,9 @@ fn main() -> Result<(), iced::Error> {
     // 防火墙放行：限定到本程序 + 具体端口。失败必须可被用户看到，
     // 因此同步执行并把错误作为首条提示传入界面。
     let firewall_warning = firewall::add_firewall_rule(startup_cfg.listen_port as u16).err();
+    if let Some(err) = &firewall_warning {
+        logf!("[Firewall] {err}");
+    }
 
     // P2P 系统初始化
     start_broadcast_listener(); 
@@ -423,8 +545,20 @@ fn main() -> Result<(), iced::Error> {
     // 初始化图标
     let (icon_rgba, w, h) = load_icon_rgba(); 
 
-    // 系统托盘
+    // 系统托盘（失败不致命：降级为"关窗即退出"）
     let tray_icon = install_tray(icon_rgba.clone(), w, h);
+    let tray_ok = tray_icon.is_some();
+    if !tray_ok {
+        logf!("[Tray] 托盘不可用，降级为关闭窗口即退出");
+    }
+
+    // 首条提示：防火墙失败 / 托盘降级，二者可能同时出现
+    let startup_notice: String = match (&firewall_warning, tray_ok) {
+        (Some(err), false) => format!("{err}；托盘不可用，关闭窗口将直接退出"),
+        (Some(err), true) => err.clone(),
+        (None, false) => "托盘不可用，关闭窗口将直接退出".to_string(),
+        (None, true) => String::new(),
+    };
 
     // 主窗体
     let result = iced::application(move || {
@@ -440,12 +574,18 @@ fn main() -> Result<(), iced::Error> {
             last_bitrate: 0.0,
             last_level_db: -60.0,
             status_text: String::new(),
-            notice: firewall_warning.clone().unwrap_or_default(),
+            notice: startup_notice.clone(),
+            notice_level: if firewall_warning.is_some() || !tray_ok {
+                NoticeLevel::Error
+            } else {
+                NoticeLevel::Info
+            },
             vb_cable_installed: audio::detect_vb_cable().is_some(),
             reverse_audio: false,
             reverse_enabled: cfg.reverse_enabled != 0,
             config: cfg,
             last_toggle_instant: now,
+            last_stats_log: now,
             session_id: 0,
         };
         (state, Task::none())
@@ -455,11 +595,16 @@ fn main() -> Result<(), iced::Error> {
         .default_font(iced::Font::with_name("Microsoft YaHei"))
         .theme(Theme::Dark)
         .window(iced::window::Settings {
+            // ⚠ 此尺寸是精心设计的视觉尺寸，请勿修改。
+            // 320×290 客户区 + 1px 边框 + 标题栏，成品窗口恰好是 322×322 的完美正方形；
+            // 任何改动都会破坏这个正方形比例。
             size: iced::Size::new(320.0, 290.0),
             position: iced::window::Position::Centered,
             resizable: false,
-            exit_on_close_request: false,
-            icon: Some(iced::window::icon::from_rgba(icon_rgba, w, h).unwrap()),
+            // 托盘不可用时必须让 X 真正退出：否则窗口隐藏后再也唤不回来，
+            // 进程会变成只能从任务管理器结束的幽灵进程。
+            exit_on_close_request: !tray_ok,
+            icon: iced::window::icon::from_rgba(icon_rgba, w, h).ok(),
             ..Default::default()
         })
         .run();
@@ -467,6 +612,17 @@ fn main() -> Result<(), iced::Error> {
     drop(tray_icon);
     result
 } 
+
+/// 诊断数值缩写：12345 → "12.3k"，2_000_000 → "2.0M"
+fn short_num(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
 
 impl AppState { 
     fn update(&mut self, message: Message) -> Task<Message> { 
@@ -489,6 +645,7 @@ impl AppState {
                     } 
                     Err(e) => { 
                         self.notice = e; 
+                        self.notice_level = NoticeLevel::Error;
                     } 
                 } 
                 Task::none() 
@@ -525,21 +682,25 @@ impl AppState {
                         Ok(p) => p, 
                         Err(_) => { 
                             self.notice = "端口号无效，请输入 1-65535".into(); 
+                            self.notice_level = NoticeLevel::Error;
                             return Task::none(); 
                         } 
                     }; 
                     if port == 0 { 
                         self.notice = "端口号不能为 0".into(); 
+                        self.notice_level = NoticeLevel::Error;
                         return Task::none(); 
                     } 
                     // 监听地址必须是本机地址；空/非法值会让 bind 直接失败
                     let ip = self.ip_input.trim().to_string();
                     if ip.is_empty() { 
                         self.notice = "监听地址不能为空".into(); 
+                        self.notice_level = NoticeLevel::Error;
                         return Task::none(); 
                     } 
                     if ip.parse::<std::net::IpAddr>().is_err() && ip != "localhost" { 
                         self.notice = format!("监听地址「{ip}」不是合法的 IP"); 
+                        self.notice_level = NoticeLevel::Error;
                         return Task::none(); 
                     } 
 
@@ -549,8 +710,7 @@ impl AppState {
                     LISTEN_PORT.store(port as u32, Ordering::Release);
 
                     // 上次音频初始化失败过则重试一次（例如用户刚装好 VB-Cable）
-                    let init_state = AUDIO_INIT_STATE.load(Ordering::Acquire);
-                    if init_state == 1 || init_state == 2 { 
+                    if matches!(AudioInitState::load(), AudioInitState::DecoderFailed | AudioInitState::DeviceFailed) { 
                         init_audio_worker(); 
                     } 
                     // 端口可能在本次会话中改过，补齐防火墙规则
@@ -571,21 +731,24 @@ impl AppState {
                 Task::none() 
             } 
             Message::StatusUpdate(info) => { 
-                if info.bitrate_kbps > 0.0 { 
+                // 只在「无流 → 有流」的那一帧做状态迁移，避免每 500ms 重复清除用户提示
+                if info.bitrate_kbps > 0.0 && !self.connected { 
                     self.connected = true; 
-                    // 音频真正流动起来后清掉历史错误
-                    if info.error_msg.is_none() { self.notice.clear(); }
+                    // 音频真正流动起来后清掉历史错误与断开标记
+                    self.notice.clear(); 
+                    self.status_text.clear(); 
                 } 
                 self.last_bitrate = info.bitrate_kbps; 
                 self.last_level_db = info.level_db; 
-                self.status_text = match info.error_msg { 
-                    Some(msg) => msg.to_string(), 
-                    None if self.connected => String::new(), 
-                    None => self.status_text.clone(), 
-                }; 
-                if let Some(msg) = info.error_msg { 
-                    self.notice = msg.to_string(); 
-                } 
+                // 音频诊断：每 30s 落一次盘（计数器由 cpal 回调与音频线程维护）
+                if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
+                    self.last_stats_log = Instant::now();
+                    let s = audio_stats().snapshot();
+                    logf!(
+                        "[Audio] 统计 块={} 重采样={} 丢样={} 欠载={}",
+                        s.writes, s.resampled, s.dropped, s.underrun
+                    );
+                }
                 Task::none() 
             } 
             Message::Disconnected => { 
@@ -593,8 +756,8 @@ impl AppState {
                     self.connected = false; 
                     self.last_bitrate = 0.0; 
                     self.last_level_db = -60.0; 
+                    // 只更新顶部状态点（● 已断开），底部提示行不再重复同一信息
                     self.status_text = "已断开".into(); 
-                    self.notice = "已断开（等待手机端重连）".into();
                 } 
                 Task::none() 
             }
@@ -609,8 +772,10 @@ impl AppState {
                 self.last_level_db = -60.0;
                 self.status_text.clear();
                 self.notice = msg;
+                self.notice_level = NoticeLevel::Error;
                 Task::none()
             }
+            Message::PeerStateChanged => Task::none(),
             Message::HideWindow => {
                 latest_window_task(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
             }
@@ -628,11 +793,12 @@ impl AppState {
         } 
     } 
 
-    fn notice_is_error(&self) -> bool {
-        ["失败", "无效", "不能", "断开", "不是合法"]
-            .iter()
-            .any(|k| self.notice.contains(k))
+    /// 状态点文字：靠 `status_text` 区分"已断开"与"等待连接"。
+    /// 这里只影响显示，不再参与配色判定。
+    fn status_is_disconnected(&self) -> bool {
+        self.status_text.contains("断开")
     }
+
 
     fn view(&self) -> Element<'_, Message> { 
         let bg = Color::from_rgb(0.08, 0.08, 0.10); 
@@ -648,28 +814,52 @@ impl AppState {
         } else if self.connected { 
             (accent, "● 已连接") 
         } else { 
-            (red, if self.status_text.contains("断开") { "● 已断开" } else { "● 等待连接" }) 
+            (red, if self.status_is_disconnected() { "● 已断开" } else { "● 等待连接" }) 
         };
 
         // P2P 状态: TYPE_CONNECT 独占绑定 / 空闲
+        // 已占用后不再拼接 8 位设备识别码：对用户没有意义，还会把顶部一行挤满。
         let p2p = p2p_snapshot();
         let (p2p_state, p2p_color) = if !self.is_running {
             (String::new(), dim)
         } else if p2p.is_busy() {
-            // 独占绑定: 通过 TYPE_CONNECT 建立, 显示设备 ID
-            let hex: String = p2p.device_id.iter().map(|b| format!("{:02x}", b)).collect();
-            let id_str = if hex.chars().all(|c| c == '0') { String::new() } else { hex[..8].to_string() };
-            if id_str.is_empty() {
-                ("● 已占用".to_string(), Color::from_rgb(0.95, 0.55, 0.15))
-            } else {
-                (format!("● 已占用 {}", id_str), Color::from_rgb(0.95, 0.55, 0.15))
-            }
+            ("● 已占用".to_string(), Color::from_rgb(0.95, 0.55, 0.15))
         } else {
             ("● 空闲".to_string(), accent)
         };
 
         let vb_str = if self.vb_cable_installed { "● VB-Cable" } else { "● VB-Cable 未安装" };
         let vb_color = if self.vb_cable_installed { Color::from_rgb(0.25, 0.80, 0.40) } else { Color::from_rgb(0.90, 0.55, 0.15) };
+
+        // ── 底部状态行（永远只占一行，三种状态互斥）──
+        //   未启动        → 广播地址
+        //   已启动未连上  → 广播地址 + 广播状态
+        //   已连接        → 音频诊断 + 反向串流状态（地址与广播状态对用户已无意义）
+        let footer_left = if self.connected {
+            let s = audio_stats().snapshot();
+            format!(
+                "重采样 {} · 丢样 {} · 欠载 {}",
+                short_num(s.resampled), short_num(s.dropped), short_num(s.underrun)
+            )
+        } else {
+            "广播地址: 255.255.255.255:44043".to_string()
+        };
+        let (footer_right, footer_right_color) = if !self.is_running {
+            (String::new(), dim)
+        } else if self.connected {
+            if self.reverse_enabled {
+                ("● 反向串流已启用".to_string(), Color::from_rgb(0.25, 0.80, 0.40))
+            } else {
+                ("○ 反向串流未启用".to_string(), dim)
+            }
+        } else {
+            let bc_on = APP_RUNNING.load(Ordering::Acquire) != 0 && !p2p.is_busy();
+            if bc_on {
+                ("● 广播中".to_string(), accent)
+            } else {
+                ("● 已静音".to_string(), dim)
+            }
+        };
 
         let mk = |label: &'static str, color: Color, msg: Message| { 
             button(text(label).size(16)) 
@@ -711,14 +901,19 @@ impl AppState {
         let db = self.last_level_db.clamp(-60.0, 0.0); 
         let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0); 
 
-        // 提示行：错误红色、普通信息蓝灰
-        let notice_line: Element<'_, Message> = if self.notice.is_empty() {
-            Space::new().into()
+        // 提示行：错误红色、普通信息蓝灰（级别由写入方显式声明）。
+        // 无提示时整块只有 6px 间隔：320×290 的方形窗口容不下常驻空行。
+        let notice_block: Element<'_, Message> = if self.notice.is_empty() {
+            Space::new().height(6).into()
         } else {
-            text(self.notice.clone())
-                .size(11)
-                .color(if self.notice_is_error() { red } else { Color::from_rgb(0.62, 0.70, 0.78) })
-                .into()
+            column![
+                Space::new().height(6),
+                text(self.notice.clone())
+                    .size(11)
+                    .color(if self.notice_level == NoticeLevel::Error { red } else { Color::from_rgb(0.62, 0.70, 0.78) }),
+                Space::new().height(6),
+            ]
+            .into()
         };
 
         container( 
@@ -743,6 +938,9 @@ impl AppState {
                             row![text(addr).size(14).color(Color::WHITE)]
                                 .height(32).align_y(Alignment::Center)
                         } else {
+                            // 与运行态分支的 .height(32) 对齐：
+                            // text_input 的固有高度 = 字号16 × 行高1.3 + padding(5+5) = 30.8px，
+                            // 不锁高的话启停切换时这张卡片会有 1.2px 的高度跳变，把下面整列推开。
                             row![
                                 text_input("0.0.0.0", &self.ip_input)
                                     .on_input(Message::IpChanged)
@@ -773,7 +971,7 @@ impl AppState {
                                             ..base
                                         }
                                     }),
-                            ].align_y(Alignment::Center)
+                            ].height(32).align_y(Alignment::Center)
                         },
                     ]
                 )
@@ -865,28 +1063,15 @@ impl AppState {
                            Message::ToggleReverse(!self.reverse_enabled))
                     },
                 ],
-                // ── 错误/提示行：历史上错误信息全部被收集却从未渲染 ──
-                Space::new().height(6),
-                notice_line,
-                Space::new().height(6),
+                // ── 提示行：只承载错误与警告（连接状态由顶部状态点负责）──
+                notice_block,
+                // ── 底部状态行：单行，按连接状态切换内容 ──
                 row![
-                    text("广播地址: 255.255.255.255:44043").size(10).color(grey),
+                    text(footer_left).size(10).color(grey),
                     Space::new().width(Length::Fill),
-                    if self.is_running {
-                        let bc_on = APP_RUNNING.load(Ordering::Acquire) != 0 && !p2p.is_busy();
-                        let bc_state = if bc_on { "● 广播中" } else { "● 已静音" };
-                        let bc_color = if bc_on { accent } else { dim };
-                        text(bc_state).size(10).color(bc_color)
-                    } else {
-                        text("")
-                    },
-                ].align_y(Alignment::Center),
-                if self.is_running && self.reverse_enabled {
-                    let rev_s = if self.connected { "● 反向串流已启用" } else { "○ 等待连接后启用" };
-                    text(rev_s).size(10).color(Color::from_rgb(0.25, 0.80, 0.40))
-                } else {
-                    text("")
-                },
+                    text(footer_right).size(10).color(footer_right_color),
+                ]
+                .align_y(Alignment::Center),
             ]
             .padding(14),
         )
@@ -939,7 +1124,10 @@ where
     })
 }
 
-fn install_tray(icon_rgba: Vec<u8>, width: u32, height: u32) -> tray_icon::TrayIcon {
+/// 创建系统托盘。失败（explorer 未就绪、远程会话、资源不足）返回 None，
+/// 由调用方降级为"关窗即退出"，绝不能 panic：发布版没有控制台，
+/// panic 的表现就是"双击图标毫无反应"。
+fn install_tray(icon_rgba: Vec<u8>, width: u32, height: u32) -> Option<tray_icon::TrayIcon> {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     let _ = TRAY_COMMANDS.set(tokio::sync::Mutex::new(receiver));
 
@@ -965,15 +1153,26 @@ fn install_tray(icon_rgba: Vec<u8>, width: u32, height: u32) -> tray_icon::TrayI
         .build();
     let _ = tray_menu.append(&quit_item);
 
-    let tray_icon_img = tray_icon::Icon::from_rgba(icon_rgba, width, height)
-        .expect("embedded tray icon must be valid");
-    tray_icon::TrayIconBuilder::new()
+    let tray_icon_img = match tray_icon::Icon::from_rgba(icon_rgba, width, height) {
+        Ok(icon) => icon,
+        Err(e) => {
+            logf!("[Tray] 图标构造失败: {e}");
+            return None;
+        }
+    };
+    match tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("UDP2CAL")
         .with_icon(tray_icon_img)
         .with_menu_on_left_click(false)
         .build()
-        .expect("tray icon must be created")
+    {
+        Ok(tray) => Some(tray),
+        Err(e) => {
+            logf!("[Tray] 托盘创建失败: {e}");
+            None
+        }
+    }
 }
 
 /// 单实例：按窗口标题激活已运行的实例
@@ -1124,10 +1323,10 @@ async fn handle_control(
                         .unwrap_or(true);
                     if port_changed && REVERSE_ENABLED.load(Ordering::Acquire) != 0 {
                         if let Ok(mut sender) = reverse_sender().lock() {
-                            if let Some(s) = sender.take() { s.stop_and_join(); }
+                            if let Some(s) = sender.take() { s.stop(); }
                             let my_id = my_device_id();
                             *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
-                            eprintln!("[P2P] 反向端口变化，已重启 -> {}:{}", src_addr.ip(), android_rev_addr.port());
+                            logf!("[P2P] 反向端口变化，已重启 -> {}:{}", src_addr.ip(), android_rev_addr.port());
                         }
                     }
                 }
@@ -1144,10 +1343,11 @@ async fn handle_control(
                 st.device_id = header.device_id;
                 st.state = DEVICE_BUSY;
             }
-            eprintln!("[P2P] 手机端 {} 已绑定连接", src_addr.ip());
-            let _ = output.try_send(Message::StatusUpdate(StatusInfo {
-                bitrate_kbps: 0.0, level_db: -60.0, error_msg: Some("已连接手机端"),
-            }));
+            logf!("[P2P] 手机端 {} 已绑定连接", src_addr.ip());
+            // 只触发一次重绘（让顶部「● 已占用」立刻出现）。
+            // 不再向底部提示行写"已连接手机端"：连接状态由顶部状态点统一表达；
+            // 也不再用 bitrate=0 的 StatusUpdate 冒充重绘信号。
+            let _ = output.try_send(Message::PeerStateChanged);
             send_connect_ack(socket, src_addr).await;
 
             // 存储 Android 地址+反向端口
@@ -1158,12 +1358,12 @@ async fn handle_control(
             if REVERSE_ENABLED.load(Ordering::Acquire) != 0 {
                 let my_id = my_device_id();
                 if let Ok(mut sender) = reverse_sender().lock() {
-                    if let Some(old) = sender.take() { old.stop_and_join(); }
+                    if let Some(old) = sender.take() { old.stop(); }
                     *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
                 }
-                eprintln!("[P2P] 反向音频发送到 {}:{}", src_addr.ip(), android_rev_addr.port());
+                logf!("[P2P] 反向音频发送到 {}:{}", src_addr.ip(), android_rev_addr.port());
             } else {
-                eprintln!("[P2P] 反向音频开关未开启，跳过启动");
+                logf!("[P2P] 反向音频开关未开启，跳过启动");
             }
         }
 }
@@ -1183,19 +1383,19 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
 
         // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
         let mut retries = 60; 
-        while AUDIO_INIT_STATE.load(Ordering::Acquire) == 0 && retries > 0 { 
+        while AudioInitState::load() == AudioInitState::Pending && retries > 0 { 
             tokio::time::sleep(Duration::from_millis(50)).await; 
             retries -= 1; 
         } 
 
-        match AUDIO_INIT_STATE.load(Ordering::Acquire) { 
-            1 => { 
+        match AudioInitState::load() { 
+            AudioInitState::DecoderFailed => { 
                 let _ = output.send(Message::EngineError(
                     "Opus 解码器初始化失败".into()
                 )).await; 
                 return; 
             } 
-            2 => { 
+            AudioInitState::DeviceFailed => { 
                 let _ = output.send(Message::EngineError(
                     "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into()
                 )).await; 
@@ -1267,21 +1467,21 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
 
             if was_disconnected { 
                 was_disconnected = false; 
-                let _ = output.send(Message::StatusUpdate(StatusInfo { 
-                    bitrate_kbps: 0.0, 
-                    level_db: -60.0, 
-                    error_msg: Some("已重新连接"), 
-                })).await; 
+                // 重连同样只刷新状态，不再往底部写"已重新连接"
+                let _ = output.send(Message::PeerStateChanged).await; 
             } 
 
             byte_count += len as u64; 
             let payload_end = (protocol::HEADER_SIZE + h.payload_len as usize).min(len);
             if payload_end > protocol::HEADER_SIZE {
-                // 只投递声明长度内的负载，避免把尾部垃圾喂给解码器
+                // 只投递声明长度内的负载，避免把尾部垃圾喂给解码器。
+                // 缓冲从池中取，音频线程解码后归还，避免每包一次 malloc。
+                let mut payload = take_payload();
+                payload.extend_from_slice(&buf[protocol::HEADER_SIZE..payload_end]);
                 send_audio(AudioMessage::Packet {
                     seq_num: h.seq_num,
                     sample_rate: h.sample_rate,
-                    payload: buf[protocol::HEADER_SIZE..payload_end].to_vec(),
+                    payload,
                 });
             }
 
@@ -1298,7 +1498,6 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
                 let _ = output.send(Message::StatusUpdate(StatusInfo { 
                     bitrate_kbps: kbps, 
                     level_db, 
-                    error_msg: None, 
                 })).await; 
             } 
         } 

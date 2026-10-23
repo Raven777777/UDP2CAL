@@ -5,7 +5,7 @@ __pycache__/
 *.py[cod]
 *.bak
 
-构建产物
+# 构建产物
 /android/.gradle/
 /android/.kotlin/
 /android/build/
@@ -23,7 +23,6 @@ __pycache__/
 /*.apk
 
 # 本地/私密配置：不得入库
-/android/local.properties
-/local.properties
+local.properties
 *.keystore
 *.jks

@@ -131,5 +131,12 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.0")
 
+    // 显式声明：NotificationCompat / ContextCompat / ServiceCompat 均来自 androidx.core，
+    // 此前仅靠 Compose 的传递依赖引入，上游一旦裁剪就会直接编译失败。
+    implementation("androidx.core:core-ktx:1.16.0")
+
+    // 协议层 JVM 单测（ReorderBuffer 的乱序/重复/跳变时序与跨端常量一致性）
+    testImplementation("junit:junit:4.13.2")
+
     // (TFLite 降噪已移除)
 }

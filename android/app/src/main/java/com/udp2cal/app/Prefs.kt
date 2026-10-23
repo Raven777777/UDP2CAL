@@ -5,7 +5,9 @@ import android.content.SharedPreferences
 
 object Prefs {
     private const val NAME = "udp2cal_prefs"
-    private lateinit var prefs: SharedPreferences
+
+    /** 主线程 init、工作线程读取；volatile 保证安全发布 */
+    @Volatile private lateinit var prefs: SharedPreferences
 
     fun init(ctx: Context) {
         prefs = ctx.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -67,8 +69,4 @@ object Prefs {
     var deviceId: String
         get() = prefs.getString("device_id", "") ?: ""
         set(v) = prefs.edit().putString("device_id", v).apply()
-
-    var connectedDeviceId: String
-        get() = prefs.getString("connected_device_id", "") ?: ""
-        set(v) = prefs.edit().putString("connected_device_id", v).apply()
 }

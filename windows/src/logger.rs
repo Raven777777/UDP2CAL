@@ -1,0 +1,91 @@
+//! 落盘日志
+//!
+//! 发布版是 GUI 子系统（`#![windows_subsystem = "windows"]`），进程没有控制台，
+//! 所有 `eprintln!` 输出都会被系统丢弃——用户报"没声音/连不上"时没有任何现场证据。
+//!
+//! 本模块提供最小可用的文件日志：
+//! - 路径：`%LOCALAPPDATA%\UDP2CAL\udp2cal.log`
+//! - 单文件上限 2 MiB，超限后轮转为 `udp2cal.1.log`（只保留一轮，不会无限增长）
+//! - 同时写 stderr：命令行启动（开发期）仍能直接看到
+//! - 全局单例 + 互斥锁；调用频率为秒级到分钟级，不在音频回调路径上
+//!
+//! 用法：`crate::logf!("[Audio] 初始化失败: {e}");`
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use windows::Win32::System::SystemInformation::GetLocalTime;
+
+/// 单文件上限，超过后轮转一次
+const MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// 初始化日志文件。失败时静默降级为"仅 stderr"，不影响主流程。
+pub fn init() {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("UDP2CAL");
+    if std::fs::create_dir_all(&base).is_err() {
+        return;
+    }
+    let path = base.join("udp2cal.log");
+
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_BYTES {
+            // 轮转：覆盖上一轮备份，保证目录里最多两个文件
+            let _ = std::fs::rename(&path, base.join("udp2cal.1.log"));
+        }
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let banner = format!(
+            "===== UDP2CAL {} 启动 (pid {}) =====\n",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
+        let _ = file.write_all(banner.as_bytes());
+        let _ = LOG.set(Mutex::new(file));
+        let _ = LOG_PATH.set(path);
+    }
+}
+
+/// 日志文件路径（用于在 UI/关于页展示，未初始化时返回 None）
+pub fn path() -> Option<&'static PathBuf> {
+    LOG_PATH.get()
+}
+
+/// 写入一行日志。任意线程可调用。
+pub fn write_line(args: std::fmt::Arguments<'_>) {
+    let line = format!("[{}] {}\n", timestamp(), args);
+    // 开发期（从命令行启动）仍输出到 stderr；release 下句柄无效，write 会被忽略
+    eprint!("{line}");
+
+    let Some(lock) = LOG.get() else { return };
+    // 锁中毒也要继续写：日志丢了比锁丢了更糟
+    let mut file = match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let _ = file.write_all(line.as_bytes());
+}
+
+/// 本地时间戳，格式 `2026-10-23 20:55:24.123`
+fn timestamp() -> String {
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+/// 写一行日志（见模块文档）
+#[macro_export]
+macro_rules! logf {
+    ($($arg:tt)*) => {
+        $crate::logger::write_line(format_args!($($arg)*))
+    };
+}

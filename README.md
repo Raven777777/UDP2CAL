@@ -24,12 +24,12 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 
 ## 组件
 
-| 目录 | 说明 | 系统要求 |
-|------|------|----------|
-| `windows/` | Windows 接收端（Rust + iced），WASAPI 播放 / Loopback 回传，系统托盘常驻 | Windows 10+，需 VB-Cable 虚拟声卡 |
-| `android/` | Android 现代版（Kotlin + Jetpack Compose），全参数 Opus 面板 | Android 10 (API 29)+ |
-| `protocol/` | UDP v2 协议编解码 crate（协议唯一真源） | — |
-| ~~`android_old/`~~ | ~~Android 低性能版（传统 View），为 Android 6~8 翻盖机优化~~ — **已停止开发，仅归档源码；v1.1.2 起 PC 端不再兼容** | — |
+| 目录                 | 说明                                                                                | 系统要求                        |
+| ------------------ | --------------------------------------------------------------------------------- | --------------------------- |
+| `windows/`         | Windows 接收端（Rust + iced），WASAPI 播放 / Loopback 回传，系统托盘常驻                           | Windows 10+，需 VB-Cable 虚拟声卡 |
+| `android/`         | Android 现代版（Kotlin + Jetpack Compose），全参数 Opus 面板                                 | Android 10 (API 29)+        |
+| `protocol/`        | UDP v2 协议编解码 crate（协议唯一真源）                                                        | —                           |
+| ~~`android_old/`~~ | ~~Android 低性能版（传统 View），为 Android 6~8 翻盖机优化~~ — **已停止开发，仅归档源码；v1.1.2 起 PC 端不再兼容** | —                           |
 
 ---
 
@@ -53,16 +53,16 @@ build.bat doctor --fix                               :: 环境体检与自动修
 
 全部技术文档位于 [`docs/`](docs/README.md)。
 
-| 文档 | 内容 |
-|------|------|
-| [docs/BUILD.md](docs/BUILD.md) | 环境要求、`build.bat` 全部命令、编译产物、常见问题 |
-| [docs/FEATURES.md](docs/FEATURES.md) | 三端功能特性、Opus 参数详解、界面截图 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统架构、技术栈、自动协商机制、运行时行为、命名约定 |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | UDP v2 协议规范、P2P 独占生命周期、常量表 |
-| [docs/ANDROID_OLD.md](docs/ANDROID_OLD.md) | 低性能版专项（已归档、不兼容）：发热优化实测数据与限制 |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | 版本历史 |
-| [docs/BUGFIX.md](docs/BUGFIX.md) | Bug 根因分析与修复记录 |
-| [docs/LEGAL.md](docs/LEGAL.md) | 版权声明、GPL-3.0 授权、第三方组件许可 |
+| 文档                                           | 内容                              |
+| -------------------------------------------- | ------------------------------- |
+| [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 全部命令、编译产物、常见问题 |
+| [docs/FEATURES.md](docs/FEATURES.md)         | 三端功能特性、Opus 参数详解、界面截图           |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统架构、技术栈、自动协商机制、运行时行为、命名约定      |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | UDP v2 协议规范、P2P 独占生命周期、常量表      |
+| [docs/ANDROID\_OLD.md](docs/ANDROID_OLD.md)  | 低性能版专项（已归档、不兼容）：发热优化实测数据与限制     |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md)       | 版本历史                            |
+| [docs/BUGFIX.md](docs/BUGFIX.md)             | Bug 根因分析与修复记录                   |
+| [docs/LEGAL.md](docs/LEGAL.md)               | 版权声明、GPL-3.0 授权、第三方组件许可         |
 
 ---
 

@@ -11,7 +11,9 @@
 ///               0=TYPE_DATA, 1=TYPE_CONNECT, 2=TYPE_DISCOVER_REQ,
 ///               3=TYPE_DISCOVER_REPLY, 4=TYPE_CONNECT_ACK
 /// Byte 3-4:     [16bit payload_len BE]
-/// Byte 5:       [8bit bitrate_kbps] (0=auto, 仅 TYPE_DATA 有效)
+/// Byte 5:       [8bit bitrate/2 kbps] (0=auto, 仅 TYPE_DATA 有效)
+///               保留字段：发送端写入实际码率，接收端**不据此工作**
+///               （码率以字节数实测为准），仅用于抓包时标注。
 /// Byte 6:       [8bit seq_num] (仅 TYPE_DATA 有效)
 /// Byte 7-14:    [8 bytes device_id] (发送端唯一标识)
 /// Byte 15+:     [payload]
@@ -205,6 +207,13 @@ pub fn compute_bitrate_id(kbps: u32) -> u8 {
     if kbps == 0 { BITRATE_AUTO } else { ((kbps / 2).min(255).max(1)) as u8 }
 }
 
+// ── 采样率 ↔ 码率的规范参考实现 ──
+//
+// 这三个函数是"协议规范的可执行定义"：两端都可以各自实现，但取值必须一致。
+// 当前 Windows 端只用 hz/常量做校验（真实码率以字节数实测），Android 端在
+// OpusEncoder.computeBitrateId 里有一份等价实现——修改任何一处都要同步另一处。
+
+/// 自动码率对应的默认值（kbps）
 pub fn default_bitrate_for_sr(sr: u8) -> u8 {
     match sr {
         SAMPLE_RATE_8K  => compute_bitrate_id(64),
@@ -221,19 +230,41 @@ pub fn resolve_bitrate(bitrate: u8, sample_rate: u8) -> u8 {
 }
 
 /// 生成 8 字节设备 ID
+///
+/// 设备 ID 是 P2P 独占唯一的准入凭据，因此不能只由时间戳推导：
+/// 历史实现用 `SystemTime` 纳秒位运算，同网段主机可推算出一个窄的候选区间。
+/// 这里混入 `RandomState`（运行期由 OS 熵初始化）与自增序号，把取值面扩大到
+/// 进程级随机 + 时间 + 计数。
+///
+/// **注意**：这不构成密码学安全。协议本身没有鉴权（device_id 每秒随
+/// DISCOVER_REPLY 明文广播），该机制只防误连、不防伪造。
 pub fn generate_device_id() -> [u8; DEVICE_ID_SIZE] {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos();
+        .as_nanos() as u64;
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+
     let mut id = [0u8; DEVICE_ID_SIZE];
-    for i in 0..DEVICE_ID_SIZE {
-        let shift = (i * 8) % 128;
-        id[i] = ((nanos >> shift) ^ (nanos.wrapping_shl(3 + i as u32) >> (i * 3))) as u8;
+    for (i, byte) in id.iter_mut().enumerate() {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(nanos);
+        hasher.write_u64(seq);
+        hasher.write_u32(pid);
+        hasher.write_u8(i as u8);
+        *byte = hasher.finish().to_le_bytes()[i % 8];
     }
-    id[0] ^= 0xA5;
-    id[4] ^= 0x5A;
+    if id.iter().all(|&b| b == 0) {
+        id[0] = 1; // 全零视为无效 ID
+    }
     id
 }
 

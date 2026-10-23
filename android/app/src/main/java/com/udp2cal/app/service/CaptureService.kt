@@ -34,7 +34,8 @@ class CaptureService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     @Volatile private var captureJob: Job? = null
     private var reverseAudioJob: Job? = null
-    private var hasNewCapture = false
+    /** 主线程置位、IO 协程读取，必须 volatile */
+    @Volatile private var hasNewCapture = false
     /** 模式切换标记：true 时 finally 保留网络层和反向解码器 */
     @Volatile private var isModeRestart = false
 
@@ -361,10 +362,32 @@ class CaptureService : Service() {
                         val pcmBuffer = ShortArray(readSize)
                         var accumPos = 0
                         var accumBuf = framePool.borrow() // 第一帧从池中借出
+                        var readErrors = 0
+                        var channelClosed = false
 
-                        while (isActive) {
+                        while (isActive && !channelClosed) {
                             val read = audioRecord?.read(pcmBuffer, 0, readSize) ?: -1
-                            if (read <= 0) continue
+                            if (read <= 0) {
+                                // 0 = 暂无数据；负值 = 错误码（-3 INVALID_OPERATION / -6 DEAD_OBJECT）。
+                                // 不加区分地 continue 会在麦克风被抢占/拔出时退化成 100% CPU 紧循环。
+                                if (read < 0) {
+                                    readErrors++
+                                    if (readErrors == 1) Log.w(TAG, "AudioRecord.read 返回错误码 $read")
+                                    if (read == AudioRecord.ERROR_DEAD_OBJECT || readErrors >= 100) {
+                                        Log.e(TAG, "AudioRecord 已失效(read=$read)，停止采集")
+                                        _status.value = _status.value.copy(
+                                            errorMsg = "麦克风读取失败，请重新开始采集"
+                                        )
+                                        // 置 false 让 finally 走完整停止路径，
+                                        // 否则服务会停在"isRunning=true 但无采集"的僵尸态
+                                        hasNewCapture = false
+                                        break
+                                    }
+                                }
+                                delay(5) // 让出 CPU，避免空转
+                                continue
+                            }
+                            readErrors = 0
 
                             var srcPos = 0
                             while (srcPos < read) {
@@ -374,13 +397,28 @@ class CaptureService : Service() {
                                 srcPos += n
 
                                 if (accumPos == frameSize) {
-                                    // 直接将 accumBuf 送出（零拷贝），再从池中借出下一块
-                                    ch.send(accumBuf)
+                                    // 直接将 accumBuf 送出（零拷贝），再从池中借出下一块。
+                                    // send 在通道关闭时抛 ClosedSendChannelException：
+                                    // 停止流程中这是预期异常，必须就地吞掉，不能炸到顶层。
+                                    val ok = try {
+                                        ch.send(accumBuf)
+                                        true
+                                    } catch (_: Exception) {
+                                        false
+                                    }
+                                    if (!ok) {
+                                        framePool.recycle(accumBuf)
+                                        channelClosed = true
+                                        break
+                                    }
                                     accumBuf = framePool.borrow()
                                     accumPos = 0
                                 }
                             }
                         }
+                        // 生产者退出时关闭通道：无论因取消、致命错误还是通道失效，
+                        // 消费者都能确定性地结束 for 循环，不会永久挂起。
+                        ch.close()
                     }
 
                     // ═══ 消费者协程 ═══：编码参数同步 → 编码 → 发送
@@ -396,8 +434,9 @@ class CaptureService : Service() {
                         var p2pConnected = false // 初始未连接，收到 ACK 后方可发包
                         var reverseJob: Job? = null
 
-                        // 模式重启时：如果有任何历史 ACK，立即恢复连接
-                        if ((udpSender?.getLastAckTime() ?: 0L) > 0) {
+                        // 模式重启时：只有当 ACK 仍在有效窗口内才直接恢复连接。
+                        // 用"历史是否收到过 ACK"判断会让早已过期的连接被误判为在线。
+                        if (udpSender?.isAckFresh() == true) {
                             p2pConnected = true
                             _status.value = _status.value.copy(connected = true, errorMsg = "")
                             reverseJob = launchReverseAudio(currentIp)
@@ -407,8 +446,11 @@ class CaptureService : Service() {
                         for (frame in ch) {
                             val nowMs = System.currentTimeMillis()
 
-                            // ── ACK 状态检查（ACK 由独立线程接收，此处只读标志）──
-                            if (udpSender?.hasAck() == true && !p2pConnected) {
+                            // ── ACK 状态检查（ACK 由独立线程接收，此处只读时间戳）──
+                            // 必须用"新鲜度"而不是"历史上收到过"：否则超时判定把
+                            // p2pConnected 置 false 后，下一帧立刻又被判成 true，
+                            // 形成 100Hz 的 连接/断开 抖动，并反复创建反向协程。
+                            if (udpSender?.isAckFresh(nowMs) == true && !p2pConnected) {
                                 p2pConnected = true
                                 _status.value = _status.value.copy(connected = true, errorMsg = "")
                                 // 连接确认后启动反向音频协程（独立 socket，不干扰正向）
@@ -655,6 +697,26 @@ class CaptureService : Service() {
             var lastReport = System.currentTimeMillis()
             var bandwidthLabel = ""
 
+            // 重排 + 去重：与 Rust 端 ReorderBuffer 同语义。
+            // 此前反向流完全没有序号处理：乱序包会被直接解码成噪音，重复包会播两遍。
+            val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length ->
+                val ns = dec.decode(buf, offset, length, pcmBuf)
+                if (ns > 0) {
+                    player.write(pcmBuf, 0, ns)
+                    lastAudioTime = System.currentTimeMillis()
+                    byteCount += length
+
+                    if (!hasAudio) {
+                        hasAudio = true
+                        bandwidthLabel = estimateBandwidth(sampleRate)
+                        _status.value = _status.value.copy(
+                            reverseAudio = true,
+                            reverseBw = bandwidthLabel
+                        )
+                    }
+                }
+            }
+
             Log.i(TAG, "反向音频接收器已启动（仅接受 $expectedIp）")
 
             while (isActive) {
@@ -674,21 +736,10 @@ class CaptureService : Service() {
 
                     val plen = hdr.payloadLen.coerceAtMost(len - Udp2CalProtocol.HEADER_SIZE)
                     if (plen <= 0) continue
-                    val ns = dec.decode(recvBuf, Udp2CalProtocol.HEADER_SIZE, plen, pcmBuf)
-                    if (ns > 0) {
-                        player.write(pcmBuf, 0, ns)
-                        lastAudioTime = System.currentTimeMillis()
-                        byteCount += plen
-
-                        if (!hasAudio) {
-                            hasAudio = true
-                            bandwidthLabel = estimateBandwidth(hdr.sampleRate)
-                            _status.value = _status.value.copy(
-                                reverseAudio = true,
-                                reverseBw = bandwidthLabel
-                            )
-                        }
-                    }
+                    reorder.insert(
+                        hdr.seqNum.toInt(), hdr.sampleRate,
+                        recvBuf, Udp2CalProtocol.HEADER_SIZE, plen
+                    )
 
                     // 每秒更新反向码率
                     val now = System.currentTimeMillis()
@@ -736,12 +787,17 @@ class CaptureService : Service() {
     fun stopCapture() {
         pendingRestart = null
         hasNewCapture = false
-        // 停止后接收端依赖 3 秒超时自动释放 P2P 独占连接
-        // 必须显式关闭 channel，防止消费者在 receive() 挂起无法退出
-        audioChannel?.close()
-        audioChannel = null
+        // 复位模式切换标记：否则 finally 会走"保留网络层"分支，
+        // 跳过 udpSender.close()/reverseDecoder.stop()，socket 与 ACK 线程泄漏。
+        isModeRestart = false
+        // 顺序很重要：必须先 cancel 再 close。
+        // close() 会把挂起在 ch.send 的生产者以 ClosedSendChannelException
+        // （IllegalStateException，非 CancellationException）唤醒，
+        // 若此时协程尚未取消，该异常会一路抛到 SupervisorJob 顶层并导致进程崩溃。
         captureJob?.cancel()
         captureJob = null
+        audioChannel?.close()
+        audioChannel = null
         reverseAudioJob?.cancel()
         reverseAudioJob = null
         _status.value = _status.value.copy(connected = false, reverseAudio = false)

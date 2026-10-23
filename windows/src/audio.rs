@@ -71,15 +71,10 @@ impl Ring {
 pub struct AudioWriter {
     ring: Arc<Ring>,
     pub device_rate: u32,
-    pub resample_count: u64,
-    #[allow(dead_code)]
-    pub underrun_count: Arc<AtomicU64>,
-    pub write_count: u64,
-    pub total_compensated: u64,
-    /// 因缓冲满被丢弃的样本数（诊断用）
-    pub dropped_samples: u64,
+    /// 诊断计数器：由 UI 线程读取并展示/落盘（见 main.rs 的 AUDIO_STATS）
+    pub stats: Arc<AudioStats>,
     /// 当前漂移补偿比率 (1.0=无, >1.0=拉伸)
-    pub drift_ratio: f64,
+    drift_ratio: f64,
 
     // ── 相位连续流式重采样器 ──
     phase: f64,
@@ -97,12 +92,49 @@ pub struct AudioWriter {
     resample_buf: Vec<f32>,
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 诊断计数器
+// 历史实现把 6 个计数器散在 AudioWriter 上，全部只写不读——诊断信息
+// 采了却没人看。这里收敛成一个可共享的单例，UI 与日志共同消费。
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Default)]
+pub struct AudioStats {
+    /// 收到并处理的音频块数
+    pub writes: AtomicU64,
+    /// 发生重采样的块数（源采样率 ≠ 设备采样率）
+    pub resampled: AtomicU64,
+    /// 因环形缓冲满被丢弃的样本数
+    pub dropped: AtomicU64,
+    /// 欠载填充的样本数（音频回调侧）
+    pub underrun: AtomicU64,
+}
+
+impl AudioStats {
+    pub fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            writes: self.writes.load(Ordering::Relaxed),
+            resampled: self.resampled.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+            underrun: self.underrun.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub writes: u64,
+    pub resampled: u64,
+    pub dropped: u64,
+    pub underrun: u64,
+}
+
 impl AudioWriter {
     pub fn write(&mut self, pcm: &[f32], source_rate: u32) {
         if pcm.is_empty() {
             return;
         }
-        self.write_count += 1;
+        self.stats.writes.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
 
         // ── 采样率变化（含首次）立即生效 ──
@@ -155,9 +187,8 @@ impl AudioWriter {
         }
 
         if source_rate != self.device_rate {
-            self.resample_count += 1;
+            self.stats.resampled.fetch_add(1, Ordering::Relaxed);
         }
-        self.total_compensated += 1;
 
         // ── 相位连续流式重采样 ──
         let n_in = pcm.len() as f64;
@@ -178,7 +209,7 @@ impl AudioWriter {
         // ── 无锁写入环形缓冲；满则丢弃（不再在锁内扩容/搬移）──
         for &s in &self.resample_buf {
             if !self.ring.push(s) {
-                self.dropped_samples += 1;
+                self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -213,14 +244,14 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
     ring: &Weak<Ring>,
-    underrun: &Weak<AtomicU64>,
+    stats: &Weak<AudioStats>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels as usize;
     let ring = ring.clone();
-    let underrun = underrun.clone();
+    let stats = stats.clone();
     device
         .build_output_stream(
             config,
@@ -247,8 +278,9 @@ where
 
                 if filled < need_frames {
                     data[idx..].fill(T::EQUILIBRIUM);
-                    if let Some(ur) = underrun.upgrade() {
-                        ur.fetch_add((need_frames - filled) as u64, Ordering::Relaxed);
+                    if let Some(st) = stats.upgrade() {
+                        st.underrun
+                            .fetch_add((need_frames - filled) as u64, Ordering::Relaxed);
                     }
                 }
             },
@@ -258,7 +290,9 @@ where
         .map_err(|e| format!("创建流失败: {e}"))
 }
 
-pub fn start_audio() -> Result<AudioWriter, String> {
+/// 打开输出设备并启动播放线程。
+/// `stats` 由调用方持有（进程级单例），音频回调通过 `Weak` 上报欠载。
+pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let device = find_vb_cable_device()
         .or_else(|| cpal::default_host().default_output_device())
         .ok_or("无可用音频输出设备")?;
@@ -283,20 +317,19 @@ pub fn start_audio() -> Result<AudioWriter, String> {
         ring.push(0.0);
     }
 
-    let underrun = Arc::new(AtomicU64::new(0));
     let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
 
     let ring_weak = Arc::downgrade(&ring);
-    let underrun_weak = Arc::downgrade(&underrun);
+    let stats_weak = Arc::downgrade(&stats);
 
     std::thread::Builder::new()
         .name("udp2cal-audio".into())
         .spawn(move || {
             let built = match sample_format {
-                SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, &ring_weak, &underrun_weak),
-                SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, &ring_weak, &underrun_weak),
-                SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, &ring_weak, &underrun_weak),
-                SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, &ring_weak, &underrun_weak),
+                SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, &ring_weak, &stats_weak),
+                SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, &ring_weak, &stats_weak),
+                SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, &ring_weak, &stats_weak),
+                SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, &ring_weak, &stats_weak),
                 other => Err(format!("不支持的输出采样格式: {other}")),
             };
             let stream = match built {
@@ -323,11 +356,7 @@ pub fn start_audio() -> Result<AudioWriter, String> {
         Ok(None) => Ok(AudioWriter {
             ring,
             device_rate: actual_rate,
-            resample_count: 0,
-            underrun_count: underrun,
-            write_count: 0,
-            total_compensated: 0,
-            dropped_samples: 0,
+            stats,
             drift_ratio: 1.0,
             phase: 0.0,
             // 首帧 write() 会按实际 source_rate 立即校正，此处仅为占位
@@ -406,11 +435,7 @@ mod tests {
             Self {
                 ring,
                 device_rate,
-                resample_count: 0,
-                underrun_count: Arc::new(AtomicU64::new(0)),
-                write_count: 0,
-                total_compensated: 0,
-                dropped_samples: 0,
+                stats: Arc::new(AudioStats::default()),
                 drift_ratio: 1.0,
                 phase: 0.0,
                 effective_ratio: 1.0,
@@ -444,6 +469,6 @@ mod tests {
         let pcm = vec![0.1f32; 480];
         aw.write(&pcm, 48000);
         assert!((aw.ring.len() as i64 - 480).abs() <= 2, "len={}", aw.ring.len());
-        assert_eq!(aw.resample_count, 0);
+        assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 0);
     }
 }

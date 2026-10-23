@@ -201,8 +201,6 @@ class AudioPlayer(private val context: Context) {
         }
     }
 
-    fun isPlaying(): Boolean = audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING
-
     /**
      * 定长循环队列（立体声交错 16bit 样本），只由 write/pump 与 stop 访问，
      * 外部通过 lock 串行化。
@@ -219,10 +217,12 @@ class AudioPlayer(private val context: Context) {
             var dropped = 0
             var i = 0
             while (i < length) {
-                if (size == capacity) {
-                    head = (head + 1) % capacity
-                    size--
-                    dropped++
+                if (size + 1 > capacity) {
+                    // 立体声交错：必须成对淘汰。只丢 1 个样本会让后续 L/R 永久错位
+                    // （每个样本都被当成另一个声道播放），听感上是长期声道互换。
+                    head = (head + 2) % capacity
+                    size -= 2
+                    dropped += 2
                 }
                 buf[(head + size) % capacity] = src[offset + i]
                 size++
@@ -246,10 +246,10 @@ class AudioPlayer(private val context: Context) {
             size -= k
         }
 
-        /** 保留最新 keep 个样本，返回被丢弃的数量 */
+        /** 保留最新 keep 个样本，返回被丢弃的数量（按偶数对齐，保持声道相位） */
         fun trimTo(keep: Int): Int {
             if (size <= keep) return 0
-            val dropped = size - keep
+            val dropped = (size - keep) and 1.inv() // 向下取偶
             drop(dropped)
             return dropped
         }

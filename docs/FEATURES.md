@@ -61,7 +61,7 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
 - **网络无缝热重连**：改 IP 不重启录音流
 - **UDP 广播自动发现**：统一 v2 协议发现局域网内 Windows 接收端
-- **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT（携带反向端口 + Opus 编码参数）+ 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
+- **P2P 双向保活**：每 ~1s（100 帧 × 10ms）发送 TYPE_CONNECT（携带反向端口 + Opus 编码参数）；CONNECT_ACK 由独立守护线程接收（500ms `soTimeout`），不再占用音频流水线
 - **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
@@ -108,7 +108,7 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
   - 双状态机：广播（Ready 周期广播/Silent 停止）+ 连接（Idle 监听/Busy 独占）
   - TYPE_CONNECT 唯一准入，READY 时拒绝所有音频
   - 设备 ID 1对1 过滤 + 并发互斥锁防抢占，重启 Win 即清空非法绑定
-  - **防抢占静默拒绝**：DEVICE_BUSY 时异设备 TYPE_CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 `drainAck()` 永 false → `p2pConnected` 永 false → 新设备不编不送音频（但持续发 CONNECT 等待，由 Win 端静默丢弃）；已有设备保活和音频流完全不受影响
+  - **防抢占静默拒绝**：DEVICE_BUSY 时异设备 TYPE_CONNECT → device_id 不匹配 → 不回复 CONNECT_ACK → 新设备 `lastAckTime` 不刷新 → `p2pConnected` 永 false → 新设备不编不送音频（但持续发 CONNECT 等待，由 Win 端静默丢弃）；已有设备保活和音频流完全不受影响
 - **双向保活**：CONNECT → CONNECT_ACK，1 秒保活周期；300ms 接收超时，1 秒无包标记断连
 - **统一 v2 协议**：15B 包头携带设备 ID，所有包同格式
 - **二进制发现服务**：监听 44043，v2 DISCOVER_REQ/REPLY

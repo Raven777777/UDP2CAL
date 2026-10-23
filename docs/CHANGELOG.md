@@ -4,6 +4,44 @@
 
 ---
 
+## 未发布 — 第二轮质量审查修复（24 项）
+
+> 详细根因与修复方式见 [BUGFIX.md](BUGFIX.md#2026-10-23--第二轮质量审查24-项)，完整报告见 [CODE_REVIEW_ROUND2_2026-10-23.md](archive/CODE_REVIEW_ROUND2_2026-10-23.md)。
+
+**windows（`udp2cal`）**
+- 反向捕获：解析端点混音采样率，非 48 kHz（如 44.1 kHz）在编码前重采样，修复音高偏差 8.8%
+- 反向编码：仅在下发配置真正变化时才调用 `opus_encoder_ctl`，消除每秒一次的状态重置
+- 托盘：创建失败不再 `panic`，降级为"关窗即退出"并提示
+- 停止反向线程改为异步 `join`，不再阻塞 UI/执行器线程
+- 新增落盘日志（`%LOCALAPPDATA%\UDP2CAL\udp2cal.log`，2 MiB 轮转），全部 `eprintln!` 迁移
+- 新增音频诊断计数器并在界面/日志中展示（重采样 / 丢样 / 欠载）
+- 发现服务加按源 IP 的令牌桶；设备 ID 生成混入 OS 熵
+- 接收路径改用有界载荷缓冲池；`AudioInitState` 枚举化；提示级别枚举化
+- 底部状态区改为**单行**并按状态切换：未启动=广播地址；已启动=广播地址+广播中；已连接=音频诊断+反向串流状态。去掉与顶部重复的"已连接手机端/已重新连接/已断开"提示，窗口保持 320×290（成品 322×322 正方形）
+- 顶部 P2P 标识去掉设备识别码，仅显示 `● 已占用`
+- 地址卡片两态统一锁定 32px 行高，消除启动/停止切换时 1.2px 的高度跳变（text_input 固有高度 30.8px）
+
+**android（versionCode 6 / v1.1.2）**
+- 修复停止采集时可能由 `ClosedSendChannelException` 导致的进程崩溃
+- 修复断连后 `p2pConnected` 以 100 Hz 翻转：改为 ACK 时效判定
+- 修复麦克风失效时 `AudioRecord.read` 的 100% CPU 紧循环
+- 修复模式切换后正常停止时 `UdpSender`/ACK 线程泄漏
+- 反向流新增重排与去重（`Udp2CalProtocol.ReorderBuffer`）
+- 修复 `AudioPlayer` 队列溢出时立体声相位错位
+- `UdpSender.send()` 去掉每帧协程调度；设备 ID 改用 `SecureRandom`
+- 显式声明 `androidx.core:core-ktx`
+- 新增协议层 JVM 单元测试 17 项（`Udp2CalProtocolTest`）
+
+**protocol（`udp2cal-protocol`）**
+- `generate_device_id()` 混入 OS 熵与进程号，不再可由时间戳推算
+- 文档标注码率字段为保留字段、码率换算函数为规范参考实现
+
+**仓库**
+- `android_old/lanmic-debug.keystore`、`android_old/local.properties` 移出版本库
+- 修正 `.gitignore` 中失效的"构建产物"规则
+
+---
+
 ## v1.1.2 — 2026-10-23 · 移除 android_old 兼容链
 
 不再保留旧版本适配：`windows/` 与 `protocol/` 中所有为 `android_old/` 服务的分支被彻底删除，v1.1.2 起的 PC 端只与 `android/` 现代版互通。

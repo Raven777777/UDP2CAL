@@ -29,7 +29,6 @@ class OpusEncoder(
     val sampleRateId: Byte = Udp2CalProtocol.hzToSampleRate(sampleRateHz)
     @Volatile var bitrateId: Byte = computeBitrateId(bitrateKbps)
     private var seqNum: Byte = 0
-    var encodeCount: Long = 0; private set
     var deviceId: ByteArray = ByteArray(Udp2CalProtocol.DEVICE_ID_SIZE)
 
     val frameSize: Int
@@ -49,25 +48,6 @@ class OpusEncoder(
         } catch (e: Exception) { Log.e(TAG, "Encoder create failed", e); false }
     }
 
-    @Synchronized
-    fun encode(pcm: ShortArray): ByteArray? {
-        val h = handle; if (h == 0L) return null
-        return try {
-            val encoded = OpusNative.encoderEncode(h, pcm) ?: return null
-            val packet = Udp2CalProtocol.buildPacket(
-                isAudio = true,
-                msgType = Udp2CalProtocol.TYPE_DATA,
-                sampleRate = sampleRateId,
-                seqNum = seqNum++,
-                deviceId = deviceId,
-                payload = encoded,
-                bitrate = bitrateId
-            )
-            encodeCount++
-            packet
-        } catch (e: Exception) { Log.e(TAG, "Encode failed", e); null }
-    }
-
     /**
      * 编码到预分配缓冲区（完全零分配版本）
      * JNI 层直接将 Opus 压缩数据写入 dest[offset+HEADER_SIZE]，
@@ -80,9 +60,7 @@ class OpusEncoder(
             val payloadOffset = offset + Udp2CalProtocol.HEADER_SIZE
             val nbBytes = OpusNative.encoderEncodeTo(h, pcm, dest, payloadOffset)
             if (nbBytes < 0) return -1
-            val written = Udp2CalProtocol.writeAudioHeader(dest, offset, nbBytes, sampleRateId, seqNum++, deviceId, bitrateId)
-            encodeCount++
-            written
+            Udp2CalProtocol.writeAudioHeader(dest, offset, nbBytes, sampleRateId, seqNum++, deviceId, bitrateId)
         } catch (e: Exception) { Log.e(TAG, "EncodeTo failed", e); -1 }
     }
 

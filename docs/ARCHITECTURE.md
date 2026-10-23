@@ -8,8 +8,19 @@
 
 ```
 udp2cal/
-├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备）
-├─ android_old/    # Android 发送端低性能版（已停止开发、仅归档；v1.1.2 起 PC 端不再兼容）
+├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备，当前维护）
+│  └─ app/src/main/
+│     ├─ java/com/udp2cal/app/
+│     │  ├─ MainActivity.kt          # Compose UI + 运行时权限申请
+│     │  ├─ DiscoveryManager.kt      # 局域网广播发现
+│     │  ├─ UdpSender.kt             # UDP 发送器（独立 ACK 接收线程，500ms soTimeout）
+│     │  ├─ Udp2CalProtocol.kt       # 协议编解码（与 Rust 端手动对齐）
+│     │  ├─ AudioPlayer.kt           # 反向音频播放（48kHz 立体声，非阻塞队列）
+│     │  ├─ Prefs.kt                 # SharedPreferences 配置
+│     │  ├─ service/CaptureService.kt# 前台采集服务（生产-消费双协程 + ShortArrayPool）
+│     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
+│     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c + vendored libopus
+├─ android_old/    # 【仅存档】低性能版，v1.1.2 起与 PC 端不互通，以下描述不代表当前实现
 │  └─ app/src/main/java/com/udp2cal/app/
 │     ├─ service/CaptureService.kt  # 采集服务（48kHz、40ms帧合并、ACK限频、CPU自动降级）
 │     ├─ AudioPlayer.kt             # 反向音频播放器（48kHz 单声道输出）
@@ -45,13 +56,13 @@ udp2cal/
 | --- | --- | --- |
 | **UI 层（Android 现代版）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
 | **UI 层（Android Old）** | 传统 View + AppCompat | 已归档；v1.1.2 起与当前 PC 端不互通 |
-| **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
+| **UI 层（Windows）** | Iced (Rust) 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
 | **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
 | **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | 已归档；**生产-消费双协程** + **40ms 帧合并编码**（2 帧打包，JNI 动态帧长，25 帧/秒）；ACK 限频检查（每 10 帧）；CPU 自动降级（`/proc/self/stat` 每 2s 检测）|
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
-| **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
+| **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；**独立 ACK 接收线程**（500ms `soTimeout`，收到 `CONNECT_ACK` 即刷新 `lastAckTime`），音频流水线不再被 1ms 超时轮询干扰 |
 | **Windows 音频引擎** | cpal / WASAPI — 全局单例 Audio Worker 守护线程 | 仅在 `init_audio_worker()` 初始化一次，通过 `SyncChannel<AudioMessage>` 接收，UI 启停不影响底层音频线程 |
 
 ---
@@ -85,7 +96,7 @@ udp2cal/
 
 ```toml
 [profile.release]
-opt-level = "s"       # 按体积优化
+opt-level = 3         # 实时音频路径优先速度，体积换性能不划算
 lto = true            # 链接时优化
 codegen-units = 1     # 单代码生成单元
 panic = "unwind"      # Panic 展开
@@ -115,11 +126,12 @@ windows = { version = "0.58", features = [
 | --- | --- |
 | 采样率（现代版） | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
 | 反向串流编码 | PC 固定 48kHz 立体声全频带，码率与复杂度由手机端 CONNECT 携带的 Opus 参数同步 |
+| 反向捕获采样率 | 读取端点共享模式混音格式的 `nSamplesPerSec`；非 48 kHz（如 44.1 kHz HDMI/USB 设备）在编码前用相位连续线性插值归一到 48 kHz |
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()` / `default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
-| 传输机制 | 15 字节包头（Big-Endian）实时携带码率、采样率、8 字节设备 ID；单一版本，无兼容分支 |
-| 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 相位连续重采样 |
+| 传输机制 | 15 字节包头（Big-Endian）实时携带码率、采样率、8 字节设备 ID；单一版本，无兼容分支。位 5 的码率字段为保留字段，接收端以字节数实测码率 |
+| 接收端解析 | 5 独立 Opus 解码器 + AudioWriter 相位连续重采样；**双向**都经重排缓冲（PC：`protocol::ReorderBuffer`，Android：`Udp2CalProtocol.ReorderBuffer`，语义一致） |
 | **局域网自动发现** | Windows 监听 44043，v2 二进制协议。Android 端 IP 框右侧图标一键搜索 |
-| **心跳与保活** | Android 每 ~1s（50 帧）发 CONNECT（携带反向端口 + Opus 编码参数同步到 PC 反向端）；Win 端 300ms 接收超时 + 1s 无包标记断连；Android 3s 无 ACK 标记断连 |
+| **心跳与保活** | Android 每 ~1s（100 帧 × 10ms）发 CONNECT（携带反向端口 + Opus 编码参数同步到 PC 反向端）；Win 端 300ms 接收超时 + 1s 无音频包标记断连；Android 3s 无新 ACK 标记断连 |
 | **反向串流保活** | 保活 CONNECT 携带反向端口，Win 重启后自动恢复反向串流。仅端口真正变化时重启发送器，防止每秒卡顿 |
 | **模式切换** | 语音↔音乐模式切换时保留 UdpSender(网络层) 和 reverseDecoder，重建 AudioPlayer(路由/声道)，零网络中断 |
 
@@ -129,11 +141,29 @@ windows = { version = "0.58", features = [
 
 | 操作 | 行为 |
 |------|------|
-| 点击关闭按钮 (X) | 隐藏窗口到系统托盘，任务栏消失 |
+| 点击关闭按钮 (X) | 隐藏窗口到系统托盘，任务栏消失（**托盘不可用时改为直接退出**） |
 | 点击最小化按钮 (—) | 最小化到任务栏 |
 | 左键单击托盘图标 | 无操作（仅右键显示菜单） |
 | 双击托盘图标 | 恢复并置顶主窗口 |
 | 托盘右键 → 退出 | 退出程序 |
+
+### 日志
+
+发布版是 GUI 子系统，没有控制台，`eprintln!` 输出不可见。所有运行期事件统一写入：
+
+```
+%LOCALAPPDATA%\UDP2CAL\udp2cal.log
+```
+
+- 单文件上限 2 MiB，超限后轮转为 `udp2cal.1.log`（只保留一轮）
+- 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/反向端口变化、
+  反向编码配置变更、发送错误计数、每 30s 一次的音频统计（块数/重采样/丢样/欠载）
+- UI 底部为**单行**状态行，按连接状态切换内容（三种状态互斥，永远只占一行）：
+  - 未启动：`广播地址: 255.255.255.255:44043`
+  - 已启动未连上：`广播地址…` + `● 广播中`（被占用静默时显示 `● 已静音`）
+  - 已连接：`重采样 N · 丢样 N · 欠载 N` + `● 反向串流已启用`（反向关闭时 `○ 反向串流未启用`）
+- 连接状态（已连接/已断开）**只在顶部状态点显示**，底部提示行仅承载错误与警告，避免同屏重复
+- 排查用户问题时优先索取该文件
 
 ### UI 状态指示
 
@@ -141,7 +171,7 @@ windows = { version = "0.58", features = [
 |--------|------|
 | `● 等待连接 / ● 已断开` | 红色 — 正在监听但无数据流 |
 | `● 已连接` | 绿色 — 收到音频数据 |
-| `● 已占用 / ● 已占用 {device_id}` | 橙色 — TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝 |
+| `● 已占用` | 橙色 — TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝（不显示设备识别码） |
 | `● 空闲` | 绿色 — 已启动但无可信连接 |
 | `● VB-Cable` / `● VB-Cable 未安装` | 绿色/橙色 — 虚拟声卡检测状态 |
 | `● 广播中` / `● 已静音` | 绿色/灰色 — 广播状态机 Ready/Silent |
@@ -175,17 +205,19 @@ windows = { version = "0.58", features = [
 
 | 角色 | 行为 |
 |------|------|
-| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；全局状态 `GLOBAL_DEVICE_STATE` 和 `BOUND_DEVICE_ID` **完全不变** |
-| **第三方 Android 端** | `drainAck()` 1ms 超时永不返回 true → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
+| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`P2P_STATE: Mutex<P2pState>` 与 `BOUND_DEVICE_ID` 记录的绑定关系**完全不变** |
+| **第三方 Android 端** | 收不到新 `CONNECT_ACK` → `lastAckTime` 不刷新 → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
 | **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id 匹配保活分支），音频流正常解码播放，**完全不受影响** |
 
 > 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
+>
+> **威胁模型**：`device_id` 随 `DISCOVER_REPLY` 每秒明文广播，本机制只用于"防误连、防抢占"，**不具备抗伪造能力**——同网段的恶意主机嗅探到 ID 后可冒充绑定设备。需要抗伪造时应在 `CONNECT` 中引入一次性 nonce 或预共享密钥 HMAC。
 
 ### 释放独占的三种途径
 
-1. **Windows 端点击「停止」** → 调用 `reset_to_ready()` 清空 `BOUND_DEVICE_ID` + 恢复 `DEVICE_READY`
-2. **已有 Android 端 1 秒无包超时** → `reset_to_ready()` 自动释放
-3. **重启 Windows 程序** → 全局状态初始化回到 `DEVICE_READY`
+1. **Windows 端点击「停止」** → 调用 `reset_to_ready()` 清空 `P2P_STATE` 中的绑定 + 恢复 `DeviceState::Ready`（重新开始广播）
+2. **已有 Android 端 1 秒无音频包超时** → `reset_to_ready()` 自动释放
+3. **重启 Windows 程序** → 全局状态初始化回到 `DeviceState::Ready`
 
 ---
 

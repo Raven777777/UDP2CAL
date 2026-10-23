@@ -7,6 +7,64 @@
 
 ---
 
+## 2026-10-23 — 第二轮质量审查（24 项）
+
+### 概述
+
+对 `windows/` 与 `android/` 的第二轮全量审查共定位 24 项问题（4 项 P1、12 项 P2、8 项 P3），本轮全部修复。审查报告见 [CODE_REVIEW_ROUND2_2026-10-23.md](archive/CODE_REVIEW_ROUND2_2026-10-23.md)。
+
+### P1（用户可感知 / 崩溃）
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | Android | `stopCapture()` 可能触发进程崩溃 | 先 `channel.close()` 再 `captureJob.cancel()`；`close()` 让阻塞在 `send` 的生产者抛 `ClosedSendChannelException`（非 CancellationException），未捕获 → 顶层 `CoroutineExceptionHandler` → 主线程崩溃 | 调换为"先 cancel 再 close"；生产者 `send` 加 try/catch 兜底 |
+| 2 | Android | 断连后状态以 100 Hz 翻转 | `UdpSender.hasAck()` 只判断 `lastAckTime > 0` 且永不复位；超时置 `p2pConnected=false` 后下一帧立刻被置回 true | 新增 `isAckFresh(now, 3000ms)` 时效判定，替换全部历史判定 |
+| 3 | Windows | 44.1 kHz 端点反向音频升调 8.8% | `parse_mix_format` 只解析声道/位深，未读 `nSamplesPerSec`，编码器硬编码 48 kHz | `CaptureFormat` 增加 `sample_rate`；新增 `StereoResampler`（线性插值 + 跨缓冲相位连续）归一到 48 kHz |
+| 4 | Windows | 托盘创建失败导致进程静默退出 | `install_tray()` 内 `expect()`；explorer 未就绪（开机自启/远程会话）时 panic，且 GUI 子系统无控制台 | 返回 `Option<TrayIcon>`，失败降级为"关窗即退出"并写入日志/提示 |
+
+### P2（健壮性 / 资源 / 可观测性）
+
+| # | 模块 | 问题 | 修复 |
+|---|------|------|------|
+| 5 | Android | `AudioRecord.read <= 0` 无退避 → 麦克风被抢占时 100% CPU 紧循环 | 区分错误码：`ERROR_DEAD_OBJECT` 或连续 100 次错误则停止采集；其余 `delay(5)` 退避 |
+| 6 | Android | 模式切换后 `isModeRestart` 残留，正常停止时跳过 `udpSender.close()` → socket/ACK 线程泄漏 | `stopCapture()` 中显式复位 `isModeRestart` |
+| 7 | Windows | UI/异步路径同步 `join` 反向线程 → 界面卡顿 | `stop_and_join()` 改为 `stop()`：置标志后把 join 交给后台线程 |
+| 8 | Windows | 每秒无条件重下发 9 个 `opus_encoder_ctl` | 缓存 `applied: Option<OpusReverseConfig>`，仅在变化时下发 |
+| 9 | Windows | 底部提示与顶部状态点重复（"已连接手机端/已重新连接/已断开"闪烁），且状态行过高被方形窗口裁切 | 底部改为**单行**并按状态切换（未启动=广播地址／已启动=广播地址+广播中／已连接=音频诊断+反向串流）；提示行仅保留错误；顶部"已占用"去掉设备识别码；窗口保持 320×290（成品 322×322） |
+| 9b | Windows | 用 `bitrate=0` 的 StatusUpdate 充当重绘信号，导致码率显示每秒闪一次 0 | 新增 `Message::PeerStateChanged` 专用重绘消息，不再污染遥测数据 |
+| 9c | Windows | 地址卡片在启动后变高 1.2px（把下方整列推开） | 运行态分支 `.height(32)` 与 input 固有高度（16×1.3+10=30.8px）不一致；未启动分支的 row 也加 `.height(32)`，两态锁死 |
+| 10 | Windows | 发布版无任何落盘日志 | 新增 `logger` 模块：`%LOCALAPPDATA%\UDP2CAL\udp2cal.log`，2 MiB 轮转；全部 `eprintln!` 改为 `logf!` |
+| 11 | Android | 反向流无序号处理，乱序包解码成噪音 | 新增 `Udp2CalProtocol.ReorderBuffer`（与 Rust 端同语义：首包基准 / 迟到窗口 8 / 重排窗口 2 / 大步跳变重同步） |
+| 12 | Windows | 设备 ID 可预测且无鉴权 | `generate_device_id()` 混入 `RandomState`（OS 熵）与进程号/序号；在 ARCHITECTURE.md 补充威胁模型章节 |
+| 13 | Windows | 发现应答可被用于 UDP 反射放大 | 发现线程加按源 IP 的令牌桶（5 次/秒，30s 清理） |
+| 14 | 仓库 | `android_old/lanmic-debug.keystore` 与 `local.properties` 仍在版本库 | `git rm --cached` 移出索引（`.gitignore` 已覆盖） |
+| 15 | Android | `androidx.core` 未显式声明，仅靠传递依赖 | 显式 `implementation("androidx.core:core-ktx:1.16.0")` |
+| 16 | Android | `hasNewCapture` / `Prefs.prefs` 跨线程无可见性保证 | 加 `@Volatile` |
+
+### P3（可维护性 / 死代码 / 一致性）
+
+| # | 模块 | 问题 | 修复 |
+|---|------|------|------|
+| 17 | Windows | `AudioWriter` 6 个计数器只写不读 | 收敛为 `AudioStats`（原子计数器），UI 底部显示"重采样/丢样/欠载"，每 30s 落盘 |
+| 18 | Android/Windows | 死代码：`isV2Packet`、`buildAudioPacketTo`、`isPlaying`、`connectedDeviceId`、`OpusEncoder.encode`、`encodeCount` | 全部删除（含 JNI `encoderEncode`） |
+| 19 | protocol | 码率字段两端都不消费，helper 仅测试使用 | 文档标注为"保留字段"，helper 标注为"规范参考实现" |
+| 20 | Windows | `notice_is_error()` 靠中文子串判定配色 | 改为 `NoticeLevel::{Info, Error}` 显式声明 |
+| 21 | Windows | `AUDIO_INIT_STATE` 裸 `u32` 魔数 | 改为 `enum AudioInitState`（`AtomicU8`） |
+| 22 | Windows | 接收路径每包 `to_vec()` | 新增有界载荷缓冲池（64 个），音频线程解码后归还 |
+| 23 | Android | 每帧 `withContext(Dispatchers.IO)` 调度抖动 | `UdpSender.send()` 改为普通函数，由消费者协程直接调用 |
+| 24 | 仓库 | `.gitignore` 第 9 行 `构建产物` 缺 `#` | 修正为注释 |
+| 附 | Android | 协议层无任何自动化测试 | 新增 `app/src/test/.../Udp2CalProtocolTest.kt`（17 项：编解码往返 / 非法包拒绝 / 跨端常量 / 重排时序）+ `testImplementation("junit:junit:4.13.2")` |
+
+### 附带修复（审查中额外发现）
+
+| 模块 | 问题 | 修复 |
+|------|------|------|
+| Android `AudioPlayer.ShortQueue` | 队满时只淘汰 1 个样本，立体声交错相位永久错位（声道互换） | 成对淘汰；`trimTo()` 向下取偶 |
+| Android `AudioPlayer` | `isPlaying()` 无人调用 | 删除 |
+| 文档 | `opt-level`、保活帧数、已删除的全局变量、`drainAck` 等 4 处漂移 | 同步 ARCHITECTURE.md / FEATURES.md |
+
+---
+
 ## 2026-06-10 — 正式版发布：GPL 许可证合规 + 最终代码审查
 
 ### 概述
