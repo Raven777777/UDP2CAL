@@ -20,6 +20,7 @@ UDP2CAL 是一个双向、低延迟的局域网音频串流系统：Android 手�
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史与重大变更 | 全部 |
 | [BUGFIX.md](BUGFIX.md) | 已修复 Bug 的根因分析与修复方式（按时间倒序） | 全部 |
 | [LEGAL.md](LEGAL.md) | 版权声明、GPL-3.0 授权、第三方开源组件许可 | 分发者、合规审查 |
+| [archive/CODE_REVIEW_2026-10-23.md](archive/CODE_REVIEW_2026-10-23.md) | 全量代码质量审查报告（43 项分级问题、证据定位、修复记录）——**已归档** | 维护者、审查者 |
 
 ---
 
@@ -45,5 +46,7 @@ docs/
 ├─ CHANGELOG.md       # 版本历史
 ├─ BUGFIX.md          # Bug 修复记录
 ├─ LEGAL.md           # 许可证与合规
+├─ archive/           # 已归档报告
+│  └─ CODE_REVIEW_2026-10-23.md  # 代码质量审查与修复记录
 └─ assets/            # 文档截图（webp）
 ```

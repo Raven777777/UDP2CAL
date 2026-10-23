@@ -93,9 +93,27 @@ build.bat adb --all         :: 编译 + 安装 + 清缓冲 + 监控 + 打开 Win
 | --- | --- | --- |
 | `udp2cal_{x64,x86}.exe` | ~6.3 MB | Windows 接收端（架构后缀，UPX 压缩后为 `.upx.exe`）|
 | `udp2cal_{x64,x86}-debug.exe` | ~22 MB | Windows 调试版 |
-| `udp2cal_arm64-v8a_Release.apk` | ~2.65 MB | Android 现代版 (64位，已签名) |
-| `udp2cal_armeabi-v7a_Release.apk` | ~2.65 MB | Android 现代版 (32位，已签名) |
+| `udp2cal_arm64-v8a_Release.apk` | ~2.7 MB | Android 现代版 (64位，已签名；签名来源见下) |
+| `udp2cal_armeabi-v7a_Release.apk` | ~2.7 MB | Android 现代版 (32位，已签名；签名来源见下) |
 | `udp2cal_old_{arm64-v8a,armeabi-v7a}_Release.apk` | ~2.65 MB | Android Old 低性能版（**已停止开发**，历史产物，见 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)）|
+
+### 发布签名
+
+仓库内**不含任何密钥库**，签名信息由 `android/local.properties` 或环境变量提供：
+
+```properties
+# android/local.properties（不入库）
+RELEASE_STORE_FILE=lanmic-debug.keystore   # 相对 android/ 目录
+RELEASE_STORE_PASSWORD=******
+RELEASE_KEY_ALIAS=lanmic
+RELEASE_KEY_PASSWORD=******
+```
+
+对应环境变量为 `UDP2CAL_STORE_FILE / UDP2CAL_STORE_PASSWORD / UDP2CAL_KEY_ALIAS / UDP2CAL_KEY_PASSWORD`。
+
+- **已配置** → Release 使用该密钥签名，可覆盖升级旧版本（需与旧 APK 同一密钥）。
+- **未配置** → 回落到本机调试密钥 `~/.android/debug.keystore`（每台机器不同、不入库），构建仍可通过且 APK 可安装，但**仅供自测**；构建日志会打印警告。
+- 若设备上已装过用其他密钥签名的旧版，安装会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，需先 `adb uninstall com.udp2cal.app`。
 
 ---
 
@@ -136,3 +154,5 @@ scripts/
 | `icon.png` 缺失导致构建失败 | 图标被移动或重命名 | 恢复 `icon.png` 到项目根目录 |
 | Android 构建找不到 SDK / NDK | `local.properties` 路径错误 | 执行 `build.bat doctor --fix` 自动修正 |
 | Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本会检查 wrapper；必要时删除 `~/.gradle/caches` 后重试 |
+| `lintVitalAnalyzeRelease` 报 `IncompatibleClassChangeError: KaCallableMemberCall` | AGP 8.7 的 lint 与 Kotlin 2.0 分析 API 不兼容（Google issue 374783344），崩溃点为 `NullSafeMutableLiveData` 检查 | 已在 `app/build.gradle.kts` 禁用该检查；升级到 AGP 8.8.2+ 后可删除该行恢复 |
+| `--proxy` 构建报 `'127.0.0.1' 不是内部或外部命令` | `-Dhttp.nonProxyHosts` 中的 `\|` 被 cmd 当作管道符 | 已修复（`scripts/udp2cal/proxy.py` 为该参数加引号）；旧脚本可改用 `--proxy direct` 绕过 |
