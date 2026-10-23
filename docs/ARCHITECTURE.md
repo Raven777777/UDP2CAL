@@ -9,7 +9,7 @@
 ```
 udp2cal/
 ├─ android/        # Android 发送端（Kotlin + JNI Opus，面向现代设备）
-├─ android_old/    # Android 发送端低性能版（Kotlin + JNI Opus，48kHz FB 全频带，面向低端/翻盖机）
+├─ android_old/    # Android 发送端低性能版（已停止开发、仅归档；v1.1.2 起 PC 端不再兼容）
 │  └─ app/src/main/java/com/udp2cal/app/
 │     ├─ service/CaptureService.kt  # 采集服务（48kHz、40ms帧合并、ACK限频、CPU自动降级）
 │     ├─ AudioPlayer.kt             # 反向音频播放器（48kHz 单声道输出）
@@ -44,11 +44,11 @@ udp2cal/
 | 层级 | 技术选型 | 运行时更新策略（免重启） |
 | --- | --- | --- |
 | **UI 层（Android 现代版）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
-| **UI 层（Android Old）** | 传统 View + AppCompat | 十字键交互、一键自动连接、关于页滑动切换；无 Compose，兼容 API 21+ |
+| **UI 层（Android Old）** | 传统 View + AppCompat | 已归档；v1.1.2 起与当前 PC 端不互通 |
 | **UI 层（Windows）** | Iced (Rust) 360×300 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
 | **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
 | **音频采集（现代版）** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
-| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | **生产-消费双协程** + **40ms 帧合并编码**（2 帧打包，JNI 动态帧长，25 帧/秒）；ACK 限频检查（每 10 帧）；`delay(1)` 防忙等；CPU 自动降级（`/proc/self/stat` 每 2s 检测）|
+| **音频采集（Old 低性能版）** | AudioRecord（VOICE_COMMUNICATION 优先，48kHz FB 全频带） | 已归档；**生产-消费双协程** + **40ms 帧合并编码**（2 帧打包，JNI 动态帧长，25 帧/秒）；ACK 限频检查（每 10 帧）；CPU 自动降级（`/proc/self/stat` 每 2s 检测）|
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
 | **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；非阻塞 1ms 超时 drainAck（收 CONNECT_ACK）|
@@ -114,13 +114,12 @@ windows = { version = "0.58", features = [
 | 协商项 | 策略 |
 | --- | --- |
 | 采样率（现代版） | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
-| 采样率（Old 低性能版） | Android 48kHz FB 全频带编码；PC 反向 48kHz 立体声最大码率（高品质模式）；Android 48kHz 解码+播放 |
-| 帧长（Old 低性能版） | 合并 2 帧（40ms）打包编码，JNI 动态帧长，编码频率 25 帧/秒，CPU ~14%（实测 Sharp NP805SH） |
+| 反向串流编码 | PC 固定 48kHz 立体声全频带，码率与复杂度由手机端 CONNECT 携带的 Opus 参数同步 |
 | 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()` / `default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
-| 传输机制 | 15 字节包头（v2 统一协议，Big-Endian）实时携带码率、采样率、8 字节设备 ID |
+| 传输机制 | 15 字节包头（Big-Endian）实时携带码率、采样率、8 字节设备 ID；单一版本，无兼容分支 |
 | 接收端解析 | `resolve_bitrate()` + 5 独立 Opus 解码器 + AudioWriter 相位连续重采样 |
 | **局域网自动发现** | Windows 监听 44043，v2 二进制协议。Android 端 IP 框右侧图标一键搜索 |
-| **心跳与保活** | Android 每 ~1s（50 帧）发 CONNECT（携带反向端口+模式标志+Opus 编码同步到 PC 反向端）；Win 端 300ms 接收超时 + 1s 无包标记断连；Android 3s 无 ACK 标记断连 |
+| **心跳与保活** | Android 每 ~1s（50 帧）发 CONNECT（携带反向端口 + Opus 编码参数同步到 PC 反向端）；Win 端 300ms 接收超时 + 1s 无包标记断连；Android 3s 无 ACK 标记断连 |
 | **反向串流保活** | 保活 CONNECT 携带反向端口，Win 重启后自动恢复反向串流。仅端口真正变化时重启发送器，防止每秒卡顿 |
 | **模式切换** | 语音↔音乐模式切换时保留 UdpSender(网络层) 和 reverseDecoder，重建 AudioPlayer(路由/声道)，零网络中断 |
 
@@ -142,7 +141,7 @@ windows = { version = "0.58", features = [
 |--------|------|
 | `● 等待连接 / ● 已断开` | 红色 — 正在监听但无数据流 |
 | `● 已连接` | 绿色 — 收到音频数据 |
-| `● 已占用 / ● 已占用 {device_id}` | 橙色 — v2 TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝 |
+| `● 已占用 / ● 已占用 {device_id}` | 橙色 — TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝 |
 | `● 空闲` | 绿色 — 已启动但无可信连接 |
 | `● VB-Cable` / `● VB-Cable 未安装` | 绿色/橙色 — 虚拟声卡检测状态 |
 | `● 广播中` / `● 已静音` | 绿色/灰色 — 广播状态机 Ready/Silent |

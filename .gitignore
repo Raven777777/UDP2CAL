@@ -5,10 +5,7 @@ __pycache__/
 *.py[cod]
 *.bak
 
-# Windows 构建产物
-/windows/target
-
-# Android 构建产物
+构建产物
 /android/.gradle/
 /android/.kotlin/
 /android/build/
@@ -19,6 +16,7 @@ __pycache__/
 /android_old/build/
 /android_old/app/build/
 /android_old/app/.cxx/
+*/target
 
 # 根目录发布产物
 /*.exe

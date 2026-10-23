@@ -259,10 +259,9 @@ pub fn start_broadcast_listener() {
             match socket.recv_from(&mut buf) { 
                 Ok((amt, src)) => { 
                     let data = &buf[..amt];
-                    // 尝试统一 v2 协议
-                    if amt >= protocol::HEADER_SIZE && protocol::is_v2_packet(data) {
-                        let hdr_buf: [u8; protocol::HEADER_SIZE] = 
-                            data[..protocol::HEADER_SIZE].try_into().unwrap_or_default();
+                    if amt >= protocol::HEADER_SIZE {
+                        let mut hdr_buf = [0u8; protocol::HEADER_SIZE];
+                        hdr_buf.copy_from_slice(&data[..protocol::HEADER_SIZE]);
                         if let Some(hdr) = protocol::decode_header(&hdr_buf) {
                             if APP_RUNNING.load(Ordering::Relaxed) != 0
                                 && GLOBAL_DEVICE_STATE.load(Ordering::Relaxed) == DEVICE_READY
@@ -541,12 +540,12 @@ impl AppState {
             (red, if self.status_text.contains("断开") { "● 已断开" } else { "● 等待连接" }) 
         };
 
-        // P2P 状态: 独占绑定(仅v2 TYPE_CONNECT触发) / 音频流连接(v1) / 空闲
+        // P2P 状态: TYPE_CONNECT 独占绑定 / 空闲
         let gs = GLOBAL_DEVICE_STATE.load(Ordering::Relaxed);
         let (p2p_state, p2p_color) = if !self.is_running {
             (String::new(), dim)
         } else if gs == DEVICE_BUSY {
-            // 独占绑定: 通过 v2 TYPE_CONNECT 建立, 显示设备 ID
+            // 独占绑定: 通过 TYPE_CONNECT 建立, 显示设备 ID
             let id_str = bound_device_id().lock().ok()
                 .map(|id| {
                     let hex: String = id.iter().map(|b| format!("{:02x}", b)).collect();
@@ -559,9 +558,6 @@ impl AppState {
             } else {
                 (format!("● 已占用 {}", id_str), Color::from_rgb(0.95, 0.55, 0.15))
             }
-        } else if self.connected {
-            // v1 音频流连接: 有数据流但无独占绑定
-            ("● 已连接".to_string(), accent)
         } else {
             ("● 空闲".to_string(), accent)
         };
@@ -933,10 +929,11 @@ fn send_connect_ack(src_addr: &std::net::SocketAddr) {
 
 /// 处理控制消息（TYPE_CONNECT / TYPE_CONNECT_ACK / TYPE_DISCOVER_*）
 fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &std::net::SocketAddr, output: &mut iced::futures::channel::mpsc::Sender<Message>) {
-    /// 从扩展 CONNECT payload 中解析 Opus 编码参数（字节 3~9）
+    /// 从 CONNECT payload 中解析 Opus 编码参数
+    /// 布局: [0..2] 反向端口, [2] 标志位(bit1=携带 Opus 参数), [3..10] 编码参数
     fn parse_opus_cfg(payload: &[u8]) -> Option<capture::OpusReverseConfig> {
         if payload.len() < 10 || (payload[2] & 0x02) == 0 {
-            return None; // 无扩展配置字段
+            return None; // 未携带扩展配置（首包仅含反向端口）
         }
         let flags = payload[6];
         Some(capture::OpusReverseConfig {
@@ -960,8 +957,6 @@ fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &st
             } else {
                 0
             };
-            // 提取低性能模式标志（payload 第3字节 bit0，0=高品质/1=低性能）
-            let low_perf = payload.len() >= 3 && (payload[2] & 0x01) != 0;
             // 同步 Opus 编码设置
             if let Some(cfg) = parse_opus_cfg(payload) {
                 capture::update_reverse_config(cfg);
@@ -991,8 +986,8 @@ fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &st
                                 if let Ok(mut sender) = reverse_sender().lock() {
                                     if let Some(s) = sender.take() { s.stop(); }
                                     let my_id = my_device_id();
-                                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id, low_perf));
-                                    eprintln!("[P2P] 反向端口变化，已重启 -> {}:{} (low_perf={})", src_addr.ip(), android_rev_addr.port(), low_perf);
+                                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
+                                    eprintln!("[P2P] 反向端口变化，已重启 -> {}:{}", src_addr.ip(), android_rev_addr.port());
                                 }
                             }
                         }
@@ -1021,9 +1016,9 @@ fn handle_control(header: &protocol::PacketHeader, payload: &[u8], src_addr: &st
             if REVERSE_ENABLED.load(Ordering::Relaxed) != 0 {
                 let my_id = my_device_id();
                 if let Ok(mut sender) = reverse_sender().lock() {
-                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id, low_perf));
+                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
                 }
-                eprintln!("[P2P] 反向音频发送到 {}:{} (low_perf={})", src_addr.ip(), android_rev_addr.port(), low_perf);
+                eprintln!("[P2P] 反向音频发送到 {}:{}", src_addr.ip(), android_rev_addr.port());
             } else {
                 eprintln!("[P2P] 反向音频开关未开启，跳过启动");
             }
@@ -1098,7 +1093,7 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
                 } 
             }; 
 
-            if len < protocol::HEADER_SIZE || !protocol::is_v2_packet(&buf) { 
+            if len < protocol::HEADER_SIZE { 
                 continue; 
             } 
 

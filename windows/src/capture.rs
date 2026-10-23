@@ -19,10 +19,8 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 
-const FRAME_SIZE: usize = 480;      // 48000 * 10ms 帧（单声道，低延迟优化）
-const FRAME_SIZE_16K: usize = 160;  // 16000 * 10ms 帧（单声道，低性能）
-const CODEC_MONO: u8 = 1;      // 协议 codec=1: Opus单声道（低性能模式）
-const CODEC_STEREO: u8 = 2;    // 协议 codec=2: Opus立体声（高品质模式）
+const FRAME_SIZE: usize = 480;               // 48000 * 10ms 单声道帧
+const FRAME_SAMPLES: usize = FRAME_SIZE * 2; // 立体声交错样本数
 
 // ═══════════════════════════════════════════════════════════════════
 // Opus 反向编码运行时配置（由主线程 CONNECT 保活包更新，运行中热生效）
@@ -134,16 +132,15 @@ pub struct ReverseSender {
 }
 
 impl ReverseSender {
-    /// low_perf=true: 单声道64kbps窄带（适配 android_old 低端设备）
-    /// low_perf=false: 立体声最大码率全频带（默认高品质）
-    pub fn start(android_addr: SocketAddr, device_id: [u8; 8], low_perf: bool) -> Self {
+    /// 立体声 48kHz 全频带编码，码率由手机端 CONNECT 携带的 Opus 参数热同步
+    pub fn start(android_addr: SocketAddr, device_id: [u8; 8]) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
         let handle = std::thread::Builder::new()
             .name("reverse-capture".into())
             .spawn(move || {
-                Self::run_loop(android_addr, device_id, &running_clone, low_perf);
+                Self::run_loop(android_addr, device_id, &running_clone);
             })
             .ok();
 
@@ -154,31 +151,23 @@ impl ReverseSender {
         self.running.store(false, Ordering::Relaxed);
     }
 
-    fn run_loop(android_addr: SocketAddr, device_id: [u8; 8], running: &AtomicBool, low_perf: bool) {
+    fn run_loop(android_addr: SocketAddr, device_id: [u8; 8], running: &AtomicBool) {
         eprintln!("[Reverse] 启动反向音频发送到 {}", android_addr);
 
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
-        // 低性能模式: 单声道 64kbps 宽带 (16kHz); 高性能: 立体声最大码率全频带
-        let (channels, _codec, frame_samps, bitrate, bandwidth, sample_rate_id) = if low_perf {
-            eprintln!("[Reverse] 低性能模式: 单声道 64kbps 16kHz 宽带");
-            (audiopus::Channels::Mono, CODEC_MONO, FRAME_SIZE_16K,
-             audiopus::Bitrate::BitsPerSecond(64000), audiopus::Bandwidth::Wideband, 2u8)
-        } else {
-            eprintln!("[Reverse] 高品质模式: 立体声 最大码率 全频带");
-            (audiopus::Channels::Stereo, CODEC_STEREO, FRAME_SIZE * 2,
-             audiopus::Bitrate::Max, audiopus::Bandwidth::Fullband, 4u8)
-        };
-
-        let sr = if low_perf { audiopus::SampleRate::Hz16000 } else { audiopus::SampleRate::Hz48000 };
-        let mut encoder = match audiopus::coder::Encoder::new(sr, channels, audiopus::Application::Audio) {
+        let mut encoder = match audiopus::coder::Encoder::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Stereo,
+            audiopus::Application::Audio,
+        ) {
             Ok(e) => e,
             Err(err) => { eprintln!("[Reverse] Opus 编码器失败: {:?}", err); return; }
         };
-        let _ = encoder.set_bitrate(bitrate);
-        let _ = encoder.set_bandwidth(bandwidth);
+        // 默认参数：最大码率 + 全频带；手机端配置到达后由 apply_config 覆盖
+        let _ = encoder.set_bitrate(audiopus::Bitrate::Max);
+        let _ = encoder.set_bandwidth(audiopus::Bandwidth::Fullband);
         let _ = encoder.set_vbr(true);
-        if low_perf { let _ = encoder.set_complexity(1); }
 
         // 应用可能已接收到的手机端配置
         if let Ok(cfg) = reverse_config().lock() {
@@ -197,10 +186,8 @@ impl ReverseSender {
             None => { eprintln!("[Reverse] 环回捕获初始化失败"); return; }
         };
 
-        let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_samps);
-        // ponytail: accum_buf 改用 vec! 使大小跟随 frame_samps (480×ch)，消除魔法数字
-        let mut accum_buf = vec![0i16; frame_samps];
-        let mut mono_buf: Vec<i16> = Vec::with_capacity(FRAME_SIZE * 2);
+        let mut pcm_buf: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
+        let mut accum_buf = vec![0i16; FRAME_SAMPLES];
         let mut encode_out = [0u8; 1500];
         let mut seq_num: u8 = 0;
         // ponytail: 栈上发送缓冲区，build_packet_to 直接写入，消除 Vec 分配
@@ -208,6 +195,8 @@ impl ReverseSender {
         // ponytail: 复用 loopback 读取缓冲区，消除高频 Vec 分配
         let mut loopback_samples: Vec<f32> = Vec::with_capacity(960);
         let mut last_cfg_check = std::time::Instant::now();
+        // ponytail: pcm_buf 硬上限 ~3 秒（288000 交错样本 / 96000 样本每秒）
+        const MAX_PCM: usize = 288000;
 
         while running.load(Ordering::Relaxed) {
             // ── 每 1 秒检查配置变化并热应用 ──
@@ -223,69 +212,32 @@ impl ReverseSender {
                 continue;
             }
 
-            if low_perf {
-                // 低性能模式不需要运行时调参（android_old 不支持同步）
-                for &sample_f32 in &*loopback_samples {
-                    let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    pcm_buf.push(s);
-                }
-                // ponytail: pcm_buf 硬上限 ~3 秒，异常情况下丢弃旧数据避免 OOM
-                const MAX_PCM: usize = 96000;
-                if pcm_buf.len() > MAX_PCM {
-                    pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
-                }
-                while pcm_buf.len() >= 2 {
-                    let l = pcm_buf[0] as i32;
-                    let r = pcm_buf[1] as i32;
-                    mono_buf.push(((l + r) / 2) as i16);
-                    pcm_buf.drain(0..2);
-                }
-                while mono_buf.len() >= FRAME_SIZE {
-                    let mut decimated = [0i16; FRAME_SIZE_16K];
-                    for i in 0..FRAME_SIZE_16K {
-                        decimated[i] = mono_buf[i * 3];
-                    }
-                    let n = encoder.encode(&decimated[..FRAME_SIZE_16K], &mut encode_out).unwrap_or(0);
+            for &sample_f32 in &*loopback_samples {
+                let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
+                pcm_buf.push(s);
+            }
+            if pcm_buf.len() > MAX_PCM {
+                pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
+            }
+
+            while pcm_buf.len() >= FRAME_SAMPLES {
+                accum_buf[..FRAME_SAMPLES].copy_from_slice(&pcm_buf[..FRAME_SAMPLES]);
+                pcm_buf.drain(..FRAME_SAMPLES);
+                if let Ok(n) = encoder.encode(&accum_buf[..FRAME_SAMPLES], &mut encode_out) {
                     let plen = n.min(1472);
                     if plen > 0 {
                         seq_num = seq_num.wrapping_add(1);
                         if let Some(total) = protocol::build_packet_to(
-                            &mut pkt_buf, 0, true, 0, sample_rate_id, seq_num,
+                            &mut pkt_buf, 0, true, protocol::TYPE_DATA,
+                            protocol::SAMPLE_RATE_48K, seq_num,
                             &device_id, &encode_out[..plen], 0,
                         ) {
                             let _ = send_sock.send_to(&pkt_buf[..total], android_addr);
                         }
                     }
-                    mono_buf.drain(..FRAME_SIZE.min(mono_buf.len()));
-                }
-            } else {
-                // 高品质模式: 立体声直通编码
-                for &sample_f32 in &*loopback_samples {
-                    let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    pcm_buf.push(s);
-                }
-                // ponytail: pcm_buf 硬上限 ~3 秒
-                const MAX_PCM: usize = 288000;
-                if pcm_buf.len() > MAX_PCM {
-                    pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
-                }
-                while pcm_buf.len() >= frame_samps {
-                    accum_buf[..frame_samps].copy_from_slice(&pcm_buf[..frame_samps]);
-                    pcm_buf.drain(..frame_samps);
-                    if let Ok(n) = encoder.encode(&accum_buf[..frame_samps], &mut encode_out) {
-                        let plen = n.min(1472);
-                        if plen > 0 {
-                            seq_num = seq_num.wrapping_add(1);
-                            if let Some(total) = protocol::build_packet_to(
-                                &mut pkt_buf, 0, true, 0, sample_rate_id, seq_num,
-                                &device_id, &encode_out[..plen], 0,
-                            ) {
-                                let _ = send_sock.send_to(&pkt_buf[..total], android_addr);
-                            }
-                        }
-                    }
                 }
             }
+
             std::thread::sleep(Duration::from_millis(2));
         }
 

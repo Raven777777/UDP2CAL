@@ -1,6 +1,6 @@
 [package]
 name = "udp2cal-protocol"
-version = "1.1.0"
+version = "1.1.2"
 edition = "2021"
 description = "UDP2CAL 私有协议编解码 (Rust实现)"
 

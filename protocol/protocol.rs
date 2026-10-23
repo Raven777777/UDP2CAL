@@ -16,7 +16,8 @@
 /// Byte 7-14:    [8 bytes device_id] (发送端唯一标识)
 /// Byte 15+:     [payload]
 ///
-/// 检测: byte[0] == 0x02 → v2 统一协议; byte[0] >= 0x80 → 旧 v1 (拒绝)
+/// 协议只有单一版本：byte[0] 必须等于 PROTO_VERSION，其余一律拒绝。
+/// 不存在版本协商、降级或旧版本兼容路径。
 
 pub const HEADER_SIZE: usize = 15;
 pub const MAX_PAYLOAD: usize = 1472;
@@ -74,11 +75,6 @@ impl Default for PacketHeader {
 }
 
 // ═══════════════════════ 编解码 ═══════════════════════
-
-/// 检测是否为 v2 统一协议包
-pub fn is_v2_packet(buf: &[u8]) -> bool {
-    buf.len() >= 1 && buf[0] == PROTO_VERSION
-}
 
 /// 编码包头
 pub fn encode_header(header: &PacketHeader, buf: &mut [u8; HEADER_SIZE]) {
@@ -336,7 +332,6 @@ mod tests {
         };
         let mut buf = [0u8; HEADER_SIZE];
         encode_header(&header, &mut buf);
-        assert!(is_v2_packet(&buf));
         let decoded = decode_header(&buf).unwrap();
         assert_eq!(decoded.is_audio, true);
         assert_eq!(decoded.msg_type, TYPE_DATA);
@@ -365,20 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_v1() {
-        // Old v1 packets have byte 0 >= 0x80, should be rejected
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = 0x94; // old v1: ver=1, codec=1, sr=4
-        buf[1] = 0;
-        assert!(!is_v2_packet(&buf));
-        assert!(decode_header(&buf).is_none());
-    }
-
-    #[test]
     fn test_reject_unknown_version() {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0] = 0x03; // unknown version
-        assert!(!is_v2_packet(&buf));
         assert!(decode_header(&buf).is_none());
     }
 

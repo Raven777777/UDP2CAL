@@ -1,4 +1,12 @@
-# Android Old 低性能版（`android_old/`）
+# Android Old 低性能版（`android_old/`）· 已归档
+
+> ## ⚠️ 本项目已停止开发
+>
+> `android_old/` 自 **v1.1.1** 起停止开发，不再接受功能更新、兼容性修复与构建支持。本文档仅作为归档记录保留，所述内容对应 v1.1.1 的最终状态。
+>
+> **v1.1.2 起，`windows/` 与 `protocol/` 已彻底删除低性能适配代码**（`low_perf` 标志、16kHz 单声道反向编码、旧版本探测），本版本 APK 无法连接 v1.1.2 及以后的 PC 端。
+>
+> **如需使用低性能版，请成对使用 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1) 的 Windows 端与已签名 APK。**
 
 > 适用于 Android 6~8（API 21~26）旧设备 / 翻盖机，支持双向音频串流
 > 相关文档：[功能特性](FEATURES.md) · [构建说明](BUILD.md) · [架构说明](ARCHITECTURE.md)

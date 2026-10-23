@@ -15,7 +15,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供两个 Android 客户端版本：
 
 - **`android/`（现代版）** — 面向 Jetpack Compose 设备，固定 48kHz 采集，支持全参数 Opus 调节 + 反向编码实时同步；
-- **`android_old/`（低性能版）** — 面向 Android 6~8 低端/翻盖机，48kHz 全频带 + 40ms 帧合并编码 + JNI 动态帧长 + CPU 自动降级保护，CPU ~14%（实测 Sharp NP805SH / 骁龙210 / 1GB RAM）。
+- **`android_old/`（低性能版，已归档）** — 面向 Android 6~8 低端/翻盖机，源码仅作归档；**v1.1.2 起 PC 端已删除低性能适配，旧 APK 与当前 PC 端不互通**。
 
 **全链路零堆分配**（ByteArray + ShortArray 双闭环，仅池热身期 3 次构造）、**生产-消费双协程**消除阻塞饥饿、**JNI 双重边界守卫**防越界写穿。
 
@@ -26,7 +26,7 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - 双向音频：手机麦克风→PC (VB-Cable) + PC 扬声器→手机听筒/扬声器
 - 反向串流：WASAPI Loopback → Opus 编码 → UDP 发送（Windows UI 按钮控制启停）
 - 声学回声消除：语音模式启用 AcousticEchoCanceler + MODE_IN_COMMUNICATION + 同 session 绑定
-- 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志）
+- 立体声/单声道自适应：现代手机立体声编码，低端设备单声道降级（CONNECT payload 模式标志，v1.1.2 已移除）
 - **android_old 发热优化**：48kHz FB + 40ms 帧合并 + JNI 动态帧长，CPU 120%→14%
 - **android_old 反向解码立体声修复**：`opus_jni_decoder.c` 单声道解码器→立体声，修复 PC 高品质模式反向无声
 - v2 控制协议：二进制发现、独占连接（TYPE_CONNECT/ACK）、8 字节设备 ID 鉴权
@@ -43,8 +43,8 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - **正向**：手机麦克风 → Opus 编码 → UDP → PC（VB-Cable 输出），逻辑不变
 - **反向**：PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器播放
 - **Windows 端开关控制**：UI 按钮（开机自启右侧）控制反向串流启停，运行中不可更改
-- **立体声编码**：高品质模式立体声最大码率全频带，手机端显示带宽+码率
-- **低性能模式**：单声道 64kbps 宽带，complexity=1，适配低端 Android 设备
+- **立体声编码**：反向串流固定 48kHz 立体声、最大码率、全频带，手机端显示带宽+码率
+- **反向参数热同步**：手机端 Opus 面板调整后，PC 反向编码器每秒读取 CONNECT 载荷并热应用，无需重启串流
 
 ---
 
@@ -61,7 +61,7 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 - **JNI `@Synchronized` 互斥锁**：杜绝多线程并发闪退
 - **网络无缝热重连**：改 IP 不重启录音流
 - **UDP 广播自动发现**：统一 v2 协议发现局域网内 Windows 接收端
-- **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT（携带反向端口+模式标志）+ 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
+- **P2P 双向保活**：每 ~1s（50 帧）发送 TYPE_CONNECT（携带反向端口 + Opus 编码参数）+ 非阻塞 1ms 超时 drainAck 收 CONNECT_ACK
 - **优雅断连重连**：断连不退出采集，持续发 CONNECT 保活等待重连，收到 ACK 自动恢复；3 秒无 ACK 标记断连
 - **持久化设备 ID**：8 字节唯一标识，SharedPreferences 存储，连接鉴权用
 
@@ -69,7 +69,9 @@ UDP2CAL 是一个**双向、低延迟**的局域网音频串流系统。提供�
 
 ---
 
-## 五、Android Old 低性能版（`android_old/`）
+## 五、Android Old 低性能版（`android_old/`）— 已停止开发
+
+> ⚠️ 该版本自 v1.1.1 起停止开发，v1.1.2 起 PC 端已删除全部低性能适配代码，与当前 PC 端**不互通**。以下特性描述对应其最终状态，源码仅归档。旧设备请成对使用 [Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)。
 
 专为 Android 6~8（API 21~26）低端设备/翻盖机定制的精简版本。详见 [ANDROID_OLD.md](ANDROID_OLD.md)。
 

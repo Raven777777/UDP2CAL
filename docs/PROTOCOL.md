@@ -7,9 +7,9 @@
 
 ## 一、统一协议（音频 + 控制共用）
 
-v2 统一协议替代了旧版分离的 v1（6B 音频头）和旧 v2（15B "UD2M" 控制头）。**所有包使用同一 15 字节包头格式，携带设备 ID 实现 1对1 P2P 过滤。**
+**所有包使用同一 15 字节包头格式，携带设备 ID 实现 1对1 P2P 过滤。**
 
-首字节 `0x02` 标识 v2 协议，与旧 v1（首字节 `0x80+`）永不冲突。
+协议只保留单一版本，不做版本协商，也不兼容任何历史包头格式：首字节必须为 `0x02`，不符合的报文直接丢弃。PC 端不再保留旧版本探测与降级路径。
 
 ### 包格式（15 字节固定头 + 负载）
 
@@ -46,9 +46,11 @@ CONNECT 保活包在基础结构之外携带：
 | 字段 | 长度 | 说明 |
 |------|------|------|
 | 反向端口 | 2 字节 | PC 向手机发送反向音频的目标端口 |
-| 模式标志 | 1 字节 | 0=高品质 / 1=低性能 |
-| Opus 参数 | 10 字节 | 手机端码率/带宽/复杂度/VBR/DTX/FEC/丢包率，供 PC 反向编码器热同步 |
+| 标志位 | 1 字节 | bit1=携带 Opus 参数；bit0 保留（固定 0，PC 端忽略） |
+| Opus 参数 | 7 字节 | 复杂度 / 信号 / 带宽 / VBR·DTX·FEC 标志 / 码率 / 丢包率 |
 
+> 首包 CONNECT 仅携带反向端口（2 字节），此时不改变 PC 反向编码器参数；带齐 `bit1` 与 7 字节参数的保活包才会触发同步。
+>
 > 手机调参后，PC 端 `capture.rs` 每秒检查一次配置并热应用 `opus_encoder_ctl`，实现反向串流参数实时同步。
 
 ---
@@ -132,7 +134,9 @@ DEVICE_BUSY 时仅接受绑定设备 ID 的 TYPE_DATA
 | Windows 接收端 | `windows/src/protocol.rs` | 重导出 |
 | Android 发送端 | `Udp2CalProtocol.kt` | Kotlin（手动对齐） |
 
-> Kotlin 端为手动对齐实现，任何协议字段变更必须同步修改 `protocol/protocol.rs`、`windows/src/protocol.rs`（若涉及重导出）以及 `android/`、`android_old/` 两份 `Udp2CalProtocol.kt`。
+> Kotlin 端为手动对齐实现，任何协议字段变更必须同步修改 `protocol/protocol.rs`、`windows/src/protocol.rs`（若涉及重导出）以及 `android/app/src/main/java/com/udp2cal/app/Udp2CalProtocol.kt`。
+>
+> `android_old/` 的 `Udp2CalProtocol.kt` 自 v1.1.2 起已脱离协议兼容链，不再随协议同步。
 >
 > 历史教训：Kotlin 版 `sampleRateToHz` 默认值曾为 `16000`，与 Rust 版 `48000` 不一致，已修正对齐（见 [BUGFIX.md](BUGFIX.md)）。
 

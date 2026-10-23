@@ -431,7 +431,7 @@ class CaptureService : Service() {
                                     val br = Prefs.opusBitrateKbps
                                     val payload = byteArrayOf(
                                         (revPort shr 8).toByte(), revPort.toByte(),
-                                        0x03.toByte(), // bit0=low_perf(0), bit1=has_opus_cfg(1)
+                                        0x02.toByte(), // 标志位: bit1=携带 Opus 参数; bit0 保留, 固定 0
                                         Prefs.opusComplexity.toByte(),
                                         mapSignal(Prefs.opusSignal),
                                         mapBandwidth(Prefs.opusBandwidth),

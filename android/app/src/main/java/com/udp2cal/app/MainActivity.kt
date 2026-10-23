@@ -587,7 +587,7 @@ fun OpusSettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
-                Text("v1.1.0", fontSize = 13.sp, color = Color(0xFF888888))
+                Text("v1.1.2", fontSize = 13.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(4.dp))
                 Text("作者：四折光曲 & 井水玉藻", fontSize = 14.sp, color = Color(0xFFCCCCCC))
                 Text("本程序为自由软件，以 GPL v3 许可证发布", fontSize = 12.sp, color = Color(0xFF666666))
