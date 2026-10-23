@@ -50,10 +50,32 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecode(
     jshortArray pcmOut, jint pcmOffset) {
 
     if (handle == 0) return -1;
+    if (opusData == NULL || pcmOut == NULL) return -1;
     DecoderState* state = (DecoderState*)(uintptr_t)handle;
 
+    // 入参边界校验：越界的 offset/length 会在 JNI 层直接造成越界访问
+    jsize data_len = (*env)->GetArrayLength(env, opusData);
+    jsize pcm_len  = (*env)->GetArrayLength(env, pcmOut);
+    if (offset < 0 || length <= 0 || offset > data_len - length) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG,
+            "decode: bad range offset=%d len=%d size=%d", offset, length, data_len);
+        return -1;
+    }
+    if (pcmOffset < 0 || pcmOffset > pcm_len - state->frame_size * state->channels) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG,
+            "decode: pcm buffer too small off=%d need=%d size=%d",
+            pcmOffset, state->frame_size * state->channels, pcm_len);
+        return -1;
+    }
+
+    // Get*ArrayElements 可能因 OOM 返回 NULL，未判空会直接空指针解引用
     jbyte* opus_bytes = (*env)->GetByteArrayElements(env, opusData, NULL);
+    if (opus_bytes == NULL) return -1;
     jshort* pcm = (*env)->GetShortArrayElements(env, pcmOut, NULL);
+    if (pcm == NULL) {
+        (*env)->ReleaseByteArrayElements(env, opusData, opus_bytes, JNI_ABORT);
+        return -1;
+    }
 
     int nb_samples = opus_decode(
         state->decoder,

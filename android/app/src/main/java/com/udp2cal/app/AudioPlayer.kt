@@ -12,6 +12,14 @@ import android.util.Log
  * 反向音频播放器
  * 支持通用适配：优先 VOICE_COMMUNICATION + 听筒路由实现 AEC，
  * 失败自动回退 MEDIA + 扬声器。
+ *
+ * 时钟模型（重要）：
+ * PC 端采集时钟与手机 DAC 时钟不同源。历史实现使用阻塞式 `write()`，
+ * 当 PC 略快时 AudioTrack 缓冲被填满 → 接收协程被阻塞 → socket 缓冲溢出 →
+ * 成片丢包，且延迟只增不减。现在改为：
+ *   1. 本地队列吸收抖动（非阻塞写入，永不阻塞接收协程）；
+ *   2. 队列超过高水位时丢最旧数据，把端到端延迟钉在目标值附近；
+ *   3. 写入用 WRITE_NON_BLOCKING，按实际写入量出队。
  */
 class AudioPlayer(private val context: Context) {
     companion object {
@@ -19,6 +27,15 @@ class AudioPlayer(private val context: Context) {
         private const val SAMPLE_RATE = 48000
         private const val BUFFER_MS = 40
         private const val CHANNELS = 2 // 立体声
+
+        /** 单次向 AudioTrack 投递的最大样本数（立体声交错） */
+        private const val CHUNK = 2048
+        /** 队列高水位：超过就裁剪，避免延迟累积（240ms） */
+        private const val HIGH_WATER = SAMPLE_RATE * CHANNELS * 240 / 1000
+        /** 裁剪目标（120ms） */
+        private const val TARGET_WATER = SAMPLE_RATE * CHANNELS * 120 / 1000
+        /** 队列容量（1s），仅作兜底 */
+        private const val QUEUE_CAPACITY = SAMPLE_RATE * CHANNELS
     }
 
     @Volatile private var audioTrack: AudioTrack? = null
@@ -26,6 +43,14 @@ class AudioPlayer(private val context: Context) {
 
     /** 是否成功启用 VOICE_COMMUNICATION 模式（含 AEC 能力） */
     @Volatile var isVoiceCommActive: Boolean = false
+
+    private val lock = Any()
+    private val queue = ShortQueue(QUEUE_CAPACITY)
+    private val chunkBuf = ShortArray(CHUNK)
+
+    /** 因队列溢出/裁剪被丢弃的样本数（诊断用） */
+    @Volatile var droppedSamples: Long = 0
+        private set
 
     fun start(audioSessionId: Int = 0, voiceMode: Boolean = true): Boolean {
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -37,6 +62,8 @@ class AudioPlayer(private val context: Context) {
             AudioFormat.ENCODING_PCM_16BIT
         )
         val finalBufSize = bufferSize.coerceAtLeast(minBufSize)
+
+        synchronized(lock) { queue.clear() }
 
         if (voiceMode) {
             // 语音模式：VOICE_COMMUNICATION + 听筒路由（启用 AEC 管线）
@@ -120,19 +147,47 @@ class AudioPlayer(private val context: Context) {
         }
     }
 
+    /**
+     * 写入解码后的 PCM（立体声交错）。
+     * 非阻塞：数据先入本地队列，再按 AudioTrack 当前可接收量投递。
+     */
     fun write(pcm: ShortArray, offset: Int, length: Int) {
+        if (length <= 0) return
+        synchronized(lock) {
+            droppedSamples += queue.push(pcm, offset, length)
+            // 高水位裁剪：把积压的延迟拉回目标值
+            if (queue.count > HIGH_WATER) {
+                droppedSamples += queue.trimTo(TARGET_WATER)
+            }
+        }
+        pump()
+    }
+
+    /** 把队列中可写的数据尽量推给 AudioTrack（不阻塞） */
+    private fun pump() {
         val track = audioTrack ?: return
-        try {
-            track.write(pcm, offset, length)
-        } catch (e: Exception) {
-            Log.e(TAG, "write 失败", e)
+        var guard = 0
+        while (guard++ < 8) {
+            val n = synchronized(lock) { queue.peek(chunkBuf, CHUNK) }
+            if (n <= 0) return
+            val written = try {
+                track.write(chunkBuf, 0, n, AudioTrack.WRITE_NON_BLOCKING)
+            } catch (e: Exception) {
+                Log.e(TAG, "write 失败", e)
+                return
+            }
+            if (written <= 0) return // 缓冲区已满，下一帧继续
+            synchronized(lock) { queue.drop(written) }
         }
     }
 
     fun stop() {
+        try { audioTrack?.pause() } catch (_: Exception) {}
+        try { audioTrack?.flush() } catch (_: Exception) {}
         try { audioTrack?.stop() } catch (_: Exception) {}
         try { audioTrack?.release() } catch (_: Exception) {}
         audioTrack = null
+        synchronized(lock) { queue.clear() }
         routeToEarpiece(false)
     }
 
@@ -147,4 +202,61 @@ class AudioPlayer(private val context: Context) {
     }
 
     fun isPlaying(): Boolean = audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING
+
+    /**
+     * 定长循环队列（立体声交错 16bit 样本），只由 write/pump 与 stop 访问，
+     * 外部通过 lock 串行化。
+     */
+    private class ShortQueue(private val capacity: Int) {
+        private val buf = ShortArray(capacity)
+        private var head = 0
+        private var size = 0
+
+        val count: Int get() = size
+
+        /** 入队；空间不足时淘汰最旧样本，返回被淘汰的样本数 */
+        fun push(src: ShortArray, offset: Int, length: Int): Int {
+            var dropped = 0
+            var i = 0
+            while (i < length) {
+                if (size == capacity) {
+                    head = (head + 1) % capacity
+                    size--
+                    dropped++
+                }
+                buf[(head + size) % capacity] = src[offset + i]
+                size++
+                i++
+            }
+            return dropped
+        }
+
+        /** 复制最多 max 个样本到 dst，不出队 */
+        fun peek(dst: ShortArray, max: Int): Int {
+            val n = minOf(max, size)
+            for (i in 0 until n) {
+                dst[i] = buf[(head + i) % capacity]
+            }
+            return n
+        }
+
+        fun drop(n: Int) {
+            val k = minOf(n, size)
+            head = (head + k) % capacity
+            size -= k
+        }
+
+        /** 保留最新 keep 个样本，返回被丢弃的数量 */
+        fun trimTo(keep: Int): Int {
+            if (size <= keep) return 0
+            val dropped = size - keep
+            drop(dropped)
+            return dropped
+        }
+
+        fun clear() {
+            head = 0
+            size = 0
+        }
+    }
 }

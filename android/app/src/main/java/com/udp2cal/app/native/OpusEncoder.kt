@@ -102,5 +102,4 @@ class OpusEncoder(
         if (h != 0L) { try { OpusNative.encoderDestroy(h) } catch (_: Exception) {}; handle = 0 }
     }
 
-    protected fun finalize() { stop() }
 }

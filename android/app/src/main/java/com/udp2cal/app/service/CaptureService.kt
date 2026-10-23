@@ -89,24 +89,36 @@ class CaptureService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
     override fun onCreate() { super.onCreate() }
 
+    private var notificationJob: Job? = null
+
     // startForeground 必须在 startService→onStartCommand 时立即调用（5s限制）
     //   NotificationChannel 必须在权限授予后创建 → 放这里而非 onCreate
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 系统重启（intent == null）时不要复活成"僵尸前台服务"：
+        // 它会常驻通知栏显示等待连接，却永远不会开始采集。
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         createNotificationChannel()
         try { startForeground(1, buildNotification()) } catch (e: Exception) {
             Log.e(TAG, "startForeground failed", e)
             stopSelf()
             return START_NOT_STICKY
         }
-        // 动态更新通知栏状态
-        serviceScope.launch {
-            _status.collect {
-                try {
-                    startForeground(1, buildNotification())
-                } catch (_: Exception) {}
+        // 动态更新通知栏状态。
+        // 必须去重：每次 startService 都会进 onStartCommand，
+        // 历史实现会让收集器不断累积，N 次启动后每秒重复 startForeground N 次。
+        if (notificationJob?.isActive != true) {
+            notificationJob = serviceScope.launch {
+                _status.collect {
+                    try {
+                        startForeground(1, buildNotification())
+                    } catch (_: Exception) {}
+                }
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     fun startCapture(sampleRateHz: Int, bitrateKbps: Int, targetIp: String, targetPort: Int,
@@ -378,6 +390,7 @@ class CaptureService : Service() {
                         var byteCount = 0L
                         var lastReport = System.currentTimeMillis()
                         var lastOpusConfigHash = 0
+                        var lastCfgSync = 0L
                         var reconnectCounter = 0
                         val RECONNECT_INTERVAL = 100 // ~1秒(10ms每帧)
                         var p2pConnected = false // 初始未连接，收到 ACK 后方可发包
@@ -387,17 +400,19 @@ class CaptureService : Service() {
                         if ((udpSender?.getLastAckTime() ?: 0L) > 0) {
                             p2pConnected = true
                             _status.value = _status.value.copy(connected = true, errorMsg = "")
-                            reverseJob = launchReverseAudio()
+                            reverseJob = launchReverseAudio(currentIp)
                             reverseAudioJob = reverseJob
                         }
 
                         for (frame in ch) {
-                            // ── 非阻塞漏极: 每帧检查 ACK ──
-                            if (udpSender?.drainAck() == true && !p2pConnected) {
+                            val nowMs = System.currentTimeMillis()
+
+                            // ── ACK 状态检查（ACK 由独立线程接收，此处只读标志）──
+                            if (udpSender?.hasAck() == true && !p2pConnected) {
                                 p2pConnected = true
                                 _status.value = _status.value.copy(connected = true, errorMsg = "")
                                 // 连接确认后启动反向音频协程（独立 socket，不干扰正向）
-                                reverseJob = launchReverseAudio()
+                                reverseJob = launchReverseAudio(currentIp)
                                 reverseAudioJob = reverseJob
                             }
 
@@ -450,7 +465,7 @@ class CaptureService : Service() {
                             // ── ACK 超时判定（优雅断连，不退出采集）──
                             val ackTime = udpSender?.getLastAckTime() ?: 0L
                             if (ackTime > 0 && p2pConnected) {
-                                val elapsed = System.currentTimeMillis() - ackTime
+                                val elapsed = nowMs - ackTime
                                 if (elapsed > 3000) {
                                     p2pConnected = false
                                     reverseJob?.cancel()
@@ -465,6 +480,12 @@ class CaptureService : Service() {
                             if (targetIpFromPrefs != currentIp || targetPortFromPrefs != currentPort) {
                                 try {
                                     Log.i(TAG, "📡 检测到 IP/端口 变更，执行热重连: $targetIpFromPrefs:$targetPortFromPrefs")
+                                    // 旧 socket 连同 reverseSock 一起失效：必须停掉反向接收协程，
+                                    // 否则它会对已关闭的 socket 疯狂抛异常（100% CPU）且永远不再工作
+                                    reverseJob?.cancel()
+                                    reverseJob = null
+                                    _status.value = _status.value.copy(reverseAudio = false, connected = false)
+                                    p2pConnected = false
                                     udpSender?.close()
                                     udpSender = UdpSender(targetIpFromPrefs, targetPortFromPrefs)
                                     udpSender?.connect()
@@ -489,35 +510,38 @@ class CaptureService : Service() {
                                 return@launch
                             }
 
-                            // ── Opus 编码参数毫秒级动态同步 ──
-                            val curCplx = Prefs.opusComplexity
-                            val curSig = Prefs.opusSignal
-                            val curBw = Prefs.opusBandwidth
-                            val curDtx = Prefs.opusDtx
-                            val curVbr = if (curDtx == 1) 1 else Prefs.opusVbr
-                            // 自动码率：48000→512k（OPUS 立体声协议上限），24000→256k，16000→128k
-                            val curBr = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else {
-                                when (sampleRateHz) { 48000 -> 512; 24000 -> 256; 16000 -> 128; else -> 64 }
-                            }
-                            val curFec = Prefs.opusFec
-                            val curPl = Prefs.opusPacketLoss
-                            val curVbrc = if (curVbr == 1) Prefs.opusVbrConstraint else 0
-                            val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc)
-                            if (curHash != lastOpusConfigHash) {
-                                if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc) == true) {
-                                    lastOpusConfigHash = curHash
-                                    val mode = when {
-                                        curDtx == 1 -> "VBR(DTX)"
-                                        curVbr == 1 && curVbrc == 1 -> "VBR约束"
-                                        curVbr == 1 -> "VBR"
-                                        else -> "CBR"
+                            // ── Opus 编码参数动态同步（5Hz 足够，避免每帧读 9 个 SharedPreferences）──
+                            if (nowMs - lastCfgSync >= 200) {
+                                lastCfgSync = nowMs
+                                val curCplx = Prefs.opusComplexity
+                                val curSig = Prefs.opusSignal
+                                val curBw = Prefs.opusBandwidth
+                                val curDtx = Prefs.opusDtx
+                                val curVbr = if (curDtx == 1) 1 else Prefs.opusVbr
+                                // 自动码率：48000→512k（OPUS 立体声协议上限），24000→256k，16000→128k
+                                val curBr = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else {
+                                    when (sampleRateHz) { 48000 -> 512; 24000 -> 256; 16000 -> 128; else -> 64 }
+                                }
+                                val curFec = Prefs.opusFec
+                                val curPl = Prefs.opusPacketLoss
+                                val curVbrc = if (curVbr == 1) Prefs.opusVbrConstraint else 0
+                                val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc)
+                                if (curHash != lastOpusConfigHash) {
+                                    if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc) == true) {
+                                        lastOpusConfigHash = curHash
+                                        val mode = when {
+                                            curDtx == 1 -> "VBR(DTX)"
+                                            curVbr == 1 && curVbrc == 1 -> "VBR约束"
+                                            curVbr == 1 -> "VBR"
+                                            else -> "CBR"
+                                        }
+                                        _status.value = _status.value.copy(
+                                            bitrateTargetKbps = curBr,
+                                            vbrMode = mode,
+                                            opusMode = if (isVoiceMode()) "语音模式" else "全频模式",
+                                            opusBandwidth = curBw
+                                        )
                                     }
-                                    _status.value = _status.value.copy(
-                                        bitrateTargetKbps = curBr,
-                                        vbrMode = mode,
-                                        opusMode = if (isVoiceMode()) "语音模式" else "全频模式",
-                                        opusBandwidth = curBw
-                                    )
                                 }
                             }
 
@@ -534,12 +558,11 @@ class CaptureService : Service() {
                             }
 
                             // ── 每秒状态汇报 ──
-                            val now = System.currentTimeMillis()
-                            if (now - lastReport >= 1000) {
-                                val kbps = if (now - lastReport > 0) (byteCount * 8f) / (now - lastReport) else 0f
+                            if (nowMs - lastReport >= 1000) {
+                                val kbps = if (nowMs - lastReport > 0) (byteCount * 8f) / (nowMs - lastReport) else 0f
                                 _status.value = _status.value.copy(bitrateKbps = kbps)
                                 byteCount = 0
-                                lastReport = now
+                                lastReport = nowMs
                             }
 
                             framePool.recycle(frame)
@@ -608,8 +631,11 @@ class CaptureService : Service() {
         }
     }
 
-    /** 启动独立协程，在反向 socket 上接收 PC→Phone 音频 */
-    private fun launchReverseAudio(): Job {
+    /**
+     * 启动独立协程，在反向 socket 上接收 PC→Phone 音频。
+     * @param expectedIp 只接受来自该地址的数据包，避免局域网内其他主机向该端口注入音频
+     */
+    private fun launchReverseAudio(expectedIp: String): Job {
         return serviceScope.launch(Dispatchers.IO) {
             val revSock = udpSender?.reverseSock ?: return@launch
             val dec = reverseDecoder ?: return@launch
@@ -622,13 +648,14 @@ class CaptureService : Service() {
             val recvBuf = ByteArray(Udp2CalProtocol.MAX_PACKET)
             val pkt = DatagramPacket(recvBuf, recvBuf.size)
             val pcmBuf = ShortArray(dec.pcmBufferSize)
+            val hdrBuf = ByteArray(Udp2CalProtocol.HEADER_SIZE)
             var hasAudio = false
             var lastAudioTime = 0L
             var byteCount = 0L
             var lastReport = System.currentTimeMillis()
             var bandwidthLabel = ""
 
-            Log.i(TAG, "反向音频接收器已启动")
+            Log.i(TAG, "反向音频接收器已启动（仅接受 $expectedIp）")
 
             while (isActive) {
                 try {
@@ -637,14 +664,16 @@ class CaptureService : Service() {
                     revSock.receive(pkt)
                     val len = pkt.length
                     if (len < Udp2CalProtocol.HEADER_SIZE) continue
+                    // 来源过滤：不是目标 PC 的包直接丢弃
+                    if (pkt.address?.hostAddress != expectedIp) continue
 
-                    val hdr = Udp2CalProtocol.decodeHeader(
-                        recvBuf.copyOfRange(0, len.coerceAtMost(Udp2CalProtocol.HEADER_SIZE))
-                    ) ?: continue
+                    System.arraycopy(recvBuf, 0, hdrBuf, 0, Udp2CalProtocol.HEADER_SIZE)
+                    val hdr = Udp2CalProtocol.decodeHeader(hdrBuf) ?: continue
 
                     if (!hdr.isAudio || hdr.payloadLen <= 0) continue
 
                     val plen = hdr.payloadLen.coerceAtMost(len - Udp2CalProtocol.HEADER_SIZE)
+                    if (plen <= 0) continue
                     val ns = dec.decode(recvBuf, Udp2CalProtocol.HEADER_SIZE, plen, pcmBuf)
                     if (ns > 0) {
                         player.write(pcmBuf, 0, ns)
@@ -676,8 +705,12 @@ class CaptureService : Service() {
                         _status.value = _status.value.copy(reverseAudio = false)
                     }
                     continue
-                } catch (_: Exception) {
-                    if (!isActive) break
+                } catch (e: Exception) {
+                    // socket 被关闭（热重连）时必须退出，否则 receive 会立即抛异常，
+                    // 循环无退避 → 单核 100% 占用且反向串流永远不会恢复
+                    if (!isActive || revSock.isClosed) break
+                    Log.w(TAG, "反向接收异常，20ms 后重试", e)
+                    delay(20)
                 }
             }
 

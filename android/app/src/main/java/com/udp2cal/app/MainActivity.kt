@@ -63,13 +63,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 适配高刷新率屏幕（90/120/144Hz）
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val maxRate = display?.supportedModes?.maxOf { it.refreshRate } ?: 60f
-            @Suppress("DEPRECATION")
-            window.attributes.preferredRefreshRate = maxRate
-        }
-
         Prefs.init(applicationContext)
         bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
 
@@ -143,9 +136,6 @@ fun MainScreen(
     var isRunning by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf("") }
     var isSearching by remember { mutableStateOf(false) }
-    // 运行时状态（仅传递给高级设置页面，主页不显示）
-    var connected by remember { mutableStateOf(false) }
-    var deviceId by remember { mutableStateOf("") }
     // 设备发现列表
     var showDeviceDialog by remember { mutableStateOf(false) }
     var discoveredDevices by remember { mutableStateOf<List<DiscoveryManager.DiscoverResult>>(emptyList()) }
@@ -154,8 +144,6 @@ fun MainScreen(
     LaunchedEffect(service) {
         service?.status?.collect { status ->
             isRunning = status.isRunning; errorMsg = status.errorMsg
-            connected = status.connected
-            deviceId = status.deviceId
         }
     }
 
@@ -285,7 +273,6 @@ fun OpusSettingsScreen(
     var targetKbps by remember { mutableStateOf(0) }
     var vbrMode by remember { mutableStateOf("") }
     var connected by remember { mutableStateOf(false) }
-    var deviceId by remember { mutableStateOf("") }
     var opusBandwidth by remember { mutableStateOf(0) }
     var reverseAudio by remember { mutableStateOf(false) }
     var reverseBitrateKbps by remember { mutableStateOf(0f) }
@@ -304,7 +291,6 @@ fun OpusSettingsScreen(
             targetKbps = status.bitrateTargetKbps
             vbrMode = status.vbrMode
             connected = status.connected
-            deviceId = status.deviceId
             opusBandwidth = status.opusBandwidth
             reverseAudio = status.reverseAudio
             reverseBitrateKbps = status.reverseBitrateKbps
@@ -451,9 +437,11 @@ fun OpusSettingsScreen(
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("音频带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         Text(
-                            if (reverseAudio && opusBandwidth > 0) bwDisplayName(opusBandwidth)
-                            else if (reverseAudio) "等待数据..."
-                            else "—",
+                            when {
+                                !reverseAudio -> "—"
+                                reverseBw.isNotEmpty() -> reverseBw
+                                else -> "等待数据..."
+                            },
                             fontSize = 13.sp,
                             color = Color.White
                         )
