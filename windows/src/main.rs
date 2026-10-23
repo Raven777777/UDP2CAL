@@ -399,7 +399,7 @@ fn main() -> Result<(), iced::Error> {
         .default_font(iced::Font::with_name("Microsoft YaHei"))
         .theme(Theme::Dark)
         .window(iced::window::Settings {
-            size: iced::Size::new(360.0, 300.0),
+            size: iced::Size::new(320.0, 290.0),
             position: iced::window::Position::Centered,
             resizable: false,
             exit_on_close_request: false,
@@ -566,7 +566,7 @@ impl AppState {
         let vb_color = if self.vb_cable_installed { Color::from_rgb(0.25, 0.80, 0.40) } else { Color::from_rgb(0.90, 0.55, 0.15) };
 
         let mk = |label: &'static str, color: Color, msg: Message| { 
-            button(text(label).size(13)) 
+            button(text(label).size(16)) 
                 .on_press(msg) 
                 .width(Length::Fill) 
                 .height(34) 
@@ -608,7 +608,7 @@ impl AppState {
         container( 
             column![ 
                 row![ 
-                    text("UDP2CAL").size(20), 
+                    text("ENJOY ME").size(20), 
                     Space::new().width(Length::Fill), 
                     text(st).color(sc).size(11),
                     Space::new().width(8),
@@ -620,7 +620,7 @@ impl AppState {
                 Space::new().height(8.0), 
                 container(
                     column![
-                        text(if self.is_running { "监听端口" } else { "目标地址" }).size(11).color(dim),
+                        text(if self.is_running { "监听端口" } else { "目标地址" }).size(14).color(dim),
                         Space::new().height(4),
                         if self.is_running {
                             let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
@@ -673,7 +673,7 @@ impl AppState {
                     column![
                         row![
                             column![
-                                text("码率").size(10).color(dim),
+                                text("码率").size(12).color(dim),
                                 Space::new().height(2),
                                 row![
                                     text(format!("{:.0}", self.last_bitrate as u32)).size(22),
@@ -682,7 +682,7 @@ impl AppState {
                                 ].align_y(Alignment::End)
                             ].width(Length::FillPortion(1)),
                             column![
-                                text("电平").size(10).color(dim),
+                                text("电平").size(12).color(dim),
                                 Space::new().height(2),
                                 row![
                                     text(format!("{:.0}", self.last_level_db as i32)).size(22),
@@ -713,7 +713,7 @@ impl AppState {
                     border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 },
                     ..Default::default()
                 }),
-                Space::new().height(10),
+                Space::new().height(15),
                 row![
                     mk(
                         if self.is_running { "停止" } else { "启动" },
@@ -729,7 +729,7 @@ impl AppState {
                     Space::new().width(8),
                     if self.is_running {
                         let rev_c = if self.reverse_enabled { accent } else { dim };
-                        button(text(if self.reverse_enabled { "反向串流" } else { "未启用" }).size(11))
+                        button(text(if self.reverse_enabled { "反向串流" } else { "未启用" }).size(16))
                             .width(Length::FillPortion(1))
                             .height(34)
                             .style(move |_, _| iced::widget::button::Style {
