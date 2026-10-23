@@ -1,3 +1,25 @@
+# 构建脚本运行产物
+/scripts/logs/
+/scripts/.cache/
+__pycache__/
+*.py[cod]
+*.bak
+
+# Windows 构建产物
 /windows/target
 
-/windows_window_demo/target
+# Android 构建产物
+/android/.gradle/
+/android/.kotlin/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+/android_old/.gradle/
+/android_old/.kotlin/
+/android_old/build/
+/android_old/app/build/
+/android_old/app/.cxx/
+
+# 根目录发布产物
+/*.exe
+/*.apk

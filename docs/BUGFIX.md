@@ -1,7 +1,9 @@
 # UDP2CAL Bug 修复记录
 
-> 记录项目中已修复的 bug 及其根因分析、修复方式。  
+> 记录项目中已修复的 bug 及其根因分析、修复方式。
 > 格式：`YYYY-MM-DD` — 按时间倒序排列。
+>
+> 相关文档：[版本历史](CHANGELOG.md) · [架构说明](ARCHITECTURE.md) · [文档索引](README.md)
 
 ---
 
