@@ -200,7 +200,13 @@ def resolve(mode: str, logger) -> Optional[ProxyInfo]:
 
 
 def jvm_args(proxy: Optional[ProxyInfo]) -> List[str]:
-    """Gradle / JVM 使用的代理参数。"""
+    """Gradle / JVM 使用的代理参数。
+
+    注意 nonProxyHosts 的值里含 '|'：在 Windows 上这些参数会被写进 GRADLE_OPTS，
+    再由 gradlew.bat 在 cmd 里展开，未加引号时 '|' 会被 cmd 当成管道符，
+    于是出现 "'127.0.0.1' 不是内部或外部命令"。
+    因此整条参数必须带引号。
+    """
     if proxy is None:
         return []
     return [
@@ -208,7 +214,7 @@ def jvm_args(proxy: Optional[ProxyInfo]) -> List[str]:
         "-Dhttp.proxyPort={}".format(proxy.port),
         "-Dhttps.proxyHost={}".format(proxy.host),
         "-Dhttps.proxyPort={}".format(proxy.port),
-        "-Dhttp.nonProxyHosts=localhost|127.0.0.1|::1",
+        '"-Dhttp.nonProxyHosts=localhost|127.0.0.1|::1"',
     ]
 
 

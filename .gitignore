@@ -21,3 +21,9 @@ __pycache__/
 # 根目录发布产物
 /*.exe
 /*.apk
+
+# 本地/私密配置：不得入库
+/android/local.properties
+/local.properties
+*.keystore
+*.jks

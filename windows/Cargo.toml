@@ -6,7 +6,7 @@ description = "UDP2CAL - 局域网音频串流Windows接收端"
 build = "build.rs"
 
 [profile.release]
-opt-level = "s"
+opt-level = 3   # 实时音频路径优先速度，体积换性能不划算
 lto = true
 codegen-units = 1
 panic = "unwind"

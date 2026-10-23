@@ -53,7 +53,7 @@ fn find_rc_path() -> Option<String> {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                 .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-                .filter(|s| s.split('.').next().map_or(false, |n| n.parse::<u32>().is_ok()))
+                .filter(|s| s.split('.').next().is_some_and(|n| n.parse::<u32>().is_ok()))
                 .collect();
             // 按版本号降序排列，取最新
             versions.sort_by(|a, b| {
