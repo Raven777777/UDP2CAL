@@ -40,10 +40,10 @@ pub enum Error {
     Opus(ErrorCode),
     /// Opus is not operating with empty packets.
     EmptyPacket,
-    /// Opus' maximum `Vec` or slice length of `std::i32::MAX` has been
+    /// Opus' maximum `Vec` or slice length of `i32::MAX` has been
     /// exceeded.
     SignalsTooLarge,
-    /// Opus' maximum `Vec` or slice length of `std::i32::MAX` has been
+    /// Opus' maximum `Vec` or slice length of `i32::MAX` has been
     /// exceeded.
     PacketTooLarge,
     /// A `Vec` representing a mapping exceeded the expected value.

@@ -12,7 +12,7 @@
 //! borrows mutably.
 //!
 //! A [`Packet`] references an underlying buffer of type `&[u8]`, it cannot be
-//! empty and not longer than [`std::i32::MAX`].
+//! empty and not longer than [`i32::MAX`].
 //!
 //! Same goes for [`MutPacket`], except the type mutably borrows the buffer thus
 //! the length may change after passing it to Opus. Hence the length of this
@@ -259,7 +259,7 @@ impl<'a, T> TryFrom<&'a mut [T]> for MutSignals<'a, T> {
     type Error = Error;
 
     fn try_from(value: &'a mut [T]) -> Result<Self> {
-        if value.len() > std::i32::MAX as usize {
+        if value.len() > i32::MAX as usize {
             return Err(Error::SignalsTooLarge);
         }
 

@@ -8,14 +8,14 @@ fn packet_len_check(packet_buffer: &[u8]) -> Result<i32> {
         // non-empty guarantee:
         x if x.is_empty() => Err(Error::EmptyPacket),
         // limited size guarantee:
-        _ if packet_buffer.len() > std::i32::MAX as usize => Err(Error::PacketTooLarge),
+        _ if packet_buffer.len() > i32::MAX as usize => Err(Error::PacketTooLarge),
         _ => Ok(packet_buffer.len() as i32),
     }
 }
 
 /// A newtype around `&[u8]` to guarantee:
 /// - Minimum one element: A packet cannot be empty.
-/// - Limited size: A packet's length may not exceed `std::i32::MAX`.
+/// - Limited size: A packet's length may not exceed `i32::MAX`.
 #[derive(Debug)]
 pub struct Packet<'a>(&'a [u8]);
 
