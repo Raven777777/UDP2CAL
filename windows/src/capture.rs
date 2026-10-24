@@ -212,6 +212,11 @@ impl ReverseSender {
         // pcm_buf 硬上限 ~3 秒（288000 交错样本 / 96000 样本每秒）
         const MAX_PCM: usize = 288000;
         let mut send_errors: u64 = 0;
+        // ── 反向链路诊断：30s 汇总一次（定位"自动码率无声"类问题）──
+        let mut diag_last = std::time::Instant::now();
+        let (mut diag_pkts, mut diag_bytes) = (0u64, 0u64);
+        let (mut diag_enc_err, mut diag_oversize, mut diag_zero) = (0u64, 0u64, 0u64);
+        let mut first_sizes_logged = false;
 
         while running.load(Ordering::Relaxed) {
             // ── 每 1 秒检查配置变化并热应用（仅在真正变化时下发）──
@@ -244,24 +249,54 @@ impl ReverseSender {
             while pcm_buf.len() >= FRAME_SAMPLES {
                 accum_buf[..FRAME_SAMPLES].copy_from_slice(&pcm_buf[..FRAME_SAMPLES]);
                 pcm_buf.drain(..FRAME_SAMPLES);
-                if let Ok(n) = encoder.encode(&accum_buf[..FRAME_SAMPLES], &mut encode_out) {
-                    // 超长包必须丢弃：截断会产出非法 Opus 包，解码端只会报错
-                    if n > 0 && n <= protocol::MAX_PAYLOAD {
-                        seq_num = seq_num.wrapping_add(1);
-                        if let Some(total) = protocol::build_packet_to(
-                            &mut pkt_buf, 0, true, protocol::TYPE_DATA,
-                            protocol::SAMPLE_RATE_48K, seq_num,
-                            &device_id, &encode_out[..n], 0,
-                        ) {
-                            if let Err(e) = send_sock.send_to(&pkt_buf[..total], android_addr) {
-                                send_errors += 1;
-                                if send_errors == 1 {
-                                    logf!("[Reverse] 发送失败（后续同类错误不再打印）: {}", e);
+                match encoder.encode(&accum_buf[..FRAME_SAMPLES], &mut encode_out) {
+                    Ok(n) => {
+                        if n == 0 {
+                            diag_zero += 1;
+                        }
+                        // 超长包必须丢弃：截断会产出非法 Opus 包，解码端只会报错
+                        if n > 0 && n <= protocol::MAX_PAYLOAD {
+                            seq_num = seq_num.wrapping_add(1);
+                            diag_pkts += 1;
+                            diag_bytes += n as u64;
+                            if !first_sizes_logged {
+                                first_sizes_logged = true;
+                                logf!("[Reverse] 首包大小 {} 字节（编码器配置 br={} bw={} cplx={}）",
+                                    n, if applied.map(|c| c.bitrate_kbps).unwrap_or(0) == 0 { "Max" } else { "手动" },
+                                    applied.map(|c| c.bandwidth).unwrap_or(0),
+                                    applied.map(|c| c.complexity).unwrap_or(0));
+                            }
+                            if let Some(total) = protocol::build_packet_to(
+                                &mut pkt_buf, 0, true, protocol::TYPE_DATA,
+                                protocol::SAMPLE_RATE_48K, seq_num,
+                                &device_id, &encode_out[..n], 0,
+                            ) {
+                                if let Err(e) = send_sock.send_to(&pkt_buf[..total], android_addr) {
+                                    send_errors += 1;
+                                    if send_errors == 1 {
+                                        logf!("[Reverse] 发送失败（后续同类错误不再打印）: {}", e);
+                                    }
                                 }
                             }
+                        } else if n > protocol::MAX_PAYLOAD {
+                            diag_oversize += 1;
+                        }
+                    }
+                    Err(e) => {
+                        diag_enc_err += 1;
+                        if diag_enc_err <= 3 {
+                            logf!("[Reverse] 编码失败: {:?}", e);
                         }
                     }
                 }
+            }
+
+            // 30s 反向链路诊断汇总
+            if diag_last.elapsed() > Duration::from_secs(30) {
+                logf!("[Reverse] 诊断30s: 发送 {} 包 / {} KB, 编码错误 {}, 超限丢弃 {}, 零长帧 {}",
+                    diag_pkts, diag_bytes / 1024, diag_enc_err, diag_oversize, diag_zero);
+                diag_pkts = 0; diag_bytes = 0; diag_enc_err = 0; diag_oversize = 0; diag_zero = 0;
+                diag_last = std::time::Instant::now();
             }
 
             std::thread::sleep(Duration::from_millis(2));
