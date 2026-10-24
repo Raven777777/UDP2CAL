@@ -47,8 +47,8 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_vbr", v).apply()
 
     var opusBitrateKbps: Int
-        get() = prefs.getInt("opus_bitrate_kbps", 0) // 0 = auto (根据采样率自动选择)
-        set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, 512)).apply() // OPUS 协议上限 510kbps（立体声），单声道理论~255k；512 为未来双声道预留
+        get() = prefs.getInt("opus_bitrate_kbps", 0) // 0 = 自动（映射为 512 kbps）；手动 512/768/960/1000
+        set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, Udp2CalProtocol.BITRATE_MAX_KBPS)).apply()
 
     var opusFec: Int
         get() {

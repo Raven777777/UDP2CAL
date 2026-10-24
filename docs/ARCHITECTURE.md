@@ -13,25 +13,25 @@ udp2cal/
 │     ├─ java/com/udp2cal/app/
 │     │  ├─ MainActivity.kt          # Compose UI + 运行时权限申请
 │     │  ├─ DiscoveryManager.kt      # 局域网广播发现
-│     │  ├─ UdpSender.kt             # UDP 发送器（独立 ACK 接收线程，500ms soTimeout）
-│     │  ├─ Udp2CalProtocol.kt       # 协议编解码（与 Rust 端手动对齐）
-│     │  ├─ AudioPlayer.kt           # 反向音频播放（48kHz 立体声，非阻塞队列）
+│     │  ├─ UdpSender.kt             # 主 socket：CONNECT + 正向 RTP；独立 ACK 线程；反向 socket 只收 RTP
+│     │  ├─ Udp2CalProtocol.kt       # 控制 v3 + RTP + 抖动缓冲 + 播放头（与 Rust 端逐字节对齐）
+│     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，阻塞写，播放头驱动）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
-│     │  ├─ service/CaptureService.kt# 前台采集服务（生产-消费双协程 + ShortArrayPool）
+│     │  ├─ service/CaptureService.kt# 前台采集服务（采集/控制/反向接收/反向播放 四路并发，无 PCM 队列）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
 │     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c（JNI 封装）
 ├─ opus-src/       # libopus 1.6.1 源码树（Android 与 Windows 共用的唯一副本）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
-│  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程
-│  │  ├─ audio.rs      # WASAPI 输出 + 流式重采样
-│  │  ├─ capture.rs    # WASAPI Loopback + Opus 编码 + 反向 UDP 发送
+│  │  ├─ main.rs       # iced UI、托盘、解复用、控制状态机、抖动缓冲、解码线程
+│  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 固定比率重采样
+│  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
 │  │  ├─ config.rs     # 注册表配置读写
-│  │  ├─ decoder.rs    # Opus 解码器封装
+│  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧）
 │  │  ├─ firewall.rs   # 防火墙规则
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
-├─ protocol/       # UDP 协议编解码（Rust crate，唯一真源）
+├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp.rs 媒体面
 ├─ docs/           # 项目文档（本目录）
 ├─ build.bat       # 统一构建入口（Windows / Android / ADB / 体检）
 ├─ scripts/        # 构建脚本实现（Python 3.8+）
@@ -50,7 +50,7 @@ udp2cal/
 | --- | --- | --- |
 | **UI 层（Android）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
 | **UI 层（Windows）** | Iced (Rust) 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
-| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs`，静默热重连不断流。v2 二进制广播自动发现 |
+| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs` 静默热重连；v3 控制包广播发现；媒体面为标准 RTP |
 | **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
 | **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
 | **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
@@ -112,20 +112,26 @@ windows = { version = "0.58", features = [
 
 ---
 
-## 四、自动协商与热同步机制
+## 四、v3 的"固定 + 热同步"机制
 
-| 协商项 | 策略 |
-| --- | --- |
-| 采样率 | Android 固定 48kHz 采集；接收端 5 独立 Opus 解码器自动匹配（8k/12k/16k/24k/48k） |
-| 反向串流编码 | PC 固定 48kHz 立体声全频带，码率与复杂度由手机端 CONNECT 携带的 Opus 参数同步 |
-| 反向捕获采样率 | 读取端点共享模式混音格式的 `nSamplesPerSec`；非 48 kHz（如 44.1 kHz HDMI/USB 设备）在编码前用相位连续线性插值归一到 48 kHz |
-| 自动码率安全防线 | Prefs 码率 0 时根据采样率动态分配默认值（48kHz→512k，24kHz→256k，16kHz→128k，≤12kHz→64k）；Rust `compute_bitrate_id()` / `default_bitrate_for_sr()` 与 Kotlin 100% 对齐 |
-| 传输机制 | 15 字节包头（Big-Endian）实时携带码率、采样率、8 字节设备 ID；单一版本，无兼容分支。位 5 的码率字段为保留字段，接收端以字节数实测码率 |
-| 接收端解析 | 5 独立 Opus 解码器 + AudioWriter 相位连续重采样；**双向**都经重排缓冲（PC：`protocol::ReorderBuffer`，Android：`Udp2CalProtocol.ReorderBuffer`，语义一致） |
-| **局域网自动发现** | Windows 监听 44043，v2 二进制协议。Android 端 IP 框右侧图标一键搜索 |
-| **心跳与保活** | Android 每 ~1s（100 帧 × 10ms）发 CONNECT（携带反向端口 + Opus 编码参数同步到 PC 反向端）；Win 端 300ms 接收超时 + 1s 无音频包标记断连；Android 3s 无新 ACK 标记断连 |
-| **反向串流保活** | 保活 CONNECT 携带反向端口，Win 重启后自动恢复反向串流。仅端口真正变化时重启发送器，防止每秒卡顿 |
-| **模式切换** | 语音↔音乐模式切换时保留 UdpSender(网络层) 和 reverseDecoder，重建 AudioPlayer(路由/声道)，零网络中断 |
+v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type 全部固定**，
+控制面只同步"反向编码器参数"，其余由各自本地决定。
+
+| 项目 | v3 取值 | 同步方式 |
+| --- | --- | --- |
+| 正向编码（手机麦克风） | 48 kHz / 单声道 / 10 ms | 手机本地决定，PC 不需要知道 |
+| 反向编码（PC 环回） | 48 kHz / 立体声 / 10 ms | CONNECT 携带 Opus 参数，PC **仅在变化时**应用 |
+| 采样率 | 48 kHz 固定 | 不协商；PC 输出设备非 48 kHz 由 `AudioWriter` 按固定比率重采样 |
+| 帧长 | 10 ms 固定（480 采样） | `frame_ms != 10` 直接拒绝连接 |
+| 码率 | `0` → 512 kbps，上限 1000 kbps | `clamp_bitrate_kbps()` / `clampBitrateKbps()` 两端一致 |
+| 传输 | 服务端口 UDP，控制包 + 正向 RTP 同 socket | 首字节解复用 |
+| 接收端 | 单方向一个 `JitterBuffer` + 一个解码实例 | 不需要"5 个采样率解码器" |
+| 发现 | Windows 监听 44043，DISCOVER_REPLY 带 `listen_port` | Android 用该端口连接，不再假定 44044 |
+| 保活 | Android 每 1 s CONNECT；PC 3 s 无 CONNECT 释放绑定；Android 3 s 无 ACK 断连 | **只看控制面**，不看 RTP |
+| 模式切换 | 语音↔音乐重建 AudioRecord/AudioTrack，网络层与 SSRC 一并重建 | 允许短暂中断，不做"保网络层"的特殊分支 |
+
+> 反向编码器的"仅在变化时应用"很重要：`OPUS_SET_*` 每次调用都会重置编码器内部状态，
+> 每秒无条件重配会造成周期性音质劣化。
 
 ---
 
@@ -148,8 +154,9 @@ windows = { version = "0.58", features = [
 ```
 
 - 单文件上限 2 MiB，超限后轮转为 `udp2cal.1.log`（只保留一轮）
-- 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/反向端口变化、
-  反向编码配置变更、发送错误计数、每 30s 一次的音频统计（块数/重采样/丢样/欠载）
+- 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/SSRC/反向端口变化、
+  反向编码配置变更、发送错误计数、每 30 s 一次的音频统计（块数/重采样/丢样/欠载）
+  与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）
 - UI 底部为**单行**状态行，按连接状态切换内容（三种状态互斥，永远只占一行）：
   - 未启动：`广播地址: 255.255.255.255:44043`
   - 已启动未连上：`广播地址…` + `● 广播中`（被占用静默时显示 `● 已静音`）
@@ -180,9 +187,9 @@ windows = { version = "0.58", features = [
 ### 局域网自动发现
 
 - Windows 端常驻监听 UDP 端口 44043（独立线程 `start_broadcast_listener`）
-- **v2 二进制协议**：手机端 `TYPE_DISCOVER_REQ` → PC 回复 `TYPE_DISCOVER_REPLY`（含端口 + 设备名）
+- **v3 控制包**：手机端 `TYPE_DISCOVER_REQ`（空负载）→ PC 回复 `TYPE_DISCOVER_REPLY`（`listen_port` + 设备名 ≤254 字节，UTF-8 不截断字符）
 - **广播状态机**（`start_broadcast_state_machine`）：READY 时每秒向 `255.255.255.255:44043` 广播 `TYPE_DISCOVER_REPLY`；BUSY 时自动静音
-- 端口随用户修改实时更新（每次发现请求从注册表读取最新值）
+- `listen_port` 取自当前监听端口（`LISTEN_PORT` 原子缓存，用户修改后立即生效）
 
 ### 图标
 
@@ -197,108 +204,103 @@ windows = { version = "0.58", features = [
 
 | 角色 | 行为 |
 |------|------|
-| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`P2P_STATE: Mutex<P2pState>` 与 `BOUND_DEVICE_ID` 记录的绑定关系**完全不变** |
-| **第三方 Android 端** | 收不到新 `CONNECT_ACK` → `lastAckTime` 不刷新 → `p2pConnected` 永为 false → **不编码不发送任何音频数据**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
-| **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id 匹配保活分支），音频流正常解码播放，**完全不受影响** |
+| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`P2P_STATE: Mutex<P2pState>` 记录的绑定关系（设备 ID / 源地址 / 双向 SSRC）**完全不变** |
+| **第三方 Android 端** | 收不到新 `CONNECT_ACK` → `isAckFresh()` 恒为 false → **不编码不发送任何正向 RTP**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
+| **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id + forward_ssrc 匹配保活分支），RTP 正常解码播放，**完全不受影响** |
 
 > 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
 >
 > **威胁模型**：`device_id` 随 `DISCOVER_REPLY` 每秒明文广播，本机制只用于"防误连、防抢占"，**不具备抗伪造能力**——同网段的恶意主机嗅探到 ID 后可冒充绑定设备。需要抗伪造时应在 `CONNECT` 中引入一次性 nonce 或预共享密钥 HMAC。
 
-### 释放独占的三种途径
+### 释放独占的途径
 
-1. **Windows 端点击「停止」** → 调用 `reset_to_ready()` 清空 `P2P_STATE` 中的绑定 + 恢复 `DeviceState::Ready`（重新开始广播）
-2. **已有 Android 端 1 秒无音频包超时** → `reset_to_ready()` 自动释放
-3. **重启 Windows 程序** → 全局状态初始化回到 `DeviceState::Ready`
+1. **Windows 端点击「停止」** → `reset_to_ready()`：清空绑定、停止反向发送、复位抖动缓冲
+2. **绑定设备 3 s 没有 CONNECT**（`PEER_TIMEOUT_MS`）→ 接收流的超时分支自动释放，回到 Ready
+3. **`forward_ssrc` 变化** → 视为新会话：重置抖动缓冲/解码器/播放头，保留绑定但换反向 SSRC
+4. **重启 Windows 程序** → 全局状态初始化回到 Ready
 
----
+> 判活只看控制面：DTX 静音期间可能长时间没有 RTP，用"是否收到音频"判活会误杀连接。
 
-## 六、Windows 端架构精要
+## 六、Windows 端架构精要（v3）
 
 ### 数据流
 
 ```
-[Android 手机] ──Opus 编码 UDP──→ [Windows PC]
-    ↓
-UDP 接收协程 → SyncChannel → 常驻 Audio Worker 线程（解码 + WASAPI 播放）
-    ↓
-VB-Cable / 扬声器 → 微信 / Zoom / OBS / 游戏
-                                     ↑
-[Windows PC] ──反向 WASAPI Loopback──┘
-    ↓
-WASAPI 捕获 → Opus 编码 → UDP → [Android 手机]
+[Android] ──RTP/Opus(PT=111, 10 ms)──→ [Windows 主 socket]
+                                            │ 首字节解复用
+                    ┌───────────────────────┴──────────────────────┐
+                    │ 0x80..0xBF → RTP                             │ 0x03 → 控制
+                    ▼                                              ▼
+          校验 源地址 + SSRC + PT                          CONNECT / DISCOVER
+                    │                                              │
+                    ▼                                              ▼
+          JitterBuffer（网络线程只插入）                    绑定状态机 + ACK
+                    │ unpark                                       │
+                    ▼                                              │
+   解码线程（按播放头拉取 → Opus 解码 / 10 ms PLC / 水位校正）        │
+                    │ 写无锁 PCM 环（预解码深度 ≤40 ms）             │
+                    ▼                                              │
+   cpal 回调（pop PCM、补静音、played_frames += n、unpark）           │
+                    │                                              │
+                    ▼                                              │
+            VB-Cable → 微信 / Zoom / OBS / 游戏                     │
+                                                                   │
+   [反向] WASAPI Loopback → 10 ms 组帧 → Opus → RTP(SSRC 来自 ACK) ──┘
 ```
 
-### 全局单例音频守护线程
+### 线程与职责
 
-音频引擎（`audio`）和解码器（`decoder`）在整个软件生命周期内只初始化一次。无论 UI 如何点击「启动/停止」，底层音频守护线程不受影响。
+| 线程 | 职责 | 明令禁止 |
+| --- | --- | --- |
+| tokio 接收流（iced subscription） | `recv_from`、解复用、校验、插抖动缓冲、回 ACK | 解码、阻塞等待播放 |
+| `udp2cal-decode` | 按播放头拉取、解码/PLC、漂移校正、写环 | 网络 IO、用定时器当节拍 |
+| `udp2cal-audio`（cpal 回调） | pop PCM、补静音、发布 `played_frames`、unpark | 加锁、分配、调用 Opus、写日志 |
+| `reverse-capture` | WASAPI 环回 → 10 ms 组帧 → Opus → RTP | 应用层积压、等待 ACK |
+| 广播 / 发现线程 | 每秒 `DISCOVER_REPLY`、应答 `DISCOVER_REQ` | 触碰音频路径 |
 
-```
-      程序启动
-         │
-    ┌────┴────┐
-    │ Audio   │ (常驻线程，不解构)
-    │ Worker  │ ← SyncChannel<AudioMessage>
-    └─────────┘
-         │
-    ┌────┴────┐
-    │ Iced UI │ ← 仅负责网络收发和数据投递
-    │ Network │
-    └─────────┘
-```
-
-- **常驻后台线程**：`init_audio_worker()` 在 `main()` 中调用一次，通过 `SyncChannel<AudioMessage>` 接收数据
-- **`Reset` 消息**替代完全销毁重建：收到后仅清空重排序缓冲区和 RMS 统计，不解构任何音频资源
-- **`session_id` 计数器**：每次启动通过自增 `session_id` 强制 Iced 视为全新订阅，避免状态残留
-
-### UDP 接收流
-
-`udp_receiver_stream` 通过参数传递 IP 和端口，不直接读取注册表，消除跨线程竞态：
+### 播放头是唯一时钟
 
 ```rust
-fn subscription(&self) -> Subscription<Message> {
-    let ip = self.config.listen_ip.clone();
-    let port = self.config.listen_port;
-    Subscription::run_with((ip, port), |data| udp_receiver_stream(data.0.clone(), data.1))
-}
+// 48 kHz 设备
+playhead_ts = playhead_base_ts + played_device_frames + timestamp_offset
+// 非 48 kHz 设备（余数累加，避免整数除法长期漂移）
+num = (played_device_frames - base_frames) * 48000 + remainder
+playhead_ts = last + num / device_rate + timestamp_offset
+remainder   = num % device_rate
 ```
 
-### EMA 漂移补偿防线
+- `played_device_frames` 只统计**真实 PCM** 被 cpal 回调消费的帧数；回调补的静音不计入，
+  因此预缓冲期间播放头静止，不会"空转"。
+- 每帧的播放/PLC 决策都由 `next_ts` 与 `playhead_ts` 比较得出：
+  `next_ts <= playhead_ts + PLC_LEAD_MS` 才生成 PLC。
+- 解码线程的预解码深度被钉在约 40 ms（`AudioWriter::filled_frames`），
+  生产节奏由声卡消费节奏约束——否则断流时会把整个环填满 PLC 帧，
+  让 `next_ts` 跑到播放头前面几百毫秒，恢复后所有真包都被判成迟到。
 
-`audio.rs` 中使用三分量 EMA 滤波器进行漂移补偿，更新前多重校验，并结合缓冲区水位快速修正：
+### 抖动缓冲（`protocol/rtp.rs`）
 
-```rust
-// ── 每 3 秒：EMA 更新漂移比率 ──
-if now.duration_since(self.last_ratio_update) > std::time::Duration::from_secs(3) {
-    let current_fill = self.buf.lock().map(|b| b.len()).unwrap_or(0);
-    let dt = now.duration_since(self.last_fill_time).as_secs_f64();
-    if dt > 2.0 && self.last_fill_sample > 0 {
-        let consume_rate = (self.last_fill_sample - current_fill) as f64 / dt;
-        let produce_rate = self.device_rate as f64 - consume_rate;
-        if produce_rate > 1000.0 && produce_rate.is_normal() {
-            let measured = self.device_rate as f64 / produce_rate;
-            if measured.is_finite() && measured > 0.5 && measured < 1.5 {
-                self.drift_ratio = self.drift_ratio * 0.7 + measured * 0.3;
-            }
-        }
-    }
-    // 缓冲区严重偏离时极小步长快速修正
-    let fill_pct = current_fill as f64 / self.target_fill as f64;
-    if fill_pct < 0.5 {
-        self.drift_ratio += 0.0005;
-    } else if fill_pct > 1.5 {
-        self.drift_ratio -= 0.0005;
-    }
-    self.drift_ratio = self.drift_ratio.clamp(0.998, 1.002); // ±0.2%
-}
-self.effective_ratio = (source_rate as f64 / self.device_rate as f64) / self.drift_ratio;
-```
+- 64 个槽位，按**扩展时间戳**索引；序号用于重复检测，时间戳是播放顺序的权威；
+- 插入路径绝不解码；`M=1` 且跳变 >200 ms 才重同步（跳变小只更新标记）；
+- 水位不足 40 ms 不开始播放；缺口到期才 PLC，连续 12 帧后输出静音但仍留在 PLAYING。
 
-- `is_normal()`：排除零、次正则、Infinity、NaN；`is_finite()`：二次确认
-- `0.5 ~ 1.5` 范围限制：防止极端值大幅污染 EMA
-- **缓冲区水位修正**：低于 50% 或高于 150% 时以 `±0.0005` 步长微调，防止缓冲耗尽/膨胀
-- **±0.2% 硬限幅**：`clamp(0.998, 1.002)` 确保漂移补偿不引起人耳可感知的变调
-- **复用重采样缓冲区**：预分配 8192 f32（32KB），避免每帧 4KB 堆分配
+### 趋势驱动的漂移校正（取代 v2 的 3 秒 EMA）
+
+判据是**水位趋势**，不是绝对水位——绝对值判定在"成簇到达"的局域网上会一直生效：
+
+| 条件 | 动作 |
+| --- | --- |
+| 总缓冲 > 120 ms 且连续 3 次评估（≈1.5 s）每次涨 > 10 ms | 丢弃 5 ms PCM（尾部淡出），`timestamp_offset += 240` |
+| 总缓冲 < 20 ms 且连续 3 次评估每次跌 > 10 ms | 插入 5 ms PCM（尾部渐入重复），`timestamp_offset -= 240` |
+| 水位稳定（哪怕停在 200 ms） | **不校正** |
+
+- **总缓冲** = 抖动缓冲里排队的 + 已写进声卡队列但还没播出的（`filled_frames` / `pendingFrames`）。
+  只看抖动缓冲会误判：解码端刻意只预解码 40 ms，其余留在抖动缓冲；
+- 两次校正至少相隔 **500 ms 音频样本时间**（24000 样本），不是墙钟；
+- 不读 `Instant`、不做 EMA、不做重采样比率微调：重采样比率恒为 `source/device`。
+
+> 回归背景：早期实现按绝对水位判定，Windows 侧水位长期 130–180 ms → 每 500 ms 丢 5 ms、
+> 手机侧水位恒 0（PCM 已提前写进 AudioTrack）→ 每 500 ms 插 5 ms，两端都在
+> **永久性 1% 削/补音频**，听感是持续的细微"卡嗒"。
 
 ### 快速双击防抖
 
@@ -332,7 +334,8 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 文档 | 内容 |
 | --- | --- |
-| [PROTOCOL.md](PROTOCOL.md) | UDP v2 协议规范 |
+| [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) | **v3 协议规范（现行）**：RTP 媒体面 + 控制面 + 时钟模型 |
+| [PROTOCOL.md](PROTOCOL.md) | v2 协议（历史存档，不兼容） |
 | [BUILD.md](BUILD.md) | 构建流程与产物 |
 | [FEATURES.md](FEATURES.md) | 功能特性与 Opus 参数 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |

@@ -26,7 +26,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 | `android/`         | Android 客户端（Kotlin + Jetpack Compose），全参数 Opus 面板                                 | Android 10 (API 29)+        |
 | `opus-src/`        | libopus 1.6.1 源码树（Android JNI 与 Windows 共用的唯一副本，勿在其内部另存副本）                            | —                           |
 | `vendor/`          | `audiopus` / `audiopus_sys` 本地副本（含本地扩展，经 `[patch.crates-io]` 引用，勿用上游覆盖）                | —                           |
-| `protocol/`        | UDP v2 协议编解码 crate（协议唯一真源）                                                        | —                           |
+| `protocol/`        | 协议 v3 crate：控制面 + RTP 媒体面（协议唯一真源）                                            | —                           |
 
 ---
 
@@ -53,7 +53,8 @@ build.bat doctor --fix                               :: 环境体检与自动修
 | [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 全部命令、编译产物、常见问题 |
 | [docs/FEATURES.md](docs/FEATURES.md)         | 三端功能特性、Opus 参数详解、界面截图           |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统架构、技术栈、自动协商机制、运行时行为、命名约定      |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | UDP v2 协议规范、P2P 独占生命周期、常量表      |
+| [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **v3 协议规范（现行）**：RTP 媒体面、控制面、时钟模型 |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | v2 协议（历史存档，不兼容）                |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md)       | 版本历史                            |
 | [docs/BUGFIX.md](docs/BUGFIX.md)             | Bug 根因分析与修复记录                   |
 | [docs/LEGAL.md](docs/LEGAL.md)               | 版权声明、GPL-3.0 授权、第三方组件许可         |

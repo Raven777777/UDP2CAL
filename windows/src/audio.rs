@@ -1,13 +1,23 @@
-﻿use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+﻿// 无锁 PCM 环 + cpal 输出回调
+//
+// v3 的时钟模型只有一条规则：**声卡播放头是唯一音频时钟**。
+// 因此本模块只做三件事：
+//   1. 提供一个无锁 SPSC 环，解码线程写、音频回调读；
+//   2. 在回调里统计"真正被消费的帧数"（`played_frames`），供播放头换算；
+//   3. 把 48 kHz 媒体流按设备采样率做**固定比率**重采样（不做 EMA、不读墙钟）。
+//
+// 漂移校正不在这里：它由解码线程根据抖动缓冲水位决定，并通过
+// `PlayheadClock::note_pcm_correction` 回写媒体时间偏移。
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::sync::{Arc, OnceLock, Weak};
+use std::thread::Thread;
 
 // ═══════════════════════════════════════════════════════════════════
 // 无锁 SPSC 环形缓冲
 // 音频回调线程绝不能等待互斥锁（优先级反转 → 欠载爆音）。
-// 单生产者（网络线程）写 head，单消费者（音频回调）写 tail，
+// 单生产者（解码线程）写 head，单消费者（音频回调）写 tail，
 // 元素用 AtomicU32 承载 f32 位模式，全部走安全 API，无需 unsafe。
 // ═══════════════════════════════════════════════════════════════════
 
@@ -66,6 +76,13 @@ impl Ring {
     fn len(&self) -> usize {
         self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
     }
+
+    /// 仅由生产者在"停止/重启"时调用：丢弃全部未播放数据
+    #[inline]
+    fn clear(&self) {
+        let head = self.head.load(Ordering::Acquire);
+        self.tail.store(head, Ordering::Release);
+    }
 }
 
 pub struct AudioWriter {
@@ -73,20 +90,16 @@ pub struct AudioWriter {
     pub device_rate: u32,
     /// 诊断计数器：由 UI 线程读取并展示/落盘（见 main.rs 的 AUDIO_STATS）
     pub stats: Arc<AudioStats>,
-    /// 当前漂移补偿比率 (1.0=无, >1.0=拉伸)
-    drift_ratio: f64,
+    /// 声卡已真正消费的帧数（只统计真实 PCM，不统计回调补的静音）
+    played: Arc<AtomicU64>,
+    /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
+    waker: Arc<OnceLock<Thread>>,
 
-    // ── 相位连续流式重采样器 ──
+    // ── 相位连续流式重采样器（固定比率，不做漂移 EMA）──
     phase: f64,
-    effective_ratio: f64,
+    ratio: f64,
     /// 当前输入采样率（0 = 尚未收到数据）
     source_rate: u32,
-
-    // ── 比率自适应 ──
-    last_ratio_update: Instant,
-    last_fill_sample: usize,
-    last_fill_time: Instant,
-    target_fill: usize,
 
     // ── 复用重采样缓冲区，消除高频堆分配 ──
     resample_buf: Vec<f32>,
@@ -94,13 +107,11 @@ pub struct AudioWriter {
 
 // ═══════════════════════════════════════════════════════════════════
 // 诊断计数器
-// 历史实现把 6 个计数器散在 AudioWriter 上，全部只写不读——诊断信息
-// 采了却没人看。这里收敛成一个可共享的单例，UI 与日志共同消费。
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Default)]
 pub struct AudioStats {
-    /// 收到并处理的音频块数
+    /// 写入环的块数
     pub writes: AtomicU64,
     /// 发生重采样的块数（源采样率 ≠ 设备采样率）
     pub resampled: AtomicU64,
@@ -130,67 +141,70 @@ pub struct StatsSnapshot {
 }
 
 impl AudioWriter {
+    /// 登记解码线程，供音频回调在每次运行后唤醒它
+    pub fn set_waker(&self, thread: Thread) {
+        let _ = self.waker.set(thread);
+    }
+
+    /// 声卡已消费的真实帧数（单调递增，32 位回绕由调用方按 u64 处理）
+    #[inline]
+    pub fn played_frames(&self) -> u64 {
+        self.played.load(Ordering::Acquire)
+    }
+
+    /// 环里还能放下多少帧（设备帧）
+    #[inline]
+    #[allow(dead_code)]
+    pub fn space_frames(&self) -> usize {
+        self.ring.capacity().saturating_sub(self.ring.len())
+    }
+
+    /// 环里已排队、尚未被声卡消费的帧数（设备帧）。
+    /// 解码线程用它把"预解码深度"钉在几十毫秒内——这正是把 PLC
+    /// 与播放头绑定的前提：生产速度必须被消费速度约束。
+    #[inline]
+    pub fn filled_frames(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// 丢弃未播放数据（重连 / 重同步 / 停止）
+    pub fn flush(&mut self) {
+        self.ring.clear();
+        self.phase = 0.0;
+    }
+
+    /// 写入 48 kHz 媒体 PCM（单声道），按设备采样率换算后入环。
+    ///
+    /// 比率固定为 `source_rate / device_rate`，**不含任何漂移补偿**：
+    /// 采集/声卡时钟差由抖动缓冲水位 + `PlayheadClock` 偏移统一处理。
     pub fn write(&mut self, pcm: &[f32], source_rate: u32) {
         if pcm.is_empty() {
             return;
         }
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
-        let now = Instant::now();
 
-        // ── 采样率变化（含首次）立即生效 ──
-        // 历史缺陷：effective_ratio 只在 3 秒 EMA 分支里更新，初值 1.0，
-        // 源/设备采样率不一致时开头 3 秒会以错误速率播放（变调）。
         if source_rate > 0 && source_rate != self.source_rate {
             self.source_rate = source_rate;
-            self.effective_ratio =
-                (source_rate as f64 / self.device_rate as f64) / self.drift_ratio;
+            let r = source_rate as f64 / self.device_rate as f64;
+            self.ratio = if (0.1..10.0).contains(&r) { r } else { 1.0 };
+            self.phase = 0.0;
         }
-        if !(0.1..10.0).contains(&self.effective_ratio) {
-            // 防御：异常比率会让下面的相位循环失控
-            self.effective_ratio = 1.0;
-        }
-
-        // ── 每 3 秒：EMA 更新漂移比率 ──
-        if now.duration_since(self.last_ratio_update) > std::time::Duration::from_secs(3) {
-            let current_fill = self.ring.len();
-            let dt = now.duration_since(self.last_fill_time).as_secs_f64();
-
-            if dt > 2.0 && self.last_fill_sample > 0 {
-                let fill_delta = self.last_fill_sample as f64 - current_fill as f64;
-                let consume_rate = fill_delta / dt; // + = buffer shrinking
-                let produce_rate = self.device_rate as f64 - consume_rate;
-
-                if produce_rate > 1000.0 && produce_rate.is_normal() {
-                    let measured = self.device_rate as f64 / produce_rate;
-                    if measured.is_finite() && measured > 0.5 && measured < 1.5 {
-                        self.drift_ratio = self.drift_ratio * 0.7 + measured * 0.3; // EMA α=0.3
-                    }
-                }
-            }
-
-            // 缓冲区严重偏离时快速修正 (使用极小步长避免明显变调)
-            let fill_pct = current_fill as f64 / self.target_fill.max(1) as f64;
-            if fill_pct < 0.5 {
-                self.drift_ratio += 0.0005;
-            } else if fill_pct > 1.5 {
-                self.drift_ratio -= 0.0005;
-            }
-
-            // 严格限制漂移区间在 ±0.2% 之间，防止人耳察觉到变调
-            self.drift_ratio = self.drift_ratio.clamp(0.998, 1.002);
-            self.effective_ratio =
-                (self.source_rate.max(1) as f64 / self.device_rate as f64) / self.drift_ratio;
-
-            self.last_fill_sample = current_fill;
-            self.last_fill_time = now;
-            self.last_ratio_update = now;
-        }
+        let ratio = self.ratio.max(1e-6);
 
         if source_rate != self.device_rate {
             self.stats.resampled.fetch_add(1, Ordering::Relaxed);
         }
 
-        // ── 相位连续流式重采样 ──
+        if (ratio - 1.0).abs() < 1e-9 {
+            for &s in pcm {
+                if !self.ring.push(s) {
+                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+
+        // ── 相位连续线性插值 ──
         let n_in = pcm.len() as f64;
         self.resample_buf.clear();
         let last = pcm.len() - 1;
@@ -200,13 +214,11 @@ impl AudioWriter {
             let frac = phase - idx as f64;
             let i0 = idx.min(last);
             let i1 = (idx + 1).min(last);
-            self.resample_buf
-                .push((pcm[i0] as f64 + (pcm[i1] - pcm[i0]) as f64 * frac) as f32);
-            phase += self.effective_ratio;
+            self.resample_buf.push((pcm[i0] as f64 + (pcm[i1] - pcm[i0]) as f64 * frac) as f32);
+            phase += ratio;
         }
         self.phase = phase - n_in;
 
-        // ── 无锁写入环形缓冲；满则丢弃（不再在锁内扩容/搬移）──
         for &s in &self.resample_buf {
             if !self.ring.push(s) {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -245,6 +257,8 @@ fn build_stream<T>(
     config: &StreamConfig,
     ring: &Weak<Ring>,
     stats: &Weak<AudioStats>,
+    played: &Weak<AtomicU64>,
+    waker: &Arc<OnceLock<Thread>>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -252,10 +266,13 @@ where
     let channels = config.channels as usize;
     let ring = ring.clone();
     let stats = stats.clone();
+    let played = played.clone();
+    let waker = waker.clone();
     device
         .build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                // 回调约束：无锁、无分配、不调用 Opus、不写日志、不做复杂计算
                 let need_frames = data.len() / channels;
                 let mut filled = 0usize;
                 let mut idx = 0usize;
@@ -276,12 +293,25 @@ where
                     }
                 }
 
+                if let Some(p) = played.upgrade() {
+                    if filled > 0 {
+                        p.fetch_add(filled as u64, Ordering::Release);
+                    }
+                }
+
                 if filled < need_frames {
                     data[idx..].fill(T::EQUILIBRIUM);
                     if let Some(st) = stats.upgrade() {
                         st.underrun
                             .fetch_add((need_frames - filled) as u64, Ordering::Relaxed);
                     }
+                }
+
+                // 唤醒解码线程：播放头已经前移，该继续拉帧了。
+                // `unpark()` 在解码线程未休眠时只是一次原子置位（无锁、无分配）；
+                // 只有当它确实处于 park 时才触发一次内核唤醒。
+                if let Some(thread) = waker.get() {
+                    thread.unpark();
                 }
             },
             |_| {},
@@ -310,26 +340,27 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
 
     let actual_rate = stream_config.sample_rate.0;
 
-    // 上限 500ms，预填充 40ms（低延迟）
-    let ring = Arc::new(Ring::with_frames(actual_rate as usize / 2));
-    let initial_fill = actual_rate as usize / 25;
-    for _ in 0..initial_fill {
-        ring.push(0.0);
-    }
+    // 容量 341 ms（48 kHz 下 16384 帧），远大于 200 ms 下限；
+    // **不预填静音**：预缓冲由抖动缓冲负责，回调在无数据时输出静音且不推进播放头。
+    let ring = Arc::new(Ring::with_frames((actual_rate as usize * 341) / 1000));
+    let played = Arc::new(AtomicU64::new(0));
+    let waker: Arc<OnceLock<Thread>> = Arc::new(OnceLock::new());
 
     let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
 
     let ring_weak = Arc::downgrade(&ring);
     let stats_weak = Arc::downgrade(&stats);
+    let played_weak = Arc::downgrade(&played);
+    let waker_thread = waker.clone();
 
     std::thread::Builder::new()
         .name("udp2cal-audio".into())
         .spawn(move || {
             let built = match sample_format {
-                SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, &ring_weak, &stats_weak),
-                SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, &ring_weak, &stats_weak),
-                SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, &ring_weak, &stats_weak),
-                SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, &ring_weak, &stats_weak),
+                SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
+                SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
+                SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
+                SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
                 other => Err(format!("不支持的输出采样格式: {other}")),
             };
             let stream = match built {
@@ -350,22 +381,17 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
         })
         .map_err(|e| format!("线程创建失败: {e}"))?;
 
-    let now = Instant::now();
     match err_rx.recv() {
         Ok(Some(e)) => Err(e),
         Ok(None) => Ok(AudioWriter {
             ring,
             device_rate: actual_rate,
             stats,
-            drift_ratio: 1.0,
+            played,
+            waker,
             phase: 0.0,
-            // 首帧 write() 会按实际 source_rate 立即校正，此处仅为占位
-            effective_ratio: 1.0,
+            ratio: 1.0,
             source_rate: 0,
-            last_ratio_update: now,
-            last_fill_sample: initial_fill,
-            last_fill_time: now,
-            target_fill: initial_fill,
             resample_buf: Vec::with_capacity(4096),
         }),
         Err(_) => Err("音频线程异常退出".into()),
@@ -393,7 +419,7 @@ fn find_vb_cable_device() -> Option<cpal::Device> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 单元测试：环形缓冲与重采样比率
+// 单元测试：环形缓冲与固定比率重采样
 // ═══════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
@@ -428,39 +454,32 @@ mod tests {
         assert_eq!(ring.len(), 1024);
     }
 
+    #[test]
+    fn ring_clear_drops_pending() {
+        let ring = Ring::with_frames(1024);
+        for _ in 0..100 {
+            ring.push(0.5);
+        }
+        ring.clear();
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.pop(), None);
+        assert!(ring.push(0.25));
+    }
+
     impl AudioWriter {
         fn for_test(device_rate: u32) -> Self {
-            let ring = Arc::new(Ring::with_frames(device_rate as usize));
-            let now = Instant::now();
             Self {
-                ring,
+                ring: Arc::new(Ring::with_frames(device_rate as usize)),
                 device_rate,
                 stats: Arc::new(AudioStats::default()),
-                drift_ratio: 1.0,
+                played: Arc::new(AtomicU64::new(0)),
+                waker: Arc::new(OnceLock::new()),
                 phase: 0.0,
-                effective_ratio: 1.0,
+                ratio: 1.0,
                 source_rate: 0,
-                last_ratio_update: now,
-                last_fill_sample: 0,
-                last_fill_time: now,
-                target_fill: device_rate as usize / 25,
                 resample_buf: Vec::new(),
             }
         }
-    }
-
-    #[test]
-    fn first_write_applies_source_rate_ratio() {
-        // 回归：历史实现 effective_ratio 初值为 1.0 且只在 3 秒后才更新，
-        // 导致 16k→48k 场景下开头 3 秒以 1:1 写入（三倍速）。
-        let mut aw = AudioWriter::for_test(48000);
-        let pcm = vec![0.1f32; 480];
-        aw.write(&pcm, 16000);
-        let produced = aw.ring.len();
-        assert!(
-            (produced as i64 - 1440).abs() <= 4,
-            "16k→48k 应产出约 1440 个样本，实际 {produced}"
-        );
     }
 
     #[test]
@@ -468,7 +487,38 @@ mod tests {
         let mut aw = AudioWriter::for_test(48000);
         let pcm = vec![0.1f32; 480];
         aw.write(&pcm, 48000);
-        assert!((aw.ring.len() as i64 - 480).abs() <= 2, "len={}", aw.ring.len());
+        assert_eq!(aw.ring.len(), 480);
         assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn forty_four_one_device_upsamples_48k_input() {
+        // 48 kHz 源 → 44.1 kHz 设备：480 样本应产出约 441 帧
+        let mut aw = AudioWriter::for_test(44100);
+        let pcm = vec![0.1f32; 480];
+        aw.write(&pcm, 48000);
+        let produced = aw.ring.len();
+        assert!((produced as i64 - 441).abs() <= 2, "produced={produced}");
+        assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resampler_keeps_phase_across_blocks() {
+        let mut aw = AudioWriter::for_test(44100);
+        let pcm = vec![0.1f32; 480];
+        for _ in 0..10 {
+            aw.write(&pcm, 48000);
+        }
+        let produced = aw.ring.len();
+        assert!((produced as i64 - 4_410).abs() <= 4, "produced={produced}");
+    }
+
+    #[test]
+    fn flush_clears_ring_and_phase() {
+        let mut aw = AudioWriter::for_test(48000);
+        aw.write(&vec![0.1f32; 480], 48000);
+        aw.flush();
+        assert_eq!(aw.ring.len(), 0);
+        assert_eq!(aw.space_frames(), aw.ring.capacity());
     }
 }

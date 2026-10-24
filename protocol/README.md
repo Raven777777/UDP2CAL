@@ -1,11 +1,18 @@
 # udp2cal-protocol
 
-UDP2CAL 私有协议 v2 的 Rust 实现（协议唯一真源，文件 `protocol.rs`）。
+UDP2CAL **协议 v3** 的 Rust 实现（协议唯一真源）。
 
-**协议规范文档已迁移至 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md)** —— 包头布局、消息类型、采样率-码率关联、P2P 独占生命周期、常量表与用法示例。
+| 文件 | 内容 |
+| --- | --- |
+| `protocol.rs` | 控制面：15 字节固定头、`CONNECT` / `CONNECT_ACK` / `DISCOVER_*` 负载、同 socket 解复用、设备 ID |
+| `rtp.rs` | 媒体面：12 字节 RTP 头、扩展 seq/ts、`JitterBuffer`（播放头拉取 / PLC）、`DriftController`、`PlayheadClock` |
+
+规范文档：[`../docs/PROTOCOL_V3_RTP.md`](../docs/PROTOCOL_V3_RTP.md)
+（v2 已归档在 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md)，**不可互通**）
 
 ```
-cargo test          # 运行协议单元测试
+cargo test          # 协议单元测试（含附录 B 的全部字节向量）
 ```
 
-被 `windows/` 作为本地依赖引用；Android 端 `Udp2CalProtocol.kt` 为手动对齐实现。
+被 `windows/` 作为本地依赖引用；Android 端 `Udp2CalProtocol.kt` 是手动对齐的镜像实现，
+两端测试共用同一组十六进制向量，任何字段改动必须同时更新三处。

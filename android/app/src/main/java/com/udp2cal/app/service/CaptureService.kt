@@ -1,6 +1,9 @@
 package com.udp2cal.app.service
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.AudioFormat
@@ -14,7 +17,6 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import java.net.DatagramPacket
 import com.udp2cal.app.AudioPlayer
 import com.udp2cal.app.DiscoveryManager
 import com.udp2cal.app.Prefs
@@ -22,52 +24,92 @@ import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
 import com.udp2cal.app.native.OpusDecoder as ReverseOpusDecoder
 import com.udp2cal.app.native.OpusEncoder
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import java.security.SecureRandom
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.coroutines.coroutineContext
 
+/**
+ * 采集服务（v3）
+ *
+ * 线程/协程模型（规范第七、八章）：
+ * ```
+ * 采集协程（AudioRecord 阻塞读 480 采样 → Opus 10 ms → RTP → 主 socket）
+ * 控制协程（每秒 CONNECT，200 ms 轮询 ACK 新鲜度）
+ * 反向接收协程（reverse socket 阻塞 receive → 校验 → 抖动缓冲）
+ * 反向播放协程（AudioTrack 播放头拉取 → 解码/PLC → 阻塞写）
+ * ```
+ * 音频路径上**没有**应用层 PCM 队列、没有 `soTimeout` 驱动、没有 PLC 定时器。
+ */
 class CaptureService : Service() {
-    companion object { private const val TAG = "CaptureService" }
+    companion object {
+        private const val TAG = "CaptureService"
+
+        /** 正向 Opus 帧采样数（10 ms @ 48 kHz，单声道） */
+        private const val FRAME = Udp2CalProtocol.OPUS_FRAME_SAMPLES
+
+        /** ACK 轮询周期：只用于检测连接状态与发送保活 */
+        private const val TICK_MS = 200L
+    }
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     @Volatile private var captureJob: Job? = null
-    private var reverseAudioJob: Job? = null
+    private var controlJob: Job? = null
+    private var reverseRxJob: Job? = null
+    private var reversePlayJob: Job? = null
+    private var notificationJob: Job? = null
+
     /** 主线程置位、IO 协程读取，必须 volatile */
     @Volatile private var hasNewCapture = false
-    /** 模式切换标记：true 时 finally 保留网络层和反向解码器 */
-    @Volatile private var isModeRestart = false
 
     private val _status = MutableStateFlow(CaptureStatus())
     val status: StateFlow<CaptureStatus> = _status.asStateFlow()
 
     private var audioRecord: AudioRecord? = null
     private var encoder: OpusEncoder? = null
-    private var udpSender: UdpSender? = null
-    /** 音频帧通道引用，用于 stopCapture 时强制关闭 */
-    private var audioChannel: Channel<ShortArray>? = null
-    /** 反向音频（PC→Phone） */
-    private var reverseDecoder: ReverseOpusDecoder? = null
-    private var audioPlayer: AudioPlayer? = null
-    /** Wi-Fi 高低延迟锁：采集期间阻止网卡进入省电聚合（丢包/延迟簇的根源） */
+    // 跨协程（不同调度线程）访问，必须 volatile 保证可见性
+    @Volatile private var udpSender: UdpSender? = null
+    @Volatile private var reverseDecoder: ReverseOpusDecoder? = null
+    @Volatile private var audioPlayer: AudioPlayer? = null
+    /** Wi-Fi 低延迟锁：采集期间阻止网卡进入省电聚合 */
     private var wifiLock: WifiManager.WifiLock? = null
-    /** AEC 实例，finally 中释放 */
     private var aecInstance: AcousticEchoCanceler? = null
 
+    // ─── 反向链路共享状态：接收协程插入，播放协程拉取 ───
+    private val linkLock = java.util.concurrent.locks.ReentrantLock()
+    private val linkSignal = linkLock.newCondition()
+    private val jitter = Udp2CalProtocol.JitterBuffer()
+    private val drift = Udp2CalProtocol.DriftController()
+    private val clock = Udp2CalProtocol.PlayheadClock()
+    @Volatile private var activeReverseSsrc = 0
+
     private data class CaptureParams(
-        val sampleRateHz: Int, val bitrateKbps: Int, val targetIp: String, val targetPort: Int,
+        val sampleRateHz: Int,
+        val bitrateKbps: Int,
+        val targetIp: String,
+        val targetPort: Int,
         val testTone: Boolean,
-        val isModeRestart: Boolean = false
     )
+
     private var pendingRestart: CaptureParams? = null
 
     /** 音源描述枚举 */
     object AudioSourceLabel {
-        const val MIC_RAW = "MIC直出"                    // 裸麦克风，硬件降噪关闭
-        const val SYSTEM_NS = "系统硬件降噪"              // VOICE_COMMUNICATION，安卓系统原生降噪
-        const val SYSTEM_NS_FALLBACK = "系统硬件降噪(已回退MIC)" // VOICE_COMMUNICATION失败，回退MIC
+        const val MIC_RAW = "MIC直出"
+        const val SYSTEM_NS = "系统硬件降噪"
+        const val SYSTEM_NS_FALLBACK = "系统硬件降噪(已回退MIC)"
         const val AEC_ENABLED = " + AEC已启用"
         const val AEC_UNAVAILABLE = " + AEC不可用"
     }
@@ -77,813 +119,775 @@ class CaptureService : Service() {
         val bitrateKbps: Float = 0f,
         val sampleRateHz: Int = 0,
         val bitrateTargetKbps: Int = 0,
-        val vbrMode: String = "",                // "CBR" / "VBR" / "VBR约束" / "VBR(DTX)"
-        val audioSource: String = "",            // 当前音源描述
-        val opusMode: String = "",               // "语音模式" / "全频模式"
-        val opusBandwidth: Int = 0,              // Opus带宽JNI常量 (1101=NB..1105=FB)
+        val vbrMode: String = "",
+        val audioSource: String = "",
+        val opusMode: String = "",
+        val opusBandwidth: Int = 0,
         val errorMsg: String = "",
-        val connected: Boolean = false,          // P2P 独占连接状态
-        val deviceId: String = "",               // 本机设备 ID
-        val reverseAudio: Boolean = false,       // 反向串流是否活跃
-        val reverseBitrateKbps: Float = 0f,      // 反向串流码率
-        val reverseBw: String = ""               // 反向串流音频带宽
+        val connected: Boolean = false,
+        val deviceId: String = "",
+        val reverseAudio: Boolean = false,
+        val reverseBitrateKbps: Float = 0f,
+        val reverseBw: String = "",
     )
 
-    inner class LocalBinder : Binder() { fun getService(): CaptureService = this@CaptureService }
+    inner class LocalBinder : Binder() {
+        fun getService(): CaptureService = this@CaptureService
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
-    override fun onCreate() { super.onCreate() }
 
-    private var notificationJob: Job? = null
+    override fun onCreate() {
+        super.onCreate()
+    }
 
-    // startForeground 必须在 startService→onStartCommand 时立即调用（5s限制）
-    //   NotificationChannel 必须在权限授予后创建 → 放这里而非 onCreate
+    // startForeground 必须在 startService→onStartCommand 时立即调用（5s 限制）
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 系统重启（intent == null）时不要复活成"僵尸前台服务"：
-        // 它会常驻通知栏显示等待连接，却永远不会开始采集。
         if (intent == null) {
             stopSelf()
             return START_NOT_STICKY
         }
         createNotificationChannel()
-        try { startForeground(1, buildNotification()) } catch (e: Exception) {
+        try {
+            startForeground(1, buildNotification())
+        } catch (e: Exception) {
             Log.e(TAG, "startForeground failed", e)
             stopSelf()
             return START_NOT_STICKY
         }
-        // 动态更新通知栏状态。
-        // 必须去重：每次 startService 都会进 onStartCommand，
-        // 历史实现会让收集器不断累积，N 次启动后每秒重复 startForeground N 次。
         if (notificationJob?.isActive != true) {
             notificationJob = serviceScope.launch {
                 _status.collect {
                     try {
                         startForeground(1, buildNotification())
-                    } catch (_: Exception) {}
+                    } catch (_: Exception) {
+                    }
                 }
             }
         }
         return START_NOT_STICKY
     }
 
-    fun startCapture(sampleRateHz: Int, bitrateKbps: Int, targetIp: String, targetPort: Int,
-                     testTone: Boolean = false) {
+    fun startCapture(
+        sampleRateHz: Int,
+        bitrateKbps: Int,
+        targetIp: String,
+        targetPort: Int,
+        testTone: Boolean = false,
+    ) {
         if (captureJob?.isActive == true) {
             pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
             captureJob?.cancel()
             return
         }
         pendingRestart = null
-        isModeRestart = false
         doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
     }
 
-    /**
-     * 判断当前 Opus 信号类型是否为语音模式，驱动音源选择
-     * 仅此一个状态变量控制音源切换：
-     *   true  → VOICE_COMMUNICATION（系统原生硬件降噪）
-     *   false → MIC（裸麦克风，硬件降噪关闭）
-     */
-    private fun isVoiceMode(): Boolean = Prefs.opusSignal == 3001 // OPUS_SIGNAL_VOICE
+    /** 语音模式：VOICE_COMMUNICATION + 硬件降噪 + AEC */
+    private fun isVoiceMode(): Boolean = Prefs.opusSignal == 3001
 
     private fun doStartCapture(
-        sampleRateHz: Int, bitrateKbps: Int, targetIp: String, targetPort: Int,
-        testTone: Boolean
+        sampleRateHz: Int,
+        bitrateKbps: Int,
+        targetIp: String,
+        targetPort: Int,
+        testTone: Boolean,
     ) {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UDP2CAL:Capture")
-        try { wakeLock.acquire() } catch (_: Exception) {}
+        try {
+            wakeLock.acquire()
+        } catch (_: Exception) {
+        }
 
-        // Wi-Fi 省电锁：PARTIAL_WAKE_LOCK 只保 CPU，网卡仍会进入省电聚合，
-        // 造成周期性 100~500ms 延迟簇（重排窗口判死 → 成片丢帧）。
-        // FULL_LOW_LATENCY 要求 API 29+（minSdk=29），失败不影响主流程。
         if (wifiLock == null) {
             try {
                 val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-                wifiLock = wm?.createWifiLock(
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "UDP2CAL:Wifi"
-                )?.apply {
-                    setReferenceCounted(false)
-                    acquire()
-                    Log.i(TAG, "WifiLock 已持有 (FULL_LOW_LATENCY)")
-                }
+                wifiLock = wm?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "UDP2CAL:Wifi")
+                    ?.apply {
+                        setReferenceCounted(false)
+                        acquire()
+                        Log.i(TAG, "WifiLock 已持有 (FULL_LOW_LATENCY)")
+                    }
             } catch (e: Exception) {
                 Log.w(TAG, "WifiLock 获取失败（继续运行）", e)
             }
         }
 
         hasNewCapture = true
-        // 捕获启动时的 isVoiceMode，用于消费者协程检测变更
-        val startIsVoiceMode = isVoiceMode()
+        val voiceMode = isVoiceMode()
+        val deviceId = DiscoveryManager.getOrCreateDeviceId()
 
         captureJob = serviceScope.launch {
             _status.value = _status.value.copy(isRunning = true, errorMsg = "")
-
             try {
-                if (isModeRestart && udpSender != null) {
-                    // 模式切换：复用已有 UdpSender，不发新 CONNECT（端口不变）
-                    Log.i(TAG, "🔄 模式切换，复用已有 UdpSender")
-                } else {
-                    udpSender = UdpSender(targetIp, targetPort)
-                    if (!udpSender!!.connect()) {
-                        _status.value = _status.value.copy(isRunning = false, errorMsg = "网络连接失败")
-                        stopSelf()
-                        return@launch
-                    }
-                }
-                encoder = OpusEncoder(sampleRateHz, bitrateKbps).also {
-                    it.deviceId = udpSender!!.getDeviceId() ?: DiscoveryManager.getOrCreateDeviceId()
-                }
-                if (!encoder!!.start()) {
-                    _status.value = _status.value.copy(isRunning = false, errorMsg = "编码器初始化失败，已保留原始PCM通路")
-                    stopSelf()
+                // ── 网络层 ──
+                val sender = UdpSender(targetIp, targetPort)
+                if (!sender.connect()) {
+                    fail("网络连接失败")
                     return@launch
                 }
+                udpSender = sender
+                activeReverseSsrc = 0
 
-                val frameSize = encoder!!.frameSize
-                if (frameSize <= 0) {
-                    _status.value = _status.value.copy(isRunning = false, errorMsg = "编码器帧大小无效")
-                    stopSelf()
-                    return@launch
-                }
-
-                _status.value = _status.value.copy(
-                    sampleRateHz = sampleRateHz,
-                    bitrateTargetKbps = bitrateKbps,
-                    opusMode = if (startIsVoiceMode) "语音模式" else "全频模式"
+                // ── 正向编码器（固定 48 kHz / 10 ms / 单声道）──
+                val enc = OpusEncoder(
+                    sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
+                    bitrateKbps = Udp2CalProtocol.clampBitrateKbps(bitrateKbps),
                 )
+                encoder = enc
+                if (!enc.start()) {
+                    fail("编码器初始化失败")
+                    return@launch
+                }
+                if (enc.frameSize != FRAME) {
+                    fail("编码器帧大小无效（${enc.frameSize}）")
+                    return@launch
+                }
 
-                if (testTone) {
-                    var byteCount = 0L
-                    var lastReport = System.currentTimeMillis()
-                    val omega = 2.0 * Math.PI * 1000.0 / sampleRateHz
-                    val testToneBuf = ShortArray(frameSize)
-                    var phase = 0.0
-                    val frameIntervalNs = (frameSize * 1_000_000_000L) / sampleRateHz
-                    var nextFrameTime = System.nanoTime()
-
-                    _status.value = _status.value.copy(isRunning = true)
-
-                    val sendBuffer = ByteArray(Udp2CalProtocol.MAX_PACKET)
-
-                    while (isActive) {
-                        for (i in 0 until frameSize) {
-                            val sample = (Math.sin(phase) * 16384.0).toInt().coerceIn(-32768, 32767)
-                            testToneBuf[i] = sample.toShort()
-                            phase += omega
-                            if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI
-                        }
-
-                        val written = encoder?.encodeTo(testToneBuf, sendBuffer, 0) ?: -1
-                        if (written > 0) {
-                            if (udpSender?.send(sendBuffer, 0, written) == true) byteCount += written
-                        }
-
-                        nextFrameTime += frameIntervalNs
-                        var nsNow: Long
-                        do {
-                            nsNow = System.nanoTime()
-                            if (nsNow >= nextFrameTime) break
-                            val remainingUs = (nextFrameTime - nsNow) / 1000
-                            if (remainingUs > 2000) Thread.sleep(remainingUs / 1000 - 1)
-                        } while (System.nanoTime() < nextFrameTime)
-
-                        val msNow = System.currentTimeMillis()
-                        if (msNow - lastReport >= 1000) {
-                            val kbps = (byteCount * 8f) / (msNow - lastReport)
-                            _status.value = _status.value.copy(bitrateKbps = kbps)
-                            byteCount = 0
-                            lastReport = msNow
-                        }
-                    }
-                } else {
-                    // === 正常麦克风采集（生产-消费双协程模型）===
-                    val minBufSize = AudioRecord.getMinBufferSize(sampleRateHz, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                    if (minBufSize == AudioRecord.ERROR || minBufSize == AudioRecord.ERROR_BAD_VALUE) {
-                        _status.value = _status.value.copy(isRunning = false, errorMsg = "麦克风不支持请求的采样率")
-                        stopSelf()
-                        return@launch
-                    }
-                    val bufferSize = (minBufSize * 2).coerceAtLeast((sampleRateHz / 1000) * 40)
-
-                    // ═══ 音源选择：由 isVoiceMode（Opus信号类型）驱动 ═══
-                    var audioSourceLabel: String
-                    if (startIsVoiceMode) {
-                        // 语音模式 → 尝试 VOICE_COMMUNICATION（系统原生硬件降噪）
-                        try {
-                            audioRecord = AudioRecord(
-                                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                                sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
-                                AudioFormat.ENCODING_PCM_16BIT, bufferSize
-                            )
-                        } catch (_: Exception) {}
-
-                        if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                            audioSourceLabel = AudioSourceLabel.SYSTEM_NS
-                            Log.i(TAG, "音源: VOICE_COMMUNICATION（系统硬件降噪）")
-                        } else {
-                            // 异常回退：VOICE_COMMUNICATION 不可用 → 降级到 MIC
-                            audioRecord?.release()
-                            Log.w(TAG, "VOICE_COMMUNICATION 不可用，回退到 MIC 裸采集")
-                            audioRecord = AudioRecord(
-                                MediaRecorder.AudioSource.MIC,
-                                sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
-                                AudioFormat.ENCODING_PCM_16BIT, bufferSize
-                            )
-                            audioSourceLabel = AudioSourceLabel.SYSTEM_NS_FALLBACK
-                        }
-                    } else {
-                        // 全频模式 → MIC 裸麦克风（硬件降噪关闭）
-                        audioRecord = AudioRecord(
-                            MediaRecorder.AudioSource.MIC,
-                            sampleRateHz, AudioFormat.CHANNEL_IN_MONO,
-                            AudioFormat.ENCODING_PCM_16BIT, bufferSize
-                        )
-                        audioSourceLabel = AudioSourceLabel.MIC_RAW
-                        Log.i(TAG, "音源: MIC（裸麦克风，硬件降噪关闭）")
-                    }
-
-                    if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                        _status.value = _status.value.copy(
-                            isRunning = false,
-                            errorMsg = "麦克风初始化失败",
-                            audioSource = AudioSourceLabel.MIC_RAW
-                        )
-                        stopSelf()
-                        return@launch
-                    }
-
-                    val readSize = frameSize * 2
-                    audioRecord?.startRecording()
-
-                    // ═══ 启用安卓原生 AEC（声学回声消除）═══
-                    if (startIsVoiceMode && AcousticEchoCanceler.isAvailable()) {
-                        try {
-                            val aec = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
-                            if (aec != null) {
-                                aec.enabled = true
-                                aecInstance = aec
-                                audioSourceLabel += AudioSourceLabel.AEC_ENABLED
-                                Log.i(TAG, "AEC 已启用")
-                            } else {
-                                audioSourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
-                            }
-                        } catch (e: Exception) {
-                            audioSourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
-                            Log.w(TAG, "AEC create 失败", e)
-                        }
-                    } else {
-                        audioSourceLabel += if (startIsVoiceMode) AudioSourceLabel.AEC_UNAVAILABLE else ""
-                    }
-
-                    // ═══ 初始化反向音频（PC→Phone 解码+播放，立体声）═══
-                    if (reverseDecoder == null) {
-                        // 首次创建解码器（模式切换时复用旧解码器）
-                        reverseDecoder = ReverseOpusDecoder(sampleRateHz, channels = 2).also {
-                            if (!it.start()) {
-                                Log.w(TAG, "反向音频解码器初始化失败，继续运行")
-                            }
-                        }
-                    }
-                    // 每次采集启动都重建 AudioPlayer（确保路由/声道与新模式一致）
-                    audioPlayer = AudioPlayer(this@CaptureService).also { player ->
-                        val aecSessionId = (audioRecord?.audioSessionId ?: 0)
-                        if (!player.start(aecSessionId, startIsVoiceMode)) {
-                            Log.w(TAG, "反向音频播放器初始化失败，继续运行")
-                        } else {
-                            if (player.isVoiceCommActive) {
-                                audioSourceLabel += " [AEC管线]"
-                            }
-                        }
-                    }
-
+                // ── 反向链路：解码器 + 播放器（PC→Phone，立体声）──
+                reverseDecoder = ReverseOpusDecoder(Udp2CalProtocol.OPUS_SAMPLE_RATE, channels = 2).also {
+                    if (!it.start()) Log.w(TAG, "反向解码器初始化失败，继续运行")
+                }
+                launchReverseReceiver()
                 _status.value = _status.value.copy(
                     isRunning = true,
-                    audioSource = audioSourceLabel,
-                    connected = false,      // 尚未收到 CONNECT_ACK，不乐观标记连接
-                    deviceId = Udp2CalProtocol.deviceIdToString(DiscoveryManager.getOrCreateDeviceId())
+                    sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
+                    bitrateTargetKbps = Udp2CalProtocol.clampBitrateKbps(bitrateKbps),
+                    opusMode = if (voiceMode) "语音模式" else "全频模式",
+                    connected = false,
+                    deviceId = Udp2CalProtocol.deviceIdToString(deviceId),
                 )
 
-                    // ── 音频帧通道（容量 3：无需无限增长，又提供足够并行度）──
-                    val ch = Channel<ShortArray>(3)
-                    audioChannel = ch // 保存引用给 stopCapture 关闭
+                // ── 控制协程 ──
+                controlJob = launch { controlLoop() }
 
-                    // ── 乒乓发送缓冲区：2 个轮流使用，防止上一帧 send 未完成时被 encodeTo 覆盖 ──
-                    val sendBuffers = arrayOf(
-                        ByteArray(Udp2CalProtocol.MAX_PACKET),
-                        ByteArray(Udp2CalProtocol.MAX_PACKET)
-                    )
-                    var bufIndex = 0
-
-                    // ── ShortArray 复用池（容量 5，比 Channel 容量 3 大 2，彻底杜绝耗尽锁死风险）──
-                    val framePool = ShortArrayPool(frameSize, 5)
-
-                    // ═══ 生产者协程 ═══：仅做 AudioRecord.read + 帧组装
-                    // Dispatchers.IO 确保硬件阻塞读不阻塞消费协程
-                    val producerJob = launch(Dispatchers.IO) {
-                        val pcmBuffer = ShortArray(readSize)
-                        var accumPos = 0
-                        var accumBuf = framePool.borrow() // 第一帧从池中借出
-                        var readErrors = 0
-                        var channelClosed = false
-
-                        while (isActive && !channelClosed) {
-                            val read = audioRecord?.read(pcmBuffer, 0, readSize) ?: -1
-                            if (read <= 0) {
-                                // 0 = 暂无数据；负值 = 错误码（-3 INVALID_OPERATION / -6 DEAD_OBJECT）。
-                                // 不加区分地 continue 会在麦克风被抢占/拔出时退化成 100% CPU 紧循环。
-                                if (read < 0) {
-                                    readErrors++
-                                    if (readErrors == 1) Log.w(TAG, "AudioRecord.read 返回错误码 $read")
-                                    if (read == AudioRecord.ERROR_DEAD_OBJECT || readErrors >= 100) {
-                                        Log.e(TAG, "AudioRecord 已失效(read=$read)，停止采集")
-                                        _status.value = _status.value.copy(
-                                            errorMsg = "麦克风读取失败，请重新开始采集"
-                                        )
-                                        // 置 false 让 finally 走完整停止路径，
-                                        // 否则服务会停在"isRunning=true 但无采集"的僵尸态
-                                        hasNewCapture = false
-                                        break
-                                    }
-                                }
-                                delay(5) // 让出 CPU，避免空转
-                                continue
-                            }
-                            readErrors = 0
-
-                            var srcPos = 0
-                            while (srcPos < read) {
-                                val n = minOf(read - srcPos, frameSize - accumPos)
-                                pcmBuffer.copyInto(accumBuf, accumPos, srcPos, srcPos + n)
-                                accumPos += n
-                                srcPos += n
-
-                                if (accumPos == frameSize) {
-                                    // 直接将 accumBuf 送出（零拷贝），再从池中借出下一块。
-                                    // send 在通道关闭时抛 ClosedSendChannelException：
-                                    // 停止流程中这是预期异常，必须就地吞掉，不能炸到顶层。
-                                    val ok = try {
-                                        ch.send(accumBuf)
-                                        true
-                                    } catch (_: Exception) {
-                                        false
-                                    }
-                                    if (!ok) {
-                                        framePool.recycle(accumBuf)
-                                        channelClosed = true
-                                        break
-                                    }
-                                    accumBuf = framePool.borrow()
-                                    accumPos = 0
-                                }
-                            }
-                        }
-                        // 生产者退出时关闭通道：无论因取消、致命错误还是通道失效，
-                        // 消费者都能确定性地结束 for 循环，不会永久挂起。
-                        ch.close()
-                    }
-
-                    // ═══ 消费者协程 ═══：编码参数同步 → 编码 → 发送
-                    val consumerJob = launch {
-                        var currentIp = targetIp
-                        var currentPort = targetPort
-                        var byteCount = 0L
-                        var lastReport = System.currentTimeMillis()
-                        var lastOpusConfigHash = 0
-                        var lastCfgSync = 0L
-                        var reconnectCounter = 0
-                        val RECONNECT_INTERVAL = 100 // ~1秒(10ms每帧)
-                        var p2pConnected = false // 初始未连接，收到 ACK 后方可发包
-                        var reverseJob: Job? = null
-
-                        // 模式重启时：只有当 ACK 仍在有效窗口内才直接恢复连接。
-                        // 用"历史是否收到过 ACK"判断会让早已过期的连接被误判为在线。
-                        if (udpSender?.isAckFresh() == true) {
-                            p2pConnected = true
-                            _status.value = _status.value.copy(connected = true, errorMsg = "")
-                            reverseJob = launchReverseAudio(currentIp)
-                            reverseAudioJob = reverseJob
-                        }
-
-                        for (frame in ch) {
-                            val nowMs = System.currentTimeMillis()
-
-                            // ── ACK 状态检查（ACK 由独立线程接收，此处只读时间戳）──
-                            // 必须用"新鲜度"而不是"历史上收到过"：否则超时判定把
-                            // p2pConnected 置 false 后，下一帧立刻又被判成 true，
-                            // 形成 100Hz 的 连接/断开 抖动，并反复创建反向协程。
-                            if (udpSender?.isAckFresh(nowMs) == true && !p2pConnected) {
-                                p2pConnected = true
-                                _status.value = _status.value.copy(connected = true, errorMsg = "")
-                                // 连接确认后启动反向音频协程（独立 socket，不干扰正向）
-                                reverseJob = launchReverseAudio(currentIp)
-                                reverseAudioJob = reverseJob
-                            }
-
-                            // ── 保活 CONNECT：持续发送（Win 端对异设备静默拒绝，不影响已有连接）──
-                            // 同时携带手机端 Opus 编码设置，PC 端反向编码实时同步
-                            reconnectCounter++
-                            if (reconnectCounter >= RECONNECT_INTERVAL) {
-                                reconnectCounter = 0
-                                try {
-                                    val devId = DiscoveryManager.getOrCreateDeviceId()
-                                    val revPort = udpSender?.reversePort ?: 0
-                                    // Opus JNI 常量→协议值映射
-                                    fun mapSignal(sig: Int): Byte = when (sig) {
-                                        3001 -> 1   // OPUS_SIGNAL_VOICE
-                                        3002 -> 2   // OPUS_SIGNAL_MUSIC
-                                        else -> 0   // auto
-                                    }
-                                    fun mapBandwidth(bw: Int): Byte = when (bw) {
-                                        1101 -> 0   // NARROWBAND
-                                        1102 -> 1   // MEDIUMBAND
-                                        1103 -> 2   // WIDEBAND
-                                        1104 -> 3   // SUPERWIDEBAND
-                                        else -> 4   // FULLBAND
-                                    }
-                                    // 自动码率与 DTX 同规则：强制 VBR 并关闭 VBR 约束
-                                    // （flags 同步的是生效值，PC 反向编码器跟随）
-                                    val autoBr = Prefs.opusBitrateKbps <= 0
-                                    val effVbr = Prefs.opusVbr == 1 || Prefs.opusDtx == 1 || autoBr
-                                    val effVbrc = effVbr && !autoBr && Prefs.opusVbrConstraint == 1
-                                    val opusFlags = (
-                                        (if (effVbr) 1 else 0) shl 0
-                                        or (if (Prefs.opusDtx == 1) 1 else 0) shl 1
-                                        or (if (effVbrc) 1 else 0) shl 2
-                                        or (if (Prefs.opusFec > 0) 1 else 0) shl 3
-                                    ).toByte()
-                                    val br = Prefs.opusBitrateKbps
-                                    val payload = byteArrayOf(
-                                        (revPort shr 8).toByte(), revPort.toByte(),
-                                        0x02.toByte(), // 标志位: bit1=携带 Opus 参数; bit0 保留, 固定 0
-                                        Prefs.opusComplexity.toByte(),
-                                        mapSignal(Prefs.opusSignal),
-                                        mapBandwidth(Prefs.opusBandwidth),
-                                        opusFlags,
-                                        (br shr 8).toByte(), br.toByte(),
-                                        Prefs.opusPacketLoss.toByte()
-                                    )
-                                    val ping = Udp2CalProtocol.buildPacket(
-                                        isAudio = false, msgType = Udp2CalProtocol.TYPE_CONNECT,
-                                        sampleRate = 0, seqNum = 0, deviceId = devId, payload = payload
-                                    )
-                                    udpSender?.send(ping, 0, ping.size)
-                                } catch (_: Exception) {}
-                            }
-
-                            // ── ACK 超时判定（优雅断连，不退出采集）──
-                            val ackTime = udpSender?.getLastAckTime() ?: 0L
-                            if (ackTime > 0 && p2pConnected) {
-                                val elapsed = nowMs - ackTime
-                                if (elapsed > 3000) {
-                                    p2pConnected = false
-                                    reverseJob?.cancel()
-                                    reverseJob = null
-                                    _status.value = _status.value.copy(connected = false, reverseAudio = false, errorMsg = "已断开（等待重连）")
-                                }
-                            }
-
-                            // ── 网络目标动态热重连 ──
-                            val targetIpFromPrefs = Prefs.targetIp
-                            val targetPortFromPrefs = Prefs.targetPort
-                            if (targetIpFromPrefs != currentIp || targetPortFromPrefs != currentPort) {
-                                try {
-                                    Log.i(TAG, "📡 检测到 IP/端口 变更，执行热重连: $targetIpFromPrefs:$targetPortFromPrefs")
-                                    // 旧 socket 连同 reverseSock 一起失效：必须停掉反向接收协程，
-                                    // 否则它会对已关闭的 socket 疯狂抛异常（100% CPU）且永远不再工作
-                                    reverseJob?.cancel()
-                                    reverseJob = null
-                                    _status.value = _status.value.copy(reverseAudio = false, connected = false)
-                                    p2pConnected = false
-                                    udpSender?.close()
-                                    udpSender = UdpSender(targetIpFromPrefs, targetPortFromPrefs)
-                                    udpSender?.connect()
-                                    currentIp = targetIpFromPrefs
-                                    currentPort = targetPortFromPrefs
-                                } catch (ex: Exception) {
-                                    Log.e(TAG, "热重连失败", ex)
-                                }
-                            }
-
-                            // ── 音源模式变更检测（isVoiceMode 驱动 AudioRecord 重建）──
-                            val newIsVoiceMode = isVoiceMode()
-                            if (newIsVoiceMode != startIsVoiceMode) {
-                                Log.i(TAG, "🔄 Opus信号类型变更(isVoiceMode: $startIsVoiceMode→$newIsVoiceMode)，触发音频源重建")
-                                isModeRestart = true
-                                pendingRestart = CaptureParams(
-                                    sampleRateHz, bitrateKbps,
-                                    Prefs.targetIp, Prefs.targetPort, testTone,
-                                    isModeRestart = true
-                                )
-                                captureJob?.cancel()
-                                return@launch
-                            }
-
-                            // ── Opus 编码参数动态同步（5Hz 足够，避免每帧读 9 个 SharedPreferences）──
-                            if (nowMs - lastCfgSync >= 200) {
-                                lastCfgSync = nowMs
-                                val curAutoBr = Prefs.opusBitrateKbps <= 0
-                                val curCplx = Prefs.opusComplexity
-                                val curSig = Prefs.opusSignal
-                                val curBw = Prefs.opusBandwidth
-                                val curDtx = Prefs.opusDtx
-                                // 自动码率与 DTX 同规则：强制 VBR 并关闭 VBR 约束
-                                val curVbr = if (curDtx == 1 || curAutoBr) 1 else Prefs.opusVbr
-                                // 自动码率：48000→512k（OPUS 立体声协议上限），24000→256k，16000→128k
-                                val curBr = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else {
-                                    when (sampleRateHz) { 48000 -> 512; 24000 -> 256; 16000 -> 128; else -> 64 }
-                                }
-                                val curFec = Prefs.opusFec
-                                val curPl = Prefs.opusPacketLoss
-                                val curVbrc = if (curVbr == 1 && !curAutoBr) Prefs.opusVbrConstraint else 0
-                                val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc)
-                                if (curHash != lastOpusConfigHash) {
-                                    if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc) == true) {
-                                        lastOpusConfigHash = curHash
-                                        val mode = when {
-                                            curDtx == 1 -> "VBR(DTX)"
-                                            curVbr == 1 && curVbrc == 1 -> "VBR约束"
-                                            curVbr == 1 -> "VBR"
-                                            else -> "CBR"
-                                        }
-                                        _status.value = _status.value.copy(
-                                            bitrateTargetKbps = curBr,
-                                            vbrMode = mode,
-                                            opusMode = if (isVoiceMode()) "语音模式" else "全频模式",
-                                            opusBandwidth = curBw
-                                        )
-                                    }
-                                }
-                            }
-
-                            // ── 编码 + 发送（断开时仅回收帧，不编不送）──
-                            if (p2pConnected) {
-                                val buf = sendBuffers[bufIndex]
-                                bufIndex = (bufIndex + 1) % 2
-                                val written = encoder?.encodeTo(frame, buf, 0) ?: -1
-                                if (written > 0) {
-                                    if (udpSender?.send(buf, 0, written) == true) {
-                                        byteCount += written
-                                    }
-                                }
-                            }
-
-                            // ── 每秒状态汇报 ──
-                            if (nowMs - lastReport >= 1000) {
-                                val kbps = if (nowMs - lastReport > 0) (byteCount * 8f) / (nowMs - lastReport) else 0f
-                                _status.value = _status.value.copy(bitrateKbps = kbps)
-                                byteCount = 0
-                                lastReport = nowMs
-                            }
-
-                            framePool.recycle(frame)
-                        }
-                    }
-
-                    // 等待生产者完成（被取消时），然后清理
-                    try {
-                        producerJob.join()
-                    } finally {
-                        consumerJob.cancel()
-                        ch.close()
-                        audioChannel = null
-                    }
+                if (testTone) {
+                    runTestToneLoop(enc, sender, voiceMode)
+                } else {
+                    runMicCaptureLoop(enc, sender, voiceMode)
                 }
             } catch (_: CancellationException) {
             } catch (e: Exception) {
                 Log.e(TAG, "采集异常", e)
                 _status.value = _status.value.copy(isRunning = false, errorMsg = e.message ?: "未知错误")
             } finally {
-                // 确保干净释放
-                try { audioRecord?.stop() } catch (_: Exception){}
-                try { audioRecord?.release() } catch (_: Exception){}
+                controlJob?.cancel()
+                controlJob = null
+                stopReverseAudio()
+                try { audioRecord?.stop() } catch (_: Exception) {}
+                try { audioRecord?.release() } catch (_: Exception) {}
                 audioRecord = null
                 encoder?.stop()
                 encoder = null
                 try { aecInstance?.release() } catch (_: Exception) {}
                 aecInstance = null
-                if (isModeRestart) {
-                    // 模式切换：保留UdpSender和reverseDecoder，audioPlayer由doStartCapture重建
-                    Log.i(TAG, "🔄 模式切换，保留UdpSender/reverseDecoder")
-                    reverseAudioJob?.cancel()
-                    audioPlayer?.stop()
-                } else {
-                    try { udpSender?.close() } catch (_: Exception){}
-                    udpSender = null
-                    reverseAudioJob?.cancel()
-                    reverseDecoder?.stop()
-                    audioPlayer?.stop()
-                    reverseDecoder = null
-                    audioPlayer = null
+                try { udpSender?.close() } catch (_: Exception) {}
+                udpSender = null
+                reverseRxJob?.cancel()
+                reverseRxJob = null
+                reverseDecoder?.stop()
+                reverseDecoder = null
+                audioPlayer?.stop()
+                audioPlayer = null
+                activeReverseSsrc = 0
+                try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception) {}
+
+                // 硬件初始化硬故障时不得无限重启
+                val fatal = _status.value.errorMsg.let {
+                    it.contains("麦克风初始化失败") || it.contains("麦克风不支持") ||
+                        it.contains("编码器初始化失败") || it.contains("编码器帧大小无效")
                 }
-
-                try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception){}
-
-                // ✅ 熔断保护：硬件初始化硬故障（麦克风被占用/不支持/编码器失败）时拒绝无限重启，防止 ANR
-                if (_status.value.errorMsg.contains("麦克风初始化失败")
-                    || _status.value.errorMsg.contains("麦克风不支持")
-                    || _status.value.errorMsg.contains("编码器初始化失败")
-                    || _status.value.errorMsg.contains("编码器帧大小无效")) {
-                    Log.e(TAG, "🚨 发生硬件初始化硬故障，清空挂起任务，实施安全熔断。")
+                if (fatal) {
+                    Log.e(TAG, "硬件初始化硬故障，清空挂起任务")
                     pendingRestart = null
                 }
 
                 val restart = pendingRestart
                 pendingRestart = null
-                isModeRestart = restart?.isModeRestart ?: false
                 if (restart != null) {
-                    serviceScope.launch { doStartCapture(restart.sampleRateHz, restart.bitrateKbps, restart.targetIp, restart.targetPort, restart.testTone) }
+                    serviceScope.launch {
+                        doStartCapture(
+                            restart.sampleRateHz, restart.bitrateKbps,
+                            restart.targetIp, restart.targetPort, restart.testTone
+                        )
+                    }
                 } else if (!hasNewCapture) {
                     _status.value = _status.value.copy(isRunning = false)
-                    try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception){}
+                    try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
                     stopSelf()
                 }
             }
         }
     }
 
-    /**
-     * 启动独立协程，在反向 socket 上接收 PC→Phone 音频。
-     * @param expectedIp 只接受来自该地址的数据包，避免局域网内其他主机向该端口注入音频
-     */
-    private fun launchReverseAudio(expectedIp: String): Job {
-        return serviceScope.launch(Dispatchers.IO) {
-            val revSock = udpSender?.reverseSock ?: return@launch
-            val dec = reverseDecoder ?: return@launch
-            val player = audioPlayer ?: return@launch
-            if (dec.frameSize <= 0) return@launch
-
-            // 立即标记反向串流已连接（不等待首帧音频）
-            _status.value = _status.value.copy(reverseAudio = true)
-
-            val recvBuf = ByteArray(Udp2CalProtocol.MAX_PACKET)
-            val pkt = DatagramPacket(recvBuf, recvBuf.size)
-            val pcmBuf = ShortArray(dec.pcmBufferSize)
-            val hdrBuf = ByteArray(Udp2CalProtocol.HEADER_SIZE)
-            var hasAudio = false
-            var lastAudioTime = 0L
-            var byteCount = 0L
-            var lastReport = System.currentTimeMillis()
-            var bandwidthLabel = ""
-
-            // ── PLC（丢包隐藏）参数：与 Windows 端 decoder/main 同策略 ──
-            // 主路径为事件驱动（ReorderBuffer 回调携带确切丢包数）；此计时器仅兜底
-            // 整流停滞（发送端 DTX / 断流）。阈值 80ms ≫ RB 乱序窗口（window=2 → ≤20ms），
-            // 避免乱序等待期间过度补偿；反向解码器为 20ms 帧
-            val REVERSE_FRAME_MS = 20L
-            val PLC_POLL_TIMEOUT_MS = 40
-            val PLC_GAP_MS = 80L
-            val PLC_MAX_GAP_MS = 2000L
-            val PLC_MAX_FRAMES = 5
-
-            // 重排 + 去重：与 Rust 端 ReorderBuffer 同语义。
-            // 此前反向流完全没有序号处理：乱序包会被直接解码成噪音，重复包会播两遍。
-            // 第 5 参数 = ReorderBuffer 确认丢失的帧数（大跳变重同步时 >0），
-            // 事件驱动 PLC：先按确切丢包数补偿，再解码真包，时间线不多不少。
-            // ── 双重补偿去重 ──：停滞计时器已补的帧记入 pendingConcealed，
-            // 事件 lost 先扣除再补差额（与 Windows 端 main.rs 同策略）
-            var pendingConcealed = 0
-            val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length, lost ->
-                val effLost = (lost - pendingConcealed).coerceAtLeast(0)
-                pendingConcealed = 0
-                repeat(effLost) {
-                    val ns = dec.plc(pcmBuf)
-                    if (ns > 0) player.write(pcmBuf, 0, ns)
-                }
-                val ns = dec.decode(buf, offset, length, pcmBuf)
-                if (ns > 0) {
-                    player.write(pcmBuf, 0, ns)
-                    lastAudioTime = System.currentTimeMillis()
-                    byteCount += length
-
-                    if (!hasAudio) {
-                        hasAudio = true
-                        bandwidthLabel = estimateBandwidth(sampleRate)
-                        _status.value = _status.value.copy(
-                            reverseAudio = true,
-                            reverseBw = bandwidthLabel
-                        )
-                    }
-                }
+    /** 反向播放器按需创建（AEC 需要麦克风的 sessionId） */
+    private fun ensurePlayer(voiceMode: Boolean, sessionId: Int) {
+        if (audioPlayer != null) return
+        audioPlayer = AudioPlayer(this@CaptureService).also { player ->
+            if (!player.start(sessionId, voiceMode)) {
+                Log.w(TAG, "反向播放器初始化失败，继续运行")
             }
+        }
+    }
 
-            Log.i(TAG, "反向音频接收器已启动（仅接受 $expectedIp）")
+    private suspend fun fail(message: String) {
+        _status.value = _status.value.copy(isRunning = false, errorMsg = message)
+        stopSelf()
+    }
 
-            while (isActive) {
-                try {
-                    // 超时窗口取帧级的 2 倍（反向解码器为 20ms 帧）：既要让 PLC 及时
-                    // 发现缺口，又不至于空闲时高频唤醒；断流检测由下方 3s 逻辑负责
-                    revSock.soTimeout = PLC_POLL_TIMEOUT_MS
-                    pkt.length = recvBuf.size
-                    revSock.receive(pkt)
-                    val len = pkt.length
-                    if (len < Udp2CalProtocol.HEADER_SIZE) continue
-                    // 来源过滤：不是目标 PC 的包直接丢弃
-                    if (pkt.address?.hostAddress != expectedIp) continue
+    // ══════════════════════════════════════════════════════════
+    // 控制面：CONNECT 保活 + ACK 状态 + 反向开关
+    // ══════════════════════════════════════════════════════════
 
-                    System.arraycopy(recvBuf, 0, hdrBuf, 0, Udp2CalProtocol.HEADER_SIZE)
-                    val hdr = Udp2CalProtocol.decodeHeader(hdrBuf) ?: continue
+    private suspend fun controlLoop() {
+        var connected = false
+        var sinceConnect = 0L
+        while (coroutineContext.isActive) {
+            val sender = udpSender ?: break
 
-                    if (!hdr.isAudio || hdr.payloadLen <= 0) continue
+            if (sinceConnect <= 0) {
+                val payload = buildConnectPayload(sender)
+                val packet = Udp2CalProtocol.buildControl(
+                    Udp2CalProtocol.TYPE_CONNECT,
+                    DiscoveryManager.getOrCreateDeviceId(),
+                    payload
+                )
+                sender.send(packet, 0, packet.size)
+                sinceConnect = 1000
+            }
+            sinceConnect -= TICK_MS
 
-                    val plen = hdr.payloadLen.coerceAtMost(len - Udp2CalProtocol.HEADER_SIZE)
-                    if (plen <= 0) continue
-                    reorder.insert(
-                        hdr.seqNum.toInt(), hdr.sampleRate,
-                        recvBuf, Udp2CalProtocol.HEADER_SIZE, plen
+            val fresh = sender.isAckFresh()
+            if (fresh != connected) {
+                connected = fresh
+                if (fresh) {
+                    _status.value = _status.value.copy(connected = true, errorMsg = "")
+                } else {
+                    _status.value = _status.value.copy(
+                        connected = false, reverseAudio = false, errorMsg = "已断开（等待重连）"
                     )
-
-                    // 每秒更新反向码率
-                    val now = System.currentTimeMillis()
-                    if (now - lastReport >= 1000 && hasAudio) {
-                        val kbps = (byteCount * 8f) / (now - lastReport)
-                        _status.value = _status.value.copy(reverseBitrateKbps = kbps)
-                        byteCount = 0
-                        lastReport = now
-                    }
-                } catch (_: java.net.SocketTimeoutException) {
-                    // 丢包补偿（PLC）：活跃流出现帧缺口时逐帧请求补偿。
-                    // Deep PLC 生效条件：库 OPUS_DEEP_PLC 构建 + 解码复杂度>=5（decoderCreate 已设）。
-                    // 单次上限 5 帧，避免断流时无限补偿；补偿后刷新计时，缺口持续 >2s 停止，
-                    // 交给下方 3s 断流检测收尾。
-                    if (hasAudio) {
-                        val gapMs = System.currentTimeMillis() - lastAudioTime
-                        if (gapMs > PLC_GAP_MS && gapMs < PLC_MAX_GAP_MS) {
-                            // 扣除已补帧数：单次停滞的总补偿量不超过真实缺口
-                            val owed = (gapMs / REVERSE_FRAME_MS).toInt()
-                            val frames = (owed - pendingConcealed).coerceIn(0, PLC_MAX_FRAMES)
-                            if (frames > 0) {
-                                repeat(frames) {
-                                    val ns = dec.plc(pcmBuf)
-                                    if (ns > 0) player.write(pcmBuf, 0, ns)
-                                }
-                                pendingConcealed += frames
-                            }
-                        }
-                    }
-                    // 3 秒无反向音频 → 同步断开状态
-                    if (hasAudio && System.currentTimeMillis() - lastAudioTime > 3000) {
-                        hasAudio = false
-                        _status.value = _status.value.copy(reverseAudio = false)
-                    }
-                    continue
-                } catch (e: Exception) {
-                    // socket 被关闭（热重连）时必须退出，否则 receive 会立即抛异常，
-                    // 循环无退避 → 单核 100% 占用且反向串流永远不会恢复
-                    if (!isActive || revSock.isClosed) break
-                    Log.w(TAG, "反向接收异常，20ms 后重试", e)
-                    delay(20)
+                    stopReverseAudio()
+                    activeReverseSsrc = 0
                 }
             }
 
-            Log.i(TAG, "反向音频接收器已停止")
+            if (connected) {
+                val ssrc = sender.reverseSsrc
+                if (ssrc != activeReverseSsrc) {
+                    activeReverseSsrc = ssrc
+                    if (ssrc == 0) {
+                        // ACK 明确表示反向未启用：必须停止播放并清空缓冲
+                        stopReverseAudio()
+                    } else {
+                        startReverseAudio()
+                    }
+                }
+            }
+
+            delay(TICK_MS)
         }
     }
 
-    /** 从 Opus 采样率编码推断带宽标签 */
-    private fun estimateBandwidth(sampleRateId: Byte): String {
-        val hz = Udp2CalProtocol.sampleRateToHz(sampleRateId)
-        // PC 端始终发送立体声，固定附加 "立体声" 标识
-        val base = when (hz) {
-            8000 -> "NB 8kHz"
-            12000 -> "MB 12kHz"
-            16000 -> "WB 16kHz"
-            24000 -> "SWB 24kHz"
-            48000 -> "FB 48kHz"
-            else -> "${hz / 1000}kHz"
-        }
-        return "$base 立体声"
+    /** CONNECT 负载固定 15 字节；Opus 参数只描述**反向**（Windows 编码器） */
+    private fun buildConnectPayload(sender: UdpSender): ByteArray {
+        val autoBr = Prefs.opusBitrateKbps <= 0
+        val dtx = Prefs.opusDtx == 1
+        val vbr = Prefs.opusVbr == 1 || dtx || autoBr
+        val vbrConstraint = vbr && !autoBr && Prefs.opusVbrConstraint == 1
+        var flags = 0
+        if (vbr) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR
+        if (dtx) flags = flags or Udp2CalProtocol.OPUS_FLAG_DTX
+        if (vbrConstraint) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR_CONSTRAINT
+        if (Prefs.opusFec > 0) flags = flags or Udp2CalProtocol.OPUS_FLAG_FEC
+
+        return Udp2CalProtocol.ConnectPayload(
+            reversePort = sender.reversePort,
+            forwardSsrc = sender.forwardSsrc,
+            complexity = Prefs.opusComplexity,
+            signal = mapSignal(Prefs.opusSignal),
+            bandwidth = mapBandwidth(Prefs.opusBandwidth),
+            opusFlags = flags,
+            bitrateKbps = if (autoBr) 0 else Prefs.opusBitrateKbps.coerceAtMost(Udp2CalProtocol.BITRATE_MAX_KBPS),
+            packetLoss = Prefs.opusPacketLoss,
+        ).encode()
     }
+
+    private fun mapSignal(sig: Int): Int = when (sig) {
+        3001 -> 1 // OPUS_SIGNAL_VOICE
+        3002 -> 2 // OPUS_SIGNAL_MUSIC
+        else -> 0
+    }
+
+    private fun mapBandwidth(bw: Int): Int = when (bw) {
+        1101 -> 0
+        1102 -> 1
+        1103 -> 2
+        1104 -> 3
+        else -> 4
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 正向发送：采集 → 编码 → RTP → 主 socket（无应用层队列）
+    // ══════════════════════════════════════════════════════════
+
+    private suspend fun runMicCaptureLoop(enc: OpusEncoder, sender: UdpSender, voiceMode: Boolean) {
+        // 采集/编码/发送跑在同一条线程上：提到音频优先级，避免被后台任务抢占
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        val minBufSize = AudioRecord.getMinBufferSize(
+            Udp2CalProtocol.OPUS_SAMPLE_RATE,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (minBufSize == AudioRecord.ERROR || minBufSize == AudioRecord.ERROR_BAD_VALUE) {
+            fail("麦克风不支持 48 kHz 单声道采集")
+            return
+        }
+        val bufferSize = minBufSize.coerceAtLeast(FRAME * 2 * 4)
+
+        var sourceLabel: String
+        if (voiceMode) {
+            try {
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, bufferSize
+                )
+            } catch (_: Exception) {
+            }
+            if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
+                sourceLabel = AudioSourceLabel.SYSTEM_NS
+            } else {
+                audioRecord?.release()
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, bufferSize
+                )
+                sourceLabel = AudioSourceLabel.SYSTEM_NS_FALLBACK
+            }
+        } else {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT, bufferSize
+            )
+            sourceLabel = AudioSourceLabel.MIC_RAW
+        }
+
+        val record = audioRecord
+        if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+            _status.value = _status.value.copy(audioSource = AudioSourceLabel.MIC_RAW)
+            fail("麦克风初始化失败")
+            return
+        }
+
+        if (voiceMode && AcousticEchoCanceler.isAvailable()) {
+            try {
+                val aec = AcousticEchoCanceler.create(record.audioSessionId)
+                if (aec != null) {
+                    aec.enabled = true
+                    aecInstance = aec
+                    sourceLabel += AudioSourceLabel.AEC_ENABLED
+                } else {
+                    sourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
+                }
+            } catch (e: Exception) {
+                sourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
+                Log.w(TAG, "AEC create 失败", e)
+            }
+        }
+
+        // 反向播放器必须在 AudioRecord 之后创建：复用其 sessionId 才能让
+        // AudioTrack 与麦克风同属一条 AEC 管线
+        ensurePlayer(voiceMode, record.audioSessionId)
+
+        record.startRecording()
+        _status.value = _status.value.copy(audioSource = sourceLabel, isRunning = true)
+
+        try {
+            sendFrames(enc, sender) { buf, off, len ->
+                record.read(buf, off, len, AudioRecord.READ_BLOCKING)
+            }
+        } finally {
+            try { record.stop() } catch (_: Exception) {}
+        }
+    }
+
+    private suspend fun runTestToneLoop(enc: OpusEncoder, sender: UdpSender, voiceMode: Boolean) {
+        ensurePlayer(voiceMode, 0)
+        _status.value = _status.value.copy(audioSource = "1kHz 测试音", isRunning = true)
+        val omega = 2.0 * Math.PI * 1000.0 / Udp2CalProtocol.OPUS_SAMPLE_RATE
+        var phase = 0.0
+        val frameNs = FRAME * 1_000_000_000L / Udp2CalProtocol.OPUS_SAMPLE_RATE
+        var nextAt = System.nanoTime()
+        sendFrames(enc, sender) { buf, off, len ->
+            for (i in 0 until len) {
+                buf[off + i] = (Math.sin(phase) * 16384.0).toInt().toShort()
+                phase += omega
+                if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI
+            }
+            // 测试音没有硬件节拍，只能按媒体时间自走
+            nextAt += frameNs * len / FRAME
+            val waitNs = nextAt - System.nanoTime()
+            if (waitNs > 0) delay(waitNs / 1_000_000)
+            len
+        }
+    }
+
+    /**
+     * 统一的 10 ms 帧发送循环。
+     *
+     * 规则（规范 4.3/4.4/8.1）：
+     *   * 每帧时间戳 +480，**无论是否真的发出**；
+     *   * 编码失败/发送失败：序列号仍 +1，让接收端看到缺口并触发 PLC；
+     *   * DTX 空帧（编码返回 0）：不递增序列号；
+     *   * 未连接（无新鲜 ACK）时不编码不发送。
+     */
+    private suspend fun sendFrames(
+        enc: OpusEncoder,
+        sender: UdpSender,
+        readInto: suspend (ShortArray, Int, Int) -> Int,
+    ) {
+        val pcm = ShortArray(FRAME)
+        val packet = ByteArray(Udp2CalProtocol.RTP_MAX_PACKET)
+        val rnd = SecureRandom()
+        var seq = rnd.nextInt() and 0xFFFF
+        var timestamp = rnd.nextInt()
+        var first = true
+        var lastSentAt = 0L
+        var byteCount = 0L
+        var lastReport = System.currentTimeMillis()
+        /** 已累积但还不足一帧的样本数 */
+        var filled = 0
+
+        while (coroutineContext.isActive) {
+            // AudioRecord.read 允许返回不足请求量的样本（缓冲区尚未填满）。
+            // 必须累积到整 480 采样再编码：补零发送等于丢音频，且会让帧率翻倍
+            // （实测 190 包/秒 → 接收端缓冲被灌满，41% 的包被判超窗丢弃）。
+            val n = readInto(pcm, filled, FRAME - filled)
+            if (n < 0) {
+                // 设备失效：不空转，交给外层 finally 收尾
+                _status.value = _status.value.copy(errorMsg = "麦克风读取失败，请重新开始采集")
+                hasNewCapture = false
+                return
+            }
+            filled += n
+            if (filled < FRAME) continue
+            filled = 0
+
+            val now = System.currentTimeMillis()
+            if (sender.isAckFresh(now)) {
+                val n = enc.encodeTo(pcm, packet, Udp2CalProtocol.RTP_HEADER_SIZE)
+                if (n > 0) {
+                    val marker = first || (now - lastSentAt > Udp2CalProtocol.RESYNC_GAP_MS.toLong())
+                    Udp2CalProtocol.writeRtpHeader(
+                        packet, 0, marker, seq, timestamp, sender.forwardSsrc
+                    )
+                    if (sender.send(packet, 0, Udp2CalProtocol.RTP_HEADER_SIZE + n)) {
+                        byteCount += n
+                        lastSentAt = System.currentTimeMillis()
+                        first = false
+                    }
+                }
+                // 编码成功（含 DTX 空帧）才推进序列号：DTX 未发包不递增
+                if (n >= 0) seq = (seq + 1) and 0xFFFF
+            }
+            timestamp += FRAME
+
+            if (now - lastReport >= 1000) {
+                val elapsed = (now - lastReport).coerceAtLeast(1)
+                _status.value = _status.value.copy(bitrateKbps = byteCount * 8f / elapsed)
+                byteCount = 0
+                lastReport = now
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 反向链路：接收（只插入） + 播放（按播放头拉取）
+    // ══════════════════════════════════════════════════════════
+
+    private fun startReverseAudio() {
+        reversePlayJob?.cancel()
+        linkLock.lock()
+        try {
+            jitter.reset()
+            linkSignal.signalAll()
+        } finally {
+            linkLock.unlock()
+        }
+        // 接收协程与会话同生命周期（见 launchReverseReceiver）
+        reversePlayJob = serviceScope.launch(Dispatchers.IO) { reversePlayLoop() }
+        _status.value = _status.value.copy(
+            reverseAudio = true,
+            reverseBw = "FB 48 kHz 立体声"
+        )
+    }
+
+    /**
+     * 反向接收协程在**整个会话**内只启动一次：
+     * `receive()` 是阻塞调用，协程取消唤不醒它；若随反向开关反复创建，
+     * 每次都会留下一个卡在 recvfrom 上的线程。会话结束时关闭 socket 即可退出。
+     */
+    private fun launchReverseReceiver() {
+        if (reverseRxJob?.isActive == true) return
+        reverseRxJob = serviceScope.launch(Dispatchers.IO) { reverseRxLoop() }
+    }
+
+    private fun stopReverseAudio() {
+        // 只停播放协程；接收协程继续保持阻塞 receive，等会话结束关闭 socket
+        reversePlayJob?.cancel()
+        reversePlayJob = null
+        linkLock.lock()
+        try {
+            jitter.reset()
+            linkSignal.signalAll()
+        } finally {
+            linkLock.unlock()
+        }
+        audioPlayer?.flush()
+        _status.value = _status.value.copy(reverseAudio = false, reverseBitrateKbps = 0f)
+    }
+
+    /**
+     * 反向接收：**阻塞** receive，不使用 `soTimeout` 驱动。
+     * 只做校验与入队，绝不在此解码。
+     */
+    private suspend fun reverseRxLoop() {
+        val sender = udpSender ?: return
+        val sock = sender.reverseSock ?: return
+        val expectedIp = sender.getRemoteIp()
+        val buf = ByteArray(2048)
+        val pkt = java.net.DatagramPacket(buf, buf.size)
+        var byteCount = 0L
+        var lastReport = System.currentTimeMillis()
+
+        while (coroutineContext.isActive) {
+            pkt.length = buf.size
+            try {
+                sock.receive(pkt)
+            } catch (e: Exception) {
+                if (!coroutineContext.isActive || sock.isClosed) break
+                continue
+            }
+            val len = pkt.length
+            if (expectedIp != null && pkt.address?.hostAddress != expectedIp) continue
+            val rtp = Udp2CalProtocol.parseRtp(buf, len) ?: continue
+            val ssrc = activeReverseSsrc
+            if (ssrc == 0 || rtp.ssrc != ssrc) continue
+
+            linkLock.lock()
+            try {
+                jitter.insert(
+                    rtp.seq, rtp.timestamp, rtp.marker,
+                    buf, rtp.payloadOffset, rtp.payloadLength
+                )
+                linkSignal.signalAll()
+            } finally {
+                linkLock.unlock()
+            }
+            byteCount += len
+
+            val now = System.currentTimeMillis()
+            if (now - lastReport >= 1000) {
+                if (activeReverseSsrc != 0) {
+                    _status.value = _status.value.copy(
+                        reverseBitrateKbps = byteCount * 8f / (now - lastReport)
+                    )
+                }
+                byteCount = 0
+                lastReport = now
+            }
+        }
+    }
+
+    /**
+     * 反向播放：播放头是唯一时钟。
+     *
+     * 预缓冲 4 帧后开始写；每帧的播放/PLC 决策完全由 `playhead_ts` 决定，
+     * `linkLock.wait(5)` 只是"等包"的存活等待，不承担节拍。
+     */
+    private suspend fun reversePlayLoop() {
+        // 播放器在 AudioRecord 之后创建（为了复用 sessionId 接 AEC）。
+        // ACK 可能先于麦克风初始化到达，这里必须等依赖就绪而不是直接退出，
+        // 否则反向串流会永久沉默。
+        var player = audioPlayer
+        var dec = reverseDecoder
+        var waitedMs = 0
+        while ((player == null || dec == null) && coroutineContext.isActive && waitedMs < 3000) {
+            delay(10)
+            waitedMs += 10
+            player = audioPlayer
+            dec = reverseDecoder
+        }
+        if (player == null || dec == null) return
+        val payload = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
+        val frameSamples = Udp2CalProtocol.OPUS_FRAME_SAMPLES * 2 // 立体声交错
+        val pcm = ShortArray(frameSamples)
+        val silence = ShortArray(frameSamples)
+        val insertBuf = ShortArray(Udp2CalProtocol.DRIFT_MAX_SAMPLES * 2)
+        var mediaSamples = 0L
+        var lastEpoch = -1L
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+
+        while (coroutineContext.isActive) {
+            var code = Udp2CalProtocol.Pull.WAIT
+            var waterMs = 0
+            var pulledLen = 0
+            var pulledTs = 0L
+            var needReset = false
+            var reason = ""
+            var jbNextTs = 0L
+            var jbResyncs = 0L
+            var jbOverflow = 0L
+
+            linkLock.lock()
+            try {
+                if (jitter.epoch != lastEpoch) {
+                    lastEpoch = jitter.epoch
+                    needReset = true
+                    reason = jitter.lastRebaseReason
+                    jbNextTs = jitter.nextTs
+                    jbResyncs = jitter.resyncs
+                    jbOverflow = jitter.overflow
+                }
+                val head = player.playbackHeadFrames()
+                val playhead = clock.update(head) ?: jitter.nextTs
+                code = jitter.pull(playhead, payload)
+                // 漂移校正看总缓冲：抖动缓冲里排队的 + 已写进 AudioTrack 还没播的
+                val queuedMs = (player.pendingFrames(head) * 1000L /
+                    Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
+                waterMs = jitter.waterMs() + queuedMs
+                pulledLen = jitter.pulledLength
+                pulledTs = jitter.pulledTs
+            } finally {
+                linkLock.unlock()
+            }
+
+            if (needReset) {
+                // 只有真正的重同步才值得告警（会 flush 掉已排队 PCM = 一次破音）；
+                // 会话开始的 epoch 变化属于正常复位，不写日志
+                if (reason.isNotEmpty()) {
+                    Log.w(
+                        TAG,
+                        "反向重同步：$reason | nextTs=$jbNextTs 水位=${waterMs}ms " +
+                            "重同步数=$jbResyncs 溢出=$jbOverflow"
+                    )
+                }
+                dec.reset()
+                clock.reset()
+                drift.reset()
+                player.flush()
+                mediaSamples = 0
+            }
+
+            when (code) {
+                Udp2CalProtocol.Pull.PACKET -> {
+                    val n = dec.decode(payload, 0, pulledLen, pcm)
+                    if (n <= 0) continue // 解码失败按丢包处理，播放头到期后 PLC
+                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
+
+                    var writeLen = n
+                    var insertLen = 0
+                    val adj = drift.update(waterMs, mediaSamples)
+                    if (adj > 0) {
+                        // 水位过高：丢掉尾部，并做 1 ms 淡出避免接缝爆音
+                        val k = minOf(adj, n / 2)
+                        writeLen = n - k
+                        val fade = minOf(48, writeLen)
+                        for (i in 0 until fade) {
+                            val idx = writeLen - 1 - i
+                            pcm[idx] = (pcm[idx] * (1f - i.toFloat() / fade)).toInt().toShort()
+                        }
+                        clock.notePcmCorrection(k.toLong())
+                        linkLock.lock()
+                        try { jitter.notePcmCorrection(k.toLong()) } finally { linkLock.unlock() }
+                        mediaSamples += k
+                    } else if (adj < 0) {
+                        // 水位过低：把尾部渐入重复一次
+                        insertLen = minOf(-adj, insertBuf.size / 2) * 2
+                        val tailStart = n - insertLen
+                        for (i in 0 until insertLen) {
+                            val gain = i.toFloat() / insertLen
+                            val src = pcm[(tailStart + i).coerceIn(0, n - 1)]
+                            insertBuf[i] = (src * gain).toInt().toShort()
+                        }
+                        clock.notePcmCorrection(-insertLen.toLong())
+                        linkLock.lock()
+                        try { jitter.notePcmCorrection(-insertLen.toLong()) } finally { linkLock.unlock() }
+                    }
+
+                    if (!player.writeBlocking(pcm, 0, writeLen)) return
+                    if (insertLen > 0) {
+                        if (!player.writeBlocking(insertBuf, 0, insertLen)) return
+                        mediaSamples += insertLen
+                    }
+                    mediaSamples += n
+                }
+
+                Udp2CalProtocol.Pull.PLC -> {
+                    val n = dec.plc(pcm)
+                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
+                    if (n > 0) {
+                        if (!player.writeBlocking(pcm, 0, n)) return
+                        mediaSamples += n
+                    } else {
+                        if (!player.writeBlocking(silence, 0, silence.size)) return
+                        mediaSamples += silence.size
+                    }
+                }
+
+                Udp2CalProtocol.Pull.SILENCE -> {
+                    // 连续 PLC 已达上限：输出静音但继续推进媒体时间
+                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
+                    if (!player.writeBlocking(silence, 0, silence.size)) return
+                    mediaSamples += silence.size
+                }
+
+                else -> {
+                    // 没数据：等接收协程的 signal（超时只防漏唤醒，不承担节拍）
+                    linkLock.lock()
+                    try {
+                        linkSignal.await(5, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                    } finally {
+                        linkLock.unlock()
+                    }
+                }
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // 生命周期
+    // ══════════════════════════════════════════════════════════
 
     fun stopCapture() {
         pendingRestart = null
         hasNewCapture = false
-        // 复位模式切换标记：否则 finally 会走"保留网络层"分支，
-        // 跳过 udpSender.close()/reverseDecoder.stop()，socket 与 ACK 线程泄漏。
-        isModeRestart = false
         try { wifiLock?.release() } catch (_: Exception) {}
         wifiLock = null
-        // 顺序很重要：必须先 cancel 再 close。
-        // close() 会把挂起在 ch.send 的生产者以 ClosedSendChannelException
-        // （IllegalStateException，非 CancellationException）唤醒，
-        // 若此时协程尚未取消，该异常会一路抛到 SupervisorJob 顶层并导致进程崩溃。
         captureJob?.cancel()
         captureJob = null
-        audioChannel?.close()
-        audioChannel = null
-        reverseAudioJob?.cancel()
-        reverseAudioJob = null
+        controlJob?.cancel()
+        controlJob = null
+        stopReverseAudio()
         _status.value = _status.value.copy(connected = false, reverseAudio = false)
     }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel("udp2cal_capture", "采集服务", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) }
+                NotificationChannel("udp2cal_capture", "采集服务", NotificationManager.IMPORTANCE_LOW)
+                    .apply { setShowBadge(false) }
             )
         }
     }
+
     private fun buildNotification(): Notification {
         val status = _status.value
-        // 通知栏摘要（保持简洁，不显示实时码率）
         val modeLabel = if (status.opusMode.contains("语音")) "语音" else "音乐"
         val audioLabel = when {
             status.audioSource.contains("AEC已启用") -> "NS+AGC+AEC"
@@ -898,46 +902,10 @@ class CaptureService : Service() {
             .setOngoing(true)
             .build()
     }
+
     override fun onDestroy() {
         stopCapture()
-        reverseDecoder?.stop()
-        audioPlayer?.stop()
         serviceScope.cancel()
         super.onDestroy()
-    }
-
-    /**
-     * 固定容量 ShortArray 对象复用池
-     * 生产者从池中借出 → 填充 → 送 Channel → 消费者处理完 → 归还
-     * 彻底消除每帧 ShortArray(960) 的堆分配
-     */
-    private class ShortArrayPool(val frameSize: Int, val capacity: Int = 3) {
-        private val pool = arrayOfNulls<ShortArray>(capacity)
-        private var head = 0
-        private var count = 0
-
-        /** 从池中借出缓冲区（池空时分配新的，仅初始热身期触发分配） */
-        @Synchronized
-        fun borrow(): ShortArray {
-            return if (count > 0) {
-                val idx = head
-                head = (head + 1) % capacity
-                count--
-                pool[idx]!!
-            } else {
-                ShortArray(frameSize) // 池空时创建新对象
-            }
-        }
-
-        /** 消费者处理完成后归还缓冲区 */
-        @Synchronized
-        fun recycle(buf: ShortArray) {
-            val tail = (head + count) % capacity
-            if (count < capacity) {
-                pool[tail] = buf
-                count++
-            }
-            // 池满则静默丢弃（让 GC 回收）
-        }
     }
 }

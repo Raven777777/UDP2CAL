@@ -15,7 +15,6 @@ use iced::{Alignment, Element, Length, Subscription, Task, Theme, Color};
 use iced::futures::SinkExt; 
 use std::net::SocketAddr; 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering}; 
-use std::sync::mpsc::{sync_channel, SyncSender}; 
 use std::sync::{Arc, Mutex, OnceLock}; 
 use std::time::{Duration, Instant}; 
 use windows::Win32::System::Threading::CreateMutexW; 
@@ -69,25 +68,43 @@ static TRAY_COMMANDS: OnceLock<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Tr
     OnceLock::new();
 
 // ══════════════════════════════════════════════
-// P2P 独占通信 - 全局共享状态
+// 控制面状态（P2P 独占绑定）
 // ══════════════════════════════════════════════
 
 const DEVICE_READY: u8 = 0;
 const DEVICE_BUSY: u8 = 1;
 
-/// P2P 独占状态。
+/// 绑定关系。
+///
 /// 历史实现把"状态"和"绑定 ID"放在两个独立全局里分别用 Relaxed 访问，
 /// 二者构成的复合不变式没有任何顺序保证，可能读到 "BUSY + 旧 ID"。
-/// 现在合并进一把锁，状态与 ID 永远同时可见。
+/// 现在合并进一把锁，状态与全部绑定字段永远同时可见。
+///
+/// 正向 RTP 的准入条件是 (源地址, SSRC, PT)，三者在绑定建立时一次性确定；
+/// 反向 RTP 由 Windows 发出，只需要 `reverse_ssrc` 与目标端口。
 #[derive(Clone, Copy)]
 struct P2pState {
     state: u8,
     device_id: [u8; protocol::DEVICE_ID_SIZE],
+    /// CONNECT 源地址（Android 主 socket）：正向 RTP 必须来自同一 IP + 端口
+    addr: Option<SocketAddr>,
+    forward_ssrc: u32,
+    reverse_ssrc: u32,
+    reverse_port: u16,
+    last_connect: Option<Instant>,
 }
 
 impl P2pState {
     const fn new() -> Self {
-        Self { state: DEVICE_READY, device_id: [0u8; protocol::DEVICE_ID_SIZE] }
+        Self {
+            state: DEVICE_READY,
+            device_id: [0u8; protocol::DEVICE_ID_SIZE],
+            addr: None,
+            forward_ssrc: 0,
+            reverse_ssrc: 0,
+            reverse_port: 0,
+            last_connect: None,
+        }
     }
     fn is_busy(&self) -> bool {
         self.state == DEVICE_BUSY
@@ -107,16 +124,10 @@ fn p2p_snapshot() -> P2pState {
     *p2p_lock()
 }
 
-/// UI 是否已启动（停止时禁止广播）
+/// UI 是否已启动（停止时禁止广播、禁止接收 RTP）
 static APP_RUNNING: AtomicU8 = AtomicU8::new(0);
 
-/// Android 端地址和反向端口（用于反向音频发送）
-static ANDROID_ADDR: OnceLock<Mutex<Option<(SocketAddr, u16)>>> = OnceLock::new();
-fn android_addr() -> &'static Mutex<Option<(SocketAddr, u16)>> {
-    ANDROID_ADDR.get_or_init(|| Mutex::new(None))
-}
-
-/// 反向串流用户开关（全局，供 handle_control 读取）
+/// 反向串流用户开关（全局，供控制面读取）
 static REVERSE_ENABLED: AtomicU8 = AtomicU8::new(0);
 
 /// 反向音频发送器句柄
@@ -139,16 +150,22 @@ fn my_device_name() -> &'static str {
 }
 
 // ══════════════════════════════════════════════
-// 全局音频守护线程架构
+// 接收侧：抖动缓冲 + 解码线程
 // ══════════════════════════════════════════════
 
-enum AudioMessage { 
-    Packet { seq_num: u8, sample_rate: u8, payload: Vec<u8> }, 
-    Reset, 
-} 
+/// 正向媒体流的抖动缓冲。网络线程只插入，解码线程只按播放头拉取。
+static JITTER: OnceLock<Mutex<protocol::rtp::JitterBuffer>> = OnceLock::new();
+fn jitter() -> &'static Mutex<protocol::rtp::JitterBuffer> {
+    JITTER.get_or_init(|| Mutex::new(protocol::rtp::JitterBuffer::new()))
+}
 
-static AUDIO_TX: OnceLock<Mutex<Option<SyncSender<AudioMessage>>>> = OnceLock::new();
-static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits()); 
+/// 解码线程句柄：网络线程与音频回调据此唤醒它（unpark 为原子置位，无分配）
+static DECODE_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+fn wake_decoder() {
+    if let Some(t) = DECODE_THREAD.get() {
+        t.unpark();
+    }
+}
 
 /// 音频初始化状态。
 /// 历史实现用裸 u32 + 魔数 0/1/2/3 表达四态，读写点分散在三个函数里，
@@ -180,7 +197,15 @@ impl AudioInitState {
     }
 }
 
-static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8); 
+static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8);
+
+/// 音频电平（dBFS），解码线程每 100 ms 更新一次
+static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
+
+/// RTP 接收计数（诊断用）
+static RTP_RX_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RTP_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RTP_RX_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 音频诊断计数器（进程级单例，UI 展示 + 落盘日志共用）
 static AUDIO_STATS: OnceLock<Arc<audio::AudioStats>> = OnceLock::new();
@@ -188,190 +213,247 @@ fn audio_stats() -> &'static Arc<audio::AudioStats> {
     AUDIO_STATS.get_or_init(|| Arc::new(audio::AudioStats::default()))
 }
 
-fn audio_tx() -> &'static Mutex<Option<SyncSender<AudioMessage>>> {
-    AUDIO_TX.get_or_init(|| Mutex::new(None))
-}
-
-/// 投递音频消息；通道不可用或已满时静默丢弃（低延迟优先）
-fn send_audio(message: AudioMessage) {
-    if let Ok(slot) = audio_tx().lock() {
-        if let Some(tx) = slot.as_ref() {
-            let _ = tx.try_send(message);
+/// 生成非零随机 32 位值（反向 SSRC 用）
+fn random_u32_nonzero() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let v = hasher.finish() as u32;
+        if v != 0 {
+            return v;
         }
     }
 }
 
-// ══════════════════════════════════════════════
-// 接收路径载荷缓冲池
-// 历史实现每包 `buf[..].to_vec()`，即 100 次/秒的小对象分配。这里复用一组
-// 固定容量的缓冲：接收侧取出、音频线程用完归还。池有界（64 个），拿不到就新分配。
-// 注意：锁只出现在"网络 → 音频线程"的交接处，cpal 回调路径仍然完全无锁。
-// ══════════════════════════════════════════════
-
-const PAYLOAD_POOL_MAX: usize = 64;
-
-static PAYLOAD_POOL: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
-fn payload_pool() -> &'static Mutex<Vec<Vec<u8>>> {
-    PAYLOAD_POOL.get_or_init(|| Mutex::new(Vec::with_capacity(PAYLOAD_POOL_MAX)))
-}
-
-fn take_payload() -> Vec<u8> {
-    payload_pool()
-        .lock()
-        .ok()
-        .and_then(|mut pool| pool.pop())
-        .unwrap_or_else(|| Vec::with_capacity(protocol::MAX_PAYLOAD))
-}
-
-fn recycle_payload(mut buf: Vec<u8>) {
-    if buf.capacity() < protocol::MAX_PAYLOAD {
-        return; // 容量不足的缓冲不值得复用
-    }
-    if let Ok(mut pool) = payload_pool().lock() {
-        if pool.len() < PAYLOAD_POOL_MAX {
-            buf.clear();
-            pool.push(buf);
-        }
-    }
-}
-
-/// 启动（或重启）音频守护线程。
-/// 允许在初始化失败后再次调用：旧线程已退出，通道被替换后其接收端会关闭。
-fn init_audio_worker() { 
-    let (tx, rx) = sync_channel::<AudioMessage>(50); 
-    if let Ok(mut slot) = audio_tx().lock() {
-        *slot = Some(tx);
-    }
+/// 启动（或重启）音频解码/播放线程。
+///
+/// 播放节拍完全由声卡播放头决定：
+///   * 解码线程只在 `AudioWriter` 有空位时拉取帧，绝不无限预解码；
+///   * 是否需要 PLC 由 `JitterBuffer::pull` 依据 `playhead_ts` 判定，
+///     不存在"超过 N 毫秒没收到包就补"的计时器；
+///   * 等待用 `park`/`unpark`（网络线程与音频回调共同唤醒），
+///     超时值只是兜底唤醒，不参与播放决策。
+fn init_audio_worker() {
     AudioInitState::Pending.store();
-
     let stats = audio_stats().clone();
+
     let _ = std::thread::Builder::new()
-        .name("udp2cal-worker".into())
-        .spawn(move || { 
-        let mut dec = match decoder::OpusDecoder::new() { 
-            Ok(d) => d, 
-            Err(e) => { 
-                logf!("[Audio] Opus 解码器初始化失败: {e:?}");
-                AudioInitState::DecoderFailed.store(); 
-                return; 
-            } 
-        }; 
-        let mut aw = match audio::start_audio(stats) { 
-            Ok(a) => a, 
-            Err(e) => { 
-                logf!("[Audio] 初始化失败: {e}");
-                AudioInitState::DeviceFailed.store(); 
-                return; 
-            } 
-        }; 
-        AudioInitState::Ready.store(); 
-        logf!("[Audio] 就绪：输出设备 {} Hz", aw.device_rate);
+        .name("udp2cal-decode".into())
+        .spawn(move || {
+            let _ = DECODE_THREAD.set(std::thread::current());
 
-        let mut rb = protocol::ReorderBuffer::new();
-        let mut rms_sum: f64 = 0.0;
-        let mut rms_count: u64 = 0;
-        let mut last_stats = Instant::now();
-        // ── 丢包隐藏（PLC）状态 ──
-        // 主路径：事件驱动（ReorderBuffer 回调携带确切丢包数）。
-        // 计时器仅兜底整流停滞（DTX/断流），阈值 60ms——小于该值不补。
-        // ── 双重补偿去重 ──：计时器补的帧记入 concealed_pending；真包到达时
-        // RB 报告的 lost 先扣除 pending，只补差额。停滞+迟到混合场景下
-        // 同一段丢失不会被补两遍（修复环形缓冲溢出/丢样暴增）。
-        const FRAME_MS: u64 = 10;
-        const PLC_STALL_MS: u64 = 60;
-        const PLC_MAX_FRAMES: u32 = 10;
-        const PLC_STREAM_IDLE_MS: u64 = 2000;
-        let mut last_audio: Option<Instant> = None;
-        let mut concealed_pending: u32 = 0;
+            let mut dec = match decoder::OpusDecoder::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    logf!("[Audio] Opus 解码器初始化失败: {e:?}");
+                    AudioInitState::DecoderFailed.store();
+                    return;
+                }
+            };
+            let mut aw = match audio::start_audio(stats) {
+                Ok(a) => a,
+                Err(e) => {
+                    logf!("[Audio] 初始化失败: {e}");
+                    AudioInitState::DeviceFailed.store();
+                    return;
+                }
+            };
+            aw.set_waker(std::thread::current());
+            AudioInitState::Ready.store();
+            logf!("[Audio] 就绪：输出设备 {} Hz（解码 48 kHz 单声道 / 10 ms）", aw.device_rate);
 
-        loop {
-            match rx.recv_timeout(Duration::from_millis(30)) {
-                Ok(AudioMessage::Reset) => {
-                    rb = protocol::ReorderBuffer::new();
-                    rms_sum = 0.0;
-                    rms_count = 0;
-                    last_audio = None;
-                    concealed_pending = 0;
-                    AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
+            let mut clock = protocol::rtp::PlayheadClock::new(aw.device_rate);
+            let mut drift = protocol::rtp::DriftController::new();
+            let mut payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
+            let silence_frame = [0.0f32; protocol::rtp::FRAME_SAMPLES as usize];
+            let mut insert_buf = [0.0f32; protocol::rtp::DRIFT_MAX_SAMPLES as usize];
+            let mut media_samples: u64 = 0;
+            let mut last_epoch = 0u64;
+            let mut idle = false;
+            let mut rms_sum = 0.0f64;
+            let mut rms_count = 0u64;
+            let mut last_stats = Instant::now();
+
+            loop {
+                if APP_RUNNING.load(Ordering::Acquire) == 0 {
+                    if !idle {
+                        idle = true;
+                        jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
+                        clock.reset();
+                        drift.reset();
+                        dec.reset();
+                        aw.flush();
+                        media_samples = 0;
+                        AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
+                    }
+                    std::thread::park_timeout(Duration::from_millis(50));
+                    continue;
                 }
-                Ok(AudioMessage::Packet { seq_num, sample_rate, payload }) => {
-                    last_audio = Some(Instant::now());
-                    rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p, lost| {
-                        // 去重：停滞计时器已补的部分从事件丢失中扣除，只补差额
-                        let extra = lost.saturating_sub(concealed_pending);
-                        concealed_pending = 0;
-                        for _ in 0..extra {
-                            if let Some((n, sr_hz)) = dec.conceal() {
-                                let pcm = dec.pcm_data();
-                                let samples = &pcm[..n.min(pcm.len())];
-                                rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                                rms_count += samples.len() as u64;
-                                aw.write(samples, sr_hz);
-                            }
-                        }
-                        if let Some((n, sr_hz)) = dec.decode(sr, p) {
-                            let pcm = dec.pcm_data();
-                            let samples = &pcm[..n.min(pcm.len())];
-                            rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                            rms_count += samples.len() as u64;
-                            aw.write(samples, sr_hz);
-                        }
-                    });
-                    recycle_payload(payload);
+                idle = false;
+
+                // 新会话 / 重同步：抖动缓冲 epoch 变化 → 重建解码器与播放头
+                let epoch = jitter().lock().unwrap_or_else(|e| e.into_inner()).epoch;
+                if epoch != last_epoch {
+                    last_epoch = epoch;
+                    dec.reset();
+                    clock.reset();
+                    drift.reset();
+                    aw.flush();
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // 兜底计时器：仅覆盖"整流停滞"（发送端 DTX 静音 / 断流）。
-                    // 阈值 60ms 小于自适应窗口上限但配额会与事件补偿去重，
-                    // 不会双重补偿。DTX 静音期间按墙钟补舒适噪声，2 秒后静音。
-                    let Some(t) = last_audio else { continue };
-                    let elapsed = t.elapsed();
-                    if elapsed > Duration::from_millis(PLC_STALL_MS)
-                        && elapsed < Duration::from_millis(PLC_STREAM_IDLE_MS)
-                    {
-                        // 扣除已补帧数：单次停滞的总补偿量不超过真实缺口
-                        let owed = (elapsed.as_millis() as u64 / FRAME_MS) as u32;
-                        let missed = owed.saturating_sub(concealed_pending).min(PLC_MAX_FRAMES);
-                        if missed > 0 {
-                            for _ in 0..missed {
-                                if let Some((n, sr_hz)) = dec.conceal() {
-                                    let pcm = dec.pcm_data();
-                                    let samples = &pcm[..n.min(pcm.len())];
-                                    rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                                    rms_count += samples.len() as u64;
-                                    aw.write(samples, sr_hz);
+
+                // 预解码深度上限（约 40 ms 设备帧）。
+                // 必须有这个上限：否则断流时解码线程会以 CPU 速度连发 PLC/静音
+                // 填满整个环，next_ts 跑到播放头前面几百毫秒，恢复后所有真包
+                // 都会被判成"迟到"。生产节奏必须由声卡消费节奏约束。
+                let max_depth = ((aw.device_rate as usize / 1000) * 40).max(512);
+                if aw.filled_frames() >= max_depth {
+                    std::thread::park_timeout(Duration::from_millis(4));
+                    continue;
+                }
+
+                let played = aw.played_frames();
+                let playhead = clock.update(played);
+                let (pull, jb_water) = {
+                    let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                    let ph = playhead.unwrap_or_else(|| jb.next_ts());
+                    let r = jb.pull(ph, &mut payload);
+                    (r, jb.water_ms())
+                };
+                // 漂移校正要看**总缓冲**：抖动缓冲里排队的 + 已经写进声卡环里的。
+                // 只看抖动缓冲会误判（解码线程刻意只预解码 ~40 ms，其余留在抖动缓冲）。
+                let queued_ms = (aw.filled_frames() as u32 * 1000) / aw.device_rate.max(1);
+                let water = jb_water.saturating_add(queued_ms);
+
+                match pull {
+                    protocol::rtp::Pull::Packet { len, ts } => {
+                        if !clock.is_started() {
+                            clock.start(ts, aw.played_frames());
+                        }
+                        match dec.decode(&payload[..len]) {
+                            Some(n) => {
+                                let pcm = dec.pcm_mut(n);
+                                let mut keep = n;
+                                let mut insert_n = 0usize;
+                                match drift.update(water, media_samples) {
+                                    protocol::rtp::DriftAction::Drop(k) => {
+                                        // 水位过高：丢掉尾部 k 个样本并做短淡出
+                                        let k = (k as usize).min(n / 2);
+                                        keep = n - k;
+                                        fade_out(&mut pcm[..keep], 48);
+                                        clock.note_pcm_correction(k as i64);
+                                        jitter()
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .note_pcm_correction(k as i64);
+                                    }
+                                    protocol::rtp::DriftAction::Insert(k) => {
+                                        // 水位过低：把尾部 k 个样本渐入重复一次
+                                        insert_n = (k as usize).min(insert_buf.len());
+                                        let start = n.saturating_sub(insert_n);
+                                        for i in 0..insert_n {
+                                            let gain = i as f32 / insert_n as f32;
+                                            insert_buf[i] = pcm[(start + i).min(n - 1)] * gain;
+                                        }
+                                        clock.note_pcm_correction(-(insert_n as i64));
+                                        jitter()
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .note_pcm_correction(-(insert_n as i64));
+                                    }
+                                    protocol::rtp::DriftAction::None => {}
                                 }
+                                rms_sum += pcm[..keep].iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += keep as u64;
+                                aw.write(&pcm[..keep], protocol::rtp::OPUS_SAMPLE_RATE);
+                                if insert_n > 0 {
+                                    aw.write(&insert_buf[..insert_n], protocol::rtp::OPUS_SAMPLE_RATE);
+                                    media_samples += insert_n as u64;
+                                }
+                                media_samples += n as u64;
                             }
-                            concealed_pending += missed;
+                            None => {
+                                // 解码失败按丢包处理：不写数据，播放头到期后自然 PLC
+                            }
                         }
-                        last_audio = Some(Instant::now());
+                    }
+                    protocol::rtp::Pull::Plc { ts } => {
+                        if !clock.is_started() {
+                            clock.start(ts, aw.played_frames());
+                        }
+                        match dec.conceal() {
+                            Some(n) => {
+                                let pcm = dec.pcm_mut(n);
+                                rms_sum += pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += n as u64;
+                                aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                                media_samples += n as u64;
+                            }
+                            None => {
+                                aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                                media_samples += silence_frame.len() as u64;
+                            }
+                        }
+                    }
+                    protocol::rtp::Pull::Silence { ts } => {
+                        // 连续 PLC 已达上限：输出静音但**继续推进媒体时间**，
+                        // 否则 next_ts 会跑到播放头前面，恢复时所有真包都会被判迟到
+                        if !clock.is_started() {
+                            clock.start(ts, aw.played_frames());
+                        }
+                        aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                        media_samples += silence_frame.len() as u64;
+                    }
+                    protocol::rtp::Pull::Wait => {
+                        std::thread::park_timeout(Duration::from_millis(4));
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            } 
-            if last_stats.elapsed() > Duration::from_millis(100) { 
-                let level_db = if rms_count > 0 { 
-                    let rms = (rms_sum / rms_count as f64).sqrt() as f32; 
-                    20.0 * (rms.max(1e-10)).log10() 
-                } else { 
-                    -60.0 
-                }; 
-                AUDIO_LEVEL_DB.store(level_db.to_bits(), Ordering::Relaxed); 
-                rms_sum = 0.0; 
-                rms_count = 0; 
-                last_stats = Instant::now(); 
-            } 
-        } 
-    }); 
-} 
+
+                if last_stats.elapsed() > Duration::from_millis(100) {
+                    let level_db = if rms_count > 0 {
+                        let rms = (rms_sum / rms_count as f64).sqrt() as f32;
+                        20.0 * (rms.max(1e-10)).log10()
+                    } else {
+                        -60.0
+                    };
+                    AUDIO_LEVEL_DB.store(level_db.to_bits(), Ordering::Relaxed);
+                    rms_sum = 0.0;
+                    rms_count = 0;
+                    last_stats = Instant::now();
+                }
+            }
+        });
+}
+
+/// 对切片尾部做线性淡出，避免漂移校正的接缝爆音
+fn fade_out(pcm: &mut [f32], len: usize) {
+    let n = len.min(pcm.len());
+    if n == 0 {
+        return;
+    }
+    let start = pcm.len() - n;
+    for i in 0..n {
+        let gain = 1.0 - (i as f32 / n as f32);
+        pcm[start + i] *= gain;
+    }
+}
 
 // ══════════════════════════════════════════════
 // 广播状态机 (独立线程)
 // ══════════════════════════════════════════════
-// Ready 模式: 每1秒广播 TYPE_DISCOVER_REPLY 到 LAN
-// Silent 模式: APP 停止或 DEVICE_BUSY 时停止广播
+// Ready 模式: 每 1 秒广播 TYPE_DISCOVER_REPLY 到 LAN
+// Silent 模式: APP 停止 / DEVICE_BUSY / 反向不可用时停止广播
 
 /// 当前监听端口（缓存，避免广播线程每秒读注册表）
-static LISTEN_PORT: AtomicU32 = AtomicU32::new(44044);
+static LISTEN_PORT: AtomicU32 = AtomicU32::new(protocol::DEFAULT_LISTEN_PORT as u32);
 
 fn start_broadcast_state_machine() {
     std::thread::spawn(move || {
@@ -381,24 +463,22 @@ fn start_broadcast_state_machine() {
         };
         let _ = socket.set_broadcast(true);
         let device_id = my_device_id();
-        let my_name = my_device_name();
+        let mut buf = [0u8; protocol::CONTROL_HEADER_SIZE + protocol::CONTROL_MAX_PAYLOAD];
         loop {
             if APP_RUNNING.load(Ordering::Acquire) != 0 && !p2p_snapshot().is_busy() {
-                let port = LISTEN_PORT.load(Ordering::Acquire) as u16;
-                // 独立 payload 缓冲区避免与 pkt_buf 可变借用冲突
-                let mut payload_buf = [0u8; 256];
-                let name_bytes = my_name.as_bytes();
-                let payload_len = 2 + name_bytes.len();
-                if payload_len + protocol::HEADER_SIZE <= 1500 && payload_len <= payload_buf.len() {
-                    let mut pkt_buf = [0u8; 1500];
-                    payload_buf[..2].copy_from_slice(&port.to_be_bytes());
-                    payload_buf[2..payload_len].copy_from_slice(name_bytes);
-                    if let Some(total) = protocol::build_packet_to(
-                        &mut pkt_buf, 0, false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
-                        &device_id, &payload_buf[..payload_len], 0,
-                    ) {
-                        let _ = socket.send_to(&pkt_buf[..total], "255.255.255.255:44043");
-                    }
+                let reply = protocol::DiscoverReply {
+                    listen_port: LISTEN_PORT.load(Ordering::Acquire) as u16,
+                    device_name: my_device_name().to_string(),
+                };
+                let payload = reply.encode();
+                if let Some(total) = protocol::build_control_to(
+                    &mut buf,
+                    0,
+                    protocol::TYPE_DISCOVER_REPLY,
+                    &device_id,
+                    &payload,
+                ) {
+                    let _ = socket.send_to(&buf[..total], ("255.255.255.255", protocol::DISCOVER_PORT));
                 }
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -406,94 +486,86 @@ fn start_broadcast_state_machine() {
     });
 }
 
-/// 重置全局状态到 DEVICE_READY
+/// 释放绑定：回到 READY，停反向发送，清空抖动缓冲。
+/// 控制面唯一的状态回退路径（超时 / 停止 / 引擎错误都走这里）。
 fn reset_to_ready() {
     {
         let mut st = p2p_lock();
-        st.state = DEVICE_READY;
-        st.device_id = [0u8; protocol::DEVICE_ID_SIZE];
-    }
-    // 清除 Android 地址并停止反向音频
-    if let Ok(mut addr) = android_addr().lock() {
-        *addr = None;
+        *st = P2pState::new();
     }
     if let Ok(mut sender) = reverse_sender().lock() {
         if let Some(s) = sender.take() {
             s.stop();
         }
     }
+    jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
+    wake_decoder();
 }
 
 // ══════════════════════════════════════════════
-// v2 发现服务 (独立线程)
+// 发现服务 (独立线程)
 // ══════════════════════════════════════════════
-pub fn start_broadcast_listener() { 
-    std::thread::spawn(move || { 
-        let socket = match std::net::UdpSocket::bind("0.0.0.0:44043") { 
-            Ok(s) => s, 
-            Err(e) => { 
-                logf!("[Discovery] 绑定广播端口失败: {}", e); 
-                return; 
-            } 
-        }; 
-        let mut buf = [0u8; 1024]; 
+pub fn start_broadcast_listener() {
+    std::thread::spawn(move || {
+        let socket = match std::net::UdpSocket::bind(("0.0.0.0", protocol::DISCOVER_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                logf!("[Discovery] 绑定广播端口失败: {}", e);
+                return;
+            }
+        };
+        let mut buf = [0u8; 1500];
         let my_id = my_device_id();
-        let my_name = my_device_name();
         // 简单令牌桶：同一源 IP 每秒最多应答 MAX_PER_SEC 次。
         // 发现请求 15B、应答 ~15B+主机名，无限制时可被用于 UDP 反射放大。
         const MAX_PER_SEC: u32 = 5;
         let mut bucket: std::collections::HashMap<std::net::IpAddr, (u32, Instant)> =
             std::collections::HashMap::new();
         let mut last_cleanup = Instant::now();
-        loop { 
-            if let Ok((amt, src)) = socket.recv_from(&mut buf) { 
-                    if last_cleanup.elapsed() > Duration::from_secs(30) {
-                        bucket.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(5));
-                        last_cleanup = Instant::now();
-                    }
-                    {
-                        let entry = bucket.entry(src.ip()).or_insert((0, Instant::now()));
-                        if entry.1.elapsed() >= Duration::from_secs(1) {
-                            *entry = (0, Instant::now());
-                        }
-                        if entry.0 >= MAX_PER_SEC {
-                            continue;
-                        }
-                        entry.0 += 1;
-                    }
-                    let data = &buf[..amt];
-                    if amt >= protocol::HEADER_SIZE {
-                        let mut hdr_buf = [0u8; protocol::HEADER_SIZE];
-                        hdr_buf.copy_from_slice(&data[..protocol::HEADER_SIZE]);
-                        if let Some(hdr) = protocol::decode_header(&hdr_buf) {
-                            if APP_RUNNING.load(Ordering::Acquire) != 0
-                                && !p2p_snapshot().is_busy()
-                                && hdr.msg_type == protocol::TYPE_DISCOVER_REQ {
-                                let port = LISTEN_PORT.load(Ordering::Acquire) as u16;
-                                // 独立 payload 缓冲区避免借用冲突
-                                let mut payload_buf = [0u8; 256];
-                                let name_bytes = my_name.as_bytes();
-                                let payload_len = 2 + name_bytes.len();
-                                if payload_len + protocol::HEADER_SIZE <= 1500 && payload_len <= payload_buf.len() {
-                                    let mut pkt_buf = [0u8; 1500];
-                                    payload_buf[..2].copy_from_slice(&port.to_be_bytes());
-                                    payload_buf[2..payload_len].copy_from_slice(name_bytes);
-                                    if let Some(total) = protocol::build_packet_to(
-                                        &mut pkt_buf, 0, false, protocol::TYPE_DISCOVER_REPLY, 0, 0,
-                                        &my_id, &payload_buf[..payload_len], 0,
-                                    ) {
-                                        let _ = socket.send_to(&pkt_buf[..total], src);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                    }
+        loop {
+            let (amt, src) = match socket.recv_from(&mut buf) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
 
-            } 
-        } 
-    }); 
-} 
+            if last_cleanup.elapsed() > Duration::from_secs(30) {
+                bucket.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(5));
+                last_cleanup = Instant::now();
+            }
+            {
+                let entry = bucket.entry(src.ip()).or_insert((0, Instant::now()));
+                if entry.1.elapsed() >= Duration::from_secs(1) {
+                    *entry = (0, Instant::now());
+                }
+                if entry.0 >= MAX_PER_SEC {
+                    continue;
+                }
+                entry.0 += 1;
+            }
+
+            let Some((hdr, payload)) = protocol::parse_control(&buf[..amt]) else {
+                continue;
+            };
+            // 只接受空负载的 DISCOVER_REQ；Busy / 未启动一律不回
+            if hdr.msg_type != protocol::TYPE_DISCOVER_REQ || !payload.is_empty() {
+                continue;
+            }
+            if APP_RUNNING.load(Ordering::Acquire) == 0 || p2p_snapshot().is_busy() {
+                continue;
+            }
+            let reply = protocol::DiscoverReply {
+                listen_port: LISTEN_PORT.load(Ordering::Acquire) as u16,
+                device_name: my_device_name().to_string(),
+            };
+            let body = reply.encode();
+            if let Some(total) =
+                protocol::build_control_to(&mut buf, 0, protocol::TYPE_DISCOVER_REPLY, &my_id, &body)
+            {
+                let _ = socket.send_to(&buf[..total], src);
+            }
+        }
+    });
+}
 
 // ══════════════════════════════════════════════
 // UI 及主控逻辑
@@ -795,13 +867,36 @@ impl AppState {
                 } 
                 self.last_bitrate = info.bitrate_kbps; 
                 self.last_level_db = info.level_db; 
-                // 音频诊断：每 30s 落一次盘（计数器由 cpal 回调与音频线程维护）
+                // 诊断：每 30s 落一次盘（音频计数器 + RTP/抖动缓冲计数器）
                 if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
                     self.last_stats_log = Instant::now();
                     let s = audio_stats().snapshot();
+                    let (j, water) = {
+                        let jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                        (jb.stats, jb.water_ms())
+                    };
+                    let peer = p2p_snapshot();
                     logf!(
                         "[Audio] 统计 块={} 重采样={} 丢样={} 欠载={}",
                         s.writes, s.resampled, s.dropped, s.underrun
+                    );
+                    logf!(
+                        "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) 水位={}ms SSRC={:#010x}",
+                        j.received, j.bytes, j.late, j.duplicate, j.overflow, j.resyncs,
+                        j.plc_frames, j.max_plc_run, water, peer.forward_ssrc
+                    );
+                    logf!(
+                        "[RTP] 丢包/非法包={} 累计接收={}",
+                        RTP_RX_DROPPED.load(Ordering::Relaxed),
+                        RTP_RX_PACKETS.load(Ordering::Relaxed)
+                    );
+                    // 反向链路统计由 UI 线程汇总：发送线程内**不得**做文件 I/O，
+                    // 否则一次慢写盘就会打断 RTP（实测每 30 s 一次破音）
+                    let (pk, bytes, enc_err, oversize, dropped, send_err, gaps) =
+                        capture::take_reverse_stats();
+                    logf!(
+                        "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={}",
+                        pk, bytes, enc_err, oversize, dropped, send_err, gaps
                     );
                 }
                 Task::none() 
@@ -1304,257 +1399,295 @@ fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
     )
 }
 
-/// 发送 CONNECT_ACK。
-/// 复用监听 socket 发送：不再每次保活都新建 socket（1 个/秒、约 8.6 万个/天），
-/// 且 ACK 源端口恒为服务端口，便于对端归属判断。
-async fn send_connect_ack(socket: &tokio::net::UdpSocket, src_addr: &std::net::SocketAddr) {
-    let my_id = my_device_id();
-    let ack_packet = protocol::build_packet(
-        false, protocol::TYPE_CONNECT_ACK, 0, 0, &my_id, &[], 0,
-    );
-    let _ = socket.send_to(&ack_packet, src_addr).await;
+/// 发送 CONNECT_ACK（6 字节负载：reverse_ssrc + PT + frame_ms）。
+/// 复用监听 socket 发送：ACK 源端口恒为服务端口，便于对端归属判断。
+async fn send_connect_ack(socket: &tokio::net::UdpSocket, src_addr: &SocketAddr, reverse_ssrc: u32) {
+    let payload = protocol::ConnectAckPayload {
+        reverse_ssrc,
+        ..protocol::ConnectAckPayload::default()
+    }
+    .encode();
+    let packet = protocol::build_control(protocol::TYPE_CONNECT_ACK, &my_device_id(), &payload);
+    let _ = socket.send_to(&packet, src_addr).await;
 }
 
-/// 处理控制消息（TYPE_CONNECT / TYPE_CONNECT_ACK / TYPE_DISCOVER_*）
+/// 本次绑定应使用的反向 SSRC。
+/// 反向关闭（用户开关关闭或 `reverse_port == 0`）时返回 0，表示不启动反向发送。
+fn desired_reverse_ssrc(reverse_port: u16, previous: u32, regenerate: bool) -> u32 {
+    if reverse_port == 0 || REVERSE_ENABLED.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    if previous != 0 && !regenerate {
+        return previous;
+    }
+    random_u32_nonzero()
+}
+
+/// 启动/重启反向发送器：先停旧的，保证同一时刻只有一个线程持有环回端点
+fn restart_reverse_sender(addr: SocketAddr, ssrc: u32) {
+    if let Ok(mut slot) = reverse_sender().lock() {
+        if let Some(old) = slot.take() {
+            old.stop();
+        }
+        if ssrc != 0 {
+            *slot = Some(capture::ReverseSender::start(addr, ssrc));
+        }
+    }
+}
+
+/// 处理一条控制消息。
+///
+/// 校验顺序（规范 5.7 第 5–7 步）：类型 → 负载布局 → 绑定关系。
+/// 任何一步失败都静默丢弃：控制面不回显错误，也不修改绑定状态。
 async fn handle_control(
-    header: &protocol::PacketHeader,
+    header: &protocol::ControlHeader,
     payload: &[u8],
-    src_addr: &std::net::SocketAddr,
+    src_addr: &SocketAddr,
     socket: &tokio::net::UdpSocket,
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
 ) {
-    /// 从 CONNECT payload 中解析 Opus 编码参数
-    /// 布局: [0..2] 反向端口, [2] 标志位(bit1=携带 Opus 参数), [3..10] 编码参数
-    fn parse_opus_cfg(payload: &[u8]) -> Option<capture::OpusReverseConfig> {
-        if payload.len() < 10 || (payload[2] & 0x02) == 0 {
-            return None; // 未携带扩展配置（首包仅含反向端口）
-        }
-        let flags = payload[6];
-        Some(capture::OpusReverseConfig {
-            bitrate_kbps: u16::from_be_bytes([payload[7], payload[8]]),
-            bandwidth: payload[5],           // 0-4
-            complexity: payload[3],           // 1-10
-            signal: payload[4],               // 0=auto, 1=voice, 2=music
-            vbr: (flags & 0x01) != 0,
-            dtx: (flags & 0x02) != 0,
-            vbr_constraint: (flags & 0x04) != 0,
-            fec: (flags & 0x08) != 0,
-            packet_loss: payload[9],          // 0-100
-        })
+    // 0（已废弃）与 5..=255（保留）都不是本端要处理的消息
+    if !header.is_known_type() || header.msg_type != protocol::TYPE_CONNECT {
+        return;
     }
 
-    if header.msg_type == protocol::TYPE_CONNECT {
-            // 提取反向端口（CONNECT payload 前2字节，big-endian）
-            let rev_port = if payload.len() >= 2 {
-                ((payload[0] as u16) << 8) | (payload[1] as u16)
-            } else {
-                0
-            };
-            // 同步 Opus 编码设置
-            if let Some(cfg) = parse_opus_cfg(payload) {
-                capture::update_reverse_config(cfg);
-            }
-            let android_rev_addr = std::net::SocketAddr::new(
-                src_addr.ip(),
-                if rev_port > 0 { rev_port } else { src_addr.port() },
-            );
+    let Some(cfg) = protocol::ConnectPayload::decode(payload) else {
+        logf!("[P2P] CONNECT 负载长度非法（{} 字节），丢弃", payload.len());
+        return;
+    };
+    if let Err(reason) = cfg.validate() {
+        logf!("[P2P] CONNECT 参数非法（{reason}），丢弃");
+        return;
+    }
+    // 反向编码器配置只描述 Windows → Android；内容相同则不下发（避免每秒重置编码器）
+    capture::update_reverse_config(capture::OpusReverseConfig::from(&cfg));
 
-            // 同设备保活重连
-            let same_device = {
-                let st = p2p_lock();
-                st.is_busy() && st.device_id == header.device_id
-            };
-            if same_device {
-                if rev_port > 0 {
-                    // 仅端口真正变化时才重启发送器（避免每秒保活都重启）
-                    let port_changed = android_addr().lock().ok()
-                        .map(|mut ad| {
-                            let changed = ad.as_ref()
-                                .map(|(_, p)| *p != rev_port)
-                                .unwrap_or(true);
-                            *ad = Some((android_rev_addr, rev_port));
-                            changed
-                        })
-                        .unwrap_or(true);
-                    if port_changed && REVERSE_ENABLED.load(Ordering::Acquire) != 0 {
-                        if let Ok(mut sender) = reverse_sender().lock() {
-                            if let Some(s) = sender.take() { s.stop(); }
-                            let my_id = my_device_id();
-                            *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
-                            logf!("[P2P] 反向端口变化，已重启 -> {}:{}", src_addr.ip(), android_rev_addr.port());
-                        }
-                    }
-                }
-                send_connect_ack(socket, src_addr).await;
-                return;
-            }
+    let now = Instant::now();
+    let peer = p2p_snapshot();
+    let same_device = peer.is_busy() && peer.device_id == header.device_id;
 
-            // 已被其他设备占用 → 静默拒绝；空闲 → 建立绑定
-            {
-                let mut st = p2p_lock();
-                if st.is_busy() {
-                    return;
-                }
-                st.device_id = header.device_id;
-                st.state = DEVICE_BUSY;
-            }
-            logf!("[P2P] 手机端 {} 已绑定连接", src_addr.ip());
-            // 只触发一次重绘（让顶部「● 已占用」立刻出现）。
-            // 不再向底部提示行写"已连接手机端"：连接状态由顶部状态点统一表达；
-            // 也不再用 bitrate=0 的 StatusUpdate 冒充重绘信号。
-            let _ = output.try_send(Message::PeerStateChanged);
-            send_connect_ack(socket, src_addr).await;
+    // ── 已被其它设备占用：静默忽略，不回 ACK ──
+    if peer.is_busy() && !same_device {
+        return;
+    }
 
-            // 存储 Android 地址+反向端口
-            if let Ok(mut ad) = android_addr().lock() {
-                *ad = Some((android_rev_addr, rev_port));
-            }
-            // 仅用户开启反向开关时才启动反向音频
-            if REVERSE_ENABLED.load(Ordering::Acquire) != 0 {
-                let my_id = my_device_id();
-                if let Ok(mut sender) = reverse_sender().lock() {
-                    if let Some(old) = sender.take() { old.stop(); }
-                    *sender = Some(capture::ReverseSender::start(android_rev_addr, my_id));
-                }
-                logf!("[P2P] 反向音频发送到 {}:{}", src_addr.ip(), android_rev_addr.port());
-            } else {
-                logf!("[P2P] 反向音频开关未开启，跳过启动");
-            }
+    if !same_device {
+        // ── 建立绑定 ──
+        let reverse_ssrc = desired_reverse_ssrc(cfg.reverse_port, 0, true);
+        {
+            let mut st = p2p_lock();
+            st.state = DEVICE_BUSY;
+            st.device_id = header.device_id;
+            st.addr = Some(*src_addr);
+            st.forward_ssrc = cfg.forward_ssrc;
+            st.reverse_ssrc = reverse_ssrc;
+            st.reverse_port = cfg.reverse_port;
+            st.last_connect = Some(now);
         }
+        // 新会话：抖动缓冲与解码器状态全部重建
+        jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
+        wake_decoder();
+        restart_reverse_sender(
+            SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
+            reverse_ssrc,
+        );
+        logf!(
+            "[P2P] 手机端 {} 已绑定（forward_ssrc={:#010x} reverse_ssrc={:#010x} reverse_port={}）",
+            src_addr.ip(),
+            cfg.forward_ssrc,
+            reverse_ssrc,
+            cfg.reverse_port
+        );
+        let _ = output.try_send(Message::PeerStateChanged);
+        send_connect_ack(socket, src_addr, reverse_ssrc).await;
+        return;
+    }
+
+    // ── 同一设备的周期 CONNECT（保活 / 参数同步）──
+    // forward_ssrc 变化表示新会话：必须重置抖动缓冲/解码器并换反向 SSRC
+    let new_session = peer.forward_ssrc != cfg.forward_ssrc;
+    let want_reverse = cfg.reverse_port != 0 && REVERSE_ENABLED.load(Ordering::Acquire) != 0;
+    let reverse_stale = new_session
+        || peer.reverse_port != cfg.reverse_port
+        || (peer.reverse_ssrc != 0) != want_reverse;
+
+    let reverse_ssrc = if reverse_stale {
+        desired_reverse_ssrc(cfg.reverse_port, peer.reverse_ssrc, true)
+    } else {
+        peer.reverse_ssrc
+    };
+
+    {
+        let mut st = p2p_lock();
+        st.addr = Some(*src_addr);
+        st.forward_ssrc = cfg.forward_ssrc;
+        st.reverse_ssrc = reverse_ssrc;
+        st.reverse_port = cfg.reverse_port;
+        st.last_connect = Some(now);
+    }
+
+    if new_session {
+        jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
+        wake_decoder();
+        logf!("[P2P] forward_ssrc 变化 → 新会话，已重置抖动缓冲");
+    }
+    if reverse_stale {
+        restart_reverse_sender(
+            SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
+            reverse_ssrc,
+        );
+        logf!(
+            "[P2P] 反向发送更新：ssrc={:#010x} port={}",
+            reverse_ssrc,
+            cfg.reverse_port
+        );
+    }
+
+    send_connect_ack(socket, src_addr, reverse_ssrc).await;
 }
 
-fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::futures::Stream<Item = Message> { 
-    iced::stream::channel(64, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move { 
-        let bind_addr = format!("{}:{}", listen_ip, listen_port); 
-        let socket = match tokio::net::UdpSocket::bind(&bind_addr).await { 
-            Ok(s) => s, 
-            Err(e) => { 
-                let _ = output.send(Message::EngineError(format!(
-                    "监听 {bind_addr} 失败：{}（端口可能被占用）", e.kind()
-                ))).await; 
-                return; 
-            } 
-        }; 
+/// 控制面超时：绑定设备 3 s 没有 CONNECT → 释放绑定、停止反向、回到 Ready。
+/// 只依据控制面保活判断（DTX 静音期间可能长时间没有 RTP）。
+fn check_peer_timeout() -> bool {
+    let st = p2p_lock();
+    if !st.is_busy() {
+        return false;
+    }
+    let expired = st
+        .last_connect
+        .map(|t| t.elapsed() > Duration::from_millis(protocol::PEER_TIMEOUT_MS))
+        .unwrap_or(true);
+    if expired {
+        drop(st);
+        reset_to_ready();
+        true
+    } else {
+        false
+    }
+}
+
+fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(64, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+        let bind_addr = format!("{}:{}", listen_ip, listen_port);
+        let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = output
+                    .send(Message::EngineError(format!(
+                        "监听 {bind_addr} 失败：{}（端口可能被占用）",
+                        e.kind()
+                    )))
+                    .await;
+                return;
+            }
+        };
 
         // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
-        let mut retries = 60; 
-        while AudioInitState::load() == AudioInitState::Pending && retries > 0 { 
-            tokio::time::sleep(Duration::from_millis(50)).await; 
-            retries -= 1; 
-        } 
+        let mut retries = 60;
+        while AudioInitState::load() == AudioInitState::Pending && retries > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            retries -= 1;
+        }
 
-        match AudioInitState::load() { 
-            AudioInitState::DecoderFailed => { 
-                let _ = output.send(Message::EngineError(
-                    "Opus 解码器初始化失败".into()
-                )).await; 
-                return; 
-            } 
-            AudioInitState::DeviceFailed => { 
-                let _ = output.send(Message::EngineError(
-                    "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into()
-                )).await; 
-                return; 
-            } 
-            _ => {} 
-        } 
+        match AudioInitState::load() {
+            AudioInitState::DecoderFailed => {
+                let _ = output
+                    .send(Message::EngineError("Opus 解码器初始化失败".into()))
+                    .await;
+                return;
+            }
+            AudioInitState::DeviceFailed => {
+                let _ = output
+                    .send(Message::EngineError(
+                        "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into(),
+                    ))
+                    .await;
+                return;
+            }
+            _ => {}
+        }
 
-        send_audio(AudioMessage::Reset); 
+        reset_to_ready();
+        wake_decoder();
 
-        let mut buf = vec![0u8; protocol::MAX_PACKET]; 
-        let mut last_stats = Instant::now(); 
-        let mut byte_count: u64 = 0; 
-        let mut last_packet = Instant::now(); 
-        let mut was_disconnected = false; 
+        let mut buf = vec![0u8; 2048];
+        let mut last_stats = Instant::now();
+        let mut byte_count: u64 = 0;
+        let mut packet_count: u64 = 0;
 
-        loop { 
-            let result = tokio::time::timeout( 
-                Duration::from_millis(300), 
-                socket.recv_from(&mut buf), 
-            ).await; 
+        loop {
+            let recv = tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
 
-            let (len, src) = match result { 
-                Ok(Ok(v)) => v, 
-                _ => { 
-                    if !was_disconnected && last_packet.elapsed() > Duration::from_secs(1) { 
-                        reset_to_ready();
-                        let _ = output.send(Message::Disconnected).await; 
-                        was_disconnected = true; 
-                    } 
-                    continue; 
-                } 
-            }; 
-
-            if len < protocol::HEADER_SIZE { 
-                continue; 
-            } 
-
-            // 解析统一协议头
-            let hdr_buf: [u8; protocol::HEADER_SIZE] = match buf[..protocol::HEADER_SIZE].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let h = match protocol::decode_header(&hdr_buf) {
-                Some(h) => h,
-                None => continue,
+            let (len, src) = match recv {
+                Ok(Ok(v)) => v,
+                // 超时 / socket 错误：只做控制面保活检查，不看 RTP
+                _ => {
+                    if check_peer_timeout() {
+                        let _ = output.send(Message::Disconnected).await;
+                    }
+                    continue;
+                }
             };
 
-            // ═══ 控制消息 ═══
-            if !h.is_audio {
-                let payload_end = (protocol::HEADER_SIZE + h.payload_len as usize).min(len);
-                let payload = &buf[protocol::HEADER_SIZE..payload_end];
-                handle_control(&h, payload, &src, &socket, &mut output).await;
-                continue;
+            match protocol::demux(&buf[..len]) {
+                protocol::Datagram::Control(data) => {
+                    if let Some((hdr, payload)) = protocol::parse_control(data) {
+                        handle_control(&hdr, payload, &src, &socket, &mut output).await;
+                    }
+                }
+                protocol::Datagram::Rtp(data) => {
+                    let peer = p2p_snapshot();
+                    // 未绑定 / 源地址不符：一律丢弃（含绑定前后的迟到包）
+                    if !peer.is_busy() || peer.addr != Some(src) {
+                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let Ok(pkt) = protocol::rtp::parse(data) else {
+                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    if pkt.ssrc != peer.forward_ssrc {
+                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // 网络线程只插入，不解码、不阻塞等待播放
+                    let accepted = {
+                        let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                        jb.insert(&pkt) != protocol::rtp::InsertResult::Dropped
+                    };
+                    if accepted {
+                        packet_count += 1;
+                        byte_count += len as u64;
+                        RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+                        RTP_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    }
+                    wake_decoder();
+                }
+                protocol::Datagram::Drop => {
+                    RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
-            // ═══ 音频数据 (TYPE_DATA) ═══
-            // 安全准入: 仅 TYPE_CONNECT 可建连，READY 时拒绝所有音频
-            // 注意：device_id 在发现回复中是明文，因此这只能防误连，不能防伪造
-            let accepted = {
-                let st = p2p_lock();
-                st.is_busy() && st.device_id == h.device_id
-            };
-            if !accepted {
-                continue;
+            if last_stats.elapsed() > Duration::from_millis(500) {
+                let elapsed = last_stats.elapsed().as_secs_f32();
+                let kbps = if elapsed > 0.0 {
+                    (byte_count * 8) as f32 / elapsed / 1000.0
+                } else {
+                    0.0
+                };
+                let level_db = f32::from_bits(AUDIO_LEVEL_DB.load(Ordering::Relaxed));
+                if packet_count > 0 {
+                    byte_count = 0;
+                    packet_count = 0;
+                } else {
+                    // 半秒内没有任何 RTP：码率归零（DTX 静音也走这里）
+                    byte_count = 0;
+                }
+                last_stats = Instant::now();
+                let _ = output
+                    .send(Message::StatusUpdate(StatusInfo { bitrate_kbps: kbps, level_db }))
+                    .await;
             }
-
-            last_packet = Instant::now(); 
-
-            if was_disconnected { 
-                was_disconnected = false; 
-                // 重连同样只刷新状态，不再往底部写"已重新连接"
-                let _ = output.send(Message::PeerStateChanged).await; 
-            } 
-
-            byte_count += len as u64; 
-            let payload_end = (protocol::HEADER_SIZE + h.payload_len as usize).min(len);
-            if payload_end > protocol::HEADER_SIZE {
-                // 只投递声明长度内的负载，避免把尾部垃圾喂给解码器。
-                // 缓冲从池中取，音频线程解码后归还，避免每包一次 malloc。
-                let mut payload = take_payload();
-                payload.extend_from_slice(&buf[protocol::HEADER_SIZE..payload_end]);
-                send_audio(AudioMessage::Packet {
-                    seq_num: h.seq_num,
-                    sample_rate: h.sample_rate,
-                    payload,
-                });
-            }
-
-            if last_stats.elapsed() > Duration::from_millis(500) { 
-                let elapsed = last_stats.elapsed().as_secs_f32(); 
-                let kbps = if elapsed > 0.0 { 
-                    (byte_count * 8) as f32 / elapsed / 1000.0 
-                } else { 
-                    0.0 
-                }; 
-                let level_db = f32::from_bits(AUDIO_LEVEL_DB.load(Ordering::Relaxed)); 
-                byte_count = 0; 
-                last_stats = Instant::now(); 
-                let _ = output.send(Message::StatusUpdate(StatusInfo { 
-                    bitrate_kbps: kbps, 
-                    level_db, 
-                })).await; 
-            } 
-        } 
-    }) 
+        }
+    })
 }

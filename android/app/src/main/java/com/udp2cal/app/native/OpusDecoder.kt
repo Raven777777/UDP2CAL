@@ -1,29 +1,30 @@
 package com.udp2cal.app.native
 
 import android.util.Log
+import com.udp2cal.app.Udp2CalProtocol
 
 /**
- * Opus 解码器 Kotlin 封装
- * 用于解码 PC 端传来的反向音频
- * 支持单声道(1ch)和立体声(2ch)
+ * Opus 解码器（v3：48 kHz / 固定 10 ms / 声道数由方向决定）
  *
- * 线程约束：`decode` / `stop` / `start` 全部加锁。
- * `stop()` 会释放 native handle，若此时接收协程仍在 `decoderDecode` 内，
- * 将出现 native 释放后使用（概率性 SIGSEGV）。协程 cancel 是异步的，
- * 因此必须靠锁保证两者不重叠。
+ * 反向流是立体声，因此 `channels = 2`；声道数**不得**从 RTP 头推断。
+ * PLC 每次只请求 480 采样（10 ms）。
+ *
+ * 线程约束：`start`/`decode`/`plc`/`stop`/`reset` 全部加锁。
+ * `stop()` 会释放 native handle，若此时解码线程仍在 `decode` 内，
+ * 将出现 native 释放后使用（概率性 SIGSEGV）。
  */
-class OpusDecoder(val sampleRateHz: Int = 48000, val channels: Int = 2) {
+class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val channels: Int = 2) {
     companion object {
         private const val TAG = "OpusDecoder"
     }
 
     @Volatile private var handle: Long = 0
 
-    /** 每通道帧采样数（20ms） */
+    /** 每通道帧采样数（10 ms = 480） */
     val frameSize: Int
-        get() = (sampleRateHz * 20) / 1000
+        get() = Udp2CalProtocol.OPUS_FRAME_SAMPLES
 
-    /** PCM 缓冲总大小 = frameSize × channels */
+    /** PCM 缓冲总大小 = frameSize × channels（交错） */
     val pcmBufferSize: Int
         get() = frameSize * channels
 
@@ -35,17 +36,13 @@ class OpusDecoder(val sampleRateHz: Int = 48000, val channels: Int = 2) {
             Log.e(TAG, "解码器创建失败")
             return false
         }
-        Log.i(TAG, "解码器已创建: sr=$sampleRateHz ch=$channels")
+        Log.i(TAG, "解码器已创建: sr=$sampleRateHz ch=$channels frame=$frameSize")
         return true
     }
 
     /**
-     * 解码 Opus 数据到 PCM
-     * @param data Opus 压缩数据所在的 ByteArray
-     * @param offset 数据起始偏移
-     * @param length Opus 数据长度
-     * @param pcmOut 输出 PCM 缓冲（大小至少 pcmBufferSize）
-     * @return 解码出的总采样数，或 -1
+     * 解码一个 10 ms Opus 包。
+     * @return 解码出的交错采样数，或 -1（失败按丢包处理）
      */
     @Synchronized
     fun decode(data: ByteArray, offset: Int, length: Int, pcmOut: ShortArray): Int {
@@ -56,15 +53,22 @@ class OpusDecoder(val sampleRateHz: Int = 48000, val channels: Int = 2) {
     }
 
     /**
-     * 丢包隐藏（PLC）：请求一帧补偿，写入 pcmOut。
-     * Deep PLC 生效条件：库 OPUS_DEEP_PLC 构建（CMakeLists 已开启）+ 解码复杂度 >=5。
-     * @return 补偿出的总采样数，或 -1
+     * 丢包隐藏：请求**一帧 10 ms**。Deep PLC 需库以 OPUS_DEEP_PLC 构建且复杂度 ≥5。
+     * @return 补偿出的交错采样数，或 -1
      */
     @Synchronized
     fun plc(pcmOut: ShortArray): Int {
         val h = handle
         if (h == 0L) return -1
         return OpusDecodeNative.decoderPlc(h, pcmOut, 0)
+    }
+
+    /** 重建解码器状态（重同步 / 新会话） */
+    @Synchronized
+    fun reset() {
+        val h = handle
+        if (h != 0L) OpusDecodeNative.decoderDestroy(h)
+        handle = OpusDecodeNative.decoderCreate(sampleRateHz, channels)
     }
 
     @Synchronized

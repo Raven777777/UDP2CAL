@@ -34,8 +34,8 @@ android {
         applicationId = "com.udp2cal.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.1.2"
+        versionCode = 7
+        versionName = "1.2.0"
 
         ndk {
             // -PtargetAbi=armeabi-v7a | arm64-v8a (default)

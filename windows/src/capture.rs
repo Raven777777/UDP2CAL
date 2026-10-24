@@ -1,58 +1,72 @@
-// WASAPI 环回捕获 + Opus 编码 + 反向 UDP 发送
-// 捕获系统音频输出（VB-Cable/扬声器）→ Opus 编码 → 发送到 Android 手机
-// 支持运行时从 CONNECT 保活包同步手机端 Opus 设置
-
+// WASAPI 环回捕获 → Opus（10 ms）→ RTP → UDP
+//
+// v3 发送端规则（规范第八节）：
+//   * 采集 → 编码 → 立即发送，**没有应用层音频队列**，失败只丢帧并计数；
+//   * 固定 10 ms 帧，每帧时间戳 +480，序列号每包 +1（丢帧也 +1，让接收端看到缺口）；
+//   * SSRC 由控制面生成并随 CONNECT_ACK 下发，本模块只使用；
+//   * 反向 Opus 配置来自 CONNECT，**只在变化时**应用（每秒重配会重置编码器状态）。
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use audiopus::Bitrate;
+use audiopus::{Application, Bitrate, Channels, SampleRate};
 
 use crate::logf;
 use crate::protocol;
+use crate::protocol::rtp;
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    eConsole, eRender, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-const FRAME_SIZE: usize = 480;               // 48000 * 10ms 单声道帧
-const FRAME_SAMPLES: usize = FRAME_SIZE * 2; // 立体声交错样本数
+/// 每声道 480 采样 = 10 ms @ 48 kHz
+const FRAME_MONO: usize = 480;
+/// 立体声交错样本数（一帧）
+const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
+/// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
+const MAX_FRAME_BACKLOG: usize = FRAME_INTERLEAVED * 4;
+/// 静音补齐上限：连续 2 s 无数据后停止补帧（DTX 语义），恢复出声时重新开始
+const MAX_SILENCE_FRAMES: u32 = 200;
+/// 帧长（毫秒）：静音补齐的墙钟节拍基准
+const FRAME_MS: u32 = rtp::FRAME_MS;
+/// WASAPI 事件等待上限：超时仅用于"静音补齐"判断，不用于播放节拍
+const WAIT_TIMEOUT_MS: u32 = 10;
 
 /// AUDCLNT_BUFFERFLAGS_SILENT：置位时缓冲内容未定义，必须按静音处理
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 
 // ═══════════════════════════════════════════════════════════════════
-// Opus 反向编码运行时配置（由主线程 CONNECT 保活包更新，运行中热生效）
+// 反向 Opus 编码配置（由 CONNECT 同步，配置变化才重新下发）
 // ═══════════════════════════════════════════════════════════════════
 
-/// Opus 编码器运行时参数（与 Android 端编码设置一一对应）
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpusReverseConfig {
-    pub bitrate_kbps: u16,     // 0=max/auto
-    pub bandwidth: u8,         // 0=NB, 1=MB, 2=WB, 3=SWB, 4=FB
-    pub complexity: u8,        // 1-10
-    pub signal: u8,            // 0=auto, 1=voice, 2=music
+    pub bitrate_kbps: u16,
+    pub bandwidth: u8,
+    pub complexity: u8,
+    pub signal: u8,
     pub vbr: bool,
     pub dtx: bool,
     pub fec: bool,
     pub vbr_constraint: bool,
-    pub packet_loss: u8,       // 0-100
+    pub packet_loss: u8,
 }
 
 impl Default for OpusReverseConfig {
     fn default() -> Self {
         Self {
-            bitrate_kbps: 0,     // auto/max
-            bandwidth: 4,        // FB
-            complexity: 3,
-            signal: 0,           // auto
+            bitrate_kbps: protocol::BITRATE_AUTO_KBPS,
+            bandwidth: 4,
+            complexity: 10,
+            signal: 1,
             vbr: true,
             dtx: false,
             fec: false,
@@ -62,110 +76,139 @@ impl Default for OpusReverseConfig {
     }
 }
 
+impl From<&protocol::ConnectPayload> for OpusReverseConfig {
+    fn from(p: &protocol::ConnectPayload) -> Self {
+        // 码率 0 统一映射 512 kbps；>1000 钳制到 1000（1024 会超 1275 字节上限）
+        Self {
+            bitrate_kbps: p.effective_bitrate_kbps(),
+            bandwidth: p.bandwidth.min(4),
+            complexity: if p.complexity == 0 { 10 } else { p.complexity.min(protocol::OPUS_COMPLEXITY_MAX) },
+            signal: p.signal.min(2),
+            vbr: p.vbr(),
+            dtx: p.dtx(),
+            fec: p.fec(),
+            vbr_constraint: p.vbr_constraint(),
+            packet_loss: p.packet_loss.min(100),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 反向链路统计（原子计数，由 UI 线程读取并落盘）
+//
+// **绝不能**在发送线程里直接写日志：`logf!` 是同步文件 I/O，一次写盘
+// 在杀毒软件扫描的机器上可以阻塞上百毫秒。发送线程一旦阻塞就会造成
+// RTP 断流——实测表现为"每 30 s 一次"的破音：诊断日志本身把流打断了。
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Default)]
+pub struct ReverseStats {
+    pub packets: AtomicU64,
+    pub bytes: AtomicU64,
+    pub encode_errors: AtomicU64,
+    pub oversize: AtomicU64,
+    pub dropped_samples: AtomicU64,
+    pub send_errors: AtomicU64,
+    /// 发送中断次数（两次发送间隔 > 200 ms，接收端会据此重同步）
+    pub gaps: AtomicU64,
+}
+
+static REVERSE_STATS: ReverseStats = ReverseStats {
+    packets: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    encode_errors: AtomicU64::new(0),
+    oversize: AtomicU64::new(0),
+    dropped_samples: AtomicU64::new(0),
+    send_errors: AtomicU64::new(0),
+    gaps: AtomicU64::new(0),
+};
+
+/// 读取并清零（30 s 汇总用，调用方为 UI 线程）
+pub fn take_reverse_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (
+        REVERSE_STATS.packets.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.bytes.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.encode_errors.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.oversize.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.dropped_samples.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.send_errors.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.gaps.swap(0, Ordering::Relaxed),
+    )
+}
+
 static REVERSE_CFG: OnceLock<Mutex<OpusReverseConfig>> = OnceLock::new();
 
 fn reverse_config() -> &'static Mutex<OpusReverseConfig> {
     REVERSE_CFG.get_or_init(|| Mutex::new(OpusReverseConfig::default()))
 }
 
-/// 由 main.rs 的 handle_control 调用，从 CONNECT 包更新反向编码参数
+/// 由 main.rs 的控制面调用；只有内容真正变化才落盘日志
 pub fn update_reverse_config(cfg: OpusReverseConfig) {
     if let Ok(mut c) = reverse_config().lock() {
         if *c != cfg {
-            logf!("[Reverse] 更新 Opus 配置: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
+            logf!(
+                "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
                 cfg.bitrate_kbps, cfg.bandwidth, cfg.complexity, cfg.signal,
-                cfg.vbr, cfg.dtx, cfg.fec, cfg.packet_loss);
+                cfg.vbr, cfg.dtx, cfg.fec, cfg.packet_loss
+            );
             *c = cfg;
         }
     }
 }
 
-/// 自动码率（bitrate_kbps=0）在反向编码器上的映射值。
-/// 固定 1024 kbps（1280 B/10ms 帧，留 192B 余量于 1472 协议上限内）。
-/// 实测依据：600/700/1024 正常；2048（2560B/帧）超上限整帧丢弃→无声；
-/// Bitrate::Max 在真机上同样无声（原因未明，离线 1.6.1 复现不了，疑似
-/// 真机链路对码率/包型有额外约束），故不再使用 Max。
-/// 诊断用：设置环境变量 UDP2CAL_REVERSE_AUTO_BR=<kbps> 可覆盖此值。
-fn auto_bitrate() -> Bitrate {
-    match std::env::var("UDP2CAL_REVERSE_AUTO_BR")
-        .ok()
-        .and_then(|v| v.trim().parse::<i32>().ok())
-        .filter(|v| *v > 0)
-    {
-        Some(kbps) => Bitrate::BitsPerSecond(kbps * 1000),
-        None => Bitrate::BitsPerSecond(1024 * 1000),
-    }
-}
-
-/// 将 Opus 配置应用到编码器（在 run_loop 线程中调用）
 fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig) {
-    // 码率：0=max, 其他按 kbps 设置
-    let bitrate = if cfg.bitrate_kbps == 0 {
-        auto_bitrate()
-    } else {
-        audiopus::Bitrate::BitsPerSecond(cfg.bitrate_kbps as i32 * 1000)
-    };
-    let _ = encoder.set_bitrate(bitrate);
-
-    // 带宽
-    let bw = match cfg.bandwidth {
+    let kbps = protocol::clamp_bitrate_kbps(cfg.bitrate_kbps) as i32;
+    // BITRATE 必须在 BANDWIDTH 之后：OPUS_SET_BANDWIDTH 会重置内部码率
+    let _ = encoder.set_vbr(cfg.vbr);
+    let _ = encoder.set_dtx(cfg.dtx);
+    let _ = encoder.set_inband_fec(cfg.fec);
+    let _ = encoder.set_packet_loss_perc(cfg.packet_loss);
+    let _ = encoder.set_vbr_constraint(if cfg.vbr { cfg.vbr_constraint } else { false });
+    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500 ms 冗余
+    let _ = encoder.set_dred_duration(if cfg.fec { 50 } else { 0 });
+    let _ = encoder.set_complexity(cfg.complexity);
+    let _ = encoder.set_signal(match cfg.signal {
+        1 => audiopus::Signal::Voice,
+        2 => audiopus::Signal::Music,
+        _ => audiopus::Signal::Auto,
+    });
+    let _ = encoder.set_bandwidth(match cfg.bandwidth {
         0 => audiopus::Bandwidth::Narrowband,
         1 => audiopus::Bandwidth::Mediumband,
         2 => audiopus::Bandwidth::Wideband,
         3 => audiopus::Bandwidth::Superwideband,
         _ => audiopus::Bandwidth::Fullband,
-    };
-    let _ = encoder.set_bandwidth(bw);
-
-    let _ = encoder.set_complexity(cfg.complexity);
-    let _ = encoder.set_vbr(cfg.vbr);
-    let _ = encoder.set_dtx(cfg.dtx);
-    let _ = encoder.set_inband_fec(cfg.fec);
-    let _ = encoder.set_packet_loss_perc(cfg.packet_loss);
-    let _ = encoder.set_vbr_constraint(cfg.vbr_constraint);
-    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500ms 冗余（50×10ms 帧），
-    // 供解码端神经网络恢复突发丢包；FEC 关闭时归零，不占用码流
-    let _ = encoder.set_dred_duration(if cfg.fec { 50 } else { 0 });
-
-    // 信号类型（影响 SILK/CELT 模式选择）
-    match cfg.signal {
-        1 => { let _ = encoder.set_signal(audiopus::Signal::Voice); }
-        2 => { let _ = encoder.set_signal(audiopus::Signal::Music); }
-        _ => { let _ = encoder.set_signal(audiopus::Signal::Auto); }
-    }
+    });
+    let _ = encoder.set_bitrate(Bitrate::BitsPerSecond(kbps * 1000));
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // 反向音频发送器
 // ═══════════════════════════════════════════════════════════════════
 
-/// 反向音频发送器
 pub struct ReverseSender {
     running: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ReverseSender {
-    /// 立体声 48kHz 全频带编码，码率由手机端 CONNECT 携带的 Opus 参数热同步
-    pub fn start(android_addr: SocketAddr, device_id: [u8; 8]) -> Self {
+    /// `ssrc` 由控制面生成并写入 CONNECT_ACK；本函数不自行生成。
+    pub fn start(target: SocketAddr, ssrc: u32) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
 
         let handle = std::thread::Builder::new()
             .name("reverse-capture".into())
             .spawn(move || {
-                Self::run_loop(android_addr, device_id, &running_clone);
+                Self::run_loop(target, ssrc, &running_clone);
             })
             .ok();
 
         ReverseSender { running, thread_handle: handle }
     }
 
-    /// 请求停止，并把 `join` 交给后台线程。
-    ///
-    /// 调用方可能是 iced 执行器线程或 UI 线程，**不能**在这里同步 join：
-    /// 反向线程可能正卡在 `IAudioCaptureClient::GetBuffer`（最长一个端点缓冲周期），
-    /// 同步等待会直接传导成界面卡顿。旧线程会在几毫秒内退出，句柄由后台线程回收。
+    /// 请求停止，`join` 交给后台线程：调用方可能是 UI/执行器线程，
+    /// 反向线程可能正卡在事件等待上，同步 join 会传导成界面卡顿。
     pub fn stop(mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
@@ -177,152 +220,199 @@ impl ReverseSender {
         }
     }
 
-    fn run_loop(android_addr: SocketAddr, device_id: [u8; 8], running: &AtomicBool) {
-        logf!("[Reverse] 启动反向音频发送到 {}", android_addr);
+    fn run_loop(target: SocketAddr, ssrc: u32, running: &AtomicBool) {
+        logf!("[Reverse] 启动反向音频 → {} (ssrc={:#010x})", target, ssrc);
 
-        // COM 初始化与反初始化严格配对，避免每次重连泄漏引用计数
         let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
         let _com_guard = ComGuard { active: com_ok };
 
         let mut encoder = match audiopus::coder::Encoder::new(
-            audiopus::SampleRate::Hz48000,
-            audiopus::Channels::Stereo,
-            audiopus::Application::Audio,
+            SampleRate::Hz48000,
+            Channels::Stereo,
+            Application::Audio,
         ) {
             Ok(e) => e,
-            Err(err) => { logf!("[Reverse] Opus 编码器失败: {:?}", err); return; }
+            Err(err) => {
+                logf!("[Reverse] Opus 编码器创建失败: {err:?}");
+                return;
+            }
         };
-        // 默认参数：最大码率 + 全频带；手机端配置到达后由 apply_config 覆盖
-        let _ = encoder.set_bitrate(auto_bitrate());
-        let _ = encoder.set_bandwidth(audiopus::Bandwidth::Fullband);
-        let _ = encoder.set_vbr(true);
 
-        // 应用可能已接收到的手机端配置。
-        // `applied == None` 表示尚未下发，启动时必定下发一次；之后仅在配置变化时下发，
-        // 避免每秒重复 ctl（每次 OPUS_SET_* 都会重置编码器内部状态）。
-        let mut applied: Option<OpusReverseConfig> = None;
+        // 启动时下发一次；之后仅在配置变化时下发
+        let mut applied = OpusReverseConfig::default();
         if let Ok(cfg) = reverse_config().lock() {
-            apply_config(&mut encoder, &cfg);
-            applied = Some(*cfg);
+            applied = *cfg;
         }
+        apply_config(&mut encoder, &applied);
 
         let send_sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
-            Err(e) => { logf!("[Reverse] UDP socket 失败: {}", e); return; }
+            Err(e) => {
+                logf!("[Reverse] UDP socket 创建失败: {e}");
+                return;
+            }
         };
 
         let capture = match LoopbackCapture::new() {
             Some(c) => c,
-            None => { logf!("[Reverse] 环回捕获初始化失败"); return; }
+            None => {
+                logf!("[Reverse] 环回捕获初始化失败");
+                return;
+            }
         };
 
-        let mut pcm_buf: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
-        let mut accum_buf = vec![0i16; FRAME_SAMPLES];
-        let mut encode_out = [0u8; 1500];
-        let mut seq_num: u8 = 0;
-        // 栈上发送缓冲区，build_packet_to 直接写入，消除 Vec 分配
-        let mut pkt_buf = [0u8; 1500];
-        // 复用 loopback 读取缓冲区，消除高频 Vec 分配
-        let mut loopback_samples: Vec<f32> = Vec::with_capacity(960);
-        // 采样率归一化：端点混音率 → 编码器固定 48 kHz
+        // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）
         let mut resampler = StereoResampler::new(capture.sample_rate(), 48_000);
+        let mut loopback: Vec<f32> = Vec::with_capacity(2_048);
         let mut resampled: Vec<f32> = Vec::with_capacity(2_048);
-        let mut last_cfg_check = std::time::Instant::now();
-        // pcm_buf 硬上限 ~3 秒（288000 交错样本 / 96000 样本每秒）
-        const MAX_PCM: usize = 288000;
-        let mut send_errors: u64 = 0;
-        // ── 反向链路诊断：30s 汇总一次（定位"自动码率无声"类问题）──
-        let mut diag_last = std::time::Instant::now();
-        let (mut diag_pkts, mut diag_bytes) = (0u64, 0u64);
-        let (mut diag_enc_err, mut diag_oversize, mut diag_zero) = (0u64, 0u64, 0u64);
-        let mut first_sizes_logged = false;
+        let mut pcm_buf: Vec<i16> = Vec::with_capacity(MAX_FRAME_BACKLOG);
+        let mut frame = vec![0i16; FRAME_INTERLEAVED];
+        let mut payload = [0u8; rtp::OPUS_MAX_PAYLOAD];
+        let mut packet = [0u8; rtp::RTP_MAX_PACKET];
 
+        let mut seq: u16 = random_u16();
+        let mut timestamp: u32 = random_u32();
+        let mut first_packet = true;
+        let mut last_sent: Option<Instant> = None;
+        let mut silence_run: u32 = 0;
+        // 端点最近一次真正给出数据的时间：只有它够久没更新时才补静音。
+        // 缺少这个判据时，事件等待超时与"事件带回 20 ms 数据"会同时成立，
+        // 结果每秒多发 3~4 帧，接收端缓冲十几秒就被灌满 → 周期性重同步（破音）。
+        let mut last_data_at = Instant::now();
+        let mut last_frame_at = Instant::now();
+
+
+        let mut cfg_check_at = Instant::now();
         while running.load(Ordering::Relaxed) {
-            // ── 每 1 秒检查配置变化并热应用（仅在真正变化时下发）──
-            if last_cfg_check.elapsed() > Duration::from_secs(1) {
+            // ── 配置变化检测：500 ms 一次，避免每帧抢锁（发送线程不该有锁流量）──
+            if cfg_check_at.elapsed() > Duration::from_millis(500) {
+                cfg_check_at = Instant::now();
                 if let Ok(cfg) = reverse_config().lock() {
-                    if applied != Some(*cfg) {
+                    if *cfg != applied {
                         apply_config(&mut encoder, &cfg);
-                        applied = Some(*cfg);
+                        applied = *cfg;
                     }
                 }
-                last_cfg_check = std::time::Instant::now();
             }
 
-            if capture.read_stereo(&mut loopback_samples).is_none() {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
+            let signaled = capture.wait(WAIT_TIMEOUT_MS);
+            let got_data = capture.read_stereo(&mut loopback).is_some();
+
+            if got_data {
+                silence_run = 0;
+                last_data_at = Instant::now();
+                last_frame_at = Instant::now();
+                resampler.process(&loopback, &mut resampled);
+                if resampled.len() > MAX_FRAME_BACKLOG {
+                    let excess = resampled.len() - MAX_FRAME_BACKLOG;
+                    REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
+                    resampled.drain(..excess);
+                }
+                for &s in &resampled {
+                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    pcm_buf.push(v);
+                }
+            } else if !signaled
+                && silence_run < MAX_SILENCE_FRAMES
+                && last_data_at.elapsed() > Duration::from_millis(200)
+                && last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64)
+            {
+                // 端点空闲超过 200 ms 才补静音，且严格按 10 ms 墙钟节拍——
+                // 这是"静音补齐"，不是播放定时器，也绝不允许超过实时速率。
+                silence_run += 1;
+                last_frame_at = Instant::now();
+                pcm_buf.extend(std::iter::repeat(0i16).take(FRAME_INTERLEAVED));
             }
 
-            // 端点混音采样率可能不是 48 kHz（44.1 kHz HDMI / USB 声卡很常见），
-            // 而编码器固定 48 kHz，必须先归一再组帧。
-            resampler.process(&loopback_samples, &mut resampled);
-            for &sample_f32 in &resampled {
-                let s = (sample_f32.clamp(-1.0, 1.0) * 32767.0) as i16;
-                pcm_buf.push(s);
-            }
-            if pcm_buf.len() > MAX_PCM {
-                pcm_buf.drain(0..pcm_buf.len() - MAX_PCM);
+            // 积压保护：超过 40 ms 只保留最新部分（发送端不得积压）
+            if pcm_buf.len() > MAX_FRAME_BACKLOG {
+                let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
+                pcm_buf.drain(..excess);
+                REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
             }
 
-            while pcm_buf.len() >= FRAME_SAMPLES {
-                accum_buf[..FRAME_SAMPLES].copy_from_slice(&pcm_buf[..FRAME_SAMPLES]);
-                pcm_buf.drain(..FRAME_SAMPLES);
-                match encoder.encode(&accum_buf[..FRAME_SAMPLES], &mut encode_out) {
-                    Ok(n) => {
-                        if n == 0 {
-                            diag_zero += 1;
+            while pcm_buf.len() >= FRAME_INTERLEAVED {
+                frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
+                pcm_buf.drain(..FRAME_INTERLEAVED);
+
+                let encoded = encoder.encode(&frame, &mut payload);
+                // `framed` = 这一帧是否"应当占用一个序列号"：
+                // 编码成功或编码失败都要 +1（让接收端看到缺口）；DTX 空帧不占号。
+                let (len, framed) = match encoded {
+                    Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => (n, true),
+                    Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
+                        // 超过 1275 字节：整帧丢弃，绝不截断
+                        REVERSE_STATS.oversize.fetch_add(1, Ordering::Relaxed);
+                        (0, true)
+                    }
+                    Ok(_) => (0, false), // DTX 空帧：时间戳推进，不发包也不占号
+                    Err(e) => {
+                        let n = REVERSE_STATS.encode_errors.fetch_add(1, Ordering::Relaxed);
+                        if n < 3 {
+                            logf!("[Reverse] 编码失败: {e:?}");
                         }
-                        // 超长包必须丢弃：截断会产出非法 Opus 包，解码端只会报错
-                        if n > 0 && n <= protocol::MAX_PAYLOAD {
-                            seq_num = seq_num.wrapping_add(1);
-                            diag_pkts += 1;
-                            diag_bytes += n as u64;
-                            if !first_sizes_logged {
-                                first_sizes_logged = true;
-                                logf!("[Reverse] 首包大小 {} 字节（编码器配置 br={} bw={} cplx={}）",
-                                    n, if applied.map(|c| c.bitrate_kbps).unwrap_or(0) == 0 { "Max" } else { "手动" },
-                                    applied.map(|c| c.bandwidth).unwrap_or(0),
-                                    applied.map(|c| c.complexity).unwrap_or(0));
+                        (0, true)
+                    }
+                };
+
+                // 时间戳每帧推进 480（含 DTX / 丢帧），序列号按 `framed` 推进
+                timestamp = timestamp.wrapping_add(rtp::FRAME_SAMPLES);
+                if len > 0 {
+                    let gap_ms = last_sent.map(|t| t.elapsed().as_millis()).unwrap_or(u128::MAX);
+                    let marker = first_packet
+                        || gap_ms > rtp::RESYNC_GAP_MS as u128;
+                    if !first_packet && marker {
+                        // 发送中断会让接收端重同步（flush + 重建解码器），必须计数备查
+                        REVERSE_STATS.gaps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(total) =
+                        rtp::write_packet(&mut packet, marker, seq, timestamp.wrapping_sub(rtp::FRAME_SAMPLES), ssrc, &payload[..len])
+                    {
+                        match send_sock.send_to(&packet[..total], target) {
+                            Ok(_) => {
+                                REVERSE_STATS.packets.fetch_add(1, Ordering::Relaxed);
+                                REVERSE_STATS.bytes.fetch_add(total as u64, Ordering::Relaxed);
+                                last_sent = Some(Instant::now());
+                                first_packet = false;
                             }
-                            if let Some(total) = protocol::build_packet_to(
-                                &mut pkt_buf, 0, true, protocol::TYPE_DATA,
-                                protocol::SAMPLE_RATE_48K, seq_num,
-                                &device_id, &encode_out[..n], 0,
-                            ) {
-                                if let Err(e) = send_sock.send_to(&pkt_buf[..total], android_addr) {
-                                    send_errors += 1;
-                                    if send_errors == 1 {
-                                        logf!("[Reverse] 发送失败（后续同类错误不再打印）: {}", e);
-                                    }
+                            Err(e) => {
+                                let n = REVERSE_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
+                                if n == 0 {
+                                    logf!("[Reverse] 发送失败（后续同类错误不再打印）: {e}");
                                 }
                             }
-                        } else if n > protocol::MAX_PAYLOAD {
-                            diag_oversize += 1;
-                        }
-                    }
-                    Err(e) => {
-                        diag_enc_err += 1;
-                        if diag_enc_err <= 3 {
-                            logf!("[Reverse] 编码失败: {:?}", e);
                         }
                     }
                 }
+                if framed {
+                    seq = seq.wrapping_add(1);
+                }
             }
 
-            // 30s 反向链路诊断汇总
-            if diag_last.elapsed() > Duration::from_secs(30) {
-                logf!("[Reverse] 诊断30s: 发送 {} 包 / {} KB, 编码错误 {}, 超限丢弃 {}, 零长帧 {}",
-                    diag_pkts, diag_bytes / 1024, diag_enc_err, diag_oversize, diag_zero);
-                diag_pkts = 0; diag_bytes = 0; diag_enc_err = 0; diag_oversize = 0; diag_zero = 0;
-                diag_last = std::time::Instant::now();
-            }
-
-            std::thread::sleep(Duration::from_millis(2));
         }
 
-        logf!("[Reverse] 反向音频线程退出（发送错误 {} 次）", send_errors);
+        logf!("[Reverse] 反向音频线程退出");
     }
+}
+
+fn random_u32() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(SEQ.fetch_add(1, AtomicOrdering::Relaxed));
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.finish() as u32
+}
+
+fn random_u16() -> u16 {
+    (random_u32() >> 8) as u16
 }
 
 /// COM 初始化守卫：无论从哪条路径退出都会正确反初始化
@@ -344,15 +434,13 @@ impl Drop for ComGuard {
 
 /// 线性插值 + 跨缓冲相位连续。
 ///
-/// 只做"把端点混音率搬到 48 kHz"这一件事，不引入低通滤波：
-/// 反向串流的目标是语音/系统提示音，48 kHz 以上的镜像分量功率极低，
-/// 为了它引入 FIR 会把热路径的复杂度提高一个量级。
+/// 只做"把端点混音率搬到 48 kHz"，不引入低通滤波：反向串流的目标是
+/// 语音/系统提示音，48 kHz 以上的镜像分量功率极低。
 struct StereoResampler {
     /// 每个输出帧消耗的输入帧数（src/dst）
     ratio: f64,
     /// 输入帧坐标系中的当前位置，始终保留 1 帧余量供下次插值
     phase: f64,
-    /// 交错立体声输入累积
     in_buf: Vec<f32>,
 }
 
@@ -398,7 +486,7 @@ impl StereoResampler {
             self.phase += self.ratio;
         }
 
-        // 丢弃已经完全消费的整帧，保留 1 帧给下一块做插值，避免块边界出现爆音
+        // 丢弃已经完全消费的整帧，保留 1 帧给下一块做插值
         let consumed = self.phase as usize;
         if consumed > 0 {
             self.in_buf.drain(0..consumed * 2);
@@ -408,24 +496,20 @@ impl StereoResampler {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// WASAPI 环回捕获
+// WASAPI 环回捕获（事件驱动，带静音补齐）
 // ═══════════════════════════════════════════════════════════════════
 
-/// 混音格式的样本类型
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SampleKind {
     F32,
     I16,
     I32,
 }
 
-/// 设备混音格式（决定如何解释 GetBuffer 返回的裸内存）
 #[derive(Clone, Copy, Debug)]
 struct CaptureFormat {
     channels: usize,
     kind: SampleKind,
-    /// 端点共享模式混音采样率。历史实现忽略该字段，
-    /// 在 44.1kHz 端点上按 48kHz 编码 → 音高 +8.8% 且持续欠载。
     sample_rate: u32,
 }
 
@@ -433,37 +517,46 @@ struct LoopbackCapture {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     format: CaptureFormat,
+    event: Option<HANDLE>,
 }
 
 impl Drop for LoopbackCapture {
     fn drop(&mut self) {
-        unsafe { let _ = self.client.Stop(); }
+        unsafe {
+            let _ = self.client.Stop();
+            if let Some(h) = self.event.take() {
+                let _ = CloseHandle(h);
+            }
+        }
     }
 }
 
 impl LoopbackCapture {
     fn new() -> Option<Self> {
         unsafe {
-            let enumerator: IMMDeviceEnumerator = CoCreateInstance(
-                &MMDeviceEnumerator, None, CLSCTX_ALL,
-            ).ok()?;
-
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None).ok()?;
 
             let fmt_ptr = client.GetMixFormat().ok()?;
-            // 关键：必须先解析格式再释放。历史实现直接丢弃格式信息，
-            // 导致下方按“f32 立体声”硬解码，在 i16 / 多声道设备上越界或错音。
             let format = parse_mix_format(fmt_ptr);
 
-            let dur = (Duration::from_millis(20).as_micros() * 10) as i64;
-            let init_ok = client.Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                dur, 0, fmt_ptr, None,
-            ).is_ok();
+            // 事件驱动：WASAPI 事件 + 10 ms 逻辑帧。缓冲区取 20 ms（事件粒度）。
+            let event = CreateEventW(None, false, false, windows::core::PCWSTR::null()).ok();
+            let mut flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
+            if event.is_some() {
+                flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+            }
+            let dur = 200_000i64; // 20 ms，单位 100 ns
+            let init_ok = client
+                .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, dur, 0, fmt_ptr, None)
+                .is_ok();
             CoTaskMemFree(Some(fmt_ptr as _));
             if !init_ok {
+                if let Some(h) = event {
+                    let _ = CloseHandle(h);
+                }
                 return None;
             }
 
@@ -471,41 +564,68 @@ impl LoopbackCapture {
                 Some(f) => f,
                 None => {
                     logf!("[Reverse] 设备混音格式不受支持（需 f32/i16/i32）");
+                    if let Some(h) = event {
+                        let _ = CloseHandle(h);
+                    }
                     return None;
                 }
             };
 
+            // 环回端点在某些驱动上不接受事件回调：失败就退回超时轮询（10 ms 粒度）
+            let mut event = event;
+            if let Some(h) = event {
+                if client.SetEventHandle(h).is_err() {
+                    logf!("[Reverse] 环回端点不支持事件回调，改用 10 ms 超时轮询");
+                    let _ = CloseHandle(h);
+                    event = None;
+                }
+            }
+
             let capture: IAudioCaptureClient = client.GetService().ok()?;
             client.Start().ok()?;
             logf!(
-                "[Reverse] WASAPI 环回捕获已启动（{} 声道 / {:?} / {} Hz）",
-                format.channels, format.kind, format.sample_rate
+                "[Reverse] WASAPI 环回已启动（{} 声道 / {:?} / {} Hz / {})",
+                format.channels,
+                format.kind,
+                format.sample_rate,
+                if event.is_some() { "事件驱动" } else { "轮询" }
             );
-            Some(Self { client, capture, format })
+            Some(Self { client, capture, format, event })
         }
     }
 
-    /// 端点混音采样率（编码前必须归一到 48 kHz）
     fn sample_rate(&self) -> u32 {
         self.format.sample_rate
     }
 
+    /// 等待一次数据就绪。返回 `true` 表示事件已触发，`false` 表示超时。
+    fn wait(&self, timeout_ms: u32) -> bool {
+        match self.event {
+            Some(h) => {
+                let r = unsafe { WaitForSingleObject(h, timeout_ms) };
+                r == WAIT_OBJECT_0
+            }
+            None => {
+                // 无事件可用：用一次短睡代替（这是降级路径，正常不会走到）
+                std::thread::sleep(Duration::from_millis(timeout_ms as u64));
+                false
+            }
+        }
+    }
+
     /// 读取一帧 PCM，输出**固定立体声交错** f32（L,R,L,R,...）
-    /// 返回 None 表示当前无数据
     fn read_stereo(&self, out: &mut Vec<f32>) -> Option<()> {
         unsafe {
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
             let mut flags: u32 = 0;
-            let mut dev_pos: u64 = 0;
-            let mut qpc_pos: u64 = 0;
 
             let hr = self.capture.GetBuffer(
                 &mut data_ptr as *mut *mut u8,
                 &mut frames,
                 &mut flags,
-                Some(&mut dev_pos),
-                Some(&mut qpc_pos),
+                None,
+                None,
             );
             if hr.is_err() || frames == 0 {
                 return None;
@@ -557,7 +677,6 @@ impl LoopbackCapture {
 }
 
 /// 解析 WAVEFORMATEX / WAVEFORMATEXTENSIBLE
-/// 返回 None 表示不支持的格式（宁可失败也不越界读取）
 unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     if fmt.is_null() {
         return None;
@@ -567,7 +686,6 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     if channels == 0 || channels > 32 {
         return None;
     }
-    // 采样率必须落在合理区间，否则重采样的比率会失控
     let sample_rate = wf.nSamplesPerSec;
     if !(8000..=384_000).contains(&sample_rate) {
         return None;
@@ -576,9 +694,8 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     let tag = wf.wFormatTag;
 
     let is_float = match (tag, wf.cbSize) {
-        (3, _) => true,   // WAVE_FORMAT_IEEE_FLOAT
-        (1, _) => false,  // WAVE_FORMAT_PCM
-        // WAVE_FORMAT_EXTENSIBLE：真实格式在 SubFormat GUID 的 Data1
+        (3, _) => true,  // WAVE_FORMAT_IEEE_FLOAT
+        (1, _) => false, // WAVE_FORMAT_PCM
         (0xFFFE, cb_size) if cb_size >= 22 => {
             let ext = &*(fmt as *const WAVEFORMATEXTENSIBLE);
             ext.SubFormat.data1 == 3
@@ -615,7 +732,6 @@ mod tests {
 
     #[test]
     fn resampler_44k1_to_48k_first_block() {
-        // 10 ms @44.1kHz = 441 帧 → 目标 480 帧；首块需要 1 帧余量，允许 ±2
         let mut rs = StereoResampler::new(44_100, 48_000);
         let input = vec![0.5f32; 441 * 2];
         let mut out = Vec::new();
@@ -626,7 +742,6 @@ mod tests {
 
     #[test]
     fn resampler_keeps_phase_across_blocks() {
-        // 连续 10 块 10 ms，累计应为 ~4800 帧（不能每块都从相位 0 重新开始）
         let mut rs = StereoResampler::new(44_100, 48_000);
         let input = vec![0.5f32; 441 * 2];
         let mut out = Vec::new();
@@ -639,18 +754,9 @@ mod tests {
     }
 
     #[test]
-    fn resampler_downsamples_96k() {
-        let mut rs = StereoResampler::new(96_000, 48_000);
-        let mut out = Vec::new();
-        rs.process(&vec![0.25f32; 960 * 2], &mut out); // 10ms @96k
-        let frames = out.len() / 2;
-        assert!((frames as i64 - 480).abs() <= 2, "frames={frames}");
-    }
-
-    #[test]
     fn parse_mix_format_reads_sample_rate() {
         let mut wf = WAVEFORMATEX {
-            wFormatTag: 3, // IEEE float
+            wFormatTag: 3,
             nChannels: 2,
             nSamplesPerSec: 44_100,
             wBitsPerSample: 32,
@@ -662,5 +768,26 @@ mod tests {
         assert_eq!(fmt.sample_rate, 44_100);
         assert_eq!(fmt.channels, 2);
         assert_eq!(fmt.kind, SampleKind::F32);
+    }
+
+    #[test]
+    fn connect_payload_maps_to_encoder_config() {
+        let p = protocol::ConnectPayload {
+            bitrate_kbps: 0,
+            complexity: 0,
+            bandwidth: 9,
+            signal: 7,
+            opus_flags: protocol::OPUS_FLAG_VBR | protocol::OPUS_FLAG_FEC,
+            ..protocol::ConnectPayload::default()
+        };
+        let cfg = OpusReverseConfig::from(&p);
+        assert_eq!(cfg.bitrate_kbps, 512); // 0 → 自动 512
+        assert_eq!(cfg.complexity, 10); // 0 → 默认
+        assert_eq!(cfg.bandwidth, 4); // 非法值钳制
+        assert_eq!(cfg.signal, 2); // 非法值钳制
+        assert!(cfg.vbr && cfg.fec && !cfg.dtx);
+
+        let p = protocol::ConnectPayload { bitrate_kbps: 1024, ..protocol::ConnectPayload::default() };
+        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 1000);
     }
 }

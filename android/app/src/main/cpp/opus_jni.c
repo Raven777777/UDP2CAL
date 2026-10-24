@@ -8,6 +8,12 @@
 
 #define TAG "OpusJNI"
 
+/* 协议上限：单个 Opus 负载 1275 字节（对应 RTP 包 1287 字节） */
+#define MAX_OPUS_PAYLOAD 1275
+
+/* v3 固定 10 ms 帧：48 kHz 下为 480 采样/声道 */
+#define FRAME_MS 10
+
 typedef struct {
     OpusEncoder* encoder;
     int sample_rate;
@@ -29,7 +35,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     jint dtx, jint vbr, jint fec, jint packetLoss, jint vbrConstraint) {
 
     int err = 0;
-    int frame_size = (sampleRate * 10) / 1000;  // 低延迟：10ms 帧
+    int frame_size = (sampleRate * FRAME_MS) / 1000;  // v3 固定 10 ms 帧（48 kHz → 480）
 
     OpusEncoder* enc = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_AUDIO, &err);
     if (err != OPUS_OK || enc == NULL) return 0;
@@ -82,10 +88,10 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     if (len < state->frame_size) return -1;
 
     // ⚠ 双重边界守卫
-    // 1) 静态阈值守卫：编码前确保剩余空间 ≥ 1276（Opus 单帧最恶劣情况上限）
+    // 1) 静态阈值守卫：编码前确保剩余空间 ≥ 1275（协议规定的单帧负载上限）
     // 2) 动态精确守卫：编码后检查实际 nbBytes 是否越界
     jsize destLen = (*env)->GetArrayLength(env, dest);
-    if (offset < 0 || offset >= destLen || (destLen - offset) < 1276) {
+    if (offset < 0 || offset >= destLen || (destLen - offset) < MAX_OPUS_PAYLOAD) {
         __android_log_print(ANDROID_LOG_ERROR, TAG,
             "Static overflow guard: destLen=%d offset=%d", destLen, offset);
         return -1;
@@ -94,7 +100,9 @@ Java_com_udp2cal_app_native_OpusNative_encoderEncodeTo(
     jshort* pcm = (*env)->GetShortArrayElements(env, pcmData, NULL);
     if (pcm == NULL) return -1;
 
-    unsigned char packet[4096];
+    // 输出缓冲严格取 1275 字节：opus_encode 会把码率钳制在该上限内，
+    // 物理上不可能产出超过 RTP/Opus 允许的负载（超限宁可整帧丢弃也不截断）
+    unsigned char packet[MAX_OPUS_PAYLOAD];
     int nbBytes = opus_encode(state->encoder, (const opus_int16*)pcm,
                                state->frame_size, packet, sizeof(packet));
     (*env)->ReleaseShortArrayElements(env, pcmData, pcm, JNI_ABORT);

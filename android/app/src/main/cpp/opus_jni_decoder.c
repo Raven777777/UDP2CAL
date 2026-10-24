@@ -8,11 +8,16 @@
 
 #define TAG "OpusDecodeJNI"
 
+/* v3 固定 10 ms 帧：48 kHz 下为 480 采样/声道。
+ * 解码与 PLC 都必须按这个长度请求——一次请求 120 ms 再当一帧播放
+ * 会让播放头与媒体时间线彻底错位。 */
+#define FRAME_MS 10
+
 typedef struct {
     OpusDecoder* decoder;
     int sample_rate;
     int channels;
-    int frame_size;  // 每通道采样数（20ms）
+    int frame_size;  // 每通道采样数（10 ms = 480）
 } DecoderState;
 
 JNIEXPORT jlong JNICALL
@@ -21,7 +26,7 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderCreate(
 
     int err = 0;
     int ch = (channels > 0) ? channels : 1;
-    int frame_size = (sampleRate * 20) / 1000;
+    int frame_size = (sampleRate * FRAME_MS) / 1000;
 
     OpusDecoder* dec = opus_decoder_create(sampleRate, ch, &err);
     if (err != OPUS_OK || dec == NULL) {

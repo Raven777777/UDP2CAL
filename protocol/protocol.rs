@@ -1,247 +1,431 @@
-/// UDP2CAL UDP私有协议编解码 (Rust实现)
-///
-/// ## v2 统一协议 (15字节包头 + 负载)
-/// 音频数据包和控制消息共用同一包头格式，所有包携带设备 ID 实现 1对1 P2P 过滤。
-///
-/// Byte 0:       PROTO_VERSION = 0x02 (8bit协议版本标识)
-/// Byte 1:       [1bit is_audio][3bit codec][4bit sample_rate]
-///               is_audio=1 音频数据, =0 控制消息
-///               codec=1 (Opus), sample_rate=0-4
-/// Byte 2:       [8bit msg_type]
-///               0=TYPE_DATA, 1=TYPE_CONNECT, 2=TYPE_DISCOVER_REQ,
-///               3=TYPE_DISCOVER_REPLY, 4=TYPE_CONNECT_ACK
-/// Byte 3-4:     [16bit payload_len BE]
-/// Byte 5:       [8bit bitrate/2 kbps] (0=auto, 仅 TYPE_DATA 有效)
-///               保留字段：发送端写入实际码率，接收端**不据此工作**
-///               （码率以字节数实测为准），仅用于抓包时标注。
-/// Byte 6:       [8bit seq_num] (仅 TYPE_DATA 有效)
-/// Byte 7-14:    [8 bytes device_id] (发送端唯一标识)
-/// Byte 15+:     [payload]
-///
-/// 协议只有单一版本：byte[0] 必须等于 PROTO_VERSION，其余一律拒绝。
-/// 不存在版本协商、降级或旧版本兼容路径。
+//! UDP2CAL 控制协议 v3（Rust 真源实现）
+//!
+//! 媒体面不再是控制包的一种：所有音频都走标准 RTP（见 [`rtp`] 模块），
+//! 本模块只负责控制面。
+//!
+//! ## 固定头（15 字节）
+//! ```text
+//! Byte 0:       0x03                     控制协议版本
+//! Byte 1:       0x00                     保留（发送写 0，接收忽略）
+//! Byte 2:       msg_type
+//! Byte 3-4:     payload_len (u16 BE)
+//! Byte 5:       0x00                     保留
+//! Byte 6:       0x00                     保留
+//! Byte 7-14:    device_id[8]
+//! Byte 15+:     payload
+//! ```
+//!
+//! 控制包与 RTP 共用同一个 UDP socket，接收端必须先看首字节再分流：
+//! `0x80..=0xBF` 为 RTP，`0x03` 为控制包，其余丢弃（见 [`demux`]）。
+//!
+//! 协议只有单一版本：`byte[0]` 必须等于 [`CONTROL_VERSION`]，不做协商、
+//! 不降级、不探测 v2。
 
-pub const HEADER_SIZE: usize = 15;
-pub const MAX_PAYLOAD: usize = 1472;
-pub const MAX_PACKET: usize = HEADER_SIZE + MAX_PAYLOAD;
-/// 重排窗口上限（自适应）：缓冲槽按此容量静态分配
-pub const MAX_REORDER: usize = 16;
-/// 重排窗口下限：网络干净时窗口收敛到此值（低延迟优先）
-pub const MIN_REORDER: usize = 2;
-/// 迟到/重复判定窗口：序号落后 next_seq 不超过该值即视为迟到，直接丢弃
-pub const MAX_LATE: u8 = 8;
-/// 自适应窗口：无迟到事件持续该时长后，抖动估计减半（窗口收敛）
-pub const JITTER_DECAY_SECS: u64 = 5;
-pub const PROTO_VERSION: u8 = 2;
+pub mod rtp;
+
+// ═══════════════════════ 常量 ═══════════════════════
+
+pub const CONTROL_VERSION: u8 = 0x03;
+pub const CONTROL_HEADER_SIZE: usize = 15;
+/// 控制负载上限；超过即丢弃（见规范 5.1）
+pub const CONTROL_MAX_PAYLOAD: usize = 512;
+
 pub const DEVICE_ID_SIZE: usize = 8;
 pub const DISCOVER_PORT: u16 = 44043;
+pub const DEFAULT_LISTEN_PORT: u16 = 44044;
 
-// --- 消息类型 ---
-pub const TYPE_DATA: u8 = 0;          // 音频数据
-pub const TYPE_CONNECT: u8 = 1;       // 连接请求
-pub const TYPE_DISCOVER_REQ: u8 = 2;  // 发现请求
-pub const TYPE_DISCOVER_REPLY: u8 = 3; // 发现回复
-pub const TYPE_CONNECT_ACK: u8 = 4;   // 连接确认
+/// CONNECT 发送间隔（保活 + 参数同步）
+pub const KEEPALIVE_INTERVAL_MS: u64 = 1000;
+/// Android 侧 ACK 超时
+pub const ACK_TIMEOUT_MS: u64 = 3000;
+/// Windows 侧绑定释放超时
+pub const PEER_TIMEOUT_MS: u64 = 3000;
 
-// --- 采样率常量 ---
-pub const SAMPLE_RATE_8K: u8 = 0;
-pub const SAMPLE_RATE_12K: u8 = 1;
-pub const SAMPLE_RATE_16K: u8 = 2;
-pub const SAMPLE_RATE_24K: u8 = 3;
-pub const SAMPLE_RATE_48K: u8 = 4;
+// ── 消息类型 ──
+/// v3 废弃：媒体走 RTP，控制包中出现该类型一律丢弃
+pub const TYPE_DATA: u8 = 0;
+pub const TYPE_CONNECT: u8 = 1;
+pub const TYPE_DISCOVER_REQ: u8 = 2;
+pub const TYPE_DISCOVER_REPLY: u8 = 3;
+pub const TYPE_CONNECT_ACK: u8 = 4;
+/// 已知类型的上界；5..=255 收到后忽略（不报错）
+pub const TYPE_MAX_KNOWN: u8 = TYPE_CONNECT_ACK;
 
-pub const BITRATE_AUTO: u8 = 0;
+// ── 负载长度 ──
+pub const CONNECT_PAYLOAD_SIZE: usize = 15;
+pub const CONNECT_ACK_PAYLOAD_SIZE: usize = 6;
+/// DISCOVER_REPLY 中设备名上限（不含 2 字节 listen_port）
+pub const DEVICE_NAME_MAX: usize = 254;
 
-// ═══════════════════════ 包头结构 ═══════════════════════
+// ── Opus 参数（控制面只传反向编码器配置）──
+pub const OPUS_PAYLOAD_TYPE: u8 = 111;
+pub const OPUS_FRAME_MS: u8 = 10;
+
+pub const OPUS_FLAG_VBR: u8 = 0x01;
+pub const OPUS_FLAG_DTX: u8 = 0x02;
+pub const OPUS_FLAG_VBR_CONSTRAINT: u8 = 0x04;
+pub const OPUS_FLAG_FEC: u8 = 0x08;
+pub const OPUS_FLAGS_RESERVED_MASK: u8 = 0xF0;
+
+/// 自动码率（`bitrate_kbps == 0`）映射值
+pub const BITRATE_AUTO_KBPS: u16 = 512;
+/// 码率硬上限：1024 kbps 会产出 1280 字节负载，超过 Opus/RTP 上限
+pub const BITRATE_MAX_KBPS: u16 = 1000;
+
+/// Opus 复杂度上限（`0` 表示使用默认值）
+pub const OPUS_COMPLEXITY_MAX: u8 = 10;
+
+// ═══════════════════════ 固定头 ═══════════════════════
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PacketHeader {
-    pub version: u8,         // PROTO_VERSION
-    pub is_audio: bool,       // true=音频数据, false=控制消息
-    pub codec: u8,           // 编码类型 (1=Opus)
-    pub sample_rate: u8,     // 采样率 ID
-    pub msg_type: u8,        // 消息类型
-    pub payload_len: u16,    // 负载长度
-    pub bitrate: u8,         // 码率 (kbps/2, 0=auto)
-    pub seq_num: u8,         // 包序号 (仅TYPE_DATA)
-    pub device_id: [u8; DEVICE_ID_SIZE], // 发送端设备ID
+pub struct ControlHeader {
+    pub msg_type: u8,
+    pub payload_len: u16,
+    pub device_id: [u8; DEVICE_ID_SIZE],
 }
 
-impl Default for PacketHeader {
+impl ControlHeader {
+    pub const fn new(msg_type: u8, payload_len: u16, device_id: [u8; DEVICE_ID_SIZE]) -> Self {
+        Self { msg_type, payload_len, device_id }
+    }
+
+    /// 写入 15 字节固定头；保留字节强制写 0。
+    pub fn encode(&self, buf: &mut [u8; CONTROL_HEADER_SIZE]) {
+        buf[0] = CONTROL_VERSION;
+        buf[1] = 0;
+        buf[2] = self.msg_type;
+        buf[3] = (self.payload_len >> 8) as u8;
+        buf[4] = self.payload_len as u8;
+        buf[5] = 0;
+        buf[6] = 0;
+        buf[7..15].copy_from_slice(&self.device_id);
+    }
+
+    /// 解析固定头。**只校验头部自身**（长度 ≥15、版本、负载上限）；
+    /// 数据报总长度与 `payload_len` 是否一致由 [`parse_control`] 负责。
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < CONTROL_HEADER_SIZE {
+            return None;
+        }
+        if buf[0] != CONTROL_VERSION {
+            return None;
+        }
+        let payload_len = u16::from_be_bytes([buf[3], buf[4]]);
+        if payload_len as usize > CONTROL_MAX_PAYLOAD {
+            return None;
+        }
+        let mut device_id = [0u8; DEVICE_ID_SIZE];
+        device_id.copy_from_slice(&buf[7..15]);
+        Some(Self { msg_type: buf[2], payload_len, device_id })
+    }
+
+    /// 是否为 v3 已定义的消息类型（1..=4）。`0` 与 `5..=255` 均返回 false。
+    pub fn is_known_type(&self) -> bool {
+        self.msg_type >= TYPE_CONNECT && self.msg_type <= TYPE_MAX_KNOWN
+    }
+}
+
+/// 解析一个完整控制数据报，返回（头, 负载）。
+///
+/// 依次执行规范 5.7 的前 4 步校验：长度 ≥15、版本 = 3、`payload_len <= 512`、
+/// 数据报长度精确等于 `15 + payload_len`。消息类型与负载布局由调用方继续校验。
+pub fn parse_control(buf: &[u8]) -> Option<(ControlHeader, &[u8])> {
+    let hdr = ControlHeader::decode(buf)?;
+    if buf.len() != CONTROL_HEADER_SIZE + hdr.payload_len as usize {
+        return None;
+    }
+    Some((hdr, &buf[CONTROL_HEADER_SIZE..]))
+}
+
+/// 构造成完整控制包（分配新 Vec）
+pub fn build_control(msg_type: u8, device_id: &[u8; DEVICE_ID_SIZE], payload: &[u8]) -> Vec<u8> {
+    let len = payload.len().min(CONTROL_MAX_PAYLOAD);
+    let mut out = Vec::with_capacity(CONTROL_HEADER_SIZE + len);
+    let mut hdr = [0u8; CONTROL_HEADER_SIZE];
+    ControlHeader::new(msg_type, len as u16, *device_id).encode(&mut hdr);
+    out.extend_from_slice(&hdr);
+    out.extend_from_slice(&payload[..len]);
+    out
+}
+
+/// 构造成完整控制包（写入预分配缓冲区，零分配）。
+/// 返回写入的字节数；缓冲区不足或负载超限返回 `None`。
+pub fn build_control_to(
+    dest: &mut [u8],
+    offset: usize,
+    msg_type: u8,
+    device_id: &[u8; DEVICE_ID_SIZE],
+    payload: &[u8],
+) -> Option<usize> {
+    if payload.len() > CONTROL_MAX_PAYLOAD {
+        return None;
+    }
+    let total = CONTROL_HEADER_SIZE + payload.len();
+    if offset + total > dest.len() {
+        return None;
+    }
+    dest[offset] = CONTROL_VERSION;
+    dest[offset + 1] = 0;
+    dest[offset + 2] = msg_type;
+    dest[offset + 3] = (payload.len() >> 8) as u8;
+    dest[offset + 4] = payload.len() as u8;
+    dest[offset + 5] = 0;
+    dest[offset + 6] = 0;
+    dest[offset + 7..offset + 15].copy_from_slice(device_id);
+    dest[offset + CONTROL_HEADER_SIZE..offset + total].copy_from_slice(payload);
+    Some(total)
+}
+
+// ═══════════════════════ 同 socket 解复用 ═══════════════════════
+
+/// 一个数据报的归属。`Drop` 表示首字节非法或长度不足，调用方只计数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Datagram<'a> {
+    Rtp(&'a [u8]),
+    Control(&'a [u8]),
+    Drop,
+}
+
+/// 按首字节分流（规范 3.2）。**不得**用长度是否 ≥15 判断控制包：
+/// DTX 期间的 RTP 包可能只有 13 字节。
+pub fn demux(buf: &[u8]) -> Datagram<'_> {
+    let Some(&b0) = buf.first() else {
+        return Datagram::Drop;
+    };
+    match b0 {
+        0x80..=0xBF => {
+            if buf.len() < rtp::RTP_HEADER_SIZE + 1 || buf.len() > rtp::RTP_MAX_PACKET {
+                Datagram::Drop
+            } else {
+                Datagram::Rtp(buf)
+            }
+        }
+        CONTROL_VERSION => {
+            if buf.len() < CONTROL_HEADER_SIZE || buf.len() > CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD
+            {
+                Datagram::Drop
+            } else {
+                Datagram::Control(buf)
+            }
+        }
+        _ => Datagram::Drop,
+    }
+}
+
+// ═══════════════════════ CONNECT（类型 1） ═══════════════════════
+
+/// CONNECT 负载，固定 15 字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectPayload {
+    /// Android 反向接收端口；`0` 表示不接收反向音频
+    pub reverse_port: u16,
+    /// Android 正向 RTP 的 SSRC；必须非零
+    pub forward_ssrc: u32,
+    pub payload_type: u8,
+    pub frame_ms: u8,
+    /// `1..=10`；`0` 表示使用默认值
+    pub complexity: u8,
+    /// `0`=auto, `1`=voice, `2`=music
+    pub signal: u8,
+    /// `0`=NB, `1`=MB, `2`=WB, `3`=SWB, `4`=FB
+    pub bandwidth: u8,
+    /// bit0=VBR, bit1=DTX, bit2=VBR 约束, bit3=FEC
+    pub opus_flags: u8,
+    /// 反向 Opus 目标码率；`0`=自动（512 kbps）
+    pub bitrate_kbps: u16,
+    /// 预期丢包率 0..=100
+    pub packet_loss: u8,
+}
+
+impl Default for ConnectPayload {
     fn default() -> Self {
         Self {
-            version: PROTO_VERSION,
-            is_audio: false,
-            codec: 1,
-            sample_rate: SAMPLE_RATE_48K,
-            msg_type: 0,
-            payload_len: 0,
-            bitrate: 0,
-            seq_num: 0,
-            device_id: [0u8; DEVICE_ID_SIZE],
+            reverse_port: 0,
+            forward_ssrc: 1,
+            payload_type: OPUS_PAYLOAD_TYPE,
+            frame_ms: OPUS_FRAME_MS,
+            complexity: 0,
+            signal: 0,
+            bandwidth: 4,
+            opus_flags: OPUS_FLAG_VBR,
+            bitrate_kbps: 0,
+            packet_loss: 0,
         }
     }
 }
 
-// ═══════════════════════ 编解码 ═══════════════════════
-
-/// 编码包头
-pub fn encode_header(header: &PacketHeader, buf: &mut [u8; HEADER_SIZE]) {
-    buf[0] = PROTO_VERSION;
-    buf[1] = (if header.is_audio { 1u8 } else { 0 }) << 7
-        | (header.codec & 0x07) << 4
-        | (header.sample_rate & 0x0F);
-    buf[2] = header.msg_type;
-    buf[3] = (header.payload_len >> 8) as u8;
-    buf[4] = header.payload_len as u8;
-    buf[5] = header.bitrate;
-    buf[6] = header.seq_num;
-    buf[7..15].copy_from_slice(&header.device_id);
-}
-
-/// 解码包头
-pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> Option<PacketHeader> {
-    if buf[0] != PROTO_VERSION {
-        return None;
+impl ConnectPayload {
+    pub fn encode(&self) -> [u8; CONNECT_PAYLOAD_SIZE] {
+        let mut b = [0u8; CONNECT_PAYLOAD_SIZE];
+        b[0..2].copy_from_slice(&self.reverse_port.to_be_bytes());
+        b[2..6].copy_from_slice(&self.forward_ssrc.to_be_bytes());
+        b[6] = self.payload_type;
+        b[7] = self.frame_ms;
+        b[8] = self.complexity;
+        b[9] = self.signal;
+        b[10] = self.bandwidth;
+        b[11] = self.opus_flags;
+        b[12..14].copy_from_slice(&self.bitrate_kbps.to_be_bytes());
+        b[14] = self.packet_loss;
+        b
     }
-    let is_audio = (buf[1] >> 7) & 0x01 == 1;
-    let codec = (buf[1] >> 4) & 0x07;
-    let sample_rate = buf[1] & 0x0F;
-    if sample_rate > SAMPLE_RATE_48K {
-        return None;
-    }
-    let msg_type = buf[2];
-    if msg_type > TYPE_CONNECT_ACK {
-        return None;
-    }
-    let payload_len = u16::from_be_bytes([buf[3], buf[4]]);
-    if payload_len as usize > MAX_PAYLOAD {
-        return None;
-    }
-    let bitrate = buf[5];
-    let seq_num = buf[6];
-    let mut device_id = [0u8; DEVICE_ID_SIZE];
-    device_id.copy_from_slice(&buf[7..15]);
-    Some(PacketHeader {
-        version: PROTO_VERSION,
-        is_audio,
-        codec,
-        sample_rate,
-        msg_type,
-        payload_len,
-        bitrate,
-        seq_num,
-        device_id,
-    })
-}
 
-/// 构建数据包（分配新 Vec）
-pub fn build_packet(
-    is_audio: bool, msg_type: u8, sample_rate: u8, seq_num: u8,
-    device_id: &[u8; DEVICE_ID_SIZE], payload: &[u8], bitrate: u8,
-) -> Vec<u8> {
-    let len = payload.len().min(MAX_PAYLOAD);
-    let mut packet = Vec::with_capacity(HEADER_SIZE + len);
-    let mut hdr_buf = [0u8; HEADER_SIZE];
-    let header = PacketHeader {
-        is_audio,
-        msg_type,
-        sample_rate,
-        seq_num,
-        payload_len: len as u16,
-        bitrate,
-        device_id: *device_id,
-        ..Default::default()
-    };
-    encode_header(&header, &mut hdr_buf);
-    packet.extend_from_slice(&hdr_buf);
-    packet.extend_from_slice(&payload[..len]);
-    packet
-}
-
-/// 构建数据包（写入预分配缓冲区，零分配）
-pub fn build_packet_to(
-    dest: &mut [u8], offset: usize,
-    is_audio: bool, msg_type: u8, sample_rate: u8, seq_num: u8,
-    device_id: &[u8; DEVICE_ID_SIZE], payload: &[u8], bitrate: u8,
-) -> Option<usize> {
-    let len = payload.len().min(MAX_PAYLOAD);
-    let total = HEADER_SIZE + len;
-    if offset + total > dest.len() {
-        return None;
+    /// 解析负载；长度必须恰好 15 字节。
+    pub fn decode(p: &[u8]) -> Option<Self> {
+        if p.len() != CONNECT_PAYLOAD_SIZE {
+            return None;
+        }
+        Some(Self {
+            reverse_port: u16::from_be_bytes([p[0], p[1]]),
+            forward_ssrc: u32::from_be_bytes([p[2], p[3], p[4], p[5]]),
+            payload_type: p[6],
+            frame_ms: p[7],
+            complexity: p[8],
+            signal: p[9],
+            bandwidth: p[10],
+            opus_flags: p[11],
+            bitrate_kbps: u16::from_be_bytes([p[12], p[13]]),
+            packet_loss: p[14],
+        })
     }
-    dest[offset] = PROTO_VERSION;
-    dest[offset + 1] = (if is_audio { 1u8 } else { 0 }) << 7
-        | (1 & 0x07) << 4 | (sample_rate & 0x0F);
-    dest[offset + 2] = msg_type;
-    dest[offset + 3] = (len >> 8) as u8;
-    dest[offset + 4] = len as u8;
-    dest[offset + 5] = bitrate;
-    dest[offset + 6] = seq_num;
-    dest[offset + 7..offset + 15].copy_from_slice(device_id);
-    dest[offset + HEADER_SIZE..offset + HEADER_SIZE + len].copy_from_slice(&payload[..len]);
-    Some(total)
-}
 
-// ═══════════════════════ 工具函数 ═══════════════════════
+    /// 校验能否接受。`Err` 携带原因（用于日志，不影响丢弃语义）。
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.payload_type != OPUS_PAYLOAD_TYPE {
+            return Err("payload_type != 111");
+        }
+        if self.frame_ms != OPUS_FRAME_MS {
+            return Err("frame_ms != 10");
+        }
+        if self.forward_ssrc == 0 {
+            return Err("forward_ssrc == 0");
+        }
+        Ok(())
+    }
 
-pub fn sample_rate_to_hz(sr: u8) -> u32 {
-    match sr {
-        SAMPLE_RATE_8K => 8000,
-        SAMPLE_RATE_12K => 12000,
-        SAMPLE_RATE_16K => 16000,
-        SAMPLE_RATE_24K => 24000,
-        SAMPLE_RATE_48K => 48000,
-        _ => 48000,
+    pub fn vbr(&self) -> bool {
+        self.opus_flags & OPUS_FLAG_VBR != 0
+    }
+    pub fn dtx(&self) -> bool {
+        self.opus_flags & OPUS_FLAG_DTX != 0
+    }
+    pub fn vbr_constraint(&self) -> bool {
+        self.opus_flags & OPUS_FLAG_VBR_CONSTRAINT != 0
+    }
+    pub fn fec(&self) -> bool {
+        self.opus_flags & OPUS_FLAG_FEC != 0
+    }
+
+    /// 生效码率：`0` → 512 kbps；超过 1000 钳制到 1000。
+    pub fn effective_bitrate_kbps(&self) -> u16 {
+        clamp_bitrate_kbps(self.bitrate_kbps)
     }
 }
 
-pub fn hz_to_sample_rate(hz: u32) -> u8 {
-    match hz {
-        8000 => SAMPLE_RATE_8K,
-        12000 => SAMPLE_RATE_12K,
-        16000 => SAMPLE_RATE_16K,
-        24000 => SAMPLE_RATE_24K,
-        48000 => SAMPLE_RATE_48K,
-        _ => SAMPLE_RATE_48K,
+/// 码率归一：`0`=自动→512，上限 1000。
+pub fn clamp_bitrate_kbps(kbps: u16) -> u16 {
+    match kbps {
+        0 => BITRATE_AUTO_KBPS,
+        k if k > BITRATE_MAX_KBPS => BITRATE_MAX_KBPS,
+        k => k,
     }
 }
 
-pub fn compute_bitrate_id(kbps: u32) -> u8 {
-    if kbps == 0 { BITRATE_AUTO } else { ((kbps / 2).min(255).max(1)) as u8 }
+// ═══════════════════════ CONNECT_ACK（类型 4） ═══════════════════════
+
+/// ACK 负载，固定 6 字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectAckPayload {
+    /// Windows 反向 RTP 的 SSRC；`0` 表示反向未启用
+    pub reverse_ssrc: u32,
+    pub payload_type: u8,
+    pub frame_ms: u8,
 }
 
-// ── 采样率 ↔ 码率的规范参考实现 ──
-//
-// 这三个函数是"协议规范的可执行定义"：两端都可以各自实现，但取值必须一致。
-// 当前 Windows 端只用 hz/常量做校验（真实码率以字节数实测），Android 端在
-// OpusEncoder.computeBitrateId 里有一份等价实现——修改任何一处都要同步另一处。
-
-/// 自动码率对应的默认值（kbps）
-pub fn default_bitrate_for_sr(sr: u8) -> u8 {
-    match sr {
-        SAMPLE_RATE_8K  => compute_bitrate_id(64),
-        SAMPLE_RATE_12K => compute_bitrate_id(64),
-        SAMPLE_RATE_16K => compute_bitrate_id(128),
-        SAMPLE_RATE_24K => compute_bitrate_id(256),
-        SAMPLE_RATE_48K => compute_bitrate_id(512),
-        _ => compute_bitrate_id(64),
+impl Default for ConnectAckPayload {
+    fn default() -> Self {
+        Self { reverse_ssrc: 0, payload_type: OPUS_PAYLOAD_TYPE, frame_ms: OPUS_FRAME_MS }
     }
 }
 
-pub fn resolve_bitrate(bitrate: u8, sample_rate: u8) -> u8 {
-    if bitrate == 0 { default_bitrate_for_sr(sample_rate) } else { bitrate }
+impl ConnectAckPayload {
+    pub fn encode(&self) -> [u8; CONNECT_ACK_PAYLOAD_SIZE] {
+        let mut b = [0u8; CONNECT_ACK_PAYLOAD_SIZE];
+        b[0..4].copy_from_slice(&self.reverse_ssrc.to_be_bytes());
+        b[4] = self.payload_type;
+        b[5] = self.frame_ms;
+        b
+    }
+
+    /// 解析负载；长度必须恰好 6 字节，PT/帧长必须合法。
+    pub fn decode(p: &[u8]) -> Option<Self> {
+        if p.len() != CONNECT_ACK_PAYLOAD_SIZE {
+            return None;
+        }
+        if p[4] != OPUS_PAYLOAD_TYPE || p[5] != OPUS_FRAME_MS {
+            return None;
+        }
+        Some(Self {
+            reverse_ssrc: u32::from_be_bytes([p[0], p[1], p[2], p[3]]),
+            payload_type: p[4],
+            frame_ms: p[5],
+        })
+    }
+}
+
+// ═══════════════════════ DISCOVER ═══════════════════════
+
+/// DISCOVER_REQ 负载为空；DISCOVER_REPLY 为 `listen_port(2) + device_name(N)`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverReply {
+    pub listen_port: u16,
+    pub device_name: String,
+}
+
+impl DiscoverReply {
+    pub fn encode(&self) -> Vec<u8> {
+        let name = truncate_utf8(&self.device_name, DEVICE_NAME_MAX);
+        let mut out = Vec::with_capacity(2 + name.len());
+        out.extend_from_slice(&self.listen_port.to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out
+    }
+
+    pub fn decode(p: &[u8]) -> Option<Self> {
+        if p.len() < 2 {
+            return None;
+        }
+        let listen_port = u16::from_be_bytes([p[0], p[1]]);
+        let name = std::str::from_utf8(&p[2..]).ok()?;
+        Some(Self { listen_port, device_name: name.to_string() })
+    }
+}
+
+/// 按字节上限截断字符串，**不切断 UTF-8 多字节字符**。
+pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// ═══════════════════════ 设备 ID ═══════════════════════
+
+/// 判断设备 ID 是否有效（全零视为无效）
+pub fn is_valid_device_id(id: &[u8; DEVICE_ID_SIZE]) -> bool {
+    id.iter().any(|&b| b != 0)
 }
 
 /// 生成 8 字节设备 ID
 ///
-/// 设备 ID 是 P2P 独占唯一的准入凭据，因此不能只由时间戳推导：
-/// 历史实现用 `SystemTime` 纳秒位运算，同网段主机可推算出一个窄的候选区间。
-/// 这里混入 `RandomState`（运行期由 OS 熵初始化）与自增序号，把取值面扩大到
-/// 进程级随机 + 时间 + 计数。
-///
-/// **注意**：这不构成密码学安全。协议本身没有鉴权（device_id 每秒随
-/// DISCOVER_REPLY 明文广播），该机制只防误连、不防伪造。
+/// 设备 ID 只用于控制面绑定与发现，**不是密码学凭据**：它每秒随
+/// DISCOVER_REPLY 明文广播，任何同网段主机都可伪造。这里混入
+/// `RandomState`（运行期由 OS 熵初始化）与自增序号，把候选面扩大到
+/// 进程级随机 + 时间 + 计数，足以避免"两台机器撞 ID"。
 pub fn generate_device_id() -> [u8; DEVICE_ID_SIZE] {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -266,157 +450,10 @@ pub fn generate_device_id() -> [u8; DEVICE_ID_SIZE] {
         hasher.write_u8(i as u8);
         *byte = hasher.finish().to_le_bytes()[i % 8];
     }
-    if id.iter().all(|&b| b == 0) {
+    if !is_valid_device_id(&id) {
         id[0] = 1; // 全零视为无效 ID
     }
     id
-}
-
-// ═══════════════════════ 重排缓冲区 ═══════════════════════
-
-struct ReorderSlot {
-    seq: u8,
-    sample_rate: u8,
-    len: usize,
-    data: [u8; MAX_PAYLOAD],
-    valid: bool,
-}
-
-pub struct ReorderBuffer {
-    buf: [ReorderSlot; MAX_REORDER],
-    write: usize,
-    next_seq: u8,
-    /// 连续被判定为"迟到"的包数；超阈值说明其实是一次大跳变，强制重同步
-    late_streak: u8,
-    /// 是否已收到过第一个包；未收到时首包无条件作为基准
-    started: bool,
-    /// 当前生效的重排窗口（自适应，MIN_REORDER..=MAX_REORDER）
-    window: usize,
-    /// 迟到深度 EMA（帧数）：观测到的乱序/迟到幅度估计
-    jitter_depth: f32,
-    /// 最近一次迟到事件时间，用于抖动估计衰减
-    last_late: Option<std::time::Instant>,
-}
-
-impl ReorderBuffer {
-    pub fn new() -> Self {
-        const INIT: ReorderSlot = ReorderSlot {
-            seq: 0, sample_rate: 0, len: 0,
-            data: [0u8; MAX_PAYLOAD], valid: false,
-        };
-        Self {
-            buf: [INIT; MAX_REORDER], write: 0, next_seq: 0,
-            late_streak: 0, started: false,
-            window: MIN_REORDER, jitter_depth: 0.0, last_late: None,
-        }
-    }
-
-    /// 记录一次乱序/迟到事件，EMA 更新抖动深度并重算窗口。
-    ///
-    /// NetEQ 思路的简化版：按观测到的乱序幅度动态扩缩重排窗口——
-    /// 抖动大时扩窗吸收（把"迟到"变"等待"，避免真包被判死），
-    /// 网络干净时窗口收敛到 MIN_REORDER（低延迟优先）。
-    fn note_jitter(&mut self, depth_frames: u32) {
-        let now = std::time::Instant::now();
-        if let Some(t) = self.last_late {
-            if now.duration_since(t).as_secs() >= JITTER_DECAY_SECS {
-                self.jitter_depth *= 0.5;
-            }
-        }
-        // 深度截断到 MAX_LATE：超过部分是丢包而非乱序，不应撑大窗口
-        let depth = depth_frames.min(MAX_LATE as u32) as f32;
-        self.jitter_depth = self.jitter_depth * 0.7 + depth * 0.3;
-        self.last_late = Some(now);
-        self.window = ((self.jitter_depth * 1.5) as usize + MIN_REORDER)
-            .clamp(MIN_REORDER, MAX_REORDER);
-    }
-
-    pub fn insert_and_drain<F>(&mut self, seq: u8, sample_rate: u8, payload: &[u8], mut f: F)
-    where F: FnMut(u8, &[u8], u32),
-    {
-        // 首包作为基准，避免发送端从 seq=1 起步时首帧被误判为乱序
-        if !self.started {
-            self.started = true;
-            self.clear();
-            self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload, 0);
-            return;
-        }
-
-        // dist = seq 相对 next_seq 的"向前"距离（u8 回绕，天然支持序号翻转）
-        let dist = seq.wrapping_sub(self.next_seq);
-
-        // ── 迟到 / 重复包：dist 落在 [256-MAX_LATE, 255] ──
-        // 必须与"向前跳变"区分开，否则一个重复包就会清空缓冲并把序号倒回去。
-        if dist >= 0u8.wrapping_sub(MAX_LATE) {
-            // 迟到深度 = 它落后 next_seq 的帧数——这是窗口不够大的直接证据
-            self.note_jitter(MAX_LATE as u32 - (dist - 0u8.wrapping_sub(MAX_LATE)) as u32);
-            self.late_streak = self.late_streak.saturating_add(1);
-            // 连续迟到过多 → 实际是发送端大跨度跳变（丢包/重启），强制重同步
-            if self.late_streak < MAX_LATE.saturating_mul(4) {
-                return;
-            }
-            self.late_streak = 0;
-            self.clear();
-            self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload, 0);
-            return;
-        }
-        self.late_streak = 0;
-
-        if dist == 0 {
-            f(sample_rate, payload, 0);
-            self.next_seq = self.next_seq.wrapping_add(1);
-        } else if (dist as usize) < self.window {
-            // 窗口内乱序：先入槽，等 expected 到达后统一排空
-            let len = payload.len().min(MAX_PAYLOAD);
-            self.buf[self.write].seq = seq;
-            self.buf[self.write].sample_rate = sample_rate;
-            self.buf[self.write].len = len;
-            self.buf[self.write].data[..len].copy_from_slice(&payload[..len]);
-            self.buf[self.write].valid = true;
-            self.write = (self.write + 1) % MAX_REORDER;
-        } else {
-            // 真正的跳变（丢包 / 发送端重启 / 长时间静默后恢复）：重置并立即输出
-            // dist 个包被确切丢弃——交给回调做精确 PLC（丢包隐藏）
-            // 同时把跳变幅度喂给抖动估计（限幅：丢包不应无限撑大窗口）
-            self.note_jitter(dist as u32);
-            self.clear();
-            self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload, dist as u32);
-            return;
-        }
-
-        loop {
-            let mut found = false;
-            for i in 0..MAX_REORDER {
-                if self.buf[i].valid && self.buf[i].seq == self.next_seq {
-                    f(self.buf[i].sample_rate, &self.buf[i].data[..self.buf[i].len], 0);
-                    self.buf[i].valid = false;
-                    self.next_seq = self.next_seq.wrapping_add(1);
-                    found = true;
-                    break;
-                }
-            }
-            if !found { break; }
-        }
-    }
-
-    fn clear(&mut self) {
-        for slot in self.buf.iter_mut() { slot.valid = false; }
-        self.write = 0;
-    }
-
-    pub fn reset(&mut self) {
-        self.clear();
-        self.next_seq = 0;
-        self.late_streak = 0;
-        self.started = false;
-    }
-}
-
-impl Default for ReorderBuffer {
-    fn default() -> Self { Self::new() }
 }
 
 // ═══════════════════════ 测试 ═══════════════════════
@@ -425,260 +462,267 @@ impl Default for ReorderBuffer {
 mod tests {
     use super::*;
 
+    const DEV: [u8; DEVICE_ID_SIZE] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+
     #[test]
-    fn test_encode_decode_audio_roundtrip() {
-        let dev_id = generate_device_id();
-        let header = PacketHeader {
-            is_audio: true,
-            msg_type: TYPE_DATA,
-            sample_rate: SAMPLE_RATE_48K,
-            seq_num: 42,
-            payload_len: 320,
-            bitrate: 32,
-            device_id: dev_id,
-            ..Default::default()
+    fn header_matches_spec_vector_b4() {
+        // 附录 B.4：版本=0x03，type=1，payload_len=15
+        let hdr = ControlHeader::new(TYPE_CONNECT, 15, DEV);
+        let mut buf = [0u8; CONTROL_HEADER_SIZE];
+        hdr.encode(&mut buf);
+        assert_eq!(
+            buf,
+            [0x03, 0x00, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        );
+        let back = ControlHeader::decode(&buf).unwrap();
+        assert_eq!(back.msg_type, TYPE_CONNECT);
+        assert_eq!(back.payload_len, 15);
+        assert_eq!(back.device_id, DEV);
+    }
+
+    #[test]
+    fn connect_payload_matches_spec_vector_b5() {
+        let p = ConnectPayload {
+            reverse_port: 50000,
+            forward_ssrc: 0x1122_3344,
+            payload_type: 111,
+            frame_ms: 10,
+            complexity: 3,
+            signal: 1,
+            bandwidth: 4,
+            opus_flags: OPUS_FLAG_VBR | OPUS_FLAG_DTX,
+            bitrate_kbps: 0,
+            packet_loss: 5,
         };
-        let mut buf = [0u8; HEADER_SIZE];
-        encode_header(&header, &mut buf);
-        let decoded = decode_header(&buf).unwrap();
-        assert_eq!(decoded.is_audio, true);
-        assert_eq!(decoded.msg_type, TYPE_DATA);
-        assert_eq!(decoded.sample_rate, SAMPLE_RATE_48K);
-        assert_eq!(decoded.seq_num, 42);
-        assert_eq!(decoded.payload_len, 320);
-        assert_eq!(decoded.bitrate, 32);
-        assert_eq!(decoded.device_id, dev_id);
+        assert_eq!(
+            p.encode(),
+            [0xC3, 0x50, 0x11, 0x22, 0x33, 0x44, 0x6F, 0x0A, 0x03, 0x01, 0x04, 0x03, 0x00, 0x00, 0x05]
+        );
+        assert_eq!(ConnectPayload::decode(&p.encode()), Some(p));
+        assert!(p.validate().is_ok());
+        assert!(p.vbr() && p.dtx() && !p.fec() && !p.vbr_constraint());
     }
 
     #[test]
-    fn test_encode_decode_connect() {
-        let dev_id = [0xAA; DEVICE_ID_SIZE];
-        let header = PacketHeader {
-            is_audio: false,
-            msg_type: TYPE_CONNECT,
-            device_id: dev_id,
-            ..Default::default()
+    fn connect_ack_matches_spec_vector_b6() {
+        let a = ConnectAckPayload { reverse_ssrc: 0xAABB_CCDD, payload_type: 111, frame_ms: 10 };
+        assert_eq!(a.encode(), [0xAA, 0xBB, 0xCC, 0xDD, 0x6F, 0x0A]);
+        assert_eq!(ConnectAckPayload::decode(&a.encode()), Some(a));
+    }
+
+    #[test]
+    fn connect_full_packet_bytes() {
+        let p = ConnectPayload {
+            reverse_port: 50000,
+            forward_ssrc: 0x1122_3344,
+            complexity: 3,
+            signal: 1,
+            bandwidth: 4,
+            opus_flags: OPUS_FLAG_VBR | OPUS_FLAG_DTX,
+            packet_loss: 5,
+            ..ConnectPayload::default()
         };
-        let mut buf = [0u8; HEADER_SIZE];
-        encode_header(&header, &mut buf);
-        let decoded = decode_header(&buf).unwrap();
-        assert_eq!(decoded.is_audio, false);
-        assert_eq!(decoded.msg_type, TYPE_CONNECT);
-        assert_eq!(decoded.device_id, dev_id);
+        let pkt = build_control(TYPE_CONNECT, &DEV, &p.encode());
+        assert_eq!(pkt.len(), CONTROL_HEADER_SIZE + CONNECT_PAYLOAD_SIZE);
+        assert_eq!(
+            pkt,
+            [
+                0x03, 0x00, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+                0xEF, 0xC3, 0x50, 0x11, 0x22, 0x33, 0x44, 0x6F, 0x0A, 0x03, 0x01, 0x04, 0x03, 0x00,
+                0x00, 0x05
+            ]
+        );
+        let hdr = ControlHeader::decode(&pkt).unwrap();
+        assert_eq!(hdr.msg_type, TYPE_CONNECT);
+        assert_eq!(&pkt[CONTROL_HEADER_SIZE..], &p.encode()[..]);
     }
 
     #[test]
-    fn test_reject_unknown_version() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = 0x03; // unknown version
-        assert!(decode_header(&buf).is_none());
+    fn discover_reply_matches_spec_vector() {
+        let r = DiscoverReply { listen_port: DEFAULT_LISTEN_PORT, device_name: "UDP2CAL".into() };
+        let mut pkt = build_control(TYPE_DISCOVER_REPLY, &DEV, &r.encode());
+        assert_eq!(
+            pkt,
+            [
+                0x03, 0x00, 0x03, 0x00, 0x09, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+                0xEF, 0xAC, 0x0C, 0x55, 0x44, 0x50, 0x32, 0x43, 0x41, 0x4C
+            ]
+        );
+        let hdr = ControlHeader::decode(&pkt).unwrap();
+        assert_eq!(hdr.msg_type, TYPE_DISCOVER_REPLY);
+        let reply = DiscoverReply::decode(&pkt[CONTROL_HEADER_SIZE..]).unwrap();
+        assert_eq!(reply.listen_port, 44044);
+        assert_eq!(reply.device_name, "UDP2CAL");
+        pkt.clear();
+        assert!(pkt.is_empty());
     }
 
     #[test]
-    fn test_reject_invalid_msg_type() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = PROTO_VERSION;
-        buf[2] = 0xFF; // invalid msg type
-        assert!(decode_header(&buf).is_none());
+    fn discover_reply_rejects_short_payload() {
+        assert!(DiscoverReply::decode(&[0xAC]).is_none());
+        assert!(DiscoverReply::decode(&[]).is_none());
     }
 
     #[test]
-    fn test_reject_invalid_sr() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = PROTO_VERSION;
-        buf[2] = TYPE_DATA;
-        buf[1] = 0x1F; // sr=15 (invalid)
-        assert!(decode_header(&buf).is_none());
+    fn truncate_utf8_never_splits_char() {
+        // "电" 占 3 字节，max=4 时只能保留 1 个完整字符
+        let s = "电音";
+        assert_eq!(truncate_utf8(s, 4), "电");
+        assert_eq!(truncate_utf8(s, 3), "电");
+        assert_eq!(truncate_utf8(s, 2), "");
+        assert_eq!(truncate_utf8("abc", 2), "ab");
+        // 设备名上限截断后不得出现非法 UTF-8
+        let long = "电".repeat(200);
+        let enc = DiscoverReply { listen_port: 1, device_name: long }.encode();
+        assert!(enc.len() <= 2 + DEVICE_NAME_MAX);
+        assert!(std::str::from_utf8(&enc[2..]).is_ok());
     }
 
     #[test]
-    fn test_reject_oversized_payload() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = PROTO_VERSION;
-        buf[2] = TYPE_DATA;
-        buf[3] = 0x06;
-        buf[4] = 0x00; // len=1536 > MAX_PAYLOAD
-        assert!(decode_header(&buf).is_none());
+    fn rejects_bad_control_header() {
+        // 版本错误
+        let mut pkt = build_control(TYPE_CONNECT, &DEV, &ConnectPayload::default().encode());
+        pkt[0] = 0x02;
+        assert!(ControlHeader::decode(&pkt).is_none());
+
+        // 长度与 payload_len 不一致（少一字节）
+        let pkt = build_control(TYPE_CONNECT, &DEV, &ConnectPayload::default().encode());
+        assert!(parse_control(&pkt[..pkt.len() - 1]).is_none());
+        // 尾部多一字节同样拒绝
+        let mut longer = pkt.clone();
+        longer.push(0);
+        assert!(parse_control(&longer).is_none());
+
+        // 负载超限
+        let big = vec![0u8; CONTROL_MAX_PAYLOAD + 1];
+        let mut pkt = build_control(TYPE_CONNECT, &DEV, &[]);
+        pkt[3] = 0x02;
+        pkt[4] = 0x01; // 513
+        pkt.extend_from_slice(&big);
+        assert!(ControlHeader::decode(&pkt).is_none());
+
+        // 负载上限边界 512 合法
+        let pkt = build_control(TYPE_CONNECT, &DEV, &vec![0u8; CONTROL_MAX_PAYLOAD]);
+        assert_eq!(ControlHeader::decode(&pkt).unwrap().payload_len, 512);
     }
 
     #[test]
-    fn test_build_audio_packet() {
-        let dev_id = generate_device_id();
-        let payload = vec![0xABu8; 100];
-        let packet = build_packet(true, TYPE_DATA, SAMPLE_RATE_48K, 5, &dev_id, &payload, 32);
-        assert_eq!(packet.len(), HEADER_SIZE + 100);
-        let hdr: [u8; HEADER_SIZE] = packet[..HEADER_SIZE].try_into().unwrap();
-        let decoded = decode_header(&hdr).unwrap();
-        assert_eq!(decoded.msg_type, TYPE_DATA);
-        assert_eq!(decoded.sample_rate, SAMPLE_RATE_48K);
-        assert_eq!(decoded.seq_num, 5);
-        assert_eq!(decoded.payload_len, 100);
-        assert_eq!(decoded.bitrate, 32);
-        assert_eq!(decoded.device_id, dev_id);
+    fn msg_type_zero_is_deprecated() {
+        let pkt = build_control(TYPE_DATA, &DEV, &[]);
+        let hdr = ControlHeader::decode(&pkt).unwrap();
+        assert_eq!(hdr.msg_type, 0);
+        assert!(!hdr.is_known_type());
+        // 5..=255 也不属于已知类型（应忽略而非报错）
+        let pkt = build_control(5, &DEV, &[]);
+        assert!(!ControlHeader::decode(&pkt).unwrap().is_known_type());
+        let pkt = build_control(255, &DEV, &[]);
+        assert!(!ControlHeader::decode(&pkt).unwrap().is_known_type());
     }
 
     #[test]
-    fn test_build_control_packet() {
-        let dev_id = [0xBB; DEVICE_ID_SIZE];
-        let packet = build_packet(false, TYPE_CONNECT, 0, 0, &dev_id, &[], 0);
-        assert_eq!(packet.len(), HEADER_SIZE);
-        let hdr: [u8; HEADER_SIZE] = packet[..HEADER_SIZE].try_into().unwrap();
-        let decoded = decode_header(&hdr).unwrap();
-        assert_eq!(decoded.msg_type, TYPE_CONNECT);
-        assert_eq!(decoded.device_id, dev_id);
+    fn connect_rejects_bad_params() {
+        let mut p = ConnectPayload::default();
+        assert!(p.validate().is_ok());
+
+        p.payload_type = 110;
+        assert!(p.validate().is_err());
+
+        let mut p = ConnectPayload::default();
+        p.frame_ms = 20;
+        assert!(p.validate().is_err());
+
+        let mut p = ConnectPayload::default();
+        p.forward_ssrc = 0;
+        assert!(p.validate().is_err());
+
+        // 负载长度必须恰好 15
+        assert!(ConnectPayload::decode(&[0u8; 14]).is_none());
+        assert!(ConnectPayload::decode(&[0u8; 16]).is_none());
     }
 
     #[test]
-    fn test_build_packet_to_buffer() {
-        let dev_id = [0xCC; DEVICE_ID_SIZE];
-        let payload = [0x01, 0x02, 0x03, 0x04];
-        let mut buf = [0u8; 32];
-        let written = build_packet_to(&mut buf, 2, false, TYPE_DISCOVER_REPLY, 0, 0, &dev_id, &payload, 0).unwrap();
-        assert_eq!(written, HEADER_SIZE + 4);
-        assert_eq!(buf[2], PROTO_VERSION);
-        assert_eq!(buf[4], TYPE_DISCOVER_REPLY);
-        assert_eq!(&buf[9..17], &dev_id);
-        assert_eq!(&buf[17..21], &payload);
+    fn ack_rejects_bad_params() {
+        assert!(ConnectAckPayload::decode(&[0u8; 5]).is_none());
+        assert!(ConnectAckPayload::decode(&[0u8; 7]).is_none());
+        let mut raw = ConnectAckPayload::default().encode();
+        raw[4] = 0; // PT 错误
+        assert!(ConnectAckPayload::decode(&raw).is_none());
+        let mut raw = ConnectAckPayload::default().encode();
+        raw[5] = 20; // 帧长错误
+        assert!(ConnectAckPayload::decode(&raw).is_none());
     }
 
     #[test]
-    fn test_resolve_bitrate() {
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_48K), compute_bitrate_id(512));
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_24K), compute_bitrate_id(256));
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_16K), compute_bitrate_id(128));
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_12K), compute_bitrate_id(64));
-        assert_eq!(resolve_bitrate(0, SAMPLE_RATE_8K),  compute_bitrate_id(64));
-        assert_eq!(resolve_bitrate(64, SAMPLE_RATE_48K), 64);
+    fn bitrate_clamped_to_1000() {
+        assert_eq!(clamp_bitrate_kbps(0), 512);
+        assert_eq!(clamp_bitrate_kbps(512), 512);
+        assert_eq!(clamp_bitrate_kbps(960), 960);
+        assert_eq!(clamp_bitrate_kbps(1000), 1000);
+        assert_eq!(clamp_bitrate_kbps(1024), 1000);
+        assert_eq!(clamp_bitrate_kbps(65535), 1000);
+        let p = ConnectPayload { bitrate_kbps: 1024, ..ConnectPayload::default() };
+        assert_eq!(p.effective_bitrate_kbps(), 1000);
     }
 
     #[test]
-    fn test_compute_bitrate_id() {
-        assert_eq!(compute_bitrate_id(0), 0);
-        assert_eq!(compute_bitrate_id(64), 32);
-        assert_eq!(compute_bitrate_id(128), 64);
-        assert_eq!(compute_bitrate_id(256), 128);
-        assert_eq!(compute_bitrate_id(512), 255);
+    fn demux_classifies_by_first_byte() {
+        // RTP
+        let rtp = [0x80u8, 0xEF, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 1, 0xF8];
+        assert!(matches!(demux(&rtp), Datagram::Rtp(_)));
+
+        // 控制
+        let ctl = build_control(TYPE_CONNECT, &DEV, &ConnectPayload::default().encode());
+        assert!(matches!(demux(&ctl), Datagram::Control(_)));
+
+        // 保留位非零的 RTP（0x81 带填充）仍归为 RTP，由 rtp::parse 拒绝
+        let padded = [0x81u8, 0x6F, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0x00];
+        assert!(matches!(demux(&padded), Datagram::Rtp(_)));
+
+        // 其他首字节
+        assert!(matches!(demux(&[0x00; 20]), Datagram::Drop));
+        assert!(matches!(demux(&[0xC0; 20]), Datagram::Drop));
+        assert!(matches!(demux(&[]), Datagram::Drop));
+
+        // 控制包长度不足 15
+        assert!(matches!(demux(&[0x03; 14]), Datagram::Drop));
+        // RTP 长度不足 13（DTX 最小包为 13 字节，必须是 12+1）
+        assert!(matches!(demux(&[0x80; 12]), Datagram::Drop));
+        // RTP 超过 1287
+        let mut big = vec![0u8; crate::rtp::RTP_MAX_PACKET + 1];
+        big[0] = 0x80;
+        assert!(matches!(demux(&big), Datagram::Drop));
     }
 
     #[test]
-    fn test_generate_device_id_not_all_zero() {
+    fn build_control_to_zero_alloc() {
+        let mut buf = [0u8; 64];
+        let payload = ConnectPayload::default().encode();
+        let n = build_control_to(&mut buf, 3, TYPE_CONNECT, &DEV, &payload).unwrap();
+        assert_eq!(n, CONTROL_HEADER_SIZE + CONNECT_PAYLOAD_SIZE);
+        assert_eq!(buf[3], CONTROL_VERSION);
+        assert_eq!(buf[5], TYPE_CONNECT);
+        assert_eq!(&buf[10..18], &DEV);
+        assert_eq!(&buf[18..18 + payload.len()], &payload);
+
+        // 缓冲区不足
+        assert!(build_control_to(&mut buf, 60, TYPE_CONNECT, &DEV, &payload).is_none());
+        // 负载超限
+        assert!(build_control_to(&mut buf, 0, TYPE_CONNECT, &DEV, &vec![0u8; 513]).is_none());
+    }
+
+    #[test]
+    fn device_id_validity() {
         let id = generate_device_id();
-        assert!(id.iter().any(|&b| b != 0));
-        let id2 = generate_device_id();
-        assert!(id != id2);
-    }
-
-    // --- 重排缓冲区测试 ---
-
-    #[test]
-    fn test_reorder_in_order() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(0, 1, &[1], |sr, data, _| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(1, 1, &[2], |sr, data, _| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(2, 1, &[3], |sr, data, _| out.push((sr, data.to_vec())));
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0], (1, vec![1]));
-        assert_eq!(out[1], (1, vec![2]));
-        assert_eq!(out[2], (1, vec![3]));
+        assert!(is_valid_device_id(&id));
+        assert!(!is_valid_device_id(&[0u8; DEVICE_ID_SIZE]));
+        assert_ne!(generate_device_id(), id);
     }
 
     #[test]
-    fn test_reorder_out_of_order() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(0, 1, &[1], |sr, data, _| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(2, 1, &[3], |sr, data, _| out.push((sr, data.to_vec())));
-        assert_eq!(out.len(), 1); // 2 入槽等待 1
-        rb.insert_and_drain(1, 1, &[2], |sr, data, _| out.push((sr, data.to_vec())));
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0], (1, vec![1]));
-        assert_eq!(out[1], (1, vec![2]));
-        assert_eq!(out[2], (1, vec![3]));
-    }
-
-    #[test]
-    fn test_reorder_first_packet_is_baseline() {
-        // 发送端从 seq=1 起步时，首包必须被立即接受（不能等一个永远不会来的 seq=0）
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(1, 1, &[1], |_sr, d, _| out.push(d[0]));
-        rb.insert_and_drain(2, 1, &[2], |_sr, d, _| out.push(d[0]));
-        assert_eq!(out, vec![1, 2]);
-    }
-
-    #[test]
-    fn test_reorder_skip() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(8, 1, &[4], |sr, data, _| out.push((sr, data.to_vec())));
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0], (1, vec![4]));
-    }
-
-    #[test]
-    fn test_reorder_duplicate_is_dropped() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<u8> = Vec::new();
-        for (seq, tag) in [(0u8, 0u8), (1, 1), (1, 9), (2, 2)] {
-            rb.insert_and_drain(seq, 1, &[tag], |_sr, d, _| out.push(d[0]));
-        }
-        // 重复的 seq=1 必须被丢弃，只输出 0,1,2
-        assert_eq!(out, vec![0, 1, 2]);
-    }
-
-    #[test]
-    #[test]
-    fn test_adaptive_window_grows_after_jitter() {
-        // 一次跳变（丢 2 帧）后，窗口应自适应扩大：
-        // 后续乱序深度 2 的包应入槽等待而非再次重同步丢包
-        let mut rb = ReorderBuffer::new();
-        let mut out = Vec::new();
-        rb.insert_and_drain(0, 1, &[0], |_, d, _| out.push(d[0]));
-        // 跳变：1,2 丢失，3 到达（lost=2，窗口 2 → 3）
-        rb.insert_and_drain(3, 1, &[3], |_, d, l| out.push(d[0] + l as u8));
-        // 乱序深度 2（5 先于 4 到达）：旧窗口(2)下会触发重同步丢 4 帧
-        rb.insert_and_drain(5, 1, &[5], |_, d, _| out.push(d[0]));
-        rb.insert_and_drain(4, 1, &[4], |_, d, l| out.push(d[0] + l as u8));
-        // 期望：0 → 3(+2=5) → 4 → 排空 5，全程无额外丢失
-        assert_eq!(out, vec![0, 5, 4, 5]);
-    }
-
-    fn test_reorder_out_of_order_then_late() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(0, 1, &[0], |_sr, d, _| out.push(d[0]));
-        rb.insert_and_drain(2, 1, &[2], |_sr, d, _| out.push(d[0])); // 入槽等待
-        rb.insert_and_drain(1, 1, &[1], |_sr, d, _| out.push(d[0])); // 触发排空：1,2
-        rb.insert_and_drain(0, 1, &[9], |_sr, d, _| out.push(d[0])); // 迟到包 → 丢弃
-        rb.insert_and_drain(3, 1, &[3], |_sr, d, _| out.push(d[0]));
-        assert_eq!(out, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn test_reorder_big_forward_jump_resyncs() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(0, 1, &[0], |_sr, d, _| out.push(d[0]));
-        // 模拟长时间静默后恢复：序号大幅超前（200 包）
-        rb.insert_and_drain(200, 1, &[200], |_sr, d, _| out.push(d[0]));
-        rb.insert_and_drain(201, 1, &[201], |_sr, d, _| out.push(d[0]));
-        assert_eq!(out, vec![0, 200, 201]);
-    }
-
-    #[test]
-    fn test_reorder_late_streak_forces_resync() {
-        let mut rb = ReorderBuffer::new();
-        let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(100, 1, &[100], |_sr, d, _| out.push(d[0]));
-        rb.insert_and_drain(101, 1, &[101], |_sr, d, _| out.push(d[0]));
-        // next_seq = 102，seq=94 属于"落后 8"，单次应被丢弃
-        for _ in 0..31 {
-            rb.insert_and_drain(94, 1, &[94], |_sr, d, _| out.push(d[0]));
-        }
-        assert_eq!(out, vec![100, 101]);
-        // 连续迟到达到阈值 → 判定为发送端大跨度回退，强制重同步并输出
-        rb.insert_and_drain(94, 1, &[94], |_sr, d, _| out.push(d[0]));
-        assert_eq!(out, vec![100, 101, 94]);
+    fn header_is_not_ambiguous_with_short_rtp() {
+        // 13 字节的 DTX RTP 包不得被当成控制包（长度 <15 但首字节为 0x80）
+        let dtx = [0x80u8, 0x6F, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 1, 0x00];
+        assert_eq!(dtx.len(), 13);
+        assert!(matches!(demux(&dtx), Datagram::Rtp(_)));
     }
 }

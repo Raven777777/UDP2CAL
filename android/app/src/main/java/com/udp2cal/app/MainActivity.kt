@@ -259,7 +259,7 @@ fun OpusSettingsScreen(
     var dtx by remember { mutableStateOf(Prefs.opusDtx != 0) }
     var vbr by remember { mutableStateOf(Prefs.opusVbr != 0) }
     var bitrateAuto by remember { mutableStateOf(Prefs.opusBitrateKbps == 0) }
-    var manualBitrate by remember { mutableStateOf(if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else 128) }
+    var manualBitrate by remember { mutableStateOf(if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else 512) }
     var fec by remember { mutableStateOf(Prefs.opusFec != 0) }
     var packetLoss by remember { mutableStateOf(Prefs.opusPacketLoss.toFloat()) }
     var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint != 0) }
@@ -486,10 +486,20 @@ fun OpusSettingsScreen(
             }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676)))
         }
         if (!bitrateAuto) {
+            // v3 固定 10 ms 帧：1024 kbps 会产出 1280 字节负载，超过 Opus 1275 字节上限，
+            // 因此手动档位只有 512 / 768 / 960 / 1000
             Text("手动码率: ${manualBitrate}kbps", fontSize = 13.sp, color = Color(0xFFB0B0B0))
-            Slider(value = manualBitrate.toFloat(), onValueChange = {
-                manualBitrate = it.toInt(); Prefs.opusBitrateKbps = it.toInt()
-            }, valueRange = 32f..512f, steps = 14, modifier = Modifier.fillMaxWidth())
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(512, 768, 960, 1000).forEach { kbps ->
+                    FilterChip(
+                        selected = manualBitrate == kbps,
+                        onClick = { manualBitrate = kbps; Prefs.opusBitrateKbps = kbps },
+                        label = { Text("$kbps") }
+                    )
+                }
+            }
+            Text("1000 kbps ≈ 1250 字节/帧，接近 1275 字节上限；1024 kbps 已禁止",
+                fontSize = 11.sp, color = Color(0xFF888888))
         }
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
@@ -579,7 +589,7 @@ fun OpusSettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
-                Text("v1.1.2", fontSize = 13.sp, color = Color(0xFF888888))
+                Text("v1.2.0", fontSize = 13.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(4.dp))
                 Text("作者：四折光曲 & 井水玉藻", fontSize = 14.sp, color = Color(0xFFCCCCCC))
                 Text("本程序为自由软件，以 GPL v3 许可证发布", fontSize = 12.sp, color = Color(0xFF666666))
