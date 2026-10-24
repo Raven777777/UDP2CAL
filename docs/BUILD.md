@@ -61,6 +61,18 @@ build.bat android --modern --abi armeabi-v7a --release
 
 `--modern` 为默认且唯一目标（`android/`）。
 
+### Opus 源码共用（Windows / Android 同源）
+
+两端均从仓库根目录的 `opus-src/`（Opus 1.6.1）构建 libopus，不再使用 `audiopus_sys` crate 内置的 Opus 1.3.1：
+
+- **Android**：`android/app/src/main/cpp/CMakeLists.txt` 通过 `add_subdirectory(../../../../../opus-src)` 直接构建；OSCE / DRED / QEXT 等 ML 增强特性保持默认关闭。
+- **Windows**：`windows/Cargo.toml` 的 `[patch.crates-io]` 将 `audiopus_sys` 重定向到 `vendor/audiopus_sys` 副本（**该目录必须入库**，patch 依赖本地路径）。其 build.rs 解析 Opus 源码的优先级：
+  1. `OPUS_SOURCE_DIR` 环境变量（显式覆盖）
+  2. `<repo>/opus-src`（默认，自动解析，日常构建无需任何设置）
+  3. `./opus`（上游兜底，本副本中不存在）
+- Windows 端 CMake 构建配置**强制 Release**：dev profile 下 CMake 默认 Debug（/MDd 调试 CRT），Opus 1.6.x 会引入 `__imp__CrtDbgReportW` 等调试 CRT 符号，与 rustc 链接的 /MD 发行版 CRT 不兼容，导致 `LNK2001/LNK1120` 链接失败。
+- `audiopus` 0.3.0-rc.0 的预生成绑定兼容 1.6.1 的 C ABI；1.6 新增 API（DRED 等）未暴露，且本项目不使用。
+
 ### 环境体检 / ADB 调试
 
 ```bat

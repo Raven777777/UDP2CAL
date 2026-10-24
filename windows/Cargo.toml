@@ -40,3 +40,7 @@ winreg = "0.52"
 audiopus = "0.3.0-rc.0"
 tray-icon = "0.24.0"
 image = "0.24"
+
+# 共用仓库根目录的 opus-src 树（Android/Windows 同源），替代 crate 内置的 Opus 1.3.1
+[patch.crates-io]
+audiopus_sys = { path = "../vendor/audiopus_sys" }
