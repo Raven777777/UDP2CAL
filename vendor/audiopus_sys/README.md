@@ -1,81 +1,22 @@
-[![ci-badge][]][ci] [![docs-badge][]][docs] [![rust version badge]][rust version link] [![crates.io version]][crates.io link]
+# audiopus_sys（vendor 副本）
 
-# About
+`audiopus_sys` 0.2.2 的本地副本，基于 crates.io 发布版修改，通过 `windows/Cargo.toml` 的
+`[patch.crates-io]` 引用，**不要同步上游覆盖本目录**。
 
-`audiopus_sys` is an FFI-Rust-binding to [`Opus`] version 1.3.
+## 本地修改
 
-Orginally, this sys-crate was made to empower the [`serenity`]-crate to build audio features on Windows, Linux, and Mac. However, it's not limited to that.
+仅改 `build.rs`，两点：
 
-Everyone is welcome to contribute,
-check out the [`CONTRIBUTING.md`](CONTRIBUTING.md) for further guidance.
+1. **Opus 源码解析**（`opus_source_path()`）：优先 `OPUS_SOURCE_DIR` 环境变量，
+   默认回落到仓库根的共享源码树 `../../opus-src`（Opus 1.6.1），
+   最后才是上游兜底 `./opus`（本副本不含内置源码，该路径不存在）。
+2. **CMake 构建配置**：
+   - 强制 `CMAKE_BUILD_TYPE=Release`——dev profile 下默认 Debug（/MDd）会引入
+     `__imp__CrtDbgReportW` 等调试 CRT 符号，与 rustc 链接的 /MD 不兼容（LNK2001）
+   - `OPUS_DEEP_PLC=ON` + `OPUS_DRED=ON`（ML 特性，Android 端 CMake 同步开启；
+     OSCE / QEXT 保持关闭）
 
-# Building
+上游的 `opus/` 内置源码目录未随本副本入库，因此不设置任何来源时构建会 panic
+（`canonicalize().expect`），这是预期行为：请使用默认的 `opus-src` 回落。
 
-## Requirements
-If you want to build Opus, you will need `cmake`.
-
-If you have `pkg-config`, it will attempt to use that before building.
-
-You can also link a pre-installed Opus, see [**Pre-installed Opus**](#Pre-installed-Opus)
-below.
-
-This crate provides a pre-built binding. In case you want to generate the
-binding yourself, you will need [`Clang`](https://rust-lang.github.io/rust-bindgen/requirements.html#clang),
-see [**Pre-installed Opus**](#Generating-The-Binding) below for further
-instructions.
-
-## Linking
-`audiopus_sys` links to Opus 1.3 and supports Windows, Linux, and MacOS
-By default, we statically link to Windows, MacOS, and if you use the
-`musl`-environment. We will link dynamically for Linux except when using
-mentioned `musl`.
-
-This can be altered by compiling with the `static` or `dynamic` feature having
-effects respective to their names. If both features are enabled,
-we will pick your system's default.
-
-Environment variables named `LIBOPUS_STATIC` or `OPUS_STATIC` will take
-precedence over features thus overriding the behaviour. The value of these
-environment variables have no influence of the result: If one of them is set,
-statically linking will be picked.
-
-## Pkg-Config
-By default, `audiopus_sys` will use `pkg-config` on Unix or GNU.
-Setting the environment variable `LIBOPUS_NO_PKG` or `OPUS_NO_PKG` will bypass
-probing for Opus via `pkg-config`.
-
-## Pre-installed Opus
-If you have Opus pre-installed, you can set `LIBOPUS_LIB_DIR` or
-`OPUS_LIB_DIR` to the directory containing Opus.
-
-Be aware that using an Opus other than version 1.3 may not work.
-
-# Generating The Binding
-If you want to generate the binding yourself, you can use the
-`generate_binding`-feature.
-
-Be aware, `bindgen` requires Clang and its `LIBCLANG_PATH`
-environment variable to be specified.
-
-# Installation
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-audiopus_sys = "0.2"
-```
-[`serenity`]: https://crates.io/crates/serenity
-
-[`Opus`]: https://www.opus-codec.org/
-
-[ci-badge]: https://img.shields.io/github/workflow/status/Lakelezz/audiopus_sys/CI?style=flat-square
-[ci]: https://github.com/Lakelezz/audiopus_sys/actions
-
-[docs-badge]: https://img.shields.io/badge/docs-online-5023dd.svg?style=flat-square&colorB=32b6b7
-[docs]: https://docs.rs/audiopus_sys
-
-[rust version badge]: https://img.shields.io/badge/rust-1.51+-93450a.svg?style=flat-square&colorB=ff9a0d
-[rust version link]: https://blog.rust-lang.org/2021/03/25/Rust-1.51.0.html
-
-[crates.io link]: https://crates.io/crates/audiopus_sys
-[crates.io version]: https://img.shields.io/crates/v/audiopus_sys.svg?style=flat-square&colorB=b73732
+其余源码（`src/lib.rs` 预生成 FFI 绑定）与上游一致。许可证见 [LICENSE.md](LICENSE.md)（ISC）。

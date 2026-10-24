@@ -79,7 +79,7 @@ build.bat android --modern --abi armeabi-v7a --release
 
 | 特性 | 生效位置 | 运行时条件 | 说明 |
 |------|---------|-----------|------|
-| 经典 PLC | 解码端 | 自动 | Windows 接收端由 `decoder.rs::conceal()` 驱动：音频流停滞超过 2 帧且不足 2 秒时，按缺口帧数请求补偿（单次上限 5 帧，发送端 DTX / 断流不会无限补偿） |
+| 经典 PLC | 解码端 | 自动 | Windows 接收端由 `decoder.rs::conceal()` 驱动：音频流停滞超过 2 帧且不足 2 秒时，按缺口帧数请求补偿（单次上限 5 帧，发送端 DTX / 断流不会无限补偿）。Android 反向接收端（PC→手机）由 `CaptureService` 的 socket 超时分支驱动，策略一致（20ms 帧，`opus_jni_decoder.c` 新增 `decoderPlc`） |
 | Deep PLC | 解码端 | 解码复杂度 ≥ 5 | Windows 端在 `OpusDecoder::new()` 对全部 5 个采样率解码器设置；Android 端在 `opus_jni_decoder.c` 创建时设置 |
 | DRED | 编码端→解码端 | FEC 开启时激活 | 编码器附带最长 500 ms（50×10ms 帧）深度冗余，码流 +12~32 kb/s；Windows 反向编码器与 Android 编码器均跟随 FEC 开关（`fec ? 50 : 0`）。1.5 与 1.6 的 DRED 互不兼容，两端同为 1.6.1 无此问题 |
 

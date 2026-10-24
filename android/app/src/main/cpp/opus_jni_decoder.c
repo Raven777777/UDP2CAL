@@ -100,6 +100,42 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecode(
     return nb_samples * state->channels;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_udp2cal_app_native_OpusDecodeNative_decoderPlc(
+    JNIEnv* env, jclass clazz, jlong handle,
+    jshortArray pcmOut, jint pcmOffset) {
+
+    if (handle == 0 || pcmOut == NULL) return -1;
+    DecoderState* state = (DecoderState*)(uintptr_t)handle;
+
+    jsize pcm_len = (*env)->GetArrayLength(env, pcmOut);
+    if (pcmOffset < 0 || pcmOffset > pcm_len - state->frame_size * state->channels) {
+        __android_log_print(ANDROID_LOG_ERROR, TAG,
+            "plc: pcm buffer too small off=%d need=%d size=%d",
+            pcmOffset, state->frame_size * state->channels, pcm_len);
+        return -1;
+    }
+
+    jshort* pcm = (*env)->GetShortArrayElements(env, pcmOut, NULL);
+    if (pcm == NULL) return -1;
+
+    // data=NULL + length=0 → 丢包隐藏（PLC）。
+    // 库以 OPUS_DEEP_PLC 构建且解码复杂度 >=5 时为神经网络补偿，否则经典 PLC。
+    int nb_samples = opus_decode(
+        state->decoder, NULL, 0,
+        (opus_int16*)(pcm + pcmOffset),
+        state->frame_size, 0
+    );
+
+    (*env)->ReleaseShortArrayElements(env, pcmOut, pcm, 0);
+
+    if (nb_samples < 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "plc error: %d", nb_samples);
+        return -1;
+    }
+    return nb_samples * state->channels;
+}
+
 JNIEXPORT void JNICALL
 Java_com_udp2cal_app_native_OpusDecodeNative_decoderDestroy(
     JNIEnv* env, jclass clazz, jlong handle) {

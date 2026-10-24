@@ -55,6 +55,18 @@ class OpusDecoder(val sampleRateHz: Int = 48000, val channels: Int = 2) {
         return OpusDecodeNative.decoderDecode(h, data, offset, length, pcmOut, 0)
     }
 
+    /**
+     * 丢包隐藏（PLC）：请求一帧补偿，写入 pcmOut。
+     * Deep PLC 生效条件：库 OPUS_DEEP_PLC 构建（CMakeLists 已开启）+ 解码复杂度 >=5。
+     * @return 补偿出的总采样数，或 -1
+     */
+    @Synchronized
+    fun plc(pcmOut: ShortArray): Int {
+        val h = handle
+        if (h == 0L) return -1
+        return OpusDecodeNative.decoderPlc(h, pcmOut, 0)
+    }
+
     @Synchronized
     fun stop() {
         val h = handle

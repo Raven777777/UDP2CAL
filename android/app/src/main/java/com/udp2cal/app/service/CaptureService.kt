@@ -697,6 +697,15 @@ class CaptureService : Service() {
             var lastReport = System.currentTimeMillis()
             var bandwidthLabel = ""
 
+            // ── PLC（丢包隐藏）参数：与 Windows 端 decoder/main 同策略 ──
+            // 反向解码器为 20ms 帧（opus_jni_decoder.c）；缺口 >2 帧且 <2s 时补偿，
+            // 单次上限 5 帧；断流 3s 由下方状态同步收尾
+            val REVERSE_FRAME_MS = 20L
+            val PLC_POLL_TIMEOUT_MS = 40
+            val PLC_GAP_MS = 40L
+            val PLC_MAX_GAP_MS = 2000L
+            val PLC_MAX_FRAMES = 5
+
             // 重排 + 去重：与 Rust 端 ReorderBuffer 同语义。
             // 此前反向流完全没有序号处理：乱序包会被直接解码成噪音，重复包会播两遍。
             val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length ->
@@ -721,7 +730,9 @@ class CaptureService : Service() {
 
             while (isActive) {
                 try {
-                    revSock.soTimeout = 1000
+                    // 超时窗口取帧级的 2 倍（反向解码器为 20ms 帧）：既要让 PLC 及时
+                    // 发现缺口，又不至于空闲时高频唤醒；断流检测由下方 3s 逻辑负责
+                    revSock.soTimeout = PLC_POLL_TIMEOUT_MS
                     pkt.length = recvBuf.size
                     revSock.receive(pkt)
                     val len = pkt.length
@@ -750,6 +761,21 @@ class CaptureService : Service() {
                         lastReport = now
                     }
                 } catch (_: java.net.SocketTimeoutException) {
+                    // 丢包补偿（PLC）：活跃流出现帧缺口时逐帧请求补偿。
+                    // Deep PLC 生效条件：库 OPUS_DEEP_PLC 构建 + 解码复杂度>=5（decoderCreate 已设）。
+                    // 单次上限 5 帧，避免断流时无限补偿；补偿后刷新计时，缺口持续 >2s 停止，
+                    // 交给下方 3s 断流检测收尾。
+                    if (hasAudio) {
+                        val gapMs = System.currentTimeMillis() - lastAudioTime
+                        if (gapMs > PLC_GAP_MS && gapMs < PLC_MAX_GAP_MS) {
+                            val frames = (gapMs / REVERSE_FRAME_MS).toInt().coerceIn(1, PLC_MAX_FRAMES)
+                            repeat(frames) {
+                                val ns = dec.plc(pcmBuf)
+                                if (ns > 0) player.write(pcmBuf, 0, ns)
+                            }
+                            lastAudioTime = System.currentTimeMillis()
+                        }
+                    }
                     // 3 秒无反向音频 → 同步断开状态
                     if (hasAudio && System.currentTimeMillis() - lastAudioTime > 3000) {
                         hasAudio = false

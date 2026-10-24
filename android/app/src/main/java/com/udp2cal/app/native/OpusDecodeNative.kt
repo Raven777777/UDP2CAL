@@ -17,6 +17,13 @@ object OpusDecodeNative {
         pcmOut: ShortArray, pcmOffset: Int
     ): Int
 
+    /**
+     * 丢包隐藏（PLC）：请求一帧补偿。
+     * 库以 OPUS_DEEP_PLC 构建且解码复杂度 >=5 时为神经网络补偿，否则经典 PLC。
+     * @return 补偿出的采样数，或 -1 失败
+     */
+    external fun decoderPlc(handle: Long, pcmOut: ShortArray, pcmOffset: Int): Int
+
     /** 销毁解码器 */
     external fun decoderDestroy(handle: Long)
 }
