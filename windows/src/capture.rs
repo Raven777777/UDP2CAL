@@ -81,8 +81,11 @@ pub fn update_reverse_config(cfg: OpusReverseConfig) {
 }
 
 /// 自动码率（bitrate_kbps=0）在反向编码器上的映射值。
-/// 默认 Bitrate::Max（与 v1.1.1 一致）。诊断用：设置环境变量
-/// UDP2CAL_REVERSE_AUTO_BR=<kbps> 可把自动码率强制映射为具体值做 A/B 实验。
+/// 固定 1024 kbps（1280 B/10ms 帧，留 192B 余量于 1472 协议上限内）。
+/// 实测依据：600/700/1024 正常；2048（2560B/帧）超上限整帧丢弃→无声；
+/// Bitrate::Max 在真机上同样无声（原因未明，离线 1.6.1 复现不了，疑似
+/// 真机链路对码率/包型有额外约束），故不再使用 Max。
+/// 诊断用：设置环境变量 UDP2CAL_REVERSE_AUTO_BR=<kbps> 可覆盖此值。
 fn auto_bitrate() -> Bitrate {
     match std::env::var("UDP2CAL_REVERSE_AUTO_BR")
         .ok()
@@ -90,7 +93,7 @@ fn auto_bitrate() -> Bitrate {
         .filter(|v| *v > 0)
     {
         Some(kbps) => Bitrate::BitsPerSecond(kbps * 1000),
-        None => Bitrate::Max,
+        None => Bitrate::BitsPerSecond(1024 * 1000),
     }
 }
 
