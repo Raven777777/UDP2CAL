@@ -4,6 +4,37 @@
 
 ---
 
+## 未发布 — 2026-10-24 · Opus 同源 ML 特性与反向链路修复
+
+> 本轮围绕「Windows 端接入共享 opus-src 1.6.1」展开：启用 ML 特性（Deep PLC / DRED）、
+> 重写丢包隐藏为事件驱动、修复反向串流自动码率无声。
+
+**Opus 共享源码树（构建）**
+- Windows 端经 `[patch.crates-io]` 接入仓库根 `opus-src/`（1.6.1），替代 audiopus_sys 内置的 1.3.1，与 Android 完全同源
+- `vendor/audiopus_sys` 副本：build.rs 解析 `OPUS_SOURCE_DIR` → 默认回落 `../../opus-src`；CMake 强制 Release（dev profile 的 /MDd 调试 CRT 与 rustc /MD 不兼容，LNK2001）
+- 开启 `OPUS_DEEP_PLC` + `OPUS_DRED`（OSCE / QEXT 保持关闭），两端产物各增约 2 MB
+- `vendor/audiopus` 副本新增 `Decoder::set_complexity`（Opus 1.5 解码器接口）与 `Encoder::set_dred_duration`（请求码 4050，1.3.1 头文件所无）
+- vendor 目录瘦身：仅保留 `Cargo.toml` + `LICENSE` + `src/**`，自写 README 记录本地修改
+
+**丢包隐藏（PLC）——事件驱动**
+- `ReorderBuffer::insert_and_drain` 回调新增 `lost` 参数：大跳变重同步时携带确切丢包数，解码端先精确补偿再解码真包（Windows 与 Android Kotlin 端同步改造）
+- 计时器降级为整流停滞兜底（DTX/断流）：Windows 100ms / Android 80ms，远大于乱序窗口；修复计时器式 PLC 与乱序等待叠加导致的 `dropped` 持续增长（实测 ~145K/分钟）
+- Windows 接收端补 PLC：此前丢包直接静音；Android 反向接收端新增 `decoderPlc` JNI + 40ms 轮询
+- Deep PLC 运行时激活：Windows 全部 5 个解码器复杂度=5；Android 解码器创建时设 5
+- DRED：编码端跟随 FEC 开关（开启时 500ms 冗余，码流 +12~32 kb/s）；两端同为 1.6.1，互操作无兼容问题
+
+**反向串流自动码率无声（真机排查定版）**
+- 自动码率（bitrate_kbps=0）在 PC 反向编码器上的映射由 `Bitrate::Max` 改为**固定 1024 kbps VBR**（1280 B/10ms 帧，1472 上限内留余量）
+- 真机 A/B 实测：600/700/1024 正常，2048 与 Max 无声；Max 在离线环境无法复现（恒定 638B），疑似真机链路额外约束，工程上弃用
+- 自动码率下手机端强制 VBR 并关闭 VBR 约束（编码器/动态同步/keepalive flags 三处 + UI 灰显）
+- 新增 `UDP2CAL_REVERSE_AUTO_BR` 环境变量诊断覆盖口；反向链路 30s 诊断汇总（发包数/编码错误/超限丢弃/零长帧）
+- 回归测试 `windows/tests/reverse_max_bitrate.rs`：Max/2048k/1024k/960k 编码与手机端等效解码
+
+**docs**
+- FEATURES：自动码率/VBR/FEC 条目更新；LEGAL：audiopus/audiopus_sys 许可证修正为 ISC 并补 vendor 说明
+
+---
+
 ## 未发布 — 第二轮质量审查修复（24 项）
 
 > 详细根因与修复方式见 [BUGFIX.md](BUGFIX.md#2026-10-23--第二轮质量审查24-项)，完整报告见 [CODE_REVIEW_ROUND2_2026-10-23.md](archive/CODE_REVIEW_ROUND2_2026-10-23.md)。
