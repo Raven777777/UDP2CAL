@@ -24,6 +24,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 | ------------------ | --------------------------------------------------------------------------------- | --------------------------- |
 | `windows/`         | Windows 接收端（Rust + iced），WASAPI 播放 / Loopback 回传，系统托盘常驻                           | Windows 10+，需 VB-Cable 虚拟声卡 |
 | `android/`         | Android 客户端（Kotlin + Jetpack Compose），全参数 Opus 面板                                 | Android 10 (API 29)+        |
+| `opus-src/`        | libopus 1.6.1 源码树（Android JNI 与 Windows 共用的唯一副本，勿在其内部另存副本）                            | —                           |
 | `protocol/`        | UDP v2 协议编解码 crate（协议唯一真源）                                                        | —                           |
 
 ---

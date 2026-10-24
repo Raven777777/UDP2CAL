@@ -19,7 +19,8 @@ udp2cal/
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
 │     │  ├─ service/CaptureService.kt# 前台采集服务（生产-消费双协程 + ShortArrayPool）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
-│     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c + vendored libopus
+│     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c（JNI 封装）
+├─ opus-src/       # libopus 1.6.1 源码树（Android 与 Windows 共用的唯一副本）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
 │  │  ├─ main.rs       # 主循环与 iced UI、托盘、UDP 接收流、音频工作线程

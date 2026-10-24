@@ -26,7 +26,7 @@
 
 | 库/项目 | 许可证 | 用途 |
 |---------|--------|------|
-| [**libopus**](https://opus-codec.org/) (1.5.2) | BSD-3-Clause | Opus 音频编解码核心 |
+| [**libopus**](https://opus-codec.org/) (1.6.1) | BSD-3-Clause | Opus 音频编解码核心 |
 | [**iced**](https://iced.rs/) (0.14) | MIT | Windows 端 GUI 框架 |
 | [**tokio**](https://tokio.rs/) (1.40) | MIT | 异步 UDP 收发与超时控制 |
 | [**cpal**](https://github.com/RustAudio/cpal) (0.15) | MIT/Apache-2.0 | WASAPI 音频播放 |

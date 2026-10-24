@@ -39,6 +39,11 @@
 **仓库**
 - 修正 `.gitignore` 中失效的"构建产物"规则
 
+**构建 / 依赖**
+- libopus 源码树从 `android/app/src/main/cpp/opus-src` 迁至仓库根 `opus-src/`，作为 Android 与 Windows 共用的唯一副本
+- libopus 1.5.2 → 1.6.1：仅取 1.4–1.6 的缺陷修复与纯增量 API（新增 9 个 `*24` 接口），`OPUS_OSCE` / `OPUS_DRED` / QEXT 保持默认关闭
+- Android 原生库体积 +3.7%（arm64-v8a / MinSizeRel：1 514 304 → 1 569 744 B）
+
 ---
 
 ## v1.1.2 — 2026-10-23 · 移除旧版 Android 客户端兼容链
