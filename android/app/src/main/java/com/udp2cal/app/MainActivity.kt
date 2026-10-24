@@ -503,18 +503,22 @@ fun OpusSettingsScreen(
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column {
-                Text("VBR (动态码率)", fontSize = 14.sp, color = if (dtx) Color(0xFF666666) else Color.White)
-                if (dtx) Text("开启DTX时强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
+                Text("VBR (动态码率)", fontSize = 14.sp,
+                    color = if (dtx || bitrateAuto) Color(0xFF666666) else Color.White)
+                when {
+                    dtx -> Text("开启DTX时强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
+                    bitrateAuto -> Text("自动码率下强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
+                }
             }
             Switch(
-                checked = vbr,
+                checked = vbr || dtx || bitrateAuto,
                 onCheckedChange = { vbr = it; Prefs.opusVbr = if (it) 1 else 0 },
-                enabled = !dtx,
+                enabled = !dtx && !bitrateAuto,
                 colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676))
             )
         }
 
-        if (vbr) {
+        if ((vbr || dtx || bitrateAuto) && !bitrateAuto) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column {
                     Text("VBR 码率约束", fontSize = 14.sp, color = Color.White)

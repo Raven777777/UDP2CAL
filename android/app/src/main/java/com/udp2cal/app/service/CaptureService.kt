@@ -479,10 +479,15 @@ class CaptureService : Service() {
                                         1104 -> 3   // SUPERWIDEBAND
                                         else -> 4   // FULLBAND
                                     }
+                                    // 自动码率与 DTX 同规则：强制 VBR 并关闭 VBR 约束
+                                    // （flags 同步的是生效值，PC 反向编码器跟随）
+                                    val autoBr = Prefs.opusBitrateKbps <= 0
+                                    val effVbr = Prefs.opusVbr == 1 || Prefs.opusDtx == 1 || autoBr
+                                    val effVbrc = effVbr && !autoBr && Prefs.opusVbrConstraint == 1
                                     val opusFlags = (
-                                        (if (Prefs.opusVbr == 1) 1 else 0) shl 0
+                                        (if (effVbr) 1 else 0) shl 0
                                         or (if (Prefs.opusDtx == 1) 1 else 0) shl 1
-                                        or (if (Prefs.opusVbrConstraint == 1) 1 else 0) shl 2
+                                        or (if (effVbrc) 1 else 0) shl 2
                                         or (if (Prefs.opusFec > 0) 1 else 0) shl 3
                                     ).toByte()
                                     val br = Prefs.opusBitrateKbps
@@ -555,18 +560,20 @@ class CaptureService : Service() {
                             // ── Opus 编码参数动态同步（5Hz 足够，避免每帧读 9 个 SharedPreferences）──
                             if (nowMs - lastCfgSync >= 200) {
                                 lastCfgSync = nowMs
+                                val curAutoBr = Prefs.opusBitrateKbps <= 0
                                 val curCplx = Prefs.opusComplexity
                                 val curSig = Prefs.opusSignal
                                 val curBw = Prefs.opusBandwidth
                                 val curDtx = Prefs.opusDtx
-                                val curVbr = if (curDtx == 1) 1 else Prefs.opusVbr
+                                // 自动码率与 DTX 同规则：强制 VBR 并关闭 VBR 约束
+                                val curVbr = if (curDtx == 1 || curAutoBr) 1 else Prefs.opusVbr
                                 // 自动码率：48000→512k（OPUS 立体声协议上限），24000→256k，16000→128k
                                 val curBr = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else {
                                     when (sampleRateHz) { 48000 -> 512; 24000 -> 256; 16000 -> 128; else -> 64 }
                                 }
                                 val curFec = Prefs.opusFec
                                 val curPl = Prefs.opusPacketLoss
-                                val curVbrc = if (curVbr == 1) Prefs.opusVbrConstraint else 0
+                                val curVbrc = if (curVbr == 1 && !curAutoBr) Prefs.opusVbrConstraint else 0
                                 val curHash = java.util.Objects.hash(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc)
                                 if (curHash != lastOpusConfigHash) {
                                     if (encoder?.update(curCplx, curSig, curBw, curDtx, curVbr, curBr, curFec, curPl, curVbrc) == true) {

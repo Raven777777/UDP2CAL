@@ -15,9 +15,11 @@ class OpusEncoder(
     val fec: Int = Prefs.opusFec,
     val packetLoss: Int = Prefs.opusPacketLoss,
     vbrConstraintRaw: Int = Prefs.opusVbrConstraint,
+    /** 自动分配码率（Prefs.opusBitrateKbps==0）：强制 VBR 并关闭 VBR 约束 */
+    val autoBitrate: Boolean = Prefs.opusBitrateKbps <= 0,
 ) {
-    val vbr: Int = if (dtx == 1) 1 else vbrRaw
-    val vbrConstraint: Int = if (vbr == 1) vbrConstraintRaw else 0
+    val vbr: Int = if (dtx == 1 || autoBitrate) 1 else vbrRaw
+    val vbrConstraint: Int = if (vbr == 1 && !autoBitrate) vbrConstraintRaw else 0
     companion object {
         private const val TAG = "OpusEncoder"
         private fun computeBitrateId(kbps: Int): Byte =
