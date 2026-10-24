@@ -184,19 +184,37 @@ object Udp2CalProtocol {
      */
     class ReorderBuffer(
         private val maxLate: Int = 8,
-        private val window: Int = 2,
+        /** 自适应窗口下限/上限（NetEQ 思路：按乱序幅度动态扩缩） */
+        private val minWindow: Int = 2,
+        private val maxWindow: Int = 16,
         private val sink: (Byte, ByteArray, Int, Int, Int) -> Unit,  // 末位 Int = 确认丢失的帧数（大跳变重同步时 >0，供精确 PLC）
     ) {
-        private val slotSeq = IntArray(window) { -1 }
-        private val slotRate = ByteArray(window)
-        private val slotData = arrayOfNulls<ByteArray>(window)
+        private val slotSeq = IntArray(maxWindow) { -1 }
+        private val slotRate = ByteArray(maxWindow)
+        private val slotData = arrayOfNulls<ByteArray>(maxWindow)
         private var writeIdx = 0
         private var nextSeq = 0
         private var lateStreak = 0
         private var started = false
+        /** 当前生效窗口（自适应，minWindow..maxWindow） */
+        private var window = minWindow
+        /** 迟到深度 EMA（帧） */
+        private var jitterDepth = 0f
+        private var lastLateMs = 0L
+
+        /** 记录一次乱序/迟到事件：EMA 更新抖动深度并重算窗口。
+         *  抖动大时扩窗吸收（迟到真包不再被判死），网络干净时收敛回下限。 */
+        private fun noteJitter(depthFrames: Int) {
+            val now = System.currentTimeMillis()
+            if (lastLateMs > 0 && now - lastLateMs >= 5000) jitterDepth /= 2f
+            val depth = depthFrames.coerceAtMost(maxLate).toFloat()
+            jitterDepth = jitterDepth * 0.7f + depth * 0.3f
+            lastLateMs = now
+            window = ((jitterDepth * 1.5f).toInt() + minWindow).coerceIn(minWindow, maxWindow)
+        }
 
         fun reset() {
-            for (i in 0 until window) {
+            for (i in 0 until maxWindow) {
                 slotSeq[i] = -1
                 slotData[i] = null
             }
@@ -219,6 +237,8 @@ object Udp2CalProtocol {
 
             val dist = (s - nextSeq) and 0xFF
             if (dist >= 256 - maxLate) {
+                // 迟到深度 = 落后 nextSeq 的帧数，喂给抖动估计
+                noteJitter(maxLate - (dist - (256 - maxLate)))
                 lateStreak++
                 if (lateStreak < maxLate * 4) return
                 // 连续迟到 → 实为发送端大跨度回退，强制重同步
@@ -239,10 +259,12 @@ object Udp2CalProtocol {
                     slotSeq[writeIdx] = s
                     slotRate[writeIdx] = sampleRate
                     slotData[writeIdx] = buf.copyOfRange(offset, offset + length)
-                    writeIdx = (writeIdx + 1) % window
+                    writeIdx = (writeIdx + 1) % maxWindow
                 }
                 else -> {
                     // 真正的跳变：dist 个包被确切丢弃，交给回调做精确 PLC
+                    // 跳变幅度限幅后喂给抖动估计（丢包不应无限撑大窗口）
+                    noteJitter(dist)
                     clearSlots()
                     nextSeq = (s + 1) and 0xFF
                     sink(sampleRate, buf, offset, length, dist)

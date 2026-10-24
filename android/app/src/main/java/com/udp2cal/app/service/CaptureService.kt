@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -50,6 +51,8 @@ class CaptureService : Service() {
     /** 反向音频（PC→Phone） */
     private var reverseDecoder: ReverseOpusDecoder? = null
     private var audioPlayer: AudioPlayer? = null
+    /** Wi-Fi 高低延迟锁：采集期间阻止网卡进入省电聚合（丢包/延迟簇的根源） */
+    private var wifiLock: WifiManager.WifiLock? = null
     /** AEC 实例，finally 中释放 */
     private var aecInstance: AcousticEchoCanceler? = null
 
@@ -149,6 +152,24 @@ class CaptureService : Service() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UDP2CAL:Capture")
         try { wakeLock.acquire() } catch (_: Exception) {}
+
+        // Wi-Fi 省电锁：PARTIAL_WAKE_LOCK 只保 CPU，网卡仍会进入省电聚合，
+        // 造成周期性 100~500ms 延迟簇（重排窗口判死 → 成片丢帧）。
+        // FULL_LOW_LATENCY 要求 API 29+（minSdk=29），失败不影响主流程。
+        if (wifiLock == null) {
+            try {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                wifiLock = wm?.createWifiLock(
+                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "UDP2CAL:Wifi"
+                )?.apply {
+                    setReferenceCounted(false)
+                    acquire()
+                    Log.i(TAG, "WifiLock 已持有 (FULL_LOW_LATENCY)")
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "WifiLock 获取失败（继续运行）", e)
+            }
+        }
 
         hasNewCapture = true
         // 捕获启动时的 isVoiceMode，用于消费者协程检测变更
@@ -718,8 +739,13 @@ class CaptureService : Service() {
             // 此前反向流完全没有序号处理：乱序包会被直接解码成噪音，重复包会播两遍。
             // 第 5 参数 = ReorderBuffer 确认丢失的帧数（大跳变重同步时 >0），
             // 事件驱动 PLC：先按确切丢包数补偿，再解码真包，时间线不多不少。
+            // ── 双重补偿去重 ──：停滞计时器已补的帧记入 pendingConcealed，
+            // 事件 lost 先扣除再补差额（与 Windows 端 main.rs 同策略）
+            var pendingConcealed = 0
             val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length, lost ->
-                repeat(lost) {
+                val effLost = (lost - pendingConcealed).coerceAtLeast(0)
+                pendingConcealed = 0
+                repeat(effLost) {
                     val ns = dec.plc(pcmBuf)
                     if (ns > 0) player.write(pcmBuf, 0, ns)
                 }
@@ -782,12 +808,16 @@ class CaptureService : Service() {
                     if (hasAudio) {
                         val gapMs = System.currentTimeMillis() - lastAudioTime
                         if (gapMs > PLC_GAP_MS && gapMs < PLC_MAX_GAP_MS) {
-                            val frames = (gapMs / REVERSE_FRAME_MS).toInt().coerceIn(1, PLC_MAX_FRAMES)
-                            repeat(frames) {
-                                val ns = dec.plc(pcmBuf)
-                                if (ns > 0) player.write(pcmBuf, 0, ns)
+                            // 扣除已补帧数：单次停滞的总补偿量不超过真实缺口
+                            val owed = (gapMs / REVERSE_FRAME_MS).toInt()
+                            val frames = (owed - pendingConcealed).coerceIn(0, PLC_MAX_FRAMES)
+                            if (frames > 0) {
+                                repeat(frames) {
+                                    val ns = dec.plc(pcmBuf)
+                                    if (ns > 0) player.write(pcmBuf, 0, ns)
+                                }
+                                pendingConcealed += frames
                             }
-                            lastAudioTime = System.currentTimeMillis()
                         }
                     }
                     // 3 秒无反向音频 → 同步断开状态
@@ -830,6 +860,8 @@ class CaptureService : Service() {
         // 复位模式切换标记：否则 finally 会走"保留网络层"分支，
         // 跳过 udpSender.close()/reverseDecoder.stop()，socket 与 ACK 线程泄漏。
         isModeRestart = false
+        try { wifiLock?.release() } catch (_: Exception) {}
+        wifiLock = null
         // 顺序很重要：必须先 cancel 再 close。
         // close() 会把挂起在 ch.send 的生产者以 ClosedSendChannelException
         // （IllegalStateException，非 CancellationException）唤醒，

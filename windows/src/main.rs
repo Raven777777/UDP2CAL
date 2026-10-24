@@ -272,13 +272,17 @@ fn init_audio_worker() {
         let mut rms_count: u64 = 0;
         let mut last_stats = Instant::now();
         // ── 丢包隐藏（PLC）状态 ──
-        // 协议帧长 10ms；主路径为事件驱动（ReorderBuffer 回调携带确切丢包数）。
-        // 此计时器仅为整流停滞兜底：阈值 100ms ≫ RB 乱序窗口，DTX/断流场景生效。
+        // 主路径：事件驱动（ReorderBuffer 回调携带确切丢包数）。
+        // 计时器仅兜底整流停滞（DTX/断流），阈值 60ms——小于该值不补。
+        // ── 双重补偿去重 ──：计时器补的帧记入 concealed_pending；真包到达时
+        // RB 报告的 lost 先扣除 pending，只补差额。停滞+迟到混合场景下
+        // 同一段丢失不会被补两遍（修复环形缓冲溢出/丢样暴增）。
         const FRAME_MS: u64 = 10;
-        const PLC_STALL_MS: u64 = 100;
+        const PLC_STALL_MS: u64 = 60;
         const PLC_MAX_FRAMES: u32 = 10;
         const PLC_STREAM_IDLE_MS: u64 = 2000;
         let mut last_audio: Option<Instant> = None;
+        let mut concealed_pending: u32 = 0;
 
         loop {
             match rx.recv_timeout(Duration::from_millis(30)) {
@@ -287,14 +291,16 @@ fn init_audio_worker() {
                     rms_sum = 0.0;
                     rms_count = 0;
                     last_audio = None;
+                    concealed_pending = 0;
                     AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
                 }
                 Ok(AudioMessage::Packet { seq_num, sample_rate, payload }) => {
                     last_audio = Some(Instant::now());
                     rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p, lost| {
-                        // 事件驱动 PLC：ReorderBuffer 大跳变重同步时携带确切丢包数，
-                        // 先按丢包数补偿再解码真包——时间线上不多不少
-                        for _ in 0..lost {
+                        // 去重：停滞计时器已补的部分从事件丢失中扣除，只补差额
+                        let extra = lost.saturating_sub(concealed_pending);
+                        concealed_pending = 0;
+                        for _ in 0..extra {
                             if let Some((n, sr_hz)) = dec.conceal() {
                                 let pcm = dec.pcm_data();
                                 let samples = &pcm[..n.min(pcm.len())];
@@ -315,24 +321,27 @@ fn init_audio_worker() {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // 兜底计时器：仅覆盖"整流停滞"（发送端 DTX 静音 / 断流）。
-                    // 阈值 100ms 远大于 ReorderBuffer 乱序窗口（MAX_REORDER=2 → ≤20ms），
-                    // 避免乱序等待期间过度补偿导致环形缓冲溢出（dropped 持续增长）。
-                    // DTX 静音期间按墙钟补舒适噪声，时间线正确；2 秒后彻底静音。
+                    // 阈值 60ms 小于自适应窗口上限但配额会与事件补偿去重，
+                    // 不会双重补偿。DTX 静音期间按墙钟补舒适噪声，2 秒后静音。
                     let Some(t) = last_audio else { continue };
                     let elapsed = t.elapsed();
                     if elapsed > Duration::from_millis(PLC_STALL_MS)
                         && elapsed < Duration::from_millis(PLC_STREAM_IDLE_MS)
                     {
-                        let missed = ((elapsed.as_millis() as u64 / FRAME_MS) as u32)
-                            .min(PLC_MAX_FRAMES);
-                        for _ in 0..missed {
-                            if let Some((n, sr_hz)) = dec.conceal() {
-                                let pcm = dec.pcm_data();
-                                let samples = &pcm[..n.min(pcm.len())];
-                                rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                                rms_count += samples.len() as u64;
-                                aw.write(samples, sr_hz);
+                        // 扣除已补帧数：单次停滞的总补偿量不超过真实缺口
+                        let owed = (elapsed.as_millis() as u64 / FRAME_MS) as u32;
+                        let missed = owed.saturating_sub(concealed_pending).min(PLC_MAX_FRAMES);
+                        if missed > 0 {
+                            for _ in 0..missed {
+                                if let Some((n, sr_hz)) = dec.conceal() {
+                                    let pcm = dec.pcm_data();
+                                    let samples = &pcm[..n.min(pcm.len())];
+                                    rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                    rms_count += samples.len() as u64;
+                                    aw.write(samples, sr_hz);
+                                }
                             }
+                            concealed_pending += missed;
                         }
                         last_audio = Some(Instant::now());
                     }

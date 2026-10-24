@@ -24,10 +24,14 @@
 pub const HEADER_SIZE: usize = 15;
 pub const MAX_PAYLOAD: usize = 1472;
 pub const MAX_PACKET: usize = HEADER_SIZE + MAX_PAYLOAD;
-/// 重排窗口：可容忍的"超前"包数（含 expected 自身）
-pub const MAX_REORDER: usize = 2;
+/// 重排窗口上限（自适应）：缓冲槽按此容量静态分配
+pub const MAX_REORDER: usize = 16;
+/// 重排窗口下限：网络干净时窗口收敛到此值（低延迟优先）
+pub const MIN_REORDER: usize = 2;
 /// 迟到/重复判定窗口：序号落后 next_seq 不超过该值即视为迟到，直接丢弃
 pub const MAX_LATE: u8 = 8;
+/// 自适应窗口：无迟到事件持续该时长后，抖动估计减半（窗口收敛）
+pub const JITTER_DECAY_SECS: u64 = 5;
 pub const PROTO_VERSION: u8 = 2;
 pub const DEVICE_ID_SIZE: usize = 8;
 pub const DISCOVER_PORT: u16 = 44043;
@@ -286,6 +290,12 @@ pub struct ReorderBuffer {
     late_streak: u8,
     /// 是否已收到过第一个包；未收到时首包无条件作为基准
     started: bool,
+    /// 当前生效的重排窗口（自适应，MIN_REORDER..=MAX_REORDER）
+    window: usize,
+    /// 迟到深度 EMA（帧数）：观测到的乱序/迟到幅度估计
+    jitter_depth: f32,
+    /// 最近一次迟到事件时间，用于抖动估计衰减
+    last_late: Option<std::time::Instant>,
 }
 
 impl ReorderBuffer {
@@ -294,7 +304,31 @@ impl ReorderBuffer {
             seq: 0, sample_rate: 0, len: 0,
             data: [0u8; MAX_PAYLOAD], valid: false,
         };
-        Self { buf: [INIT; MAX_REORDER], write: 0, next_seq: 0, late_streak: 0, started: false }
+        Self {
+            buf: [INIT; MAX_REORDER], write: 0, next_seq: 0,
+            late_streak: 0, started: false,
+            window: MIN_REORDER, jitter_depth: 0.0, last_late: None,
+        }
+    }
+
+    /// 记录一次乱序/迟到事件，EMA 更新抖动深度并重算窗口。
+    ///
+    /// NetEQ 思路的简化版：按观测到的乱序幅度动态扩缩重排窗口——
+    /// 抖动大时扩窗吸收（把"迟到"变"等待"，避免真包被判死），
+    /// 网络干净时窗口收敛到 MIN_REORDER（低延迟优先）。
+    fn note_jitter(&mut self, depth_frames: u32) {
+        let now = std::time::Instant::now();
+        if let Some(t) = self.last_late {
+            if now.duration_since(t).as_secs() >= JITTER_DECAY_SECS {
+                self.jitter_depth *= 0.5;
+            }
+        }
+        // 深度截断到 MAX_LATE：超过部分是丢包而非乱序，不应撑大窗口
+        let depth = depth_frames.min(MAX_LATE as u32) as f32;
+        self.jitter_depth = self.jitter_depth * 0.7 + depth * 0.3;
+        self.last_late = Some(now);
+        self.window = ((self.jitter_depth * 1.5) as usize + MIN_REORDER)
+            .clamp(MIN_REORDER, MAX_REORDER);
     }
 
     pub fn insert_and_drain<F>(&mut self, seq: u8, sample_rate: u8, payload: &[u8], mut f: F)
@@ -315,6 +349,8 @@ impl ReorderBuffer {
         // ── 迟到 / 重复包：dist 落在 [256-MAX_LATE, 255] ──
         // 必须与"向前跳变"区分开，否则一个重复包就会清空缓冲并把序号倒回去。
         if dist >= 0u8.wrapping_sub(MAX_LATE) {
+            // 迟到深度 = 它落后 next_seq 的帧数——这是窗口不够大的直接证据
+            self.note_jitter(MAX_LATE as u32 - (dist - 0u8.wrapping_sub(MAX_LATE)) as u32);
             self.late_streak = self.late_streak.saturating_add(1);
             // 连续迟到过多 → 实际是发送端大跨度跳变（丢包/重启），强制重同步
             if self.late_streak < MAX_LATE.saturating_mul(4) {
@@ -331,7 +367,7 @@ impl ReorderBuffer {
         if dist == 0 {
             f(sample_rate, payload, 0);
             self.next_seq = self.next_seq.wrapping_add(1);
-        } else if (dist as usize) < MAX_REORDER {
+        } else if (dist as usize) < self.window {
             // 窗口内乱序：先入槽，等 expected 到达后统一排空
             let len = payload.len().min(MAX_PAYLOAD);
             self.buf[self.write].seq = seq;
@@ -343,6 +379,8 @@ impl ReorderBuffer {
         } else {
             // 真正的跳变（丢包 / 发送端重启 / 长时间静默后恢复）：重置并立即输出
             // dist 个包被确切丢弃——交给回调做精确 PLC（丢包隐藏）
+            // 同时把跳变幅度喂给抖动估计（限幅：丢包不应无限撑大窗口）
+            self.note_jitter(dist as u32);
             self.clear();
             self.next_seq = seq.wrapping_add(1);
             f(sample_rate, payload, dist as u32);
@@ -590,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_adaptive_window_grows_after_jitter() {
+        // 一次跳变（丢 2 帧）后，窗口应自适应扩大：
+        // 后续乱序深度 2 的包应入槽等待而非再次重同步丢包
+        let mut rb = ReorderBuffer::new();
+        let mut out = Vec::new();
+        rb.insert_and_drain(0, 1, &[0], |_, d, _| out.push(d[0]));
+        // 跳变：1,2 丢失，3 到达（lost=2，窗口 2 → 3）
+        rb.insert_and_drain(3, 1, &[3], |_, d, l| out.push(d[0] + l as u8));
+        // 乱序深度 2（5 先于 4 到达）：旧窗口(2)下会触发重同步丢 4 帧
+        rb.insert_and_drain(5, 1, &[5], |_, d, _| out.push(d[0]));
+        rb.insert_and_drain(4, 1, &[4], |_, d, l| out.push(d[0] + l as u8));
+        // 期望：0 → 3(+2=5) → 4 → 排空 5，全程无额外丢失
+        assert_eq!(out, vec![0, 5, 4, 5]);
+    }
+
     fn test_reorder_out_of_order_then_late() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
