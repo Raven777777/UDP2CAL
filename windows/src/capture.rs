@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use audiopus::Bitrate;
+
 use crate::logf;
 use crate::protocol;
 
@@ -78,11 +80,25 @@ pub fn update_reverse_config(cfg: OpusReverseConfig) {
     }
 }
 
+/// 自动码率（bitrate_kbps=0）在反向编码器上的映射值。
+/// 默认 Bitrate::Max（与 v1.1.1 一致）。诊断用：设置环境变量
+/// UDP2CAL_REVERSE_AUTO_BR=<kbps> 可把自动码率强制映射为具体值做 A/B 实验。
+fn auto_bitrate() -> Bitrate {
+    match std::env::var("UDP2CAL_REVERSE_AUTO_BR")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|v| *v > 0)
+    {
+        Some(kbps) => Bitrate::BitsPerSecond(kbps * 1000),
+        None => Bitrate::Max,
+    }
+}
+
 /// 将 Opus 配置应用到编码器（在 run_loop 线程中调用）
 fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig) {
     // 码率：0=max, 其他按 kbps 设置
     let bitrate = if cfg.bitrate_kbps == 0 {
-        audiopus::Bitrate::Max
+        auto_bitrate()
     } else {
         audiopus::Bitrate::BitsPerSecond(cfg.bitrate_kbps as i32 * 1000)
     };
@@ -174,7 +190,7 @@ impl ReverseSender {
             Err(err) => { logf!("[Reverse] Opus 编码器失败: {:?}", err); return; }
         };
         // 默认参数：最大码率 + 全频带；手机端配置到达后由 apply_config 覆盖
-        let _ = encoder.set_bitrate(audiopus::Bitrate::Max);
+        let _ = encoder.set_bitrate(auto_bitrate());
         let _ = encoder.set_bandwidth(audiopus::Bandwidth::Fullband);
         let _ = encoder.set_vbr(true);
 
