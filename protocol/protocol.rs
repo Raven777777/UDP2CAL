@@ -298,14 +298,14 @@ impl ReorderBuffer {
     }
 
     pub fn insert_and_drain<F>(&mut self, seq: u8, sample_rate: u8, payload: &[u8], mut f: F)
-    where F: FnMut(u8, &[u8]),
+    where F: FnMut(u8, &[u8], u32),
     {
         // 首包作为基准，避免发送端从 seq=1 起步时首帧被误判为乱序
         if !self.started {
             self.started = true;
             self.clear();
             self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload);
+            f(sample_rate, payload, 0);
             return;
         }
 
@@ -323,13 +323,13 @@ impl ReorderBuffer {
             self.late_streak = 0;
             self.clear();
             self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload);
+            f(sample_rate, payload, 0);
             return;
         }
         self.late_streak = 0;
 
         if dist == 0 {
-            f(sample_rate, payload);
+            f(sample_rate, payload, 0);
             self.next_seq = self.next_seq.wrapping_add(1);
         } else if (dist as usize) < MAX_REORDER {
             // 窗口内乱序：先入槽，等 expected 到达后统一排空
@@ -342,9 +342,10 @@ impl ReorderBuffer {
             self.write = (self.write + 1) % MAX_REORDER;
         } else {
             // 真正的跳变（丢包 / 发送端重启 / 长时间静默后恢复）：重置并立即输出
+            // dist 个包被确切丢弃——交给回调做精确 PLC（丢包隐藏）
             self.clear();
             self.next_seq = seq.wrapping_add(1);
-            f(sample_rate, payload);
+            f(sample_rate, payload, dist as u32);
             return;
         }
 
@@ -352,7 +353,7 @@ impl ReorderBuffer {
             let mut found = false;
             for i in 0..MAX_REORDER {
                 if self.buf[i].valid && self.buf[i].seq == self.next_seq {
-                    f(self.buf[i].sample_rate, &self.buf[i].data[..self.buf[i].len]);
+                    f(self.buf[i].sample_rate, &self.buf[i].data[..self.buf[i].len], 0);
                     self.buf[i].valid = false;
                     self.next_seq = self.next_seq.wrapping_add(1);
                     found = true;
@@ -535,9 +536,9 @@ mod tests {
     fn test_reorder_in_order() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(0, 1, &[1], |sr, data| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(1, 1, &[2], |sr, data| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(2, 1, &[3], |sr, data| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(0, 1, &[1], |sr, data, _| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(1, 1, &[2], |sr, data, _| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(2, 1, &[3], |sr, data, _| out.push((sr, data.to_vec())));
         assert_eq!(out.len(), 3);
         assert_eq!(out[0], (1, vec![1]));
         assert_eq!(out[1], (1, vec![2]));
@@ -548,10 +549,10 @@ mod tests {
     fn test_reorder_out_of_order() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(0, 1, &[1], |sr, data| out.push((sr, data.to_vec())));
-        rb.insert_and_drain(2, 1, &[3], |sr, data| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(0, 1, &[1], |sr, data, _| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(2, 1, &[3], |sr, data, _| out.push((sr, data.to_vec())));
         assert_eq!(out.len(), 1); // 2 入槽等待 1
-        rb.insert_and_drain(1, 1, &[2], |sr, data| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(1, 1, &[2], |sr, data, _| out.push((sr, data.to_vec())));
         assert_eq!(out.len(), 3);
         assert_eq!(out[0], (1, vec![1]));
         assert_eq!(out[1], (1, vec![2]));
@@ -563,8 +564,8 @@ mod tests {
         // 发送端从 seq=1 起步时，首包必须被立即接受（不能等一个永远不会来的 seq=0）
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(1, 1, &[1], |_sr, d| out.push(d[0]));
-        rb.insert_and_drain(2, 1, &[2], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(1, 1, &[1], |_sr, d, _| out.push(d[0]));
+        rb.insert_and_drain(2, 1, &[2], |_sr, d, _| out.push(d[0]));
         assert_eq!(out, vec![1, 2]);
     }
 
@@ -572,7 +573,7 @@ mod tests {
     fn test_reorder_skip() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
-        rb.insert_and_drain(8, 1, &[4], |sr, data| out.push((sr, data.to_vec())));
+        rb.insert_and_drain(8, 1, &[4], |sr, data, _| out.push((sr, data.to_vec())));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], (1, vec![4]));
     }
@@ -582,7 +583,7 @@ mod tests {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
         for (seq, tag) in [(0u8, 0u8), (1, 1), (1, 9), (2, 2)] {
-            rb.insert_and_drain(seq, 1, &[tag], |_sr, d| out.push(d[0]));
+            rb.insert_and_drain(seq, 1, &[tag], |_sr, d, _| out.push(d[0]));
         }
         // 重复的 seq=1 必须被丢弃，只输出 0,1,2
         assert_eq!(out, vec![0, 1, 2]);
@@ -592,11 +593,11 @@ mod tests {
     fn test_reorder_out_of_order_then_late() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(0, 1, &[0], |_sr, d| out.push(d[0]));
-        rb.insert_and_drain(2, 1, &[2], |_sr, d| out.push(d[0])); // 入槽等待
-        rb.insert_and_drain(1, 1, &[1], |_sr, d| out.push(d[0])); // 触发排空：1,2
-        rb.insert_and_drain(0, 1, &[9], |_sr, d| out.push(d[0])); // 迟到包 → 丢弃
-        rb.insert_and_drain(3, 1, &[3], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(0, 1, &[0], |_sr, d, _| out.push(d[0]));
+        rb.insert_and_drain(2, 1, &[2], |_sr, d, _| out.push(d[0])); // 入槽等待
+        rb.insert_and_drain(1, 1, &[1], |_sr, d, _| out.push(d[0])); // 触发排空：1,2
+        rb.insert_and_drain(0, 1, &[9], |_sr, d, _| out.push(d[0])); // 迟到包 → 丢弃
+        rb.insert_and_drain(3, 1, &[3], |_sr, d, _| out.push(d[0]));
         assert_eq!(out, vec![0, 1, 2, 3]);
     }
 
@@ -604,10 +605,10 @@ mod tests {
     fn test_reorder_big_forward_jump_resyncs() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(0, 1, &[0], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(0, 1, &[0], |_sr, d, _| out.push(d[0]));
         // 模拟长时间静默后恢复：序号大幅超前（200 包）
-        rb.insert_and_drain(200, 1, &[200], |_sr, d| out.push(d[0]));
-        rb.insert_and_drain(201, 1, &[201], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(200, 1, &[200], |_sr, d, _| out.push(d[0]));
+        rb.insert_and_drain(201, 1, &[201], |_sr, d, _| out.push(d[0]));
         assert_eq!(out, vec![0, 200, 201]);
     }
 
@@ -615,15 +616,15 @@ mod tests {
     fn test_reorder_late_streak_forces_resync() {
         let mut rb = ReorderBuffer::new();
         let mut out: Vec<u8> = Vec::new();
-        rb.insert_and_drain(100, 1, &[100], |_sr, d| out.push(d[0]));
-        rb.insert_and_drain(101, 1, &[101], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(100, 1, &[100], |_sr, d, _| out.push(d[0]));
+        rb.insert_and_drain(101, 1, &[101], |_sr, d, _| out.push(d[0]));
         // next_seq = 102，seq=94 属于"落后 8"，单次应被丢弃
         for _ in 0..31 {
-            rb.insert_and_drain(94, 1, &[94], |_sr, d| out.push(d[0]));
+            rb.insert_and_drain(94, 1, &[94], |_sr, d, _| out.push(d[0]));
         }
         assert_eq!(out, vec![100, 101]);
         // 连续迟到达到阈值 → 判定为发送端大跨度回退，强制重同步并输出
-        rb.insert_and_drain(94, 1, &[94], |_sr, d| out.push(d[0]));
+        rb.insert_and_drain(94, 1, &[94], |_sr, d, _| out.push(d[0]));
         assert_eq!(out, vec![100, 101, 94]);
     }
 }

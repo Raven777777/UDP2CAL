@@ -160,7 +160,7 @@ if let Some(h) = decode_header(&buf) {
 
 // 零分配重排序
 let mut rb = ReorderBuffer::new();
-rb.insert_and_drain(h.seq_num, h.sample_rate, &payload, |sr, data| {
+rb.insert_and_drain(h.seq_num, h.sample_rate, &payload, |sr, data, lost| {
     // 按序到达的帧
 });
 ```

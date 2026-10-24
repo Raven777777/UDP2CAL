@@ -185,7 +185,7 @@ object Udp2CalProtocol {
     class ReorderBuffer(
         private val maxLate: Int = 8,
         private val window: Int = 2,
-        private val sink: (Byte, ByteArray, Int, Int) -> Unit,
+        private val sink: (Byte, ByteArray, Int, Int, Int) -> Unit,  // 末位 Int = 确认丢失的帧数（大跳变重同步时 >0，供精确 PLC）
     ) {
         private val slotSeq = IntArray(window) { -1 }
         private val slotRate = ByteArray(window)
@@ -213,7 +213,7 @@ object Udp2CalProtocol {
             if (!started) {
                 started = true
                 nextSeq = (s + 1) and 0xFF
-                sink(sampleRate, buf, offset, length)
+                sink(sampleRate, buf, offset, length, 0)
                 return
             }
 
@@ -225,14 +225,14 @@ object Udp2CalProtocol {
                 lateStreak = 0
                 clearSlots()
                 nextSeq = (s + 1) and 0xFF
-                sink(sampleRate, buf, offset, length)
+                sink(sampleRate, buf, offset, length, 0)
                 return
             }
             lateStreak = 0
 
             when {
                 dist == 0 -> {
-                    sink(sampleRate, buf, offset, length)
+                    sink(sampleRate, buf, offset, length, 0)
                     nextSeq = (nextSeq + 1) and 0xFF
                 }
                 dist < window -> {
@@ -242,9 +242,10 @@ object Udp2CalProtocol {
                     writeIdx = (writeIdx + 1) % window
                 }
                 else -> {
+                    // 真正的跳变：dist 个包被确切丢弃，交给回调做精确 PLC
                     clearSlots()
                     nextSeq = (s + 1) and 0xFF
-                    sink(sampleRate, buf, offset, length)
+                    sink(sampleRate, buf, offset, length, dist)
                     return
                 }
             }
@@ -255,7 +256,7 @@ object Udp2CalProtocol {
                 for (i in 0 until window) {
                     if (slotSeq[i] == nextSeq) {
                         val data = slotData[i] ?: continue
-                        sink(slotRate[i], data, 0, data.size)
+                        sink(slotRate[i], data, 0, data.size, 0)
                         slotSeq[i] = -1
                         slotData[i] = null
                         nextSeq = (nextSeq + 1) and 0xFF

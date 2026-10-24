@@ -272,10 +272,11 @@ fn init_audio_worker() {
         let mut rms_count: u64 = 0;
         let mut last_stats = Instant::now();
         // ── 丢包隐藏（PLC）状态 ──
-        // 协议帧长 10ms；连续 2 帧未收到包视为出现缺口，按缺口帧数请求 PLC 补齐。
-        // 上限 5 帧：长时间静默（发送端 DTX / 断流）不做无限补偿，2 秒后彻底静音。
+        // 协议帧长 10ms；主路径为事件驱动（ReorderBuffer 回调携带确切丢包数）。
+        // 此计时器仅为整流停滞兜底：阈值 100ms ≫ RB 乱序窗口，DTX/断流场景生效。
         const FRAME_MS: u64 = 10;
-        const PLC_MAX_FRAMES: u32 = 5;
+        const PLC_STALL_MS: u64 = 100;
+        const PLC_MAX_FRAMES: u32 = 10;
         const PLC_STREAM_IDLE_MS: u64 = 2000;
         let mut last_audio: Option<Instant> = None;
 
@@ -290,7 +291,18 @@ fn init_audio_worker() {
                 }
                 Ok(AudioMessage::Packet { seq_num, sample_rate, payload }) => {
                     last_audio = Some(Instant::now());
-                    rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p| {
+                    rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p, lost| {
+                        // 事件驱动 PLC：ReorderBuffer 大跳变重同步时携带确切丢包数，
+                        // 先按丢包数补偿再解码真包——时间线上不多不少
+                        for _ in 0..lost {
+                            if let Some((n, sr_hz)) = dec.conceal() {
+                                let pcm = dec.pcm_data();
+                                let samples = &pcm[..n.min(pcm.len())];
+                                rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += samples.len() as u64;
+                                aw.write(samples, sr_hz);
+                            }
+                        }
                         if let Some((n, sr_hz)) = dec.decode(sr, p) {
                             let pcm = dec.pcm_data();
                             let samples = &pcm[..n.min(pcm.len())];
@@ -302,10 +314,13 @@ fn init_audio_worker() {
                     recycle_payload(payload);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // 兜底计时器：仅覆盖"整流停滞"（发送端 DTX 静音 / 断流）。
+                    // 阈值 100ms 远大于 ReorderBuffer 乱序窗口（MAX_REORDER=2 → ≤20ms），
+                    // 避免乱序等待期间过度补偿导致环形缓冲溢出（dropped 持续增长）。
+                    // DTX 静音期间按墙钟补舒适噪声，时间线正确；2 秒后彻底静音。
                     let Some(t) = last_audio else { continue };
                     let elapsed = t.elapsed();
-                    // 仍在活跃流内但出现帧缺口 → 逐帧 PLC（Deep PLC 在此生效）
-                    if elapsed > Duration::from_millis(FRAME_MS * 2)
+                    if elapsed > Duration::from_millis(PLC_STALL_MS)
                         && elapsed < Duration::from_millis(PLC_STREAM_IDLE_MS)
                     {
                         let missed = ((elapsed.as_millis() as u64 / FRAME_MS) as u32)

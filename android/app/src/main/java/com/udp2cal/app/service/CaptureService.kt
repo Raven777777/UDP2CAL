@@ -698,17 +698,24 @@ class CaptureService : Service() {
             var bandwidthLabel = ""
 
             // ── PLC（丢包隐藏）参数：与 Windows 端 decoder/main 同策略 ──
-            // 反向解码器为 20ms 帧（opus_jni_decoder.c）；缺口 >2 帧且 <2s 时补偿，
-            // 单次上限 5 帧；断流 3s 由下方状态同步收尾
+            // 主路径为事件驱动（ReorderBuffer 回调携带确切丢包数）；此计时器仅兜底
+            // 整流停滞（发送端 DTX / 断流）。阈值 80ms ≫ RB 乱序窗口（window=2 → ≤20ms），
+            // 避免乱序等待期间过度补偿；反向解码器为 20ms 帧
             val REVERSE_FRAME_MS = 20L
             val PLC_POLL_TIMEOUT_MS = 40
-            val PLC_GAP_MS = 40L
+            val PLC_GAP_MS = 80L
             val PLC_MAX_GAP_MS = 2000L
             val PLC_MAX_FRAMES = 5
 
             // 重排 + 去重：与 Rust 端 ReorderBuffer 同语义。
             // 此前反向流完全没有序号处理：乱序包会被直接解码成噪音，重复包会播两遍。
-            val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length ->
+            // 第 5 参数 = ReorderBuffer 确认丢失的帧数（大跳变重同步时 >0），
+            // 事件驱动 PLC：先按确切丢包数补偿，再解码真包，时间线不多不少。
+            val reorder = Udp2CalProtocol.ReorderBuffer { sampleRate, buf, offset, length, lost ->
+                repeat(lost) {
+                    val ns = dec.plc(pcmBuf)
+                    if (ns > 0) player.write(pcmBuf, 0, ns)
+                }
                 val ns = dec.decode(buf, offset, length, pcmBuf)
                 if (ns > 0) {
                     player.write(pcmBuf, 0, ns)
