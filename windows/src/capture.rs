@@ -104,6 +104,9 @@ fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig)
     let _ = encoder.set_inband_fec(cfg.fec);
     let _ = encoder.set_packet_loss_perc(cfg.packet_loss);
     let _ = encoder.set_vbr_constraint(cfg.vbr_constraint);
+    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500ms 冗余（50×10ms 帧），
+    // 供解码端神经网络恢复突发丢包；FEC 关闭时归零，不占用码流
+    let _ = encoder.set_dred_duration(if cfg.fec { 50 } else { 0 });
 
     // 信号类型（影响 SILK/CELT 模式选择）
     match cfg.signal {

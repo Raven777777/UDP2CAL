@@ -71,7 +71,21 @@ build.bat android --modern --abi armeabi-v7a --release
   2. `<repo>/opus-src`（默认，自动解析，日常构建无需任何设置）
   3. `./opus`（上游兜底，本副本中不存在）
 - Windows 端 CMake 构建配置**强制 Release**：dev profile 下 CMake 默认 Debug（/MDd 调试 CRT），Opus 1.6.x 会引入 `__imp__CrtDbgReportW` 等调试 CRT 符号，与 rustc 链接的 /MD 发行版 CRT 不兼容，导致 `LNK2001/LNK1120` 链接失败。
-- `audiopus` 0.3.0-rc.0 的预生成绑定兼容 1.6.1 的 C ABI；1.6 新增 API（DRED 等）未暴露，且本项目不使用。
+- `audiopus` 0.3.0-rc.0 的预生成绑定兼容 1.6.1 的 C ABI；1.6 新增 API（Opus HD 等）未暴露，且本项目不使用。
+
+### Opus ML 特性（Deep PLC + DRED）
+
+两端均以 `OPUS_DEEP_PLC=ON` + `OPUS_DRED=ON` 构建（OSCE / QEXT 保持关闭），产物体积各增约 2 MB：
+
+| 特性 | 生效位置 | 运行时条件 | 说明 |
+|------|---------|-----------|------|
+| 经典 PLC | 解码端 | 自动 | Windows 接收端由 `decoder.rs::conceal()` 驱动：音频流停滞超过 2 帧且不足 2 秒时，按缺口帧数请求补偿（单次上限 5 帧，发送端 DTX / 断流不会无限补偿） |
+| Deep PLC | 解码端 | 解码复杂度 ≥ 5 | Windows 端在 `OpusDecoder::new()` 对全部 5 个采样率解码器设置；Android 端在 `opus_jni_decoder.c` 创建时设置 |
+| DRED | 编码端→解码端 | FEC 开启时激活 | 编码器附带最长 500 ms（50×10ms 帧）深度冗余，码流 +12~32 kb/s；Windows 反向编码器与 Android 编码器均跟随 FEC 开关（`fec ? 50 : 0`）。1.5 与 1.6 的 DRED 互不兼容，两端同为 1.6.1 无此问题 |
+
+DRED 数据在 Opus 码流内传输，`protocol` 层与旧版本兼容（旧解码端忽略冗余层）。
+
+`audiopus` 副本（`vendor/audiopus`）为支持上述特性做了本地扩展：`Decoder::set_complexity`（1.5 新增的解码器复杂度接口）与 `Encoder::set_dred_duration`（1.3.1 头文件无此请求码 4050，本地定义）。
 
 ### 环境体检 / ADB 调试
 

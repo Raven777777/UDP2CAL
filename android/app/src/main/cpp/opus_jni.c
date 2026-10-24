@@ -41,6 +41,9 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(packetLoss));
     // 防御：VBR=0 时 constraint 无意义，强制清零防止意外
     opus_encoder_ctl(enc, OPUS_SET_VBR_CONSTRAINT(vbr ? vbrConstraint : 0));
+    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500ms 冗余（50×10ms 帧），
+    // 供解码端神经网络恢复突发丢包；与 Windows 端同为 1.6.1，DRED 可互操作
+    opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(fec ? 50 : 0));
     opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
     opus_encoder_ctl(enc, OPUS_SET_SIGNAL(signalType));
     opus_encoder_ctl(enc, OPUS_SET_BANDWIDTH(bandwidth));

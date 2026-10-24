@@ -11,7 +11,11 @@ if(NOT EXISTS "${UDP2CAL_OPUS_SRC}/CMakeLists.txt")
 endif()
 
 # Build libopus 1.6.1 from local source
-# 注意：OPUS_OSCE / OPUS_DRED / QEXT 均保持默认关闭，本项目不使用其 ML 增强特性
+# OPUS_DEEP_PLC：解码端神经网络 PLC（+约1MB，运行时需解码复杂度>=5）
+# OPUS_DRED：编码端深度冗余（模型600KB，码流+12~32kb/s），与 Windows 端同为 1.6.1 可互操作
+# 注意：OPUS_OSCE / QEXT 保持关闭，本项目不使用其语音增强与 96kHz 特性
+set(OPUS_DEEP_PLC ON CACHE BOOL "" FORCE)
+set(OPUS_DRED ON CACHE BOOL "" FORCE)
 add_subdirectory("${UDP2CAL_OPUS_SRC}" opus_build)
 
 # JNI library: Opus encoder + decoder

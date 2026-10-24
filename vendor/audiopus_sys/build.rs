@@ -79,6 +79,11 @@ fn build_opus(is_static: bool) {
     // （如 __imp__CrtDbgReportW）与 rustc 链接的 /MD 发行版 CRT 不兼容。
     let mut config = cmake::Config::new(&opus_path);
     config.profile("Release");
+    // ML 特性：Deep PLC（解码端神经网络丢包隐藏）+ DRED（编码端深度冗余，
+    // 可恢复最长 1s 突发丢包）。两端同为 opus-src 1.6.1，DRED 互操作无问题。
+    // OSCE / QEXT 保持关闭（语音增强与 96kHz 实验特性，本项目不使用）。
+    config.define("OPUS_DEEP_PLC", "ON");
+    config.define("OPUS_DRED", "ON");
     let opus_build_dir = config.build();
 
     link_opus(is_static, opus_build_dir.display())

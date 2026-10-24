@@ -267,31 +267,62 @@ fn init_audio_worker() {
         AudioInitState::Ready.store(); 
         logf!("[Audio] 就绪：输出设备 {} Hz", aw.device_rate);
 
-        let mut rb = protocol::ReorderBuffer::new(); 
-        let mut rms_sum: f64 = 0.0; 
-        let mut rms_count: u64 = 0; 
-        let mut last_stats = Instant::now(); 
+        let mut rb = protocol::ReorderBuffer::new();
+        let mut rms_sum: f64 = 0.0;
+        let mut rms_count: u64 = 0;
+        let mut last_stats = Instant::now();
+        // ── 丢包隐藏（PLC）状态 ──
+        // 协议帧长 10ms；连续 2 帧未收到包视为出现缺口，按缺口帧数请求 PLC 补齐。
+        // 上限 5 帧：长时间静默（发送端 DTX / 断流）不做无限补偿，2 秒后彻底静音。
+        const FRAME_MS: u64 = 10;
+        const PLC_MAX_FRAMES: u32 = 5;
+        const PLC_STREAM_IDLE_MS: u64 = 2000;
+        let mut last_audio: Option<Instant> = None;
 
-        for msg in rx { 
-            match msg { 
-                AudioMessage::Reset => { 
-                    rb = protocol::ReorderBuffer::new(); 
-                    rms_sum = 0.0; 
-                    rms_count = 0; 
-                    AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed); 
-                } 
-                AudioMessage::Packet { seq_num, sample_rate, payload } => { 
-                    rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p| { 
-                        if let Some((n, sr_hz)) = dec.decode(sr, p) { 
-                            let pcm = dec.pcm_data(); 
-                            let samples = &pcm[..n.min(pcm.len())]; 
-                            rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>(); 
-                            rms_count += samples.len() as u64; 
-                            aw.write(samples, sr_hz); 
-                        } 
-                    }); 
+        loop {
+            match rx.recv_timeout(Duration::from_millis(30)) {
+                Ok(AudioMessage::Reset) => {
+                    rb = protocol::ReorderBuffer::new();
+                    rms_sum = 0.0;
+                    rms_count = 0;
+                    last_audio = None;
+                    AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
+                }
+                Ok(AudioMessage::Packet { seq_num, sample_rate, payload }) => {
+                    last_audio = Some(Instant::now());
+                    rb.insert_and_drain(seq_num, sample_rate, &payload, |sr, p| {
+                        if let Some((n, sr_hz)) = dec.decode(sr, p) {
+                            let pcm = dec.pcm_data();
+                            let samples = &pcm[..n.min(pcm.len())];
+                            rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                            rms_count += samples.len() as u64;
+                            aw.write(samples, sr_hz);
+                        }
+                    });
                     recycle_payload(payload);
-                } 
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let Some(t) = last_audio else { continue };
+                    let elapsed = t.elapsed();
+                    // 仍在活跃流内但出现帧缺口 → 逐帧 PLC（Deep PLC 在此生效）
+                    if elapsed > Duration::from_millis(FRAME_MS * 2)
+                        && elapsed < Duration::from_millis(PLC_STREAM_IDLE_MS)
+                    {
+                        let missed = ((elapsed.as_millis() as u64 / FRAME_MS) as u32)
+                            .min(PLC_MAX_FRAMES);
+                        for _ in 0..missed {
+                            if let Some((n, sr_hz)) = dec.conceal() {
+                                let pcm = dec.pcm_data();
+                                let samples = &pcm[..n.min(pcm.len())];
+                                rms_sum += samples.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += samples.len() as u64;
+                                aw.write(samples, sr_hz);
+                            }
+                        }
+                        last_audio = Some(Instant::now());
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             } 
             if last_stats.elapsed() > Duration::from_millis(100) { 
                 let level_db = if rms_count > 0 { 

@@ -30,6 +30,9 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderCreate(
         return 0;
     }
 
+    // Opus 1.5+：解码复杂度 >=5 启用 Deep PLC（库需 OPUS_DEEP_PLC 构建，见 CMakeLists）
+    opus_decoder_ctl(dec, OPUS_SET_COMPLEXITY(5));
+
     DecoderState* state = (DecoderState*)malloc(sizeof(DecoderState));
     if (state == NULL) { opus_decoder_destroy(dec); return 0; }
     state->decoder     = dec;
