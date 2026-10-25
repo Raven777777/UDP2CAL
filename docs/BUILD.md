@@ -79,10 +79,10 @@ build.bat android --modern --abi armeabi-v7a --release
 
 | 特性 | 生效位置 | 运行时条件 | 说明 |
 |------|---------|-----------|------|
-| 经典 PLC | 解码端 | 自动 | **事件驱动 + 双重补偿去重**：ReorderBuffer 大跳变重同步时回调携带确切丢包数（`insert_and_drain` 第 3 参数 `lost`），解码端先按 `lost` 帧精确补偿、再解码真包；停滞兜底计时器（Windows 60ms / Android 80ms）补过的帧记入 pending，事件 lost 先扣除再补差额——同一段丢失不会被补两遍。持续停滞 2 秒后彻底静音 |
-| **自适应重排窗口** | ReorderBuffer | 自动 | 窗口 2~16 包动态调整（NetEQ 思路）：按观测到的乱序/迟到深度 EMA 扩窗（抖动大时把"迟到"变"等待"），网络干净时收敛回 2（低延迟优先）；无迟到事件 5s 抖动估计减半 |
+| 经典 PLC | 解码端 | 播放头到期 | 缺口在 `next_ts <= playhead_ts + PLC_LEAD_MS` 时补一帧 480 采样；连续 12 帧后转静音但仍留在 PLAYING。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡播放头决定（协议 7.8） |
+| 抖动缓冲 | `protocol/rtp.rs` | 自动 | 固定 64 槽、按扩展时间戳索引；序号只用于重复检测。v3 **不再**动态扩缩重排窗口 |
 | **Wi-Fi 省电锁（Android）** | CaptureService | 采集期间 | 采集期间持有 `WIFI_MODE_FULL_LOW_LATENCY` WifiLock，阻止网卡进入省电聚合（周期性 100~500ms 延迟簇的根源），停止采集释放 |
-| Deep PLC | 解码端 | 解码复杂度 ≥ 5 | Windows 端在 `OpusDecoder::new()` 对全部 5 个采样率解码器设置；Android 端在 `opus_jni_decoder.c` 创建时设置 |
+| Deep PLC | 解码端 | 解码复杂度 ≥ 5 | 两端在解码器创建时设置（Windows `OpusDecoder::new()`、Android `opus_jni_decoder.c`）；v3 固定单解码器 48 kHz 单声道 |
 | DRED | 编码端→解码端 | FEC 开启时激活 | 编码器附带最长 500 ms（50×10ms 帧）深度冗余，码流 +12~32 kb/s；Windows 反向编码器与 Android 编码器均跟随 FEC 开关（`fec ? 50 : 0`）。1.5 与 1.6 的 DRED 互不兼容，两端同为 1.6.1 无此问题 |
 
 DRED 数据在 Opus 码流内传输，`protocol` 层与旧版本兼容（旧解码端忽略冗余层）。

@@ -19,7 +19,9 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.udp2cal.app.AudioPlayer
 import com.udp2cal.app.DiscoveryManager
+import com.udp2cal.app.PcmSlip
 import com.udp2cal.app.Prefs
+import com.udp2cal.app.StreamResampler
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
 import com.udp2cal.app.native.OpusDecoder as ReverseOpusDecoder
@@ -105,6 +107,66 @@ class CaptureService : Service() {
     )
 
     private var pendingRestart: CaptureParams? = null
+    /** 当前会话的采集参数（重启时复用；码率以 Prefs 为准，见 restartCapture） */
+    @Volatile private var activeParams: CaptureParams? = null
+
+    // ─── 运行期参数热更新 ───
+    //
+    // 设置页改动会即时写入 Prefs，但编码器只在创建时读过一次参数，导致
+    // "改了没反应"。发送循环每 100 ms 比对一次快照：
+    //   * 编码器参数（码率/复杂度/带宽/DTX/VBR/FEC/丢包率/信号提示）→ OPUS_SET_*，下一帧生效；
+    //   * 采集链路参数（语音↔音乐、测试音）→ AudioRecord 音源/AEC/AudioTrack 模式
+    //     都是创建时定型的，只能重建链路。
+    /** 已生效的编码器参数快照；null 表示尚未与编码器对齐 */
+    @Volatile private var appliedCfg: EncoderCfg? = null
+    @Volatile private var appliedVoiceMode: Boolean? = null
+    @Volatile private var appliedTestTone: Boolean = false
+    /** 已因参数变化投递重启，避免 100 ms 检查重复触发 */
+    @Volatile private var restartPending: Boolean = false
+
+    /**
+     * 编码器参数快照。
+     *
+     * 推导规则必须与 [`OpusEncoder`] 构造函数**逐字一致**：
+     * DTX 开启 → 强制 VBR；VBR 关闭 → 约束清零。否则热更新后的状态
+     * 会与"从头创建"不一致，表现为"改了别的参数，VBR 又变回去了"。
+     */
+    private data class EncoderCfg(
+        val bitrateKbps: Int,
+        val complexity: Int,
+        val signal: Int,
+        val bandwidth: Int,
+        val dtx: Int,
+        val vbr: Int,
+        val vbrConstraint: Int,
+        val fec: Int,
+        val packetLoss: Int,
+    ) {
+        companion object {
+            fun fromPrefs(): EncoderCfg {
+                val dtx = Prefs.opusDtx.coerceIn(0, 1)
+                val vbr = if (dtx == 1) 1 else Prefs.opusVbr.coerceIn(0, 1)
+                return EncoderCfg(
+                    bitrateKbps = Udp2CalProtocol.clampBitrateKbps(Prefs.opusBitrateKbps),
+                    complexity = Prefs.opusComplexity,
+                    signal = Prefs.opusSignal,
+                    bandwidth = Prefs.opusBandwidth,
+                    dtx = dtx,
+                    vbr = vbr,
+                    vbrConstraint = if (vbr == 1) Prefs.opusVbrConstraint.coerceIn(0, 1) else 0,
+                    fec = Prefs.opusFec,
+                    packetLoss = Prefs.opusPacketLoss,
+                )
+            }
+        }
+
+        /** 状态卡展示用：当前码率控制模式的短标签 */
+        fun vbrLabel(): String = when {
+            vbr == 0 -> "CBR"
+            vbrConstraint == 1 -> "VBR·约束"
+            else -> "VBR"
+        }
+    }
 
     /** 音源描述枚举 */
     object AudioSourceLabel {
@@ -219,6 +281,8 @@ class CaptureService : Service() {
         hasNewCapture = true
         val voiceMode = isVoiceMode()
         val deviceId = DiscoveryManager.getOrCreateDeviceId()
+        activeParams = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
+        restartPending = false
 
         captureJob = serviceScope.launch {
             _status.value = _status.value.copy(isRunning = true, errorMsg = "")
@@ -235,11 +299,27 @@ class CaptureService : Service() {
                 activeReverseSsrc = 0
 
                 // ── 正向编码器（固定 48 kHz / 10 ms / 单声道）──
+                //
+                // 参数一律取**当前 Prefs 的快照**，不取入参：重建链路可能就发生在
+                // 用户刚改完设置之后（例如语音↔音乐），用旧入参会把新设置丢掉。
+                // 快照同时作为 appliedCfg 的初值，构造与"已生效"状态原子一致。
+                val cfg0 = EncoderCfg.fromPrefs()
                 val enc = OpusEncoder(
                     sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
-                    bitrateKbps = Udp2CalProtocol.clampBitrateKbps(bitrateKbps),
+                    bitrateKbps = cfg0.bitrateKbps,
+                    complexity = cfg0.complexity,
+                    signalType = cfg0.signal,
+                    bandwidth = cfg0.bandwidth,
+                    dtx = cfg0.dtx,
+                    vbrRaw = cfg0.vbr,
+                    fec = cfg0.fec,
+                    packetLoss = cfg0.packetLoss,
+                    vbrConstraintRaw = cfg0.vbrConstraint,
                 )
                 encoder = enc
+                appliedCfg = cfg0
+                appliedVoiceMode = voiceMode
+                appliedTestTone = testTone
                 if (!enc.start()) {
                     fail("编码器初始化失败")
                     return@launch
@@ -257,7 +337,11 @@ class CaptureService : Service() {
                 _status.value = _status.value.copy(
                     isRunning = true,
                     sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
-                    bitrateTargetKbps = Udp2CalProtocol.clampBitrateKbps(bitrateKbps),
+                    bitrateTargetKbps = cfg0.bitrateKbps,
+                    vbrMode = cfg0.vbrLabel(),
+                    // 状态卡片的「带宽」一行读的就是这个字段；以前从没赋过值，
+                    // 于是永远渲染成 "—"，看起来像"改了带宽没反应"
+                    opusBandwidth = cfg0.bandwidth,
                     opusMode = if (voiceMode) "语音模式" else "全频模式",
                     connected = false,
                     deviceId = Udp2CalProtocol.deviceIdToString(deviceId),
@@ -395,10 +479,10 @@ class CaptureService : Service() {
 
     /** CONNECT 负载固定 15 字节；Opus 参数只描述**反向**（Windows 编码器） */
     private fun buildConnectPayload(sender: UdpSender): ByteArray {
-        val autoBr = Prefs.opusBitrateKbps <= 0
+        // 自动档已移除：始终发送具体档位（0 仅作跨版本兼容保留在协议里）
         val dtx = Prefs.opusDtx == 1
-        val vbr = Prefs.opusVbr == 1 || dtx || autoBr
-        val vbrConstraint = vbr && !autoBr && Prefs.opusVbrConstraint == 1
+        val vbr = Prefs.opusVbr == 1 || dtx
+        val vbrConstraint = vbr && Prefs.opusVbrConstraint == 1
         var flags = 0
         if (vbr) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR
         if (dtx) flags = flags or Udp2CalProtocol.OPUS_FLAG_DTX
@@ -412,7 +496,7 @@ class CaptureService : Service() {
             signal = mapSignal(Prefs.opusSignal),
             bandwidth = mapBandwidth(Prefs.opusBandwidth),
             opusFlags = flags,
-            bitrateKbps = if (autoBr) 0 else Prefs.opusBitrateKbps.coerceAtMost(Udp2CalProtocol.BITRATE_MAX_KBPS),
+            bitrateKbps = Prefs.opusBitrateKbps.coerceAtMost(Udp2CalProtocol.BITRATE_MAX_KBPS),
             packetLoss = Prefs.opusPacketLoss,
         ).encode()
     }
@@ -523,27 +607,87 @@ class CaptureService : Service() {
         _status.value = _status.value.copy(audioSource = "1kHz 测试音", isRunning = true)
         val omega = 2.0 * Math.PI * 1000.0 / Udp2CalProtocol.OPUS_SAMPLE_RATE
         var phase = 0.0
-        val frameNs = FRAME * 1_000_000_000L / Udp2CalProtocol.OPUS_SAMPLE_RATE
-        var nextAt = System.nanoTime()
+        // 节拍由 sendFrames 的 1 帧整形统一负责，这里只负责把样本填满
         sendFrames(enc, sender) { buf, off, len ->
             for (i in 0 until len) {
                 buf[off + i] = (Math.sin(phase) * 16384.0).toInt().toShort()
                 phase += omega
                 if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI
             }
-            // 测试音没有硬件节拍，只能按媒体时间自走
-            nextAt += frameNs * len / FRAME
-            val waitNs = nextAt - System.nanoTime()
-            val waitMs = waitNs / 1_000_000
-            if (waitMs > 0) {
-                delay(waitMs)
-            } else {
-                // 落后于节拍时不得用 delay(0) 空转（会占满调度线程），
-                // 交出执行权后继续追赶
-                yield()
-            }
             len
         }
+    }
+
+    /**
+     * 运行期参数对齐（发送循环每 100 ms 调一次）。
+     *
+     * 分两类，因为"能不能热改"取决于参数落在哪一层：
+     *
+     * 1. **编码器参数** —— 码率 / 复杂度 / 带宽 / DTX / VBR / VBR 约束 / FEC / 丢包率 /
+     *    信号提示：直接 `OPUS_SET_*`，下一帧生效，不断流、不重连。
+     * 2. **采集链路参数** —— 语音↔音乐（决定 AudioRecord 音源是 VOICE_COMMUNICATION
+     *    还是 MIC、是否挂 AEC、AudioTrack 是否走语音通路）、测试音开关：
+     *    这些都在对象创建时定型，Opus 的 signal 提示改了也没用（音源不变）。
+     *    只能重建链路——走既有的 restart 通道，代价是约 1 s 的重连。
+     *
+     * 第二类先判：重建期间不去打 ctl（新编码器还没建好）。
+     */
+    private fun applyRuntimeConfig(enc: OpusEncoder) {
+        val voiceMode = isVoiceMode()
+        val testTone = Prefs.testToneMode
+        if (voiceMode != appliedVoiceMode || testTone != appliedTestTone) {
+            if (!restartPending) {
+                Log.i(
+                    TAG,
+                    "采集链路参数变化（语音模式 $appliedVoiceMode→$voiceMode，测试音 $appliedTestTone→$testTone），重建采集链路"
+                )
+                restartCapture()
+            }
+            return
+        }
+
+        val want = EncoderCfg.fromPrefs()
+        if (want == appliedCfg) return
+        val ok = enc.update(
+            complexity = want.complexity,
+            signalType = want.signal,
+            bandwidth = want.bandwidth,
+            dtx = want.dtx,
+            vbr = want.vbr,
+            bitrateKbps = want.bitrateKbps,
+            fec = want.fec,
+            packetLoss = want.packetLoss,
+            vbrConstraint = want.vbrConstraint,
+        )
+        if (!ok) return // 编码器已销毁（退出中），下一轮自然不再调用
+        val old = appliedCfg
+        appliedCfg = want
+        Log.i(
+            TAG,
+            "编码参数热更新: ${old?.bitrateKbps}→${want.bitrateKbps}k " +
+                "cplx=${want.complexity} bw=${want.bandwidth} dtx=${want.dtx} " +
+                "vbr=${want.vbr} vbrc=${want.vbrConstraint} fec=${want.fec} pl=${want.packetLoss}"
+        )
+        _status.value = _status.value.copy(
+            bitrateTargetKbps = want.bitrateKbps,
+            vbrMode = want.vbrLabel(),
+            opusBandwidth = want.bandwidth,
+        )
+    }
+
+    /**
+     * 因参数变化重建采集链路。
+     *
+     * 复用 `startCapture` 已有的 restart 通道：置 `pendingRestart` 后取消当前任务，
+     * `doStartCapture` 的 finally 会以**同一套参数**重新起一条采集链。
+     * 码率取当前 Prefs（用户可能在触发重建的同一时刻也改了码率）。
+     */
+    private fun restartCapture() {
+        // 先置位：即使 activeParams 已失效（正在退出），也不要每 100 ms 重复打日志
+        restartPending = true
+        val p = activeParams ?: return
+        pendingRestart = p.copy(bitrateKbps = Prefs.opusBitrateKbps)
+        captureJob?.cancel()
     }
 
     /**
@@ -554,6 +698,11 @@ class CaptureService : Service() {
      *   * 编码失败/发送失败/DTX 空帧：该帧不产出负载，但序列号仍 +1
      *     （让接收端看到连续的时间线，避免恢复包被判迟到）；
      *   * 未连接（无新鲜 ACK）时不编码不发送，时间戳与序列号照常推进。
+     *
+     * **1 帧节拍整形**：AudioRecord 的阻塞读天然成簇返回（常见 20 ms 一次），
+     * 直接发就是"两包挨着、然后静默 20 ms"，接收端水位呈锯齿。这里把发送时刻
+     * 钉在 10 ms 网格上——不是攒队列，最多只压 1 帧；落后超过 4 帧就重置节拍，
+     * 绝不追赶式突发（突发会让接收端水位瞬间抬高，正是要消灭的东西）。
      */
     private suspend fun sendFrames(
         enc: OpusEncoder,
@@ -571,6 +720,10 @@ class CaptureService : Service() {
         var lastReport = System.currentTimeMillis()
         /** 已累积但还不足一帧的样本数 */
         var filled = 0
+        /** 节拍网格上的下一个发送时刻（nanoTime） */
+        val frameNs = FRAME * 1_000_000_000L / Udp2CalProtocol.OPUS_SAMPLE_RATE
+        var nextSendAt = System.nanoTime()
+        var lastCfgCheck = 0L
 
         while (coroutineContext.isActive) {
             // AudioRecord.read 允许返回不足请求量的样本（缓冲区尚未填满）。
@@ -588,6 +741,11 @@ class CaptureService : Service() {
             filled = 0
 
             val now = System.currentTimeMillis()
+            // 每 100 ms 对齐一次 Prefs：设置页的改动在下一帧就生效
+            if (now - lastCfgCheck >= 100) {
+                lastCfgCheck = now
+                applyRuntimeConfig(enc)
+            }
             if (sender.isAckFresh(now)) {
                 val n = enc.encodeTo(pcm, packet, Udp2CalProtocol.RTP_HEADER_SIZE)
                 if (n > 0) {
@@ -616,6 +774,17 @@ class CaptureService : Service() {
                 _status.value = _status.value.copy(bitrateKbps = byteCount * 8f / elapsed)
                 byteCount = 0
                 lastReport = now
+            }
+
+            // ── 1 帧节拍整形 ──
+            nextSendAt += frameNs
+            val waitNs = nextSendAt - System.nanoTime()
+            when {
+                waitNs >= 1_000_000L -> delay(waitNs / 1_000_000L)
+                waitNs > 0L -> yield() // 不足 1 ms：让出执行权，不忙等
+                // 落后超过 4 帧（调度抖动/断连恢复）：重置节拍，
+                // 绝不用连续突发把落后的时间补回来
+                waitNs < -4 * frameNs -> nextSendAt = System.nanoTime()
             }
         }
     }
@@ -742,9 +911,17 @@ class CaptureService : Service() {
         val frameSamples = Udp2CalProtocol.OPUS_FRAME_SAMPLES * 2 // 立体声交错
         val pcm = ShortArray(frameSamples)
         val silence = ShortArray(frameSamples)
-        val insertBuf = ShortArray(Udp2CalProtocol.DRIFT_MAX_SAMPLES * 2)
+        // 有界回落的交叉淡化插入缓冲：一帧 + 1 ms
+        val slipBuf = ShortArray(
+            (Udp2CalProtocol.OPUS_FRAME_SAMPLES + Udp2CalProtocol.SLIP_SAMPLES) * 2
+        )
+        // 受控重采样：媒体 48 kHz、设备 48 kHz，固定比率 1.0，只做 ±0.5% 微调
+        val resampler = StreamResampler(2)
+        resampler.setSourceRate(Udp2CalProtocol.OPUS_SAMPLE_RATE, Udp2CalProtocol.OPUS_SAMPLE_RATE)
         var mediaSamples = 0L
         var lastEpoch = -1L
+        var lastLatencyLog = 0L
+        var latencyMs = 0
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
         while (coroutineContext.isActive) {
@@ -757,6 +934,7 @@ class CaptureService : Service() {
             var jbNextTs = 0L
             var jbResyncs = 0L
             var jbOverflow = 0L
+            var arrivalNanos = -1L
 
             linkLock.lock()
             try {
@@ -771,6 +949,8 @@ class CaptureService : Service() {
                 val head = player.playbackHeadFrames()
                 val playhead = clock.update(head) ?: jitter.nextTs
                 code = jitter.pull(playhead, payload)
+                // 延迟估算：播放头那一帧是多久以前到达的
+                arrivalNanos = jitter.arrivalNanosAt(playhead)
                 // 漂移校正看总缓冲：抖动缓冲里排队的 + 已写进 AudioTrack 还没播的
                 val queuedMs = (player.pendingFrames(head) * 1000L /
                     Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
@@ -794,8 +974,32 @@ class CaptureService : Service() {
                 dec.reset()
                 clock.reset()
                 drift.reset()
+                resampler.reset()
                 player.flush()
                 mediaSamples = 0
+            }
+
+            // ── 漂移校正：比率微调（每 10 ms）+ 有界回落（每秒 ≤1 次）──
+            val du = drift.update(waterMs, mediaSamples)
+            resampler.setAdjust(du.adjust)
+
+            // ── 总延迟估算 ──
+            // 口径：正在播放的那一帧是多久以前到达本机的。AudioTrack 的播放头
+            // 已是"混音器消费到的位置"，所以这个年龄天然包含播放缓冲，
+            // 只少一个混音周期（5–20 ms，公开 SDK 无法读出）。
+            if (arrivalNanos > 0) {
+                val ageMs = ((System.nanoTime() - arrivalNanos) / 1_000_000L).toInt()
+                latencyMs = ageMs.coerceAtLeast(0)
+                val now = System.currentTimeMillis()
+                if (now - lastLatencyLog >= 10_000) {
+                    lastLatencyLog = now
+                    Log.i(
+                        TAG,
+                        "反向延迟≈${latencyMs}ms 水位=${waterMs}ms " +
+                            "比率微调=${"%.3f".format(du.adjust * 100)}% " +
+                            "回落=${drift.slipDrops + drift.slipInserts}次"
+                    )
+                }
             }
 
             when (code) {
@@ -804,50 +1008,50 @@ class CaptureService : Service() {
                     if (n <= 0) continue // 解码失败按丢包处理，播放头到期后 PLC
                     if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
 
-                    var writeLen = n
-                    var insertLen = 0
-                    val adj = drift.update(waterMs, mediaSamples)
-                    if (adj > 0) {
-                        // 水位过高：丢掉尾部，并做 1 ms 淡出避免接缝爆音
-                        val k = minOf(adj, n / 2)
-                        writeLen = n - k
-                        val fade = minOf(48, writeLen)
-                        for (i in 0 until fade) {
-                            val idx = writeLen - 1 - i
-                            pcm[idx] = (pcm[idx] * (1f - i.toFloat() / fade)).toInt().toShort()
-                        }
-                        // 媒体时间偏移只作用在播放头上：pull 的缺口判定用的就是 playheadTs
-                        clock.notePcmCorrection(k.toLong())
-                        mediaSamples += k
-                    } else if (adj < 0) {
-                        // 水位过低：把尾部渐入重复一次
-                        insertLen = minOf(-adj, insertBuf.size / 2) * 2
-                        val tailStart = n - insertLen
-                        for (i in 0 until insertLen) {
-                            val gain = i.toFloat() / insertLen
-                            val src = pcm[(tailStart + i).coerceIn(0, n - 1)]
-                            insertBuf[i] = (src * gain).toInt().toShort()
-                        }
-                        clock.notePcmCorrection(-insertLen.toLong())
+                    var frames = n / 2
+                    // 媒体时间按**解码出的帧数**推进（回落不改媒体时间线，只改设备帧数）
+                    val mediaFrames = frames
+                    // 有界回落：只在真实 PCM 帧上做，且必须交叉淡化
+                    var buf = pcm
+                    if (du.slipSamples > 0) {
+                        val nf = PcmSlip.drop(pcm, frames, du.slipSamples)
+                        clock.notePcmCorrection((frames - nf).toLong())
+                        frames = nf
+                    } else if (du.slipSamples < 0) {
+                        val nf = PcmSlip.insert(pcm, frames, slipBuf, -du.slipSamples)
+                        clock.notePcmCorrection(-(nf - frames).toLong())
+                        buf = slipBuf
+                        frames = nf
                     }
 
-                    if (!player.writeBlocking(pcm, 0, writeLen)) return
-                    if (insertLen > 0) {
-                        if (!player.writeBlocking(insertBuf, 0, insertLen)) return
-                        mediaSamples += insertLen
+                    // 比率微调：连续量，不留接缝
+                    val produced = resampler.process(buf, 0, frames)
+                    if (produced > 0) {
+                        if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                        clock.noteRatioCorrection((produced / 2) * du.adjust)
+                    } else {
+                        if (!player.writeBlocking(buf, 0, frames * 2)) return
+                        clock.noteRatioCorrection(frames * du.adjust)
                     }
-                    mediaSamples += n
+                    mediaSamples += mediaFrames
                 }
 
                 Udp2CalProtocol.Pull.PLC -> {
                     val n = dec.plc(pcm)
                     if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
                     if (n > 0) {
-                        if (!player.writeBlocking(pcm, 0, n)) return
-                        mediaSamples += n
+                        // PLC 帧同样要过重采样器：它和真实 PCM 走同一条时间线
+                        val produced = resampler.process(pcm, 0, n / 2)
+                        if (produced > 0) {
+                            if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                            clock.noteRatioCorrection((produced / 2) * du.adjust)
+                        } else if (!player.writeBlocking(pcm, 0, n)) {
+                            return
+                        }
+                        mediaSamples += n / 2
                     } else {
                         if (!player.writeBlocking(silence, 0, silence.size)) return
-                        mediaSamples += silence.size
+                        mediaSamples += silence.size / 2
                     }
                 }
 
@@ -855,7 +1059,7 @@ class CaptureService : Service() {
                     // 连续 PLC 已达上限：输出静音但继续推进媒体时间
                     if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
                     if (!player.writeBlocking(silence, 0, silence.size)) return
-                    mediaSamples += silence.size
+                    mediaSamples += silence.size / 2
                 }
 
                 else -> {
@@ -878,6 +1082,8 @@ class CaptureService : Service() {
 
     fun stopCapture() {
         pendingRestart = null
+        activeParams = null
+        restartPending = false
         hasNewCapture = false
         try { wifiLock?.release() } catch (_: Exception) {}
         wifiLock = null

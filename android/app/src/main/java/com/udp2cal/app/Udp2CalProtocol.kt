@@ -51,30 +51,59 @@ object Udp2CalProtocol {
     const val UDP_IP_MAX_PACKET = RTP_MAX_PACKET + 8 + 20
 
     // ═══════ 码率 ═══════
+    /**
+     * 线上码率 `0` 的映射值（跨版本兼容）。
+     *
+     * 本版客户端**不再发送 0**：设置页只有具体档位，自动档已移除。
+     * 保留它只为兼容旧客户端/旧配置——收到 0 时按"用上限"处理。
+     * 因此该值必须恒等于 [BITRATE_MAX_KBPS]。
+     */
     const val BITRATE_AUTO_KBPS = 512
-    const val BITRATE_MAX_KBPS = 1000
+    /** 码率硬上限。两端必须同值：接收端用它钳制对端下发的值 */
+    const val BITRATE_MAX_KBPS = 512
+    /** 手动档位（UI 滑块的五档），64 / 128 / 256 / 384 / 512 */
+    val BITRATE_STEPS_KBPS = intArrayOf(64, 128, 256, 384, 512)
 
     // ═══════ 抖动缓冲参数（与 Rust rtp.rs 一致）═══════
     const val MAX_REORDER_PACKETS = 64
-    const val JITTER_START_MS = 40
+    /** 到达时刻追踪深度：128 × 10 ms ≈ 1.28 s，远大于任何可用水位 */
+    const val ARRIVAL_TRACE = 128
+    /** 预缓冲启动阈值（3 帧 = 30 ms）。离散丢/插让位给受控重采样后可下探到 30 ms */
+    const val JITTER_START_MS = 30
     const val JITTER_TARGET_MS = 60
     const val JITTER_HIGH_MS = 120
     const val JITTER_LOW_MS = 20
     const val PLC_LEAD_MS = 20
     const val PLC_MAX_MS = 120
     const val RESYNC_GAP_MS = 200
-    const val DRIFT_MAX_SAMPLES = 240
-    const val DRIFT_INTERVAL_SAMPLES = 24000L
-    /** 连续多少次评估同向变化才动手（每次 500 ms 音频时间） */
-    const val DRIFT_TREND_ROUNDS = 3
-    /** 单次评估水位变化小于该值视为持平（抑制抖动噪声） */
-    const val DRIFT_TREND_DEADBAND_MS = 10
-    /** 高水位排空下限：低于该值不再主动削减，避免在边界上反复微剪 */
-    const val DRIFT_TRIM_FLOOR_MS = 200
-    /** 深度积压时的排空节奏（500 ms 一次 5 ms） */
-    const val DRIFT_TRIM_FAST_INTERVAL = DRIFT_INTERVAL_SAMPLES
-    /** 接近下限时的排空节奏（2 s 一次 5 ms） */
-    const val DRIFT_TRIM_SLOW_INTERVAL = 4 * DRIFT_INTERVAL_SAMPLES
+
+    // ═══════ 漂移校正参数（与 Rust rtp.rs 一一对应）═══════
+    /** 有界回落的单次量：1 ms */
+    const val SLIP_SAMPLES = 48
+    /** 交叉淡化长度：1 ms，丢/插都只能在淡化区内完成 */
+    const val SLIP_FADE_SAMPLES = 48
+    /** 回落高带：高于目标 30 ms */
+    const val SLIP_HIGH_MARGIN_MS = 30
+    /** 回落低带：低于目标 10 ms */
+    const val SLIP_LOW_MARGIN_MS = 10
+    /** 回落最小间隔：1 秒音频样本时间 —— 每秒最多 1 ms */
+    const val SLIP_MIN_INTERVAL_SAMPLES = 48000L
+    /** 回落评估周期：100 ms 音频样本时间 */
+    const val SLIP_EVAL_SAMPLES = 4800L
+    /** 高带"稳定"判据：连续 5 次评估 */
+    const val SLIP_STABLE_ROUNDS = 5
+    /** 启动宽限：前 2 秒只做比率微调 */
+    const val SLIP_WARMUP_SAMPLES = 96000L
+    /** 重采样比率微调上限（±0.5%） */
+    const val RESAMPLE_MAX_ADJUST = 0.005
+    /** 比率更新周期：每 10 ms（1 帧） */
+    const val RATIO_UPDATE_SAMPLES = 480L
+    /** 单次比率更新最大步进（1%/s 的斜坡） */
+    const val RATIO_SLEW_STEP = 0.0001
+    const val RATIO_DEADBAND_MS = 5.0
+    const val RATIO_FULL_MS = 20.0
+    /** 水位一阶低通系数（τ ≈ 150 ms） */
+    const val WATER_SMOOTH_ALPHA = 0.065
 
     // ═══════ 控制头 ═══════
 
@@ -196,11 +225,30 @@ object Udp2CalProtocol {
         }
     }
 
-    /** 码率归一：0=自动→512，上限 1000 */
+    /** 码率归一：0=自动→上限，其余钳制到 [BITRATE_MAX_KBPS] */
     fun clampBitrateKbps(kbps: Int): Int = when {
         kbps <= 0 -> BITRATE_AUTO_KBPS
         kbps > BITRATE_MAX_KBPS -> BITRATE_MAX_KBPS
         else -> kbps
+    }
+
+    /**
+     * 把任意码率吸附到最近的手动档位（[BITRATE_STEPS_KBPS]）。
+     *
+     * 只用于 UI/配置归一，不参与协议：历史配置里可能有 768/960/1000，
+     * 直接塞进五档滑块会让滑块停在非法位置。等距时取较小档
+     * （宁可少占带宽，也不悄悄把码率抬上去）。`0`（自动）原样返回。
+     */
+    fun snapBitrateKbps(kbps: Int): Int {
+        if (kbps == 0) return 0
+        val k = kbps.coerceAtMost(BITRATE_MAX_KBPS)
+        var best = BITRATE_STEPS_KBPS[0]
+        var bestD = Int.MAX_VALUE
+        for (s in BITRATE_STEPS_KBPS) {
+            val d = kotlin.math.abs(s - k)
+            if (d < bestD) { bestD = d; best = s }
+        }
+        return best
     }
 
     /** DISCOVER_REPLY 负载：listen_port(2) + 设备名（UTF-8，不带 NUL，≤254 字节） */
@@ -336,6 +384,11 @@ object Udp2CalProtocol {
         private val slotLen = IntArray(MAX_REORDER_PACKETS)
         private val slotData = Array(MAX_REORDER_PACKETS) { ByteArray(OPUS_MAX_PAYLOAD) }
 
+        /** 到达时刻环形记录：估算"正在播放的样本有多旧"（总延迟） */
+        private val arrivalTs = LongArray(ARRIVAL_TRACE)
+        private val arrivalAt = LongArray(ARRIVAL_TRACE) { -1L }
+        private var arrivalPos = 0
+
         var nextSeq = 0L; private set
         var nextTs = 0L; private set
         private var highestSeq = 0L
@@ -373,7 +426,25 @@ object Udp2CalProtocol {
             plcRun = 0
             // 必须清空：否则新会话的日志会打印上一次会话的重同步原因（诊断误导）
             lastRebaseReason = ""
+            // 到达记录随重同步一起作废：留着会让延迟估算瞬间跳成"几百秒"
+            arrivalAt.fill(-1L)
+            arrivalPos = 0
             epoch++
+        }
+
+        /**
+         * 查询"时间戳 [ts] 那一帧是什么时候到达的"（`System.nanoTime()`）。
+         *
+         * 取最新一条 `entryTs <= ts` 的记录——帧按时间戳单调到达，该记录就是
+         * 这一帧（或它最近的同刻邻居）。查不到（刚重同步/记录已被覆盖）返回 -1。
+         */
+        fun arrivalNanosAt(ts: Long): Long {
+            for (i in 0 until ARRIVAL_TRACE) {
+                val idx = (arrivalPos + ARRIVAL_TRACE - 1 - i) % ARRIVAL_TRACE
+                val at = arrivalAt[idx]
+                if (at >= 0 && arrivalTs[idx] <= ts) return at
+            }
+            return -1L
         }
 
         fun waterMs(): Int = contiguousFrames() * OPUS_FRAME_MS
@@ -529,6 +600,10 @@ object Udp2CalProtocol {
             slotSeq[idx] = seq
             slotTs[idx] = ts
             slotLen[idx] = length
+            // 所有"接纳成功"的路径都汇聚到这里：到达时刻一并落账（延迟估算用）
+            arrivalTs[arrivalPos] = ts
+            arrivalAt[arrivalPos] = System.nanoTime()
+            arrivalPos = (arrivalPos + 1) % ARRIVAL_TRACE
         }
 
         private fun dropOldestNonNext() {
@@ -543,78 +618,115 @@ object Udp2CalProtocol {
     }
 
     /**
-     * 漂移 / 延迟校正器，两条互相独立的策略：
+     * 漂移 / 延迟校正器（与 Rust `rtp::DriftController` 同语义）。
      *
-     * * **高水位 → 排空延迟**（按绝对值，限速）：启动突发或网络成簇会把缓冲顶高，
-     *   "生产 == 消费"不会让它自己回落。>300 ms 每 500 ms 削 5 ms（1%），
-     *   200–300 ms 每 2 s 削 5 ms（0.25%），**低于 200 ms 一律不动**。
-     * * **低水位 → 补时钟漂移**（按趋势）：PCM 提前写进 AudioTrack 时抖动缓冲
-     *   水位本就是 0，按绝对值判定会永久每 500 ms 插 5 ms；只在连续 3 次评估
-     *   都在下降时才补。
+     * **第一级：受控重采样（主力）** —— 水位偏差经低通后按比例映射到重采样
+     * 比率的 ±0.5%，每 10 ms 更新一次，单次步进 ≤0.0001。比率是连续量，
+     * 不会在 PCM 里留下任何接缝。
      *
-     * 返回正数=丢弃该样本数，负数=插入该样本数，0=不校正。
+     * **第二级：有界回落（安全网）** —— 只有水位持续跑出回落带（高于目标
+     * 30 ms 且稳定 / 低于目标 10 ms）才做一次 1 ms 的丢/插，每秒最多一次，
+     * 且必须交叉淡化。
+     *
+     * @return [DriftUpdate]：`adjust` 为比率微调；`slipSamples > 0` 表示丢弃
+     *         该样本数、`< 0` 表示插入该样本数、`0` 表示不动作。
      */
     class DriftController {
-        private var prevWater = 0
-        private var rising = 0
-        private var falling = 0
-        private var lastEval = 0L
-        private var lastAction = 0L
+        private var water = 0.0
+        private var adjust = 0.0
         private var primed = false
-        var corrections = 0L; private set
+        private var lastRatio = 0L
+        private var lastEval = 0L
+        private var lastSlip = 0L
+        private var streak = 0
+
+        var ratioUpdates = 0L; private set
+        var slipDrops = 0L; private set
+        var slipInserts = 0L; private set
+        var slippedSamples = 0L; private set
 
         fun reset() {
-            prevWater = 0
-            rising = 0
-            falling = 0
-            lastEval = 0
-            lastAction = 0
+            water = 0.0
+            adjust = 0.0
             primed = false
+            lastRatio = 0
+            lastEval = 0
+            lastSlip = 0
+            streak = 0
         }
 
-        /** [waterMs] 必须是**总缓冲深度**（抖动缓冲 + AudioTrack 排队） */
-        fun update(waterMs: Int, mediaSamples: Long): Int {
+        fun adjust(): Double = adjust
+
+        fun update(waterMs: Int, mediaSamples: Long): DriftUpdate {
             if (!primed) {
                 primed = true
-                prevWater = waterMs
+                water = waterMs.toDouble()
+                lastRatio = mediaSamples
                 lastEval = mediaSamples
-                lastAction = mediaSamples
-                return 0
+                lastSlip = mediaSamples
+                return DriftUpdate.NONE
             }
-            if (mediaSamples - lastEval < DRIFT_INTERVAL_SAMPLES) return 0
+
+            // ── 第一级：比率微调（每 10 ms 一次）──
+            if (mediaSamples - lastRatio >= RATIO_UPDATE_SAMPLES) {
+                lastRatio = mediaSamples
+                water += WATER_SMOOTH_ALPHA * (waterMs - water)
+                val err = water - JITTER_TARGET_MS
+                val mag = kotlin.math.abs(err)
+                val want = if (mag <= RATIO_DEADBAND_MS) {
+                    0.0
+                } else {
+                    val k = ((mag - RATIO_DEADBAND_MS) / (RATIO_FULL_MS - RATIO_DEADBAND_MS))
+                        .coerceAtMost(1.0)
+                    kotlin.math.sign(err) * RESAMPLE_MAX_ADJUST * k
+                }
+                val step = (want - adjust).coerceIn(-RATIO_SLEW_STEP, RATIO_SLEW_STEP)
+                adjust = (adjust + step).coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
+                ratioUpdates++
+            }
+
+            // ── 第二级：有界回落 ──
+            return DriftUpdate(adjust, evaluateSlip(waterMs, mediaSamples))
+        }
+
+        private fun evaluateSlip(waterMs: Int, mediaSamples: Long): Int {
+            if (mediaSamples - lastEval < SLIP_EVAL_SAMPLES) return 0
             lastEval = mediaSamples
 
-            val delta = waterMs - prevWater
-            prevWater = waterMs
-            when {
-                delta > DRIFT_TREND_DEADBAND_MS -> { rising++; falling = 0 }
-                delta < -DRIFT_TREND_DEADBAND_MS -> { falling++; rising = 0 }
-                else -> { rising = 0; falling = 0 }
-            }
-
-            // 高水位：限速排空
-            if (waterMs > DRIFT_TRIM_FLOOR_MS) {
-                val interval = if (waterMs > DRIFT_TRIM_FLOOR_MS * 3 / 2) {
-                    DRIFT_TRIM_FAST_INTERVAL
-                } else {
-                    DRIFT_TRIM_SLOW_INTERVAL
-                }
-                if (mediaSamples - lastAction >= interval) {
-                    lastAction = mediaSamples
-                    corrections++
-                    return DRIFT_MAX_SAMPLES
-                }
+            if (mediaSamples < SLIP_WARMUP_SAMPLES) {
+                streak = 0
                 return 0
             }
 
-            // 低水位：只在持续变薄时补
-            if (falling >= DRIFT_TREND_ROUNDS && waterMs < JITTER_LOW_MS) {
-                falling = 0
-                lastAction = mediaSamples
-                corrections++
-                return -DRIFT_MAX_SAMPLES
+            val high = JITTER_TARGET_MS + SLIP_HIGH_MARGIN_MS
+            val low = JITTER_TARGET_MS - SLIP_LOW_MARGIN_MS
+            if (waterMs > high) streak++ else streak = 0
+
+            // 速率闸门：每秒最多 1 ms，绝不连续触发
+            if (mediaSamples - lastSlip < SLIP_MIN_INTERVAL_SAMPLES) return 0
+
+            if (streak >= SLIP_STABLE_ROUNDS) {
+                streak = 0
+                lastSlip = mediaSamples
+                slipDrops++
+                slippedSamples += SLIP_SAMPLES
+                return SLIP_SAMPLES
+            }
+            if (waterMs < low) {
+                streak = 0
+                lastSlip = mediaSamples
+                slipInserts++
+                slippedSamples += SLIP_SAMPLES
+                return -SLIP_SAMPLES
             }
             return 0
+        }
+    }
+
+    /** 一次漂移校正评估的产物 */
+    class DriftUpdate(val adjust: Double, val slipSamples: Int) {
+        companion object {
+            val NONE = DriftUpdate(0.0, 0)
         }
     }
 
@@ -630,6 +742,8 @@ object Udp2CalProtocol {
         private var lastValue = 0L
         private var remainder = 0L
         private var offset = 0L
+        /** 比率微调造成的不足一个样本的残余（逐帧取整会吃掉近 17% 的校正量） */
+        private var offsetFrac = 0.0
         var isStarted = false; private set
 
         fun start(baseTs: Long, playedFrames: Long) {
@@ -638,6 +752,7 @@ object Udp2CalProtocol {
             this.lastDeviceFrames = playedFrames
             this.remainder = 0
             this.offset = 0
+            this.offsetFrac = 0.0
             isStarted = true
         }
 
@@ -656,8 +771,23 @@ object Udp2CalProtocol {
 
         fun value(): Long? = if (isStarted) lastValue + offset else null
 
+        /** 有界回落：丢 PCM → delta > 0 让播放头前移 */
         fun notePcmCorrection(deltaSamples: Long) {
             offset += deltaSamples
+        }
+
+        /**
+         * 重采样比率微调造成的媒体时间偏移（**连续量**，每帧调用）。
+         * 比率乘 `(1+u)` 后每个设备帧要多算 `u` 个媒体样本，必须用小数累积。
+         */
+        fun noteRatioCorrection(samples: Double) {
+            if (!samples.isFinite()) return
+            offsetFrac += samples
+            val whole = offsetFrac.toLong()
+            if (whole != 0L) {
+                offset += whole
+                offsetFrac -= whole
+            }
         }
 
         fun reset() {
@@ -667,6 +797,7 @@ object Udp2CalProtocol {
             lastDeviceFrames = 0
             remainder = 0
             offset = 0
+            offsetFrac = 0.0
         }
     }
 }

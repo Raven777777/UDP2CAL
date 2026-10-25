@@ -5,7 +5,6 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
-import android.os.Build
 import android.util.Log
 
 /**
@@ -24,9 +23,17 @@ class AudioPlayer(private val context: Context) {
         private const val TAG = "AudioPlayer"
         private const val SAMPLE_RATE = Udp2CalProtocol.OPUS_SAMPLE_RATE
         private const val CHANNELS = 2
+        private const val BYTES_PER_SAMPLE = 2
 
-        /** 输出缓冲 80 ms：覆盖 60 ms 目标水位 + 调度余量 */
-        private const val BUFFER_MS = 80
+        /**
+         * 输出缓冲：**最小可行值**。
+         *
+         * 结构上我们每 10 ms 阻塞写一帧，所以缓冲至少要能装下"一帧 + 调度余量"；
+         * 2 帧（20 ms）是 low-latency 模式下不因调度抖动周期性断音的下限。
+         * 更小的缓冲不会降低听感延迟（延迟主要由抖动缓冲水位决定，
+         * 目标是 60 ms），只会把欠载风险换成爆音。
+         */
+        private const val BUFFER_FRAMES = 2 * Udp2CalProtocol.OPUS_FRAME_SAMPLES
     }
 
     @Volatile private var audioTrack: AudioTrack? = null
@@ -59,8 +66,10 @@ class AudioPlayer(private val context: Context) {
             AudioFormat.CHANNEL_OUT_STEREO,
             AudioFormat.ENCODING_PCM_16BIT
         )
-        val wanted = (SAMPLE_RATE * BUFFER_MS / 1000) * 2 * CHANNELS
-        val finalBufSize = wanted.coerceAtLeast(minBufSize)
+        val wanted = BUFFER_FRAMES * BYTES_PER_SAMPLE * CHANNELS
+        val finalBufSize = wanted.coerceAtLeast(
+            if (minBufSize > 0) minBufSize else wanted
+        )
 
         headRaw = 0
         headFrames = 0
@@ -71,7 +80,7 @@ class AudioPlayer(private val context: Context) {
             routeToEarpiece(true)
             if (!tryCreateTrack(
                     AudioAttributes.USAGE_VOICE_COMMUNICATION, AudioAttributes.CONTENT_TYPE_SPEECH,
-                    AudioManager.STREAM_VOICE_CALL, audioSessionId, finalBufSize
+                    audioSessionId, finalBufSize
                 )
             ) {
                 Log.w(TAG, "VOICE_COMMUNICATION 不可用，回退到 MEDIA")
@@ -79,7 +88,7 @@ class AudioPlayer(private val context: Context) {
                 routeToEarpiece(false)
                 if (!tryCreateTrack(
                         AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC,
-                        AudioManager.STREAM_MUSIC, 0, finalBufSize
+                        0, finalBufSize
                     )
                 ) {
                     Log.e(TAG, "AudioTrack 创建彻底失败")
@@ -92,7 +101,7 @@ class AudioPlayer(private val context: Context) {
             isVoiceCommActive = false
             if (!tryCreateTrack(
                     AudioAttributes.USAGE_MEDIA, AudioAttributes.CONTENT_TYPE_MUSIC,
-                    AudioManager.STREAM_MUSIC, 0, finalBufSize
+                    0, finalBufSize
                 )
             ) {
                 Log.e(TAG, "AudioTrack 创建彻底失败")
@@ -110,46 +119,40 @@ class AudioPlayer(private val context: Context) {
             return false
         }
 
-        Log.i(TAG, "AudioPlayer 已启动（${if (voiceMode) "语音模式" else "音乐模式"}·${if (isVoiceCommActive) "VOICE_COMMUNICATION" else "MEDIA"}·缓冲 ${finalBufSize / 4} 帧）")
+        Log.i(TAG, "AudioPlayer 已启动（${if (voiceMode) "语音模式" else "音乐模式"}·${if (isVoiceCommActive) "VOICE_COMMUNICATION" else "MEDIA"}·缓冲 ${finalBufSize / 4} 帧·low-latency)")
         return true
     }
 
+    /**
+     * 固定 48 kHz 立体声 + 低延迟路径。
+     *
+     * `PERFORMANCE_MODE_LOW_LATENCY`（API 26+，本项目 minSdk=29）让系统优先
+     * 走 fast mixer 通路：AudioTrack 不再被塞进 192 帧的常规混音块，
+     * `getPlaybackHeadPosition()` 的粒度也随之变细，反向播放的播放头换算
+     * 因此更贴近真实出声位置。
+     */
     private fun tryCreateTrack(
-        usage: Int, contentType: Int, streamType: Int,
+        usage: Int, contentType: Int,
         sessionId: Int, bufSize: Int
     ): Boolean {
         return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val attrs = AudioAttributes.Builder()
-                    .setUsage(usage)
-                    .setContentType(contentType)
-                    .build()
-                val format = AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                    .build()
-                audioTrack = AudioTrack.Builder()
-                    .setAudioAttributes(attrs)
-                    .setAudioFormat(format)
-                    .setBufferSizeInBytes(bufSize)
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .apply {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                        }
-                        if (sessionId > 0) setSessionId(sessionId)
-                    }
-                    .build()
-            } else {
-                @Suppress("DEPRECATION")
-                audioTrack = AudioTrack(
-                    streamType, SAMPLE_RATE,
-                    AudioFormat.CHANNEL_OUT_STEREO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize, AudioTrack.MODE_STREAM
-                )
-            }
+            val attrs = AudioAttributes.Builder()
+                .setUsage(usage)
+                .setContentType(contentType)
+                .build()
+            val format = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(SAMPLE_RATE)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                .build()
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(attrs)
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(bufSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                .apply { if (sessionId > 0) setSessionId(sessionId) }
+                .build()
             isVoiceCommActive = (usage == AudioAttributes.USAGE_VOICE_COMMUNICATION)
             true
         } catch (e: Exception) {
@@ -188,6 +191,21 @@ class AudioPlayer(private val context: Context) {
     /** 已写入但尚未播放的帧数（AudioTrack 缓冲深度） */
     fun pendingFrames(playedFrames: Long): Long = synchronized(trackLock) {
         (writtenFrames - playedFrames).coerceAtLeast(0)
+    }
+
+    /**
+     * 实际协商到的缓冲深度（帧），用于启动日志。
+     *
+     * 注意：Android **没有**公开 `AudioTrack.getLatency()`（该 API 是 system-api，
+     * 不在公开 SDK 里）。本端不做"声卡自报延迟"的单独测量——
+     * [playbackHeadFrames] 返回的已经是混音器消费到的位置，
+     * 由此算出的"播放头那一帧的到达年龄"天然包含 AudioTrack 缓冲，
+     * 只少一个混音周期（典型 5–20 ms）。
+     */
+    fun bufferFrames(): Int = try {
+        audioTrack?.getBufferSizeInFrames() ?: 0
+    } catch (_: Exception) {
+        0
     }
 
     /**

@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.udp2cal.app.service.CaptureService
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     companion object { private const val TAG = "MainActivity" }
@@ -157,7 +158,8 @@ class MainActivity : ComponentActivity() {
     private fun doStart(ip: String, port: Int) {
         Prefs.targetIp = ip; Prefs.targetPort = port
         val sampleRateHz = 48000
-        val bitrateKbps = if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else 512
+        // 码率已是具体档位（Prefs 读出即吸附），不存在自动档
+        val bitrateKbps = Prefs.opusBitrateKbps
 
         val action = {
             startService(Intent(this, CaptureService::class.java))
@@ -301,6 +303,17 @@ fun MainScreen(
     }
 }
 
+/** 带宽码（Opus 枚举值）→ 滑块与状态卡片共用的文案表 */
+private val BW_CODES = intArrayOf(1101, 1102, 1103, 1104, 1105)
+private val BW_LABELS = arrayOf(
+    "窄带 NB · 8 kHz",
+    "中带 MB · 12 kHz",
+    "宽带 WB · 16 kHz",
+    "超宽带 SWB · 24 kHz",
+    "全频带 FB · 48 kHz",
+)
+private val BW_SHORT = arrayOf("NB", "MB", "WB", "SWB", "FB")
+
 @Composable
 fun OpusSettingsScreen(
     onBack: () -> Unit,
@@ -312,8 +325,8 @@ fun OpusSettingsScreen(
     var bandwidth by remember { mutableStateOf(Prefs.opusBandwidth) }
     var dtx by remember { mutableStateOf(Prefs.opusDtx != 0) }
     var vbr by remember { mutableStateOf(Prefs.opusVbr != 0) }
-    var bitrateAuto by remember { mutableStateOf(Prefs.opusBitrateKbps == 0) }
-    var manualBitrate by remember { mutableStateOf(if (Prefs.opusBitrateKbps > 0) Prefs.opusBitrateKbps else 512) }
+    // 码率固定为具体档位：不再有"自动分配"（它等价于用上限，且会强制开 VBR）
+    var bitrate by remember { mutableStateOf(Prefs.opusBitrateKbps) }
     var fec by remember { mutableStateOf(Prefs.opusFec != 0) }
     var packetLoss by remember { mutableStateOf(Prefs.opusPacketLoss.toFloat()) }
     var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint != 0) }
@@ -352,14 +365,11 @@ fun OpusSettingsScreen(
         }
     }
 
-    // 带宽 JNI 常量 → 显示名称
-    fun bwDisplayName(bw: Int): String = when (bw) {
-        1101 -> "窄带 NB 8kHz"
-        1102 -> "中带 MB 12kHz"
-        1103 -> "宽带 WB 16kHz"
-        1104 -> "超宽带 SWB 24kHz"
-        1105 -> "全频带 FB 48kHz"
-        else -> ""
+    // 带宽码（Opus 枚举值 1101..1105）→ 显示文本。
+    // 滑块与状态卡片共用同一张表，避免两处文案各自漂移。
+    fun bwDisplayName(bw: Int): String {
+        val i = BW_CODES.indexOf(bw)
+        return if (i >= 0) BW_LABELS[i] else ""
     }
 
     Column(
@@ -444,11 +454,18 @@ fun OpusSettingsScreen(
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(bwDisplayName(opusBandwidth).ifEmpty { "—" }, fontSize = 13.sp, color = Color.White)
+                        // 运行时显示**已生效**值（编码器上报），未运行时显示**已配置**值，
+                        // 这样任何时候改滑块都能在这一行看到结果
+                        Text(
+                            bwDisplayName(if (isRunning) opusBandwidth else bandwidth).ifEmpty { "—" },
+                            fontSize = 13.sp, color = Color.White
+                        )
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("采样率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(if (sampleRateHz > 0) "${sampleRateHz / 1000}kHz" else "—", fontSize = 13.sp, color = Color.White)
+                        // 采集/编码输入固定 48 kHz；"带宽"指的是编码后保留的频率范围，
+                        // 两者不是一回事，标签写清楚免得看起来自相矛盾
+                        Text("输入采样率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(if (sampleRateHz > 0) "${sampleRateHz / 1000}kHz" else "48kHz", fontSize = 13.sp, color = Color.White)
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("实时码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
@@ -456,11 +473,18 @@ fun OpusSettingsScreen(
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("目标码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(if (targetKbps > 0) "${targetKbps}kbps" else "自动", fontSize = 13.sp, color = Color.White)
+                        val shownKbps = if (isRunning && targetKbps > 0) targetKbps else bitrate
+                        Text("${shownKbps}kbps", fontSize = 13.sp, color = Color.White)
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text("VBR模式", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(vbrMode.ifEmpty { "—" }, fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                        // 与 EncoderCfg.vbrLabel() 同义：DTX 会强制 VBR
+                        val shownVbr = when {
+                            !(vbr || dtx) -> "CBR"
+                            vbrConstraint -> "VBR·约束"
+                            else -> "VBR"
+                        }
+                        Text(if (isRunning && vbrMode.isNotEmpty()) vbrMode else shownVbr, fontSize = 13.sp, color = Color(0xFFB0B0B0))
                     }
                 }
             }
@@ -523,37 +547,75 @@ fun OpusSettingsScreen(
         }
 
         Text("音频带宽 (Bandwidth)", fontSize = 14.sp, color = Color.White)
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            val bws = listOf(1101 to "窄带 (NB) - 8kHz", 1102 to "中带 (MB) - 12kHz", 1103 to "宽带 (WB) - 16kHz", 1104 to "超宽带 (SWB) - 24kHz", 1105 to "全频带 (FB) - 48kHz")
-            bws.forEach { (valOf, label) ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(selected = bandwidth == valOf, onClick = { bandwidth = valOf; Prefs.opusBandwidth = valOf })
-                    Text(label, fontSize = 13.sp, color = Color(0xFFD0D0D0))
-                }
-            }
-        }
-
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Text("自动分配码率", fontSize = 14.sp, color = Color.White)
-            Switch(checked = bitrateAuto, onCheckedChange = {
-                bitrateAuto = it; Prefs.opusBitrateKbps = if (it) 0 else manualBitrate
-            }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676)))
-        }
-        if (!bitrateAuto) {
-            // v3 固定 10 ms 帧：1024 kbps 会产出 1280 字节负载，超过 Opus 1275 字节上限，
-            // 因此手动档位只有 512 / 768 / 960 / 1000
-            Text("手动码率: ${manualBitrate}kbps", fontSize = 13.sp, color = Color(0xFFB0B0B0))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(512, 768, 960, 1000).forEach { kbps ->
-                    FilterChip(
-                        selected = manualBitrate == kbps,
-                        onClick = { manualBitrate = kbps; Prefs.opusBitrateKbps = kbps },
-                        label = { Text("$kbps") }
+        run {
+            // 与码率滑块保持完全一致的版式：标题 → 当前值 → 滑块 → 刻度 → 说明
+            val lastIdx = BW_CODES.lastIndex
+            val idx = BW_CODES.indexOf(bandwidth).takeIf { it >= 0 } ?: lastIdx
+            Text(
+                "当前: ${BW_LABELS[idx]}",
+                fontSize = 13.sp, color = Color(0xFFB0B0B0)
+            )
+            Slider(
+                value = idx.toFloat(),
+                onValueChange = { v ->
+                    val i = v.roundToInt().coerceIn(0, lastIdx)
+                    if (BW_CODES[i] != bandwidth) {
+                        bandwidth = BW_CODES[i]
+                        Prefs.opusBandwidth = BW_CODES[i]
+                    }
+                },
+                valueRange = 0f..lastIdx.toFloat(),
+                steps = BW_CODES.size - 2,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                BW_SHORT.forEachIndexed { i, code ->
+                    Text(
+                        code,
+                        fontSize = 10.sp,
+                        color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888)
                     )
                 }
             }
-            Text("1000 kbps ≈ 1250 字节/帧，接近 1275 字节上限；1024 kbps 已禁止",
-                fontSize = 11.sp, color = Color(0xFF888888))
+            Text(
+                "限制编码频率范围，越低越省码率；语音推荐 WB/SWB，音乐用 FB",
+                fontSize = 11.sp, color = Color(0xFF888888)
+            )
+        }
+
+        // 码率：五档滑块。协议上限 512 kbps（10 ms 帧下 640 字节/帧，远低于 1275）
+        Text("码率 (Bitrate)", fontSize = 14.sp, color = Color.White)
+        run {
+            val steps = Udp2CalProtocol.BITRATE_STEPS_KBPS
+            val lastIdx = steps.lastIndex
+            val idx = steps.indexOf(bitrate).takeIf { it >= 0 } ?: lastIdx
+            Text("当前: ${steps[idx]} kbps", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+            Slider(
+                value = idx.toFloat(),
+                onValueChange = { v ->
+                    val i = v.roundToInt().coerceIn(0, lastIdx)
+                    if (steps[i] != bitrate) {
+                        bitrate = steps[i]
+                        Prefs.opusBitrateKbps = steps[i]
+                    }
+                },
+                valueRange = 0f..lastIdx.toFloat(),
+                steps = steps.size - 2,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                steps.forEach { kbps ->
+                    Text(
+                        "$kbps",
+                        fontSize = 10.sp,
+                        color = if (kbps == bitrate) Color(0xFF00E676) else Color(0xFF888888)
+                    )
+                }
+            }
+            Text(
+                "${steps[idx]} kbps ≈ ${steps[idx] * 1000 / 8 * 10 / 1000} 字节/帧（10 ms），Opus 上限 1275 字节",
+                fontSize = 11.sp, color = Color(0xFF888888)
+            )
         }
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
@@ -568,21 +630,20 @@ fun OpusSettingsScreen(
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column {
                 Text("VBR (动态码率)", fontSize = 14.sp,
-                    color = if (dtx || bitrateAuto) Color(0xFF666666) else Color.White)
-                when {
-                    dtx -> Text("开启DTX时强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
-                    bitrateAuto -> Text("自动码率下强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
+                    color = if (dtx) Color(0xFF666666) else Color.White)
+                if (dtx) {
+                    Text("开启DTX时强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
                 }
             }
             Switch(
-                checked = vbr || dtx || bitrateAuto,
+                checked = vbr || dtx,
                 onCheckedChange = { vbr = it; Prefs.opusVbr = if (it) 1 else 0 },
-                enabled = !dtx && !bitrateAuto,
+                enabled = !dtx,
                 colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676))
             )
         }
 
-        if ((vbr || dtx || bitrateAuto) && !bitrateAuto) {
+        if (vbr || dtx) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column {
                     Text("VBR 码率约束", fontSize = 14.sp, color = Color.White)

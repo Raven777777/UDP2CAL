@@ -266,7 +266,7 @@ grep -n "class ReorderBuffer" android/app/src/main/java/com/udp2cal/app/Udp2CalP
 
 ## 十、修复记录
 
-24 项缺陷 + 4 处文档漂移已全部修复，逐项对应如下（细节见 [BUGFIX.md](BUGFIX.md#2026-10-23--第二轮质量审查24-项)）。
+24 项缺陷 + 4 处文档漂移已全部修复，逐项对应如下（细节见 [BUGFIX.md](../BUGFIX.md) 与 [BUGFIX_V2_ERA.md](BUGFIX_V2_ERA.md)）。
 
 | 缺陷 | 修复要点 | 涉及文件 |
 |------|----------|----------|

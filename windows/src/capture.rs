@@ -78,7 +78,7 @@ impl Default for OpusReverseConfig {
 
 impl From<&protocol::ConnectPayload> for OpusReverseConfig {
     fn from(p: &protocol::ConnectPayload) -> Self {
-        // 码率 0 统一映射 512 kbps；>1000 钳制到 1000（1024 会超 1275 字节上限）
+        // 码率 0（自动）= 上限；高于上限一律钳制（旧客户端的 768/960/1000 都落到 512）
         Self {
             bitrate_kbps: p.effective_bitrate_kbps(),
             bandwidth: p.bandwidth.min(4),
@@ -281,6 +281,12 @@ impl ReverseSender {
         let mut last_data_at = Instant::now();
         let mut last_frame_at = Instant::now();
 
+        // ── 1 帧节拍整形 ──
+        // WASAPI 环回事件通常一次带回一个周期（10/20 ms），直接发就是"两包挨着、
+        // 然后静默 20 ms"，接收端水位呈锯齿。这里把发送时刻钉在 10 ms 网格上：
+        // 不是攒队列（最多只压 1 帧），而是把成簇的输出摊平。
+        let frame_gap = Duration::from_millis(FRAME_MS as u64);
+        let mut next_send_at = Instant::now();
 
         let mut cfg_check_at = Instant::now();
         while running.load(Ordering::Relaxed) {
@@ -295,7 +301,19 @@ impl ReverseSender {
                 }
             }
 
-            let signaled = capture.wait(WAIT_TIMEOUT_MS);
+            // 有帧在等发送窗口时，等待时长按"离下一个发送时刻还有多久"算，
+            // 这样既不阻塞采集读取，又能准点发出
+            let wait_ms = if pcm_buf.len() >= FRAME_INTERLEAVED {
+                let now = Instant::now();
+                if next_send_at > now {
+                    (next_send_at - now).as_millis().clamp(1, WAIT_TIMEOUT_MS as u128) as u32
+                } else {
+                    0
+                }
+            } else {
+                WAIT_TIMEOUT_MS
+            };
+            let signaled = capture.wait(wait_ms);
             let got_data = capture.read_stereo(&mut loopback).is_some();
 
             if got_data {
@@ -331,7 +349,13 @@ impl ReverseSender {
                 REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
             }
 
-            while pcm_buf.len() >= FRAME_INTERLEAVED {
+            // 只发到点的帧：节拍整形。落后超过 4 帧（调度抖动/设备暂停）时
+            // 重置网格，绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
+            while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
+                next_send_at += frame_gap;
+                if next_send_at + 4 * frame_gap < Instant::now() {
+                    next_send_at = Instant::now();
+                }
                 frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
                 pcm_buf.drain(..FRAME_INTERLEAVED);
 
@@ -785,13 +809,15 @@ mod tests {
             ..protocol::ConnectPayload::default()
         };
         let cfg = OpusReverseConfig::from(&p);
-        assert_eq!(cfg.bitrate_kbps, 512); // 0 → 自动 512
+        assert_eq!(cfg.bitrate_kbps, 512); // 0 → 自动 = 上限
         assert_eq!(cfg.complexity, 10); // 0 → 默认
         assert_eq!(cfg.bandwidth, 4); // 非法值钳制
         assert_eq!(cfg.signal, 2); // 非法值钳制
         assert!(cfg.vbr && cfg.fec && !cfg.dtx);
 
         let p = protocol::ConnectPayload { bitrate_kbps: 1024, ..protocol::ConnectPayload::default() };
-        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 1000);
+        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 512, "高于上限必须钳制");
+        let p = protocol::ConnectPayload { bitrate_kbps: 64, ..protocol::ConnectPayload::default() };
+        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 64, "低档位原样透传");
     }
 }

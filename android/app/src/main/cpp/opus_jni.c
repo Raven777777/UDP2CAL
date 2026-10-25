@@ -156,6 +156,9 @@ Java_com_udp2cal_app_native_OpusNative_encoderUpdate(
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR(vbr));
     opus_encoder_ctl(state->encoder, OPUS_SET_INBAND_FEC(fec));
     opus_encoder_ctl(state->encoder, OPUS_SET_PACKET_LOSS_PERC(packetLoss));
+    // DRED 与 FEC 联动：运行期关掉 FEC 必须同时撤掉 DRED，否则冗余还在发、
+    // 单帧体积还在涨（创建路径已经这么做了，更新路径以前漏了）
+    opus_encoder_ctl(state->encoder, OPUS_SET_DRED_DURATION(fec ? 50 : 0));
     // 防御：VBR=0 时 constraint 无意义，强制清零防止意外
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR_CONSTRAINT(vbr ? vbrConstraint : 0));
     opus_encoder_ctl(state->encoder, OPUS_SET_BITRATE(bitrate * 1000));

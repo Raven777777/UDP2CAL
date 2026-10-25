@@ -211,6 +211,20 @@ static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8)
 /// 音频电平（dBFS），解码线程每 100 ms 更新一次
 static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
 
+/// 总延迟估算（ms）：`now − 播放头那一帧到达本机的时刻 + 声卡自报延迟`。
+///
+/// 口径说明：这是接收端**唯一**能在本地测到的延迟——发送端采集到发包、
+/// 以及单程网络时延，在没有跨设备时钟的情况下无法测出，不计入。
+/// 它等于"此刻正在从音箱出来的那个样本，是多久以前到达网卡的"，
+/// 也就是缓冲水位 + 声卡缓冲的真实合并值（比水位更接近听感延迟）。
+static LATENCY_MS: AtomicU32 = AtomicU32::new(0);
+/// 声卡自报的缓冲延迟（ms），供 UI/日志解释"总延迟"的构成
+static DEVICE_LATENCY_MS: AtomicU32 = AtomicU32::new(0);
+/// 当前重采样比率微调量（f32 位模式，±0.005）
+static DRIFT_ADJUST_BITS: AtomicU32 = AtomicU32::new(0);
+/// 有界回落累计次数（丢 + 插）
+static SLIP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// RTP 接收计数（诊断用）
 static RTP_RX_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RTP_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -278,19 +292,26 @@ fn init_audio_worker() {
             };
             aw.set_waker(std::thread::current());
             AudioInitState::Ready.store();
-            logf!("[Audio] 就绪：输出设备 {} Hz（解码 48 kHz 单声道 / 10 ms）", aw.device_rate);
+            logf!(
+                "[Audio] 就绪：输出设备 {} Hz（解码 48 kHz 单声道 / 10 ms），声卡缓冲 {} ms",
+                aw.device_rate,
+                aw.device_latency_ms()
+            );
 
             let mut clock = protocol::rtp::PlayheadClock::new(aw.device_rate);
             let mut drift = protocol::rtp::DriftController::new();
             let mut payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
             let silence_frame = [0.0f32; protocol::rtp::FRAME_SAMPLES as usize];
-            let mut insert_buf = [0.0f32; protocol::rtp::DRIFT_MAX_SAMPLES as usize];
+            // 交叉淡化插入用的输出缓冲：一帧 + 1 ms
+            let mut slip_buf =
+                [0.0f32; protocol::rtp::FRAME_SAMPLES as usize + protocol::rtp::SLIP_SAMPLES as usize];
             let mut media_samples: u64 = 0;
             let mut last_epoch = 0u64;
             let mut idle = false;
             let mut rms_sum = 0.0f64;
             let mut rms_count = 0u64;
             let mut last_stats = Instant::now();
+            let mut last_latency_log = Instant::now();
 
             loop {
                 if APP_RUNNING.load(Ordering::Acquire) == 0 {
@@ -330,57 +351,70 @@ fn init_audio_worker() {
                 }
 
                 let played = aw.played_frames();
-                let playhead = clock.update(played);
-                let (pull, jb_water) = {
+                // 播放头取**可听位置**：回调把 PCM 填进 WASAPI 缓冲时 played 就前移了，
+                // 而这段数据还要经过引擎缓冲 + DMA 才出声。减去声卡自报的延迟，
+                // playhead_ts 才真正对应"此刻从喇叭出来的那个样本"，plc 的
+                // 判定点也随之推后一个缓冲长度（等于多给网络一个缓冲的时间）。
+                let audible = played.saturating_sub(aw.device_latency_frames());
+                let playhead = clock.update(audible);
+                let (pull, jb_water, arrival) = {
                     let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
                     let ph = playhead.unwrap_or_else(|| jb.next_ts());
                     let r = jb.pull(ph, &mut payload);
-                    (r, jb.water_ms())
+                    (r, jb.water_ms(), jb.arrival_of(ph))
                 };
                 // 漂移校正要看**总缓冲**：抖动缓冲里排队的 + 已经写进声卡环里的。
                 // 只看抖动缓冲会误判（解码线程刻意只预解码 ~40 ms，其余留在抖动缓冲）。
                 let queued_ms = (aw.filled_frames() as u32 * 1000) / aw.device_rate.max(1);
                 let water = jb_water.saturating_add(queued_ms);
 
+                // ── 漂移校正（P1 主力 + P0 安全网）──
+                // 每帧评估一次：比率微调每 10 ms 更新、有界回落至多每秒一次。
+                let du = drift.update(water, media_samples);
+                aw.set_ratio_adjust(du.adjust);
+                DRIFT_ADJUST_BITS.store((du.adjust as f32).to_bits(), Ordering::Relaxed);
+
+                // ── 总延迟估算 ──
+                // 正在播放的那一帧是多久以前到达的 + 声卡缓冲 = 听感延迟。
+                if let Some(at) = arrival {
+                    let dev_ms = aw.device_latency_ms();
+                    DEVICE_LATENCY_MS.store(dev_ms, Ordering::Relaxed);
+                    let age_ms = at.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    LATENCY_MS.store(age_ms.saturating_add(dev_ms), Ordering::Relaxed);
+                }
+
                 match pull {
                     protocol::rtp::Pull::Packet { len, ts } => {
                         if !clock.is_started() {
-                            clock.start(ts, aw.played_frames());
+                            clock.start(ts, audible);
                         }
                         match dec.decode(&payload[..len]) {
                             Some(n) => {
                                 let pcm = dec.pcm_mut(n);
-                                let mut keep = n;
-                                let mut insert_n = 0usize;
-                                match drift.update(water, media_samples) {
-                                    protocol::rtp::DriftAction::Drop(k) => {
-                                        // 水位过高：丢掉尾部 k 个样本并做短淡出
-                                        let k = (k as usize).min(n / 2);
-                                        keep = n - k;
-                                        fade_out(&mut pcm[..keep], 48);
-                                        // 媒体时间偏移只需作用在播放头上：
-                                        // pull 的缺口判定用的就是 playhead_ts
-                                        clock.note_pcm_correction(k as i64);
+                                // 有界回落：只在真实 PCM 帧上做（PLC/静音帧没有接缝问题）
+                                let (slice, out_len, slip_delta) = match du.slip {
+                                    protocol::rtp::Slip::Drop(k) => {
+                                        let nl = audio::slip_drop(&mut pcm[..n], k as usize);
+                                        (&pcm[..nl], nl, (n - nl) as i64)
                                     }
-                                    protocol::rtp::DriftAction::Insert(k) => {
-                                        // 水位过低：把尾部 k 个样本渐入重复一次
-                                        insert_n = (k as usize).min(insert_buf.len());
-                                        let start = n.saturating_sub(insert_n);
-                                        for i in 0..insert_n {
-                                            let gain = i as f32 / insert_n as f32;
-                                            insert_buf[i] = pcm[(start + i).min(n - 1)] * gain;
-                                        }
-                                        clock.note_pcm_correction(-(insert_n as i64));
+                                    protocol::rtp::Slip::Insert(k) => {
+                                        let nl = audio::slip_insert(&pcm[..n], &mut slip_buf, k as usize);
+                                        (&slip_buf[..nl], nl, -((nl - n) as i64))
                                     }
-                                    protocol::rtp::DriftAction::None => {}
+                                    protocol::rtp::Slip::None => (&pcm[..n], n, 0i64),
+                                };
+                                if slip_delta != 0 {
+                                    // 媒体时间偏移只作用在播放头上：
+                                    // pull 的缺口判定用的就是 playhead_ts
+                                    clock.note_pcm_correction(slip_delta);
+                                    SLIP_COUNT.fetch_add(1, Ordering::Relaxed);
                                 }
-                                rms_sum += pcm[..keep].iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                                rms_count += keep as u64;
-                                aw.write(&pcm[..keep], protocol::rtp::OPUS_SAMPLE_RATE);
-                                if insert_n > 0 {
-                                    aw.write(&insert_buf[..insert_n], protocol::rtp::OPUS_SAMPLE_RATE);
-                                    media_samples += insert_n as u64;
-                                }
+                                rms_sum += slice.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += out_len as u64;
+                                let produced = aw.write(slice, protocol::rtp::OPUS_SAMPLE_RATE);
+                                // 比率微调让每个设备帧多/少对应 u 个媒体样本：
+                                // 必须同步累加到播放头偏移，否则播放头会与音频背道而驰
+                                clock.note_ratio_correction(produced as f64 * du.adjust);
                                 media_samples += n as u64;
                             }
                             None => {
@@ -390,18 +424,20 @@ fn init_audio_worker() {
                     }
                     protocol::rtp::Pull::Plc { ts } => {
                         if !clock.is_started() {
-                            clock.start(ts, aw.played_frames());
+                            clock.start(ts, audible);
                         }
                         match dec.conceal() {
                             Some(n) => {
                                 let pcm = dec.pcm_mut(n);
                                 rms_sum += pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
                                 rms_count += n as u64;
-                                aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                                let produced = aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                                clock.note_ratio_correction(produced as f64 * du.adjust);
                                 media_samples += n as u64;
                             }
                             None => {
-                                aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                                let produced = aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                                clock.note_ratio_correction(produced as f64 * du.adjust);
                                 media_samples += silence_frame.len() as u64;
                             }
                         }
@@ -410,9 +446,10 @@ fn init_audio_worker() {
                         // 连续 PLC 已达上限：输出静音但**继续推进媒体时间**，
                         // 否则 next_ts 会跑到播放头前面，恢复时所有真包都会被判迟到
                         if !clock.is_started() {
-                            clock.start(ts, aw.played_frames());
+                            clock.start(ts, audible);
                         }
-                        aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                        let produced = aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                        clock.note_ratio_correction(produced as f64 * du.adjust);
                         media_samples += silence_frame.len() as u64;
                     }
                     protocol::rtp::Pull::Wait => {
@@ -432,21 +469,22 @@ fn init_audio_worker() {
                     rms_count = 0;
                     last_stats = Instant::now();
                 }
+
+                // 延迟构成每 10 s 落一次盘：比率、水位、缓冲分解一目了然，
+                // 出现"延迟越来越大"时可以直接从这行判断是水位涨还是声卡缓冲涨
+                if last_latency_log.elapsed() >= Duration::from_secs(10) {
+                    last_latency_log = Instant::now();
+                    logf!(
+                        "[Latency] 总延迟≈{}ms（水位 {}ms + 声卡 {}ms）比率微调 {:+.3}% 回落 {} 次",
+                        LATENCY_MS.load(Ordering::Relaxed),
+                        water,
+                        aw.device_latency_ms(),
+                        du.adjust * 100.0,
+                        SLIP_COUNT.load(Ordering::Relaxed)
+                    );
+                }
             }
         });
-}
-
-/// 对切片尾部做线性淡出，避免漂移校正的接缝爆音
-fn fade_out(pcm: &mut [f32], len: usize) {
-    let n = len.min(pcm.len());
-    if n == 0 {
-        return;
-    }
-    let start = pcm.len() - n;
-    for i in 0..n {
-        let gain = 1.0 - (i as f32 / n as f32);
-        pcm[start + i] *= gain;
-    }
 }
 
 // ══════════════════════════════════════════════
@@ -893,6 +931,13 @@ impl AppState {
                         s.writes, s.resampled, s.dropped, s.underrun
                     );
                     logf!(
+                        "[Audio] 延迟≈{}ms（含声卡 {}ms）比率微调 {:+.3}% 有界回落 {} 次",
+                        LATENCY_MS.load(Ordering::Relaxed),
+                        DEVICE_LATENCY_MS.load(Ordering::Relaxed),
+                        f32::from_bits(DRIFT_ADJUST_BITS.load(Ordering::Relaxed)) * 100.0,
+                        SLIP_COUNT.load(Ordering::Relaxed)
+                    );
+                    logf!(
                         "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) 水位={}ms SSRC={:#010x}",
                         j.received, j.bytes, j.late, j.duplicate, j.overflow, j.resyncs,
                         j.plc_frames, j.max_plc_run, water, peer.forward_ssrc
@@ -999,9 +1044,13 @@ impl AppState {
         //   已连接        → 音频诊断 + 反向串流状态（地址与广播状态对用户已无意义）
         let footer_left = if self.connected {
             let s = audio_stats().snapshot();
+            // 延迟放在最前：它是用户唯一能直接感知的指标，
+            // 重采样计数已失去诊断价值（比率每帧都在动），只在日志里保留
             format!(
-                "重采样 {} · 丢样 {} · 欠载 {}",
-                short_num(s.resampled), short_num(s.dropped), short_num(s.underrun)
+                "延迟 {}ms · 丢样 {} · 欠载 {}",
+                LATENCY_MS.load(Ordering::Relaxed),
+                short_num(s.dropped),
+                short_num(s.underrun)
             )
         } else {
             "广播地址: 255.255.255.255:44043".to_string()

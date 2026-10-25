@@ -1,15 +1,19 @@
 ﻿// 无锁 PCM 环 + cpal 输出回调
 //
 // v3 的时钟模型只有一条规则：**声卡播放头是唯一音频时钟**。
-// 因此本模块只做三件事：
+// 因此本模块只做四件事：
 //   1. 提供一个无锁 SPSC 环，解码线程写、音频回调读；
-//   2. 在回调里统计"真正被消费的帧数"（`played_frames`），供播放头换算；
-//   3. 把 48 kHz 媒体流按设备采样率做**固定比率**重采样（不做 EMA、不读墙钟）。
+//   2. 在回调里统计"真正交给声卡播放的帧数"（`played_frames`），供播放头换算；
+//   3. 把 48 kHz 媒体流按设备采样率做相位连续重采样，比率可被解码线程
+//      在 ±0.5% 内微调（漂移校正的**主力手段**，见 `set_ratio_adjust`）；
+//   4. 上报声卡自报的"回调 → 实际发声"延迟（`device_latency_us`），
+//      用于回答"playhead_ts 到底含不含 DMA 缓冲"。
 //
-// 漂移校正不在这里：它由解码线程根据抖动缓冲水位决定，并通过
-// `PlayheadClock::note_pcm_correction` 回写媒体时间偏移。
+// 离散的丢/插不在这里决策：由解码线程根据抖动缓冲水位决定，
+// 并通过 `PlayheadClock::note_pcm_correction` 回写媒体时间偏移。
+use crate::protocol::rtp;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample, StreamConfig};
+use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread::Thread;
@@ -134,14 +138,24 @@ pub struct AudioWriter {
     pub device_rate: u32,
     /// 诊断计数器：由 UI 线程读取并展示/落盘（见 main.rs 的 AUDIO_STATS）
     pub stats: Arc<AudioStats>,
-    /// 声卡已真正输出的帧数（含欠载时补的静音：它们同样占据媒体时间线）
+    /// 声卡已接手的帧数（含欠载时补的静音：它们同样占据媒体时间线）。
+    ///
+    /// ⚠ 这是"数据被交给驱动"的位置，**不是"已经听到"的位置**：
+    /// 回调把 PCM 填进 WASAPI 缓冲区时计数就前移了，而这段数据要再经过
+    /// 引擎缓冲 + DMA 才真正出声。二者之差由 `device_latency_frames()` 给出。
     played: Arc<AtomicU64>,
+    /// 声卡自报延迟（微秒）：`timestamp().playback - timestamp().callback`。
+    /// 这是本进程里唯一能拿到的"playhead 不含的那部分"实测值。
+    device_latency_us: Arc<AtomicU64>,
     /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
     waker: Arc<OnceLock<Thread>>,
 
-    // ── 相位连续流式重采样器（固定比率，不做漂移 EMA）──
+    // ── 相位连续流式重采样器 ──
     phase: f64,
-    ratio: f64,
+    /// 固定比率 = 源采样率 / 设备采样率（不含微调）
+    base_ratio: f64,
+    /// 比率微调量（±0.005），由漂移控制器每 10 ms 写入一次
+    adjust: f64,
     /// 当前输入采样率（0 = 尚未收到数据）
     source_rate: u32,
 
@@ -197,6 +211,25 @@ impl AudioWriter {
         self.played.load(Ordering::Acquire)
     }
 
+    /// 声卡自报的"填缓冲 → 真正发声"延迟（设备帧）。
+    ///
+    /// 由音频回调从 cpal 的时间戳里读出来（`playback - callback`），
+    /// 未测量到时为 0。用它把 `played_frames` 折算成**可听位置**：
+    /// `audible = played_frames - device_latency_frames()`。
+    #[inline]
+    pub fn device_latency_frames(&self) -> u64 {
+        let us = self.device_latency_us.load(Ordering::Acquire);
+        let rate = self.device_rate.max(1) as u64;
+        // 上限 1 秒：时间戳异常时宁可当作"没测到"，也不能让播放头倒退
+        (us.saturating_mul(rate) / 1_000_000).min(rate)
+    }
+
+    /// 同上，毫秒（诊断展示用）
+    #[inline]
+    pub fn device_latency_ms(&self) -> u32 {
+        ((self.device_latency_frames() * 1000) / self.device_rate.max(1) as u64) as u32
+    }
+
     /// 环里还能放下多少帧（设备帧）
     #[inline]
     #[allow(dead_code)]
@@ -219,35 +252,62 @@ impl AudioWriter {
         self.phase = 0.0;
     }
 
-    /// 写入 48 kHz 媒体 PCM（单声道），按设备采样率换算后入环。
+    /// 设置重采样比率微调量（±0.5%）。
     ///
-    /// 比率固定为 `source_rate / device_rate`，**不含任何漂移补偿**：
-    /// 采集/声卡时钟差由抖动缓冲水位 + `PlayheadClock` 偏移统一处理。
-    pub fn write(&mut self, pcm: &[f32], source_rate: u32) {
+    /// 这是漂移校正的**主力手段**：比率是连续量，改变它不会在 PCM 里留下
+    /// 任何接缝，听感上只是极其缓慢的变调（0.5% ≈ 8.7 音分），
+    /// 远低于"丢/插 1 ms"这种离散编辑的可闻度。
+    ///
+    /// 语义：`实际比率 = 源/设备 × (1 + adjust)`；adjust > 0 → 每秒产出的
+    /// 设备帧变少 → 缓冲水位回落。
+    pub fn set_ratio_adjust(&mut self, adjust: f64) {
+        let a = if adjust.is_finite() {
+            adjust.clamp(-rtp::RESAMPLE_MAX_ADJUST, rtp::RESAMPLE_MAX_ADJUST)
+        } else {
+            0.0
+        };
+        self.adjust = a;
+    }
+
+    /// 当前生效的重采样比率（含微调）
+    #[inline]
+    fn current_ratio(&self) -> f64 {
+        (self.base_ratio * (1.0 + self.adjust)).clamp(1e-6, 1e6)
+    }
+
+    /// 写入 48 kHz 媒体 PCM（单声道），按设备采样率换算后入环。
+    /// 返回**实际写入环的设备帧数**（调用方用它折算比率校正的媒体时间偏移）。
+    ///
+    /// 比率 = `源/设备 × (1 + adjust)`，`adjust` 由漂移控制器每 10 ms 更新。
+    /// 采集/声卡时钟差就是这样被吸收掉的——不需要丢样或插样。
+    pub fn write(&mut self, pcm: &[f32], source_rate: u32) -> usize {
         if pcm.is_empty() {
-            return;
+            return 0;
         }
         self.stats.writes.fetch_add(1, Ordering::Relaxed);
 
         if source_rate > 0 && source_rate != self.source_rate {
             self.source_rate = source_rate;
             let r = source_rate as f64 / self.device_rate as f64;
-            self.ratio = if (0.1..10.0).contains(&r) { r } else { 1.0 };
+            self.base_ratio = if (0.1..10.0).contains(&r) { r } else { 1.0 };
             self.phase = 0.0;
         }
-        let ratio = self.ratio.max(1e-6);
+        let ratio = self.current_ratio();
 
-        if source_rate != self.device_rate {
+        if source_rate != self.device_rate || self.adjust.abs() > 1e-12 {
             self.stats.resampled.fetch_add(1, Ordering::Relaxed);
         }
 
         if (ratio - 1.0).abs() < 1e-9 {
+            let mut written = 0usize;
             for &s in pcm {
-                if !self.ring.push(s) {
+                if self.ring.push(s) {
+                    written += 1;
+                } else {
                     self.stats.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            return;
+            return written;
         }
 
         // ── 相位连续线性插值 ──
@@ -270,12 +330,75 @@ impl AudioWriter {
         }
         self.phase = phase - n_in;
 
+        let mut written = 0usize;
         for &s in &self.resample_buf {
-            if !self.ring.push(s) {
+            if self.ring.push(s) {
+                written += 1;
+            } else {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+        written
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 有界回落的 PCM 编辑（P0 安全网）
+//
+// 两条铁律：
+//   1. 交叉淡化长度 ≥ 1 ms（48 样本），丢和插都只能在淡化区内完成；
+//   2. 接缝处必须一阶连续 —— 权重用升余弦，两端导数为零，不会留下折角。
+//
+// 几何（以 n=480、k=48 为例）：
+//   丢：把 x[p..p+k] 与 x[p+k..p+2k] 在 k 个样本内交叉，输出 n-k 个样本；
+//   插：把 x[p+k..] 整体后移 k，并在 k 个样本内从 x[p..] 交叉到 x[p-k..]，
+//       输出 n+k 个样本（信号在此"停顿" 1 ms 再继续）。
+// 两种编辑都从上一帧末样本平滑接上、并平滑交接下一帧首样本。
+// ═══════════════════════════════════════════════════════════════════
+
+/// 升余弦淡入权重：`i` 从 0 到 k-1 → 权重从 ≈0 到 ≈1
+#[inline]
+fn fade_weight(i: usize, k: usize) -> f32 {
+    0.5 - 0.5 * (std::f32::consts::PI * (i as f32 + 1.0) / (k as f32 + 1.0)).cos()
+}
+
+/// 丢弃 `k` 个样本（每声道），在帧尾 `k` 个样本内交叉淡化。
+///
+/// 就地压缩 `pcm`，返回新长度 `n - k`。样本数不足 `3k` 时不动，
+/// 原样返回 `n`（调用方据此判断这次回落是否真的生效）。
+pub fn slip_drop(pcm: &mut [f32], k: usize) -> usize {
+    let n = pcm.len();
+    if k == 0 || n < 3 * k {
+        return n;
+    }
+    let p = n - 2 * k;
+    for i in 0..k {
+        let w = fade_weight(i, k);
+        pcm[p + i] = pcm[p + i] * (1.0 - w) + pcm[p + i + k] * w;
+    }
+    pcm.copy_within(p + 2 * k..n, p + k);
+    n - k
+}
+
+/// 插入 `k` 个样本（每声道）：把 `pcm[..n]` 重写进 `out`，在帧中间
+/// 做 `k` 个样本的交叉淡化，返回新长度 `n + k`。
+///
+/// `out` 至少需要 `n + k` 个位置；条件不满足时退化为原样拷贝并返回 `n`。
+pub fn slip_insert(pcm: &[f32], out: &mut [f32], k: usize) -> usize {
+    let n = pcm.len();
+    if k == 0 || n < 3 * k || out.len() < n + k {
+        let take = n.min(out.len());
+        out[..take].copy_from_slice(&pcm[..take]);
+        return take;
+    }
+    let p = n / 2;
+    out[..p].copy_from_slice(&pcm[..p]);
+    for i in 0..k {
+        let w = fade_weight(i, k);
+        out[p + i] = pcm[p + i] * (1.0 - w) + pcm[p + i - k] * w;
+    }
+    out[p + k..n + k].copy_from_slice(&pcm[p..n]);
+    n + k
 }
 
 /// 优先选择 f32，其次 i16/u16/i32；同等格式下优先单声道（回调会复制到所有声道）
@@ -309,6 +432,7 @@ fn build_stream<T>(
     ring: &Weak<Ring>,
     stats: &Weak<AudioStats>,
     played: &Weak<AtomicU64>,
+    latency: &Arc<AtomicU64>,
     waker: &Arc<OnceLock<Thread>>,
 ) -> Result<cpal::Stream, String>
 where
@@ -318,15 +442,25 @@ where
     let ring = ring.clone();
     let stats = stats.clone();
     let played = played.clone();
+    let latency = latency.clone();
     let waker = waker.clone();
     device
         .build_output_stream(
             config,
-            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
                 // 回调约束：无锁、无分配、不调用 Opus、不写日志、不做复杂计算
                 let need_frames = data.len() / channels;
                 let mut filled = 0usize;
                 let mut idx = 0usize;
+
+                // 声卡自报延迟：数据"填进缓冲"到"真正出声"的间隔。
+                // WASAPI 侧由 IAudioClock 给出，已包含引擎缓冲与 DMA 排队。
+                // 这是回答"playhead_ts 含不含 DMA 缓冲"的唯一实测口径。
+                let ts = info.timestamp();
+                if let Some(d) = ts.playback.duration_since(&ts.callback) {
+                    let us = d.as_micros().min(u64::MAX as u128) as u64;
+                    latency.store(us, Ordering::Release);
+                }
 
                 // 生产者只能"请求"丢弃（flush），由消费者在这里落地
                 if let Some(ring) = ring.upgrade() {
@@ -384,8 +518,9 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
 
     let supported_config = pick_output_config(&device)?;
     let sample_format = supported_config.sample_format();
+    let supported_buffer = *supported_config.buffer_size();
 
-    let stream_config: StreamConfig = if supported_config.min_sample_rate() <= cpal::SampleRate(48000)
+    let mut stream_config: StreamConfig = if supported_config.min_sample_rate() <= cpal::SampleRate(48000)
         && supported_config.max_sample_rate() >= cpal::SampleRate(48000)
     {
         supported_config.with_sample_rate(cpal::SampleRate(48000)).into()
@@ -395,41 +530,74 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
 
     let actual_rate = stream_config.sample_rate.0;
 
+    // ── 显式 10 ms 输出缓冲 ──
+    //
+    // 不显式指定时 WASAPI 会给默认引擎周期（Windows 上常见 10–20 ms，
+    // 某些驱动 30 ms），播放头的量化粒度随之变粗。这里钉成 10 ms：
+    // 缓冲延迟低一档，欠载风险由上游 341 ms 的 PCM 环吸收。
+    //
+    // ⚠ cpal 0.15.3 的 `buffer_size_to_duration()` 把帧数换算成 hnsBufferDuration
+    // 时少乘了 100（480 帧被算成 0.1 ms 而不是 10 ms）。共享模式下 WASAPI 会把
+    // 过小的周期向上取整到引擎最小周期，因此实际值不等于这里的请求值——
+    // 所以我们**不信任请求值**，而是从 `OutputCallbackInfo` 里实测
+    // `playback - callback`（见 `device_latency_us`）。
+    let want_frames = (actual_rate / 100).max(1); // 10 ms
+    let min_frames = match supported_buffer {
+        cpal::SupportedBufferSize::Range { min, .. } => min,
+        cpal::SupportedBufferSize::Unknown => 1,
+    };
+    let buffer_frames = want_frames.max(min_frames);
+    stream_config.buffer_size = BufferSize::Fixed(buffer_frames);
+
     // 容量 341 ms（48 kHz 下 16384 帧），远大于 200 ms 下限；
     // **不预填静音**：预缓冲由抖动缓冲负责，回调在无数据时输出静音且不推进播放头。
     let ring = Arc::new(Ring::with_frames((actual_rate as usize * 341) / 1000));
     let played = Arc::new(AtomicU64::new(0));
+    let device_latency_us = Arc::new(AtomicU64::new(0));
     let waker: Arc<OnceLock<Thread>> = Arc::new(OnceLock::new());
 
-    let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Option<String>>(1);
+    let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
     let ring_weak = Arc::downgrade(&ring);
     let stats_weak = Arc::downgrade(&stats);
     let played_weak = Arc::downgrade(&played);
     let waker_thread = waker.clone();
+    let latency_shared = device_latency_us.clone();
 
     std::thread::Builder::new()
         .name("udp2cal-audio".into())
         .spawn(move || {
-            let built = match sample_format {
-                SampleFormat::F32 => build_stream::<f32>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
-                SampleFormat::I16 => build_stream::<i16>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
-                SampleFormat::U16 => build_stream::<u16>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
-                SampleFormat::I32 => build_stream::<i32>(&device, &stream_config, &ring_weak, &stats_weak, &played_weak, &waker_thread),
-                other => Err(format!("不支持的输出采样格式: {other}")),
-            };
-            let stream = match built {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = err_tx.send(Some(e));
-                    return;
+            // 固定 10 ms 失败（驱动拒绝该周期）时退回驱动默认值，
+            // 绝不让"低延迟优化"变成"打不开设备"
+            let mut last_err = String::new();
+            let mut chosen = None;
+            for bs in [BufferSize::Fixed(buffer_frames), BufferSize::Default] {
+                let mut cfg = stream_config.clone();
+                cfg.buffer_size = bs;
+                let built = match sample_format {
+                    SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
+                    SampleFormat::I16 => build_stream::<i16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
+                    SampleFormat::U16 => build_stream::<u16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
+                    SampleFormat::I32 => build_stream::<i32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
+                    other => Err(format!("不支持的输出采样格式: {other}")),
+                };
+                match built {
+                    Ok(s) => {
+                        chosen = Some(s);
+                        break;
+                    }
+                    Err(e) => last_err = e,
                 }
+            }
+            let Some(stream) = chosen else {
+                let _ = err_tx.send(Err(last_err));
+                return;
             };
             if let Err(e) = stream.play() {
-                let _ = err_tx.send(Some(format!("播放失败: {e}")));
+                let _ = err_tx.send(Err(format!("播放失败: {e}")));
                 return;
             }
-            let _ = err_tx.send(None);
+            let _ = err_tx.send(Ok(()));
             loop {
                 std::thread::park();
             }
@@ -437,18 +605,20 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
         .map_err(|e| format!("线程创建失败: {e}"))?;
 
     match err_rx.recv() {
-        Ok(Some(e)) => Err(e),
-        Ok(None) => Ok(AudioWriter {
+        Ok(Ok(())) => Ok(AudioWriter {
             ring,
             device_rate: actual_rate,
             stats,
             played,
+            device_latency_us,
             waker,
             phase: 0.0,
-            ratio: 1.0,
+            base_ratio: 1.0,
+            adjust: 0.0,
             source_rate: 0,
             resample_buf: Vec::with_capacity(4096),
         }),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err("音频线程异常退出".into()),
     }
 }
@@ -588,9 +758,11 @@ mod tests {
                 device_rate,
                 stats: Arc::new(AudioStats::default()),
                 played: Arc::new(AtomicU64::new(0)),
+                device_latency_us: Arc::new(AtomicU64::new(0)),
                 waker: Arc::new(OnceLock::new()),
                 phase: 0.0,
-                ratio: 1.0,
+                base_ratio: 1.0,
+                adjust: 0.0,
                 source_rate: 0,
                 resample_buf: Vec::new(),
             }
@@ -601,7 +773,7 @@ mod tests {
     fn same_rate_write_is_one_to_one() {
         let mut aw = AudioWriter::for_test(48000);
         let pcm = vec![0.1f32; 480];
-        aw.write(&pcm, 48000);
+        assert_eq!(aw.write(&pcm, 48000), 480);
         assert_eq!(aw.ring.len(), 480);
         assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 0);
     }
@@ -626,6 +798,127 @@ mod tests {
         }
         let produced = aw.ring.len();
         assert!((produced as i64 - 4_410).abs() <= 4, "produced={produced}");
+    }
+
+    #[test]
+    fn ratio_adjust_changes_produced_frames() {
+        // adjust > 0 → 比率变大 → 每秒**少**产出约 240 帧（水位回落）
+        for (adjust, expect) in [(0.005f64, 47761i64), (-0.005, 48241)] {
+            let mut aw = AudioWriter::for_test(48000);
+            aw.set_ratio_adjust(adjust);
+            let pcm = vec![0.1f32; 480];
+            let mut total = 0i64;
+            for _ in 0..100 {
+                total += aw.write(&pcm, 48000) as i64;
+            }
+            assert!(
+                (total - expect).abs() <= 3,
+                "adjust={adjust} 1 秒内产出 {total}，期望约 {expect}"
+            );
+        }
+    }
+
+    #[test]
+    fn ratio_adjust_is_clamped() {
+        let mut aw = AudioWriter::for_test(48000);
+        aw.set_ratio_adjust(9.0);
+        assert!((aw.current_ratio() - (1.0 + rtp::RESAMPLE_MAX_ADJUST)).abs() < 1e-12);
+        aw.set_ratio_adjust(f64::NAN);
+        assert_eq!(aw.adjust, 0.0);
+    }
+
+    #[test]
+    fn device_latency_never_exceeds_one_second() {
+        let aw = AudioWriter::for_test(48000);
+        aw.device_latency_us.store(10_000, Ordering::Release); // 10 ms
+        assert_eq!(aw.device_latency_frames(), 480);
+        assert_eq!(aw.device_latency_ms(), 10);
+        aw.device_latency_us.store(u64::MAX, Ordering::Release);
+        assert_eq!(aw.device_latency_frames(), 48000, "异常时间戳必须被钳到 1 s");
+    }
+
+    // ── 有界回落的交叉淡化 ──
+
+    /// 用一条 480 样本的正弦测"接缝处是否有台阶"：
+    /// 回落前后都必须保持一阶连续（相邻样本差不超过正弦自身的最大斜率 + 容差）。
+    fn assert_smooth(sig: &[f32], from: usize, to: usize, max_step: f32) {
+        for i in from..to {
+            let d = (sig[i + 1] - sig[i]).abs();
+            assert!(d <= max_step, "样本 {i} 处有台阶: Δ={d} > {max_step}");
+        }
+    }
+
+    #[test]
+    fn slip_drop_is_crossfaded_not_cut() {
+        // 1 kHz 正弦，480 样本/帧
+        let n = 480usize;
+        let k = rtp::SLIP_FADE_SAMPLES;
+        let mut pcm: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin() * 0.5)
+            .collect();
+        let tail = pcm[n - 1];
+        let new_len = slip_drop(&mut pcm, k);
+        assert_eq!(new_len, n - k);
+        // 1 kHz 在 48 kHz 下的最大相邻差 ≈ 0.5 × 2π×1000/48000 ≈ 0.0655
+        assert_smooth(&pcm, 0, new_len - 1, 0.09);
+        // 末样本必须等于原帧末样本：不丢音频尾巴，也不与下一帧错位
+        assert!((pcm[new_len - 1] - tail).abs() < 1e-4);
+    }
+
+    #[test]
+    fn slip_drop_removes_exactly_k_samples() {
+        let mut pcm = vec![0.0f32; 480];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = i as f32;
+        }
+        let k = 48usize;
+        let n = slip_drop(&mut pcm, k);
+        assert_eq!(n, 432);
+        // 末样本保留（淡入权重约 0.999，误差 < 0.05 个 LSB 的量化级）
+        assert!((pcm[431] - 479.0).abs() < 0.1, "末样本 {}", pcm[431]);
+        // 前段原样
+        assert_eq!(pcm[0], 0.0);
+        assert_eq!(pcm[383], 383.0);
+    }
+
+    #[test]
+    fn slip_insert_is_crossfaded_not_cut() {
+        let n = 480usize;
+        let k = rtp::SLIP_FADE_SAMPLES;
+        let pcm: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin() * 0.5)
+            .collect();
+        let mut out = vec![0.0f32; n + k];
+        let new_len = slip_insert(&pcm, &mut out, k);
+        assert_eq!(new_len, n + k);
+        assert_smooth(&out, 0, new_len - 1, 0.09);
+        assert_eq!(out[new_len - 1], pcm[n - 1], "末样本必须与原帧一致");
+        assert_eq!(out[0], pcm[0]);
+    }
+
+    #[test]
+    fn slip_ignores_frames_too_short_for_fade() {
+        // 帧长 < 3k 时不得动手（宁可少一次校正，也不能把帧切坏）
+        let mut tiny = vec![1.0f32; 100];
+        assert_eq!(slip_drop(&mut tiny, rtp::SLIP_FADE_SAMPLES), 100);
+        let out_len = {
+            let mut out = vec![0.0f32; 100 + rtp::SLIP_FADE_SAMPLES];
+            slip_insert(&tiny, &mut out, rtp::SLIP_FADE_SAMPLES)
+        };
+        assert_eq!(out_len, 100);
+    }
+
+    #[test]
+    fn slip_fade_weights_are_monotone() {
+        let k = rtp::SLIP_FADE_SAMPLES;
+        let mut prev = fade_weight(0, k);
+        assert!(prev < 0.02, "淡入起点必须接近 0");
+        for i in 1..k {
+            let w = fade_weight(i, k);
+            assert!(w > prev, "权重必须单调递增");
+            prev = w;
+        }
+        assert!(prev > 0.98, "淡入终点必须接近 1");
     }
 
     #[test]

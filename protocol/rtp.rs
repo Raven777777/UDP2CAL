@@ -7,10 +7,12 @@
 //! 2. **扩展序号/时间戳**：[`extend_seq`] / [`extend_ts`]，用有符号差值把 16/32 位
 //!    回绕扩展成 64 位单调计数；
 //! 3. **接收侧时钟模型**：[`JitterBuffer`] 只负责"按水位存放"，[`DriftController`]
-//!    只根据可播放水位给出丢/插建议；**播放决策完全由声卡播放头驱动**，
-//!    本模块内不存在任何定时器、`sleep` 或墙钟。
+//!    用受控重采样比率把可播放水位钉在目标上、并在比率顶满时做有界单次回落；
+//!    **播放决策完全由声卡播放头驱动**，本模块内不存在任何定时器、`sleep` 或墙钟。
 
 // ═══════════════════════ 常量 ═══════════════════════
+
+use std::time::Instant;
 
 pub const RTP_VERSION: u8 = 2;
 pub const RTP_HEADER_SIZE: usize = 12;
@@ -33,8 +35,11 @@ pub const MAX_REORDER_PACKETS: usize = 64;
 // ── 抖动缓冲参数（规范 7.2）──
 pub const FRAME_MS: u32 = OPUS_FRAME_MS;
 pub const FRAME_SAMPLES: u32 = OPUS_FRAME_SAMPLES;
-/// 预缓冲启动阈值（4 帧连续）
-pub const JITTER_START_MS: u32 = 40;
+/// 预缓冲启动阈值（3 帧连续）。
+///
+/// 40 ms 是为"离散丢/插校正"留的安全垫；改用受控重采样后水位由比率闭环
+/// 维持在目标附近，启动门槛可以降到 30 ms 而不增加 PLC 概率。
+pub const JITTER_START_MS: u32 = 30;
 /// 目标水位（6 帧）
 pub const JITTER_TARGET_MS: u32 = 60;
 /// 高水位（12 帧）
@@ -49,10 +54,47 @@ pub const PLC_MAX_MS: u32 = 120;
 pub const RESYNC_GAP_MS: u32 = 200;
 
 // ── 漂移校正参数（规范 7.9）──
-/// 单次校正上限 5 ms
-pub const DRIFT_MAX_SAMPLES: u32 = FRAME_SAMPLES / 2;
-/// 两次校正之间至少间隔 500 ms 的**音频样本时间**（不是墙钟）
-pub const DRIFT_INTERVAL_SAMPLES: u64 = 500 * OPUS_SAMPLE_RATE as u64 / 1000;
+//
+// 两级手段，按优先级：
+//   1. **受控重采样**（主力）：把重采样比在 ±0.5% 内按水位偏差缓慢调整，
+//      每 10 ms 更新一次。比率是连续量，永远不会产生离散接缝，
+//      0.5% 相当于每秒最多吞吐 5 ms 的缓冲差，足够覆盖任何真实时钟漂移
+//      （晶振级漂移典型 10–100 ppm）。
+//   2. **有界回落**（安全网）：只有当水位仍持续跑出 ±(30/10) ms 的回落带
+//      ——即比率已经顶到上限、单靠重采样收不住——才做一次 1 ms 的丢/插。
+//      每秒最多 1 ms，且必须在 ≥1 ms 的交叉淡化区内完成，绝不硬切。
+
+/// 有界回落的单次量：1 ms（48 样本）
+pub const SLIP_SAMPLES: u32 = FRAME_SAMPLES / 10;
+/// 交叉淡化长度：1 ms。丢/插都在这个窗口内完成，不得硬切。
+pub const SLIP_FADE_SAMPLES: usize = SLIP_SAMPLES as usize;
+/// 回落高带：水位高于目标 30 ms 以上
+pub const SLIP_HIGH_MARGIN_MS: u32 = 30;
+/// 回落低带：水位低于目标 10 ms
+pub const SLIP_LOW_MARGIN_MS: u32 = 10;
+/// 回落最小间隔：1 秒**音频样本时间**（不是墙钟）—— 每秒最多 1 ms
+pub const SLIP_MIN_INTERVAL_SAMPLES: u64 = OPUS_SAMPLE_RATE as u64;
+/// 回落评估周期：100 ms 音频样本时间
+pub const SLIP_EVAL_SAMPLES: u64 = OPUS_SAMPLE_RATE as u64 / 10;
+/// 高带"稳定"判据：连续 5 次评估（500 ms）都在高带内才动手
+pub const SLIP_STABLE_ROUNDS: u32 = 5;
+/// 启动宽限：前 2 秒只做比率微调。此时水位必然从 0 爬向目标，
+/// 若允许回落会在启动阶段连发多次插入。
+pub const SLIP_WARMUP_SAMPLES: u64 = 2 * OPUS_SAMPLE_RATE as u64;
+
+/// 重采样比率的微调上限（±0.5%）
+pub const RESAMPLE_MAX_ADJUST: f64 = 0.005;
+/// 比率更新周期：每 10 ms（1 帧）更新一次
+pub const RATIO_UPDATE_SAMPLES: u64 = FRAME_SAMPLES as u64;
+/// 单次比率更新的最大步进。0.0001/10 ms = 1%/s，
+/// 到达 ±0.5% 满幅需要 0.5 s——既是变调不可闻的斜坡，也足够跟上真实漂移。
+pub const RATIO_SLEW_STEP: f64 = 0.0001;
+/// 比率死区：偏差 ≤5 ms 认为已在目标上，不动作（避免来回抖动）
+pub const RATIO_DEADBAND_MS: f64 = 5.0;
+/// 比率满幅点：偏差 ≥20 ms 时比率达到 ±0.5%
+pub const RATIO_FULL_MS: f64 = 20.0;
+/// 水位一阶低通系数（每次更新 10 ms，等效时间常数 ≈ 150 ms）
+pub const WATER_SMOOTH_ALPHA: f64 = 0.065;
 
 #[inline]
 pub const fn ms_to_samples(ms: u32) -> u32 {
@@ -254,6 +296,23 @@ struct PacketSlot {
 
 const EMPTY_SLOT: PacketSlot = PacketSlot { valid: false, seq: 0, ts: 0, len: 0 };
 
+/// 到达时刻追踪深度：128 × 10 ms ≈ 1.28 s，远大于任何可能的总水位。
+const ARRIVAL_TRACE: usize = 128;
+
+/// 单条到达记录：RTP 时间戳 + 该包进入接收端时的本地时刻。
+///
+/// 用途只有一个：估算"正在播放的样本有多旧"。`now - arrival_of(playhead_ts)`
+/// 就是这一段音频从到达网卡到被声卡播出的真实时长，再加上声卡自身的
+/// 缓冲延迟即为端到端延迟估算。这是接收端**唯一**能在本地测到的延迟口径——
+/// 发送端到接收端的单程网络时延无法在没有跨设备时钟的情况下测出。
+#[derive(Clone, Copy)]
+struct Arrival {
+    ts: u64,
+    at: Option<Instant>,
+}
+
+const EMPTY_ARRIVAL: Arrival = Arrival { ts: 0, at: None };
+
 /// 单方向的接收抖动缓冲。
 ///
 /// 线程模型：插入由网络线程完成，拉取由播放/解码线程完成，二者共享同一把锁；
@@ -272,6 +331,9 @@ pub struct JitterBuffer {
     /// 每次重同步/复位自增，播放线程据此重建解码器状态
     pub epoch: u64,
     pub stats: JitterStats,
+    /// 到达时刻环形记录（见 [`Arrival`]）
+    arrivals: Box<[Arrival]>,
+    arrival_pos: usize,
 }
 
 impl JitterBuffer {
@@ -288,6 +350,8 @@ impl JitterBuffer {
             plc_run: 0,
             epoch: 0,
             stats: JitterStats::default(),
+            arrivals: vec![EMPTY_ARRIVAL; ARRIVAL_TRACE].into_boxed_slice(),
+            arrival_pos: 0,
         }
     }
 
@@ -542,6 +606,32 @@ impl JitterBuffer {
         let base = idx * OPUS_MAX_PAYLOAD;
         self.data[base..base + len].copy_from_slice(&pkt.payload[..len]);
         self.slots[idx] = PacketSlot { valid: true, seq, ts, len: len as u16 };
+        // 所有"接纳成功"的路径都汇聚到这里：到达时刻一并落账
+        self.note_arrival(ts);
+    }
+
+    /// 记录一个包的到达时刻（仅诊断用：总延迟估算）
+    fn note_arrival(&mut self, ts: u64) {
+        self.arrivals[self.arrival_pos] = Arrival { ts, at: Some(Instant::now()) };
+        self.arrival_pos = (self.arrival_pos + 1) % ARRIVAL_TRACE;
+    }
+
+    /// 查"时间戳 `ts` 那一帧是什么时候到达的"。
+    ///
+    /// 取的是最新一条 `entry.ts <= ts` 的记录：帧是按时间戳单调到达的，
+    /// 该记录就是这一帧（或它最近的同刻邻居）。查不到（例如刚重同步、
+    /// 记录已被覆盖）返回 `None`，调用方应跳过本次延迟估算。
+    pub fn arrival_of(&self, ts: u64) -> Option<Instant> {
+        for i in 0..ARRIVAL_TRACE {
+            let idx = (self.arrival_pos + ARRIVAL_TRACE - 1 - i) % ARRIVAL_TRACE;
+            let a = self.arrivals[idx];
+            if let Some(at) = a.at {
+                if a.ts <= ts {
+                    return Some(at);
+                }
+            }
+        }
+        None
     }
 
     /// 丢弃扩展序号最小的非 `next` 包（缓冲满时的准入策略）
@@ -564,6 +654,9 @@ impl JitterBuffer {
         for s in self.slots.iter_mut() {
             s.valid = false;
         }
+        // 到达记录的时间线随重同步一起作废：留着会让延迟估算瞬间跳成"几百秒"
+        self.arrivals.fill(EMPTY_ARRIVAL);
+        self.arrival_pos = 0;
     }
 }
 
@@ -575,8 +668,12 @@ impl Default for JitterBuffer {
 
 // ═══════════════════════ 漂移校正 ═══════════════════════
 
+/// 有界回落动作：水位跑出回落带时做的一次**单样本块**修正。
+///
+/// 所有动作都必须在 `SLIP_FADE_SAMPLES`（1 ms）的交叉淡化区内完成，
+/// 由调用方的 PCM 处理函数负责；本模块只决定"丢/插多少"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriftAction {
+pub enum Slip {
     None,
     /// 丢弃 `n` 个样本（每声道）
     Drop(u32),
@@ -584,118 +681,180 @@ pub enum DriftAction {
     Insert(u32),
 }
 
-/// 漂移 / 延迟校正器。
-///
-/// 两条互相独立的策略，故意用不同判据：
-///
-/// * **高水位 → 排空延迟**（按绝对值）：启动突发或网络成簇会把缓冲顶高，而
-///   "生产速率 == 消费速率"不会让它自己回落，必须主动削减。为不产生可闻接缝，
-///   限速执行：>300 ms 每 500 ms 削 5 ms（1%），200–300 ms 每 2 s 削 5 ms（0.25%），
-///   **低于 200 ms 一律不动**——避免在 120 ms 边界上反复微剪。
-/// * **低水位 → 补时钟漂移**（按趋势）：PCM 提前写进声卡时抖动缓冲水位本就是 0，
-///   按绝对值判定会每 500 ms 插 5 ms（永久 1%）。所以只在"水位连续 3 次评估都在
-///   下降"时才补，稳定低位视为正常。
-pub struct DriftController {
-    prev_water: i64,
-    rising: u32,
-    falling: u32,
-    last_eval: u64,
-    last_action: u64,
-    primed: bool,
-    pub corrections: u64,
-    pub corrected_samples: u64,
+impl Slip {
+    /// 折算成"媒体时间偏移"：丢弃 → 播放头前移（正），插入 → 后退（负）
+    pub fn signed_samples(self) -> i32 {
+        match self {
+            Slip::None => 0,
+            Slip::Drop(n) => n as i32,
+            Slip::Insert(n) => -(n as i32),
+        }
+    }
 }
 
-/// 连续多少次评估同向才判定为趋势（每次间隔 500 ms 音频时间）
-const DRIFT_TREND_ROUNDS: u32 = 3;
-/// 单次评估的水位变化小于该值视为持平（抑制抖动噪声）
-const DRIFT_TREND_DEADBAND_MS: i64 = 10;
-/// 高水位排空的下限：低于该值不再主动削减
-const DRIFT_TRIM_FLOOR_MS: u32 = 200;
-/// 深度积压时的排空节奏（每 500 ms 削一次）
-const DRIFT_TRIM_FAST_INTERVAL: u64 = DRIFT_INTERVAL_SAMPLES;
-/// 接近下限时的排空节奏（每 2 s 削一次）
-const DRIFT_TRIM_SLOW_INTERVAL: u64 = 4 * DRIFT_INTERVAL_SAMPLES;
+/// 一次校正评估的产物：比率微调（每 10 ms）+ 可能的有界回落（每秒 ≤1 次）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriftUpdate {
+    /// 重采样比率微调量，范围 ±[`RESAMPLE_MAX_ADJUST`]。
+    /// 语义：`实际比率 = 固定比率(源/设备) × (1 + adjust)`。
+    /// 水位偏高 → adjust > 0 → 每秒产出的设备帧变少 → 水位回落。
+    pub adjust: f64,
+    /// 有界回落（绝大多数情况下是 `Slip::None`）
+    pub slip: Slip,
+}
+
+impl Default for DriftUpdate {
+    fn default() -> Self {
+        Self { adjust: 0.0, slip: Slip::None }
+    }
+}
+
+/// 漂移 / 延迟校正器（规范 7.9）。
+///
+/// **第一级：受控重采样（主力）**
+/// 水位偏差经一阶低通后按比例映射到重采样比率的 ±0.5%，每 10 ms 更新一次，
+/// 单次步进 ≤0.0001。比率是连续量：声卡端听到的只是极其缓慢的"变调"，
+/// 不存在任何样本级接缝——这是专业音频接收端的标准做法，也是彻底消灭
+/// 离散咔嗒声的关键。
+///
+/// **第二级：有界回落（安全网）**
+/// 只有当比率已经顶满、水位仍然持续跑出回落带时才启用：
+/// * 高于目标 +30 ms 且连续 5 次评估都在带内 → 丢 1 ms；
+/// * 低于目标 −10 ms → 插 1 ms；
+/// * 两次之间至少间隔 1 s 音频时间（每秒最多 1 ms），绝不连续触发；
+/// * 高带要求"稳定"，低带不要求——插入本身会把水位抬回带内，天然自限。
+///
+/// 两者都用**音频样本计数**计时，不读墙钟、不依赖任何定时器。
+pub struct DriftController {
+    /// 低通后的水位（ms），只用于比率支路
+    water: f64,
+    /// 当前比率微调量
+    adjust: f64,
+    primed: bool,
+    last_ratio: u64,
+    last_eval: u64,
+    last_slip: u64,
+    /// 高带连续评估计数
+    streak: u32,
+    pub ratio_updates: u64,
+    pub slip_drops: u64,
+    pub slip_inserts: u64,
+    /// 累计回落的样本数（每声道）
+    pub slipped_samples: u64,
+    /// 比率微调累计造成的媒体时间偏移（样本，诊断用）
+    pub adjust_integral: f64,
+}
 
 impl DriftController {
     pub fn new() -> Self {
         Self {
-            prev_water: 0,
-            rising: 0,
-            falling: 0,
-            last_eval: 0,
-            last_action: 0,
+            water: 0.0,
+            adjust: 0.0,
             primed: false,
-            corrections: 0,
-            corrected_samples: 0,
+            last_ratio: 0,
+            last_eval: 0,
+            last_slip: 0,
+            streak: 0,
+            ratio_updates: 0,
+            slip_drops: 0,
+            slip_inserts: 0,
+            slipped_samples: 0,
+            adjust_integral: 0.0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.prev_water = 0;
-        self.rising = 0;
-        self.falling = 0;
-        self.last_eval = 0;
-        self.last_action = 0;
+        self.water = 0.0;
+        self.adjust = 0.0;
         self.primed = false;
+        self.last_ratio = 0;
+        self.last_eval = 0;
+        self.last_slip = 0;
+        self.streak = 0;
+    }
+
+    /// 当前比率微调量（供诊断/日志读取）
+    pub fn adjust(&self) -> f64 {
+        self.adjust
     }
 
     /// `water_ms` 为**总缓冲深度**（抖动缓冲 + 输出队列），
-    /// `media_samples` 为累计输出的音频样本数。
-    pub fn update(&mut self, water_ms: u32, media_samples: u64) -> DriftAction {
+    /// `media_samples` 为累计输出的音频样本数（10 ms 帧 → 每帧 +480）。
+    pub fn update(&mut self, water_ms: u32, media_samples: u64) -> DriftUpdate {
         if !self.primed {
             self.primed = true;
-            self.prev_water = water_ms as i64;
+            self.water = water_ms as f64;
+            self.last_ratio = media_samples;
             self.last_eval = media_samples;
-            self.last_action = media_samples;
-            return DriftAction::None;
+            // 启动宽限从"现在"起算：前 2 s 不允许回落
+            self.last_slip = media_samples;
+            return DriftUpdate::default();
         }
-        // 每 500 ms 音频时间评估一次
-        if media_samples.saturating_sub(self.last_eval) < DRIFT_INTERVAL_SAMPLES {
-            return DriftAction::None;
+
+        // ── 第一级：比率微调（每 10 ms 一次）──
+        if media_samples.saturating_sub(self.last_ratio) >= RATIO_UPDATE_SAMPLES {
+            self.last_ratio = media_samples;
+            self.water += WATER_SMOOTH_ALPHA * (water_ms as f64 - self.water);
+            // 水位偏高 → 需要"少产出"→ ratio 增大 → adjust 为正
+            let err = self.water - JITTER_TARGET_MS as f64;
+            let mag = err.abs();
+            let want = if mag <= RATIO_DEADBAND_MS {
+                0.0
+            } else {
+                let k = ((mag - RATIO_DEADBAND_MS) / (RATIO_FULL_MS - RATIO_DEADBAND_MS)).min(1.0);
+                err.signum() * RESAMPLE_MAX_ADJUST * k
+            };
+            let step = (want - self.adjust).clamp(-RATIO_SLEW_STEP, RATIO_SLEW_STEP);
+            self.adjust = (self.adjust + step).clamp(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST);
+            self.ratio_updates += 1;
+        }
+
+        // ── 第二级：有界回落（每 100 ms 评估，每秒最多出手一次）──
+        let slip = self.evaluate_slip(water_ms, media_samples);
+        DriftUpdate { adjust: self.adjust, slip }
+    }
+
+    fn evaluate_slip(&mut self, water_ms: u32, media_samples: u64) -> Slip {
+        if media_samples.saturating_sub(self.last_eval) < SLIP_EVAL_SAMPLES {
+            return Slip::None;
         }
         self.last_eval = media_samples;
 
-        // ── 更新趋势 ──
-        let water = water_ms as i64;
-        let delta = water - self.prev_water;
-        self.prev_water = water;
-        if delta > DRIFT_TREND_DEADBAND_MS {
-            self.rising += 1;
-            self.falling = 0;
-        } else if delta < -DRIFT_TREND_DEADBAND_MS {
-            self.falling += 1;
-            self.rising = 0;
+        // 启动宽限：水位从 0 爬到目标的过程中不回落
+        if media_samples < SLIP_WARMUP_SAMPLES {
+            self.streak = 0;
+            return Slip::None;
+        }
+
+        let high = JITTER_TARGET_MS + SLIP_HIGH_MARGIN_MS;
+        let low = JITTER_TARGET_MS.saturating_sub(SLIP_LOW_MARGIN_MS);
+
+        if water_ms > high {
+            self.streak += 1;
         } else {
-            self.rising = 0;
-            self.falling = 0;
+            self.streak = 0;
         }
 
-        // ── 高水位：限速排空（延迟控制，不是漂移检测）──
-        if water_ms > DRIFT_TRIM_FLOOR_MS {
-            let interval = if water_ms > DRIFT_TRIM_FLOOR_MS * 3 / 2 {
-                DRIFT_TRIM_FAST_INTERVAL
-            } else {
-                DRIFT_TRIM_SLOW_INTERVAL
-            };
-            if media_samples.saturating_sub(self.last_action) >= interval {
-                self.last_action = media_samples;
-                self.corrections += 1;
-                self.corrected_samples += DRIFT_MAX_SAMPLES as u64;
-                return DriftAction::Drop(DRIFT_MAX_SAMPLES);
-            }
-            return DriftAction::None;
+        // 速率闸门：每秒最多 1 ms，绝不连续触发（1 s 音频样本时间）
+        if media_samples.saturating_sub(self.last_slip) < SLIP_MIN_INTERVAL_SAMPLES {
+            return Slip::None;
         }
 
-        // ── 低水位：只在持续变薄时补时钟漂移 ──
-        if self.falling >= DRIFT_TREND_ROUNDS && water_ms < JITTER_LOW_MS {
-            self.falling = 0;
-            self.last_action = media_samples;
-            self.corrections += 1;
-            self.corrected_samples += DRIFT_MAX_SAMPLES as u64;
-            return DriftAction::Insert(DRIFT_MAX_SAMPLES);
+        if self.streak >= SLIP_STABLE_ROUNDS {
+            self.streak = 0;
+            self.last_slip = media_samples;
+            self.slip_drops += 1;
+            self.slipped_samples += SLIP_SAMPLES as u64;
+            return Slip::Drop(SLIP_SAMPLES);
         }
-        DriftAction::None
+        if water_ms < low {
+            self.streak = 0;
+            self.last_slip = media_samples;
+            self.slip_inserts += 1;
+            self.slipped_samples += SLIP_SAMPLES as u64;
+            return Slip::Insert(SLIP_SAMPLES);
+        }
+        Slip::None
     }
 }
 
@@ -711,7 +870,8 @@ impl Default for DriftController {
 ///
 /// - `base_ts`：第一帧真实 PCM 被写入时的 RTP 时间戳；
 /// - `base_device_frames`：该时刻声卡已消费的设备帧数；
-/// - `offset`：漂移校正累计偏移（样本）。
+/// - `offset`：漂移校正累计偏移（样本），由有界回落的丢/插**和**重采样
+///   比率微调的连续积分共同写入。
 ///
 /// 非 48 kHz 设备用余数累加器换算，避免整数除法造成长期漂移。
 pub struct PlayheadClock {
@@ -722,6 +882,9 @@ pub struct PlayheadClock {
     last_device_frames: u64,
     last_value: u64,
     offset: i64,
+    /// 比率微调造成的**不足一个样本**的残余（避免每帧四舍五入吃掉校正量：
+    /// u=0.005、每帧 480 帧时每帧只有 2.4 个样本，逐帧取整会丢掉 17%）
+    offset_frac: f64,
     started: bool,
 }
 
@@ -735,6 +898,7 @@ impl PlayheadClock {
             last_device_frames: 0,
             last_value: 0,
             offset: 0,
+            offset_frac: 0.0,
             started: false,
         }
     }
@@ -751,6 +915,7 @@ impl PlayheadClock {
         self.remainder = 0;
         self.last_value = base_ts;
         self.offset = 0;
+        self.offset_frac = 0.0;
         self.started = true;
     }
 
@@ -793,6 +958,25 @@ impl PlayheadClock {
         self.offset += delta_samples;
     }
 
+    /// 重采样比率微调造成的媒体时间偏移（**连续量**，每帧调用）。
+    ///
+    /// 比率乘以 `(1+u)` 后，`n` 个设备帧对应的媒体时间变成 `n×(1+u)`，
+    /// 也就是每个设备帧要多算 `u` 个媒体样本。逐帧量是小数（u=0.005 时
+    /// 每 480 帧只有 2.4 个样本），因此必须用 f64 累积、只把整数部分
+    /// 加到 `offset` 上；每帧四舍五入会丢掉近 17% 的校正量，
+    /// 表现为水位与播放头缓慢背道而驰。
+    pub fn note_ratio_correction(&mut self, samples: f64) {
+        if !samples.is_finite() {
+            return;
+        }
+        self.offset_frac += samples;
+        let whole = self.offset_frac.trunc();
+        if whole != 0.0 {
+            self.offset = self.offset.saturating_add(whole as i64);
+            self.offset_frac -= whole;
+        }
+    }
+
     pub fn reset(&mut self) {
         self.started = false;
         self.base_ts = 0;
@@ -801,6 +985,7 @@ impl PlayheadClock {
         self.last_device_frames = 0;
         self.last_value = 0;
         self.offset = 0;
+        self.offset_frac = 0.0;
     }
 }
 
@@ -1126,97 +1311,256 @@ mod tests {
         assert!(jb.epoch > 0);
     }
 
-    // ── 漂移 ──
+    // ── 漂移校正 ──
 
-    #[test]
-    fn drift_keeps_normal_water_untouched() {
-        // 20–120 ms 是正常工作区间：稳定在此不得产生任何编辑
-        let mut d = DriftController::new();
-        let mut media = 0u64;
-        d.update(60, media);
-        for _ in 0..600 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            assert_eq!(d.update(60, media), DriftAction::None);
-        }
-        assert_eq!(d.corrections, 0);
-    }
-
-    #[test]
-    fn drift_does_not_trim_below_floor() {
-        // 150 ms 高于规范高水位但低于排空下限：不主动削减，
-        // 宁可多 30 ms 延迟，也不在边界上反复微剪
-        let mut d = DriftController::new();
-        let mut media = 0u64;
-        d.update(150, media);
-        for _ in 0..600 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            assert_eq!(d.update(150, media), DriftAction::None);
-        }
-        assert_eq!(d.corrections, 0);
-    }
-
-    #[test]
-    fn drift_drains_excess_water_at_bounded_rate() {
-        // 400 ms 积压：每 500 ms 削 5 ms（1%），10 秒正好 20 次
-        let mut d = DriftController::new();
-        let mut media = 0u64;
-        d.update(400, media);
-        let mut drops = 0;
-        for _ in 0..20 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            if d.update(400, media) == DriftAction::Drop(DRIFT_MAX_SAMPLES) {
-                drops += 1;
+    /// 按 10 ms 一帧推进 `frames` 帧，返回期间出现的所有回落动作
+    fn run_drift(d: &mut DriftController, water: u32, frames: u64, media: &mut u64) -> Vec<Slip> {
+        let mut slips = Vec::new();
+        for _ in 0..frames {
+            *media += FRAME_SAMPLES as u64;
+            let u = d.update(water, *media);
+            if u.slip != Slip::None {
+                slips.push(u.slip);
             }
         }
-        assert_eq!(drops, 20);
-        assert_eq!(d.corrections, 20);
+        slips
     }
 
     #[test]
-    fn drift_drains_slowly_near_floor() {
-        // 220 ms：降到 0.25% 的节奏（每 2 s 一次）
+    fn drift_on_target_does_nothing() {
+        // 水位稳定在目标上：比率不动、不回落
         let mut d = DriftController::new();
         let mut media = 0u64;
-        d.update(220, media);
-        let mut drops = 0;
-        for _ in 0..20 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            if d.update(220, media) == DriftAction::Drop(DRIFT_MAX_SAMPLES) {
-                drops += 1;
+        d.update(JITTER_TARGET_MS, media);
+        let slips = run_drift(&mut d, JITTER_TARGET_MS, 1000, &mut media);
+        assert!(slips.is_empty());
+        assert_eq!(d.adjust(), 0.0);
+        assert_eq!(d.slip_drops, 0);
+        assert_eq!(d.slip_inserts, 0);
+    }
+
+    #[test]
+    fn drift_ignores_jitter_inside_deadband() {
+        // 目标 ±5 ms 内的小抖动不得触发任何动作（否则会与水位的自然抖动打架）
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(JITTER_TARGET_MS, media);
+        let mut slips = Vec::new();
+        for i in 0..2000u64 {
+            media += FRAME_SAMPLES as u64;
+            let water = JITTER_TARGET_MS as i32 + if i % 2 == 0 { 4 } else { -4 };
+            if d.update(water.max(0) as u32, media).slip != Slip::None {
+                slips.push(i);
             }
         }
-        assert_eq!(drops, 5);
+        assert!(slips.is_empty(), "死区内不得回落");
+        assert!(d.adjust().abs() < 1e-9, "死区内不得动比率: {}", d.adjust());
     }
 
     #[test]
-    fn drift_inserts_only_when_falling() {
+    fn drift_ratio_is_bounded_and_has_expected_sign() {
+        // 水位高出 40 ms：比率向上顶，但绝不越过 ±0.5%
         let mut d = DriftController::new();
         let mut media = 0u64;
-        d.update(120, media);
-        let mut action = DriftAction::None;
-        for k in 1..30u64 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            let water = 120u32.saturating_sub(k as u32 * 20);
-            let a = d.update(water, media);
-            if a != DriftAction::None {
-                action = a;
-                break;
+        d.update(100, media);
+        let mut max_adjust: f64 = 0.0;
+        for _ in 0..200 {
+            media += FRAME_SAMPLES as u64;
+            let u = d.update(100, media).adjust;
+            max_adjust = max_adjust.max(u.abs());
+            assert!(u <= RESAMPLE_MAX_ADJUST + 1e-12, "比率越界: {u}");
+        }
+        assert!(max_adjust > RESAMPLE_MAX_ADJUST * 0.99, "高水位应把比率顶到上限，实际 {max_adjust}");
+        assert!(d.adjust() > 0.0, "水位偏高时 adjust 必须为正");
+    }
+
+    #[test]
+    fn drift_ratio_slew_is_gradual() {
+        // 单次比率更新步进受限：不允许一帧之内跳到满幅（那是可闻的变调台阶）
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(300, media);
+        let mut prev = 0.0f64;
+        for _ in 0..60 {
+            media += FRAME_SAMPLES as u64;
+            let u = d.update(300, media).adjust;
+            assert!((u - prev).abs() <= RATIO_SLEW_STEP + 1e-12, "步进过大: {prev} → {u}");
+            prev = u;
+        }
+        assert!(prev.abs() > 0.0);
+    }
+
+    #[test]
+    fn drift_ratio_decays_back_to_zero() {
+        // 水位回到目标后比率必须归零，否则会永久变调
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(200, media);
+        for _ in 0..200 {
+            media += FRAME_SAMPLES as u64;
+            d.update(200, media);
+        }
+        assert!(d.adjust() > 0.004);
+        for _ in 0..400 {
+            media += FRAME_SAMPLES as u64;
+            d.update(JITTER_TARGET_MS, media);
+        }
+        assert_eq!(d.adjust(), 0.0, "回到目标后比率必须归零");
+    }
+
+    #[test]
+    fn drift_slip_high_band_needs_stability() {
+        // 单次尖峰（<500 ms）不得触发丢样
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(JITTER_TARGET_MS, media);
+        // 先过启动宽限
+        run_drift(&mut d, JITTER_TARGET_MS, 400, &mut media);
+        // 300 ms 尖峰
+        let slips = run_drift(&mut d, 200, 30, &mut media);
+        assert!(slips.is_empty(), "不稳定尖峰不得回落: {slips:?}");
+        // 回到目标再跑 1 s，仍然不得回落
+        let slips = run_drift(&mut d, JITTER_TARGET_MS, 100, &mut media);
+        assert!(slips.is_empty());
+        assert_eq!(d.slip_drops, 0);
+    }
+
+    #[test]
+    fn drift_slip_rate_is_one_ms_per_second() {
+        // 水位持续高企：回落节奏必须是"每秒最多 1 ms、每次 1 ms"
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(200, media);
+        // 10 s，仅统计宽限期之后的动作
+        let slips = run_drift(&mut d, 200, 1000, &mut media);
+        assert!(slips.iter().all(|s| *s == Slip::Drop(SLIP_SAMPLES)), "{slips:?}");
+        // 每秒最多一次：10 s 内不会超过 9 次（首个 2 s 是宽限）
+        assert!(slips.len() <= 9, "回落过频: {} 次 / 10 s", slips.len());
+        assert!(slips.len() >= 6, "水位长期偏高却几乎不回落: {}", slips.len());
+    }
+
+    #[test]
+    fn drift_slip_is_never_consecutive() {
+        // 任意两次回落之间必须至少间隔 1 s 音频时间
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(200, media);
+        let mut last: Option<u64> = None;
+        for _ in 0..2000 {
+            media += FRAME_SAMPLES as u64;
+            if d.update(200, media).slip != Slip::None {
+                if let Some(prev) = last {
+                    assert!(
+                        media - prev >= SLIP_MIN_INTERVAL_SAMPLES,
+                        "两次回落间隔仅 {} 样本",
+                        media - prev
+                    );
+                }
+                last = Some(media);
             }
         }
-        assert_eq!(action, DriftAction::Insert(DRIFT_MAX_SAMPLES));
+        assert!(last.is_some());
     }
 
     #[test]
-    fn drift_ignores_stable_low_water() {
-        // PCM 已提前写进声卡时水位恒为低位：不得按绝对值补帧
+    fn drift_slip_low_band_inserts() {
+        // 水位被打空（环即将欠载）：按 1 ms/s 插入，把水位抬回来
         let mut d = DriftController::new();
         let mut media = 0u64;
-        d.update(10, media);
-        for _ in 0..600 {
-            media += DRIFT_INTERVAL_SAMPLES;
-            assert_eq!(d.update(10, media), DriftAction::None);
+        d.update(JITTER_TARGET_MS, media);
+        run_drift(&mut d, JITTER_TARGET_MS, 400, &mut media);
+        let slips = run_drift(&mut d, 10, 200, &mut media);
+        assert!(!slips.is_empty(), "水位 10 ms 必须触发插入");
+        assert!(slips.iter().all(|s| *s == Slip::Insert(SLIP_SAMPLES)), "{slips:?}");
+        assert_eq!(d.slip_inserts, slips.len() as u64);
+        assert_eq!(d.slip_drops, 0);
+    }
+
+    #[test]
+    fn drift_slip_band_edges_are_exact() {
+        // 高带 = 目标+30：等于 90 不动作，91 动作；低带 = 目标-10：等于 50 不动作
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(JITTER_TARGET_MS, media);
+        let slips = run_drift(&mut d, JITTER_TARGET_MS + SLIP_HIGH_MARGIN_MS, 400, &mut media);
+        assert!(slips.is_empty(), "带边不得动作: {slips:?}");
+
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(JITTER_TARGET_MS, media);
+        let slips = run_drift(&mut d, JITTER_TARGET_MS - SLIP_LOW_MARGIN_MS, 400, &mut media);
+        assert!(slips.is_empty(), "低带边不得动作: {slips:?}");
+
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(JITTER_TARGET_MS, media);
+        let slips = run_drift(&mut d, JITTER_TARGET_MS + SLIP_HIGH_MARGIN_MS + 1, 400, &mut media);
+        assert!(!slips.is_empty(), "越过带边必须动作");
+    }
+
+    #[test]
+    fn drift_no_slip_during_warmup() {
+        // 启动阶段水位从 0 爬升：哪怕长时间低位也不得插入
+        let mut d = DriftController::new();
+        let mut media = 0u64;
+        d.update(0, media);
+        let slips = run_drift(&mut d, 0, 190, &mut media); // 1.9 s
+        assert!(slips.is_empty(), "启动宽限内不得回落: {slips:?}");
+    }
+
+    #[test]
+    fn drift_slip_offsets_media_time() {
+        // 回落/插入的符号语义：丢 → 播放头前移；插 → 播放头后退
+        assert_eq!(Slip::Drop(SLIP_SAMPLES).signed_samples(), SLIP_SAMPLES as i32);
+        assert_eq!(Slip::Insert(SLIP_SAMPLES).signed_samples(), -(SLIP_SAMPLES as i32));
+        assert_eq!(Slip::None.signed_samples(), 0);
+    }
+
+    #[test]
+    fn playhead_accumulates_fractional_ratio_correction() {
+        // 每帧 2.4 个样本的连续校正不得被逐帧取整吃掉（取整会丢 17%）
+        let mut clock = PlayheadClock::new(48_000);
+        clock.start(0, 0);
+        for _ in 0..100 {
+            clock.note_ratio_correction(480.0 * 0.005);
         }
-        assert_eq!(d.corrections, 0);
+        let v = clock.value().unwrap();
+        assert!((v as i64 - 240).abs() <= 1, "100 帧 × 2.4 样本 ≈ 240，实际 {v}");
+        // 长跑 1000 帧：2400 样本，误差仍 ≤1（小数残留在 offset_frac 里）
+        for _ in 0..900 {
+            clock.note_ratio_correction(480.0 * 0.005);
+        }
+        let v = clock.value().unwrap();
+        assert!((v as i64 - 2400).abs() <= 1, "1000 帧 ≈ 2400，实际 {v}");
+    }
+
+    // ── 到达时刻追踪（总延迟估算）──
+
+    #[test]
+    fn arrival_trace_reports_when_frame_landed() {
+        let mut jb = JitterBuffer::new();
+        insert(&mut jb, 0, 0, true, 1);
+        insert(&mut jb, 1, 480, false, 2);
+        let a0 = jb.arrival_of(0).expect("首帧必须有到达记录");
+        let a1 = jb.arrival_of(480).expect("第二帧必须有到达记录");
+        assert!(a1 >= a0, "到达时刻必须单调");
+        // 查询一个尚未到达的时间戳：回落到最近的更早记录，而不是 None
+        assert!(jb.arrival_of(960).is_some());
+        // 重同步会清空记录，避免延迟估算跨会话跳变
+        jb.reset();
+        assert!(jb.arrival_of(480).is_none());
+    }
+
+    #[test]
+    fn jb_prebuffer_threshold_is_three_frames() {
+        // JITTER_START_MS = 30 → 3 帧即可起播（配合受控重采样的低水位稳态）
+        let mut jb = JitterBuffer::new();
+        for i in 0..2u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        assert_eq!(jb.pull(0, &mut [0u8; 1275]), Pull::Wait, "2 帧不得起播");
+        insert(&mut jb, 2, 960, false, 3);
+        assert_eq!(pull_tags(&mut jb, 0, 3), vec![1, 2, 3]);
     }
 
     #[test]

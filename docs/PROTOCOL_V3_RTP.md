@@ -2,13 +2,13 @@
 
 > **状态：已实现（v1.2.0）。**
 > 本文档描述 v3 的线格式与接收端时钟模型；`protocol/`、`windows/`、`android/` 均已按本文实现，
-> v2 代码路径已删除（`docs/PROTOCOL.md` 仅作历史存档）。
+> v2 代码路径已删除（`archive/PROTOCOL_V2.md` 仅作历史存档）。
 >
 > - 控制协议版本：**3**
 > - 媒体承载：**标准 RTP/AVP，RTP version 2**
 > - 适用范围：Android ↔ Windows，局域网 / 点对点，单向或双向实时音频
 > - 协议真源：`protocol/protocol.rs`（控制面） + `protocol/rtp.rs`（媒体面 / 抖动缓冲 / 播放头）
-> - 相关文档：[v2 协议（历史）](PROTOCOL.md) · [架构说明](ARCHITECTURE.md)
+> - 相关文档：[v2 协议（历史）](archive/PROTOCOL_V2.md) · [架构说明](ARCHITECTURE.md)
 >
 > 本文使用 RFC 2119 风格的关键词：**必须（MUST）**、**不得（MUST NOT）**、**应该（SHOULD）**、**可以（MAY）**。
 
@@ -241,17 +241,26 @@ v3 使用标准 RTP 固定头，12 字节，无 CSRC、无扩展、无填充。
 
 | 码率 | 每帧字节数（CBR 参考） | RTP 包大小 | UDP/IP 总计 | 结论 |
 |------|------------------------|-----------|-------------|------|
-| 512 kbps | 640 | 652 | 680 | 安全 |
-| 768 kbps | 960 | 972 | 1000 | 安全 |
-| 960 kbps | 1200 | 1212 | 1240 | 安全 |
-| 1000 kbps | 1250 | 1262 | 1290 | 推荐上限 |
+| 64 kbps | 80 | 92 | 120 | 安全 |
+| 128 kbps | 160 | 172 | 200 | 安全 |
+| 256 kbps | 320 | 332 | 360 | 安全 |
+| 384 kbps | 480 | 492 | 520 | 安全 |
+| 512 kbps | 640 | 652 | 680 | **上限**（产品设定） |
 | 1024 kbps | 1280 | 1292 | 1320 | **禁止**（超过 Opus 1275 字节上限） |
 
 规则：
 
 - 固定 10 ms 帧；v3 不支持 20 ms 或 120 ms 帧。
-- 自动码率 `0` 映射为 **512 kbps**。
-- 手动可选 `512 / 768 / 960 / 1000 kbps`；超过 1000 kbps 的配置必须被拒绝或钳制到 1000。
+- **码率上限为 512 kbps**（`BITRATE_MAX_KBPS`），两端必须同值：
+  接收端用它钳制对端下发的值，跨端不一致会出现"界面显示 512、实际跑 1000"。
+- 自动码率 `0` 的含义是"用上限"：映射为 **512 kbps**，由 VBR 在该上限内浮动，
+  不做动态探测。因此 `BITRATE_AUTO_KBPS` 必须恒等于 `BITRATE_MAX_KBPS`。
+  本版客户端**不再提供自动档**（UI 只发具体档位）；`0` 仅作跨版本兼容保留。
+- 手动档位固定五档 `64 / 128 / 256 / 384 / 512 kbps`（`BITRATE_STEPS_KBPS`）。
+  协议只强制上限，不强制档位；档位是 UI 约定，用于把滑块量化为整数位置。
+  非档位值（例如历史配置 768/960/1000）由 `snap_bitrate_kbps()` 吸附到最近档位，
+  等距时取较小档，超过上限的先钳制再吸附。
+- 高于 512 kbps 的配置必须被拒绝或钳制到 512。
 - Opus 负载最大 1275 字节；编码结果超过 1275 字节时：
   - 必须丢弃该帧，不得截断；
   - 计数并降低码率/关闭或降低 FEC/DRED 冗余；
@@ -475,7 +484,7 @@ Android                                   Windows
 - Windows 绑定成功后，才可以接受正向 RTP；未绑定状态下收到 RTP 一律丢弃。
 - Android 收到 `reverse_ssrc != 0` 的 ACK 后，才可以启动反向接收。
 - Windows 只有在 CONNECT 的 `reverse_port != 0` 且反向功能开启时，才启动反向发送。
-- 接收端在收到第一个 RTP 包后进入预缓冲；预缓冲满足 40 ms 才开始播放。
+- 接收端在收到第一个 RTP 包后进入预缓冲；预缓冲满足 30 ms（3 帧）才开始播放。
 
 ### 6.4 保活与超时
 
@@ -550,7 +559,7 @@ Reconnecting ──(ACK)──> Connected
 |------|----|------|
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
-| `JITTER_START_MS` | 40 ms | 预缓冲启动阈值（4 帧连续） |
+| `JITTER_START_MS` | 30 ms | 预缓冲启动阈值（3 帧连续） |
 | `JITTER_TARGET_MS` | 60 ms | 目标水位（6 帧） |
 | `JITTER_HIGH_MS` | 120 ms | 高水位（12 帧） |
 | `JITTER_LOW_MS` | 20 ms | 低水位（2 帧） |
@@ -558,6 +567,16 @@ Reconnecting ──(ACK)──> Connected
 | `PLC_MAX_MS` | 120 ms | 连续 PLC 上限（12 帧） |
 | `MAX_REORDER_PACKETS` | 64 | 编码包重排槽位 |
 | `RESYNC_GAP_MS` | 200 ms | 触发重同步的时间戳跳变阈值 |
+| `SLIP_SAMPLES` | 48 (1 ms) | 有界回落的单次量 |
+| `SLIP_FADE_SAMPLES` | 48 (1 ms) | 交叉淡化长度（≥1 ms，不得硬切） |
+| `SLIP_HIGH_MARGIN_MS` | +30 ms | 回落高带（高于目标） |
+| `SLIP_LOW_MARGIN_MS` | −10 ms | 回落低带（低于目标） |
+| `SLIP_MIN_INTERVAL_SAMPLES` | 48000 (1 s) | 回落最小间隔：每秒最多 1 ms |
+| `RESAMPLE_MAX_ADJUST` | ±0.005 | 重采样比率微调上限（±0.5%） |
+| `RATIO_UPDATE_SAMPLES` | 480 (10 ms) | 比率更新周期 |
+| `RATIO_SLEW_STEP` | 0.0001 | 单次比率步进（1%/s 斜坡） |
+| `RATIO_DEADBAND_MS` | 5 ms | 比率死区 |
+| `RATIO_FULL_MS` | 20 ms | 比率满幅点 |
 
 ### 7.3 数据结构
 
@@ -670,7 +689,7 @@ return silence        // 还不到缺口，继续等
 IDLE
   │ 收到第一个合法 RTP
   ▼
-PREBUFFER ──(连续 >= 4 帧)──> PLAYING
+PREBUFFER ──(连续 >= 3 帧)──> PLAYING
   ▲                              │
   │                              ├─ 下一帧缺失，但 next_ts > playhead+lead
   │                              │     └─> GAP（输出静音/等待）
@@ -693,10 +712,10 @@ PREBUFFER ──(连续 >= 4 帧)──> PLAYING
 **启动**
 
 - 首包建立基准；不要求首包序列号是某个固定值。
-- 连续 4 帧（40 ms）可解码后才开始播放。
+- 连续 3 帧（30 ms）可解码后才开始播放。降到 30 ms 的前提是水位由受控重采样闭环维持（7.9），不再是"离散校正需要留安全垫"的旧模型。
 - 若首包丢失，以第一个收到的包为基准；不得无限等待“第 0 帧”。
 - Windows cpal 回调在预缓冲完成前输出静音；第一帧真实 PCM 被消费时，播放头才从该帧时间戳开始计时。
-- Android 可以先向 AudioTrack 写入 4 帧，再 `play()`；这 4 帧是输出缓冲，不是应用层无限队列。
+- Android 的 AudioTrack 只需 2 帧（20 ms）缓冲并启用 low-latency 通路；这 2 帧是输出缓冲，不是应用层无限队列。
 
 **重同步**
 
@@ -712,7 +731,7 @@ PREBUFFER ──(连续 >= 4 帧)──> PLAYING
 2. 重置 `next_seq/next_ts/highest_*`；
 3. 重置 Opus 解码器和 PLC 状态；
 4. 对输出做短淡出/淡入，避免爆音；
-5. 回到 `PREBUFFER`，重新满足 4 帧后播放。
+5. 回到 `PREBUFFER`，重新满足 3 帧后播放。
 
 ### 7.8 PLC 规则
 
@@ -726,25 +745,61 @@ PREBUFFER ──(连续 >= 4 帧)──> PLAYING
 
 ### 7.9 漂移校正
 
-发送端采集时钟与接收端声卡时钟不同源，水位会缓慢漂移。v3 不使用 3 秒 EMA、不读取墙钟；只根据**可播放水位**校正。
+发送端采集时钟与接收端声卡时钟不同源，水位会缓慢漂移。v3 不使用 3 秒 EMA、不读取墙钟；只根据**可播放水位**校正，分两级：
 
-| 水位 | 动作 |
+**第一级：受控重采样（主力）**
+
+把重采样比在 **±0.5%** 内按水位偏差缓慢调整，每 10 ms 更新一次。
+
+```
+ratio = 源采样率 / 设备采样率 × (1 + u)，  u ∈ [−0.005, +0.005]
+err   = 低通(总水位) − 目标水位(60 ms)
+|err| ≤ 5 ms          → u 目标 = 0                （死区）
+|err| ≥ 20 ms         → u 目标 = ±0.5%            （满幅）
+两者之间              → 线性插值
+每 10 ms 的 u 变化    ≤ 0.0001                    （1%/s 的斜坡）
+```
+
+- 比率是**连续量**：改变它不会在 PCM 里留下任何接缝，听感只是极缓慢的变调
+  （0.5% ≈ 8.7 音分），因此可从根上消灭离散"咔嗒"；
+- 0.5% 的吞吐能力是每秒 5 ms 缓冲差，足够覆盖任何真实晶振漂移（典型 10–100 ppm）；
+- 比率造成的媒体时间偏移是连续量，必须用小数累积后回写播放头
+  （`PlayheadClock::note_ratio_correction`）。逐帧取整会吃掉近 17% 的校正量。
+
+**第二级：有界回落（安全网）**
+
+只有水位持续跑出回落带——即比率已经顶满、单靠重采样收不住——才做一次**单样本块**修正：
+
+| 条件 | 动作 |
 |------|------|
-| > 120 ms 且持续超过滞回窗口 | 丢弃 1–5 ms PCM（在零交叉/交叉淡化处） |
-| < 20 ms 且持续超过滞回窗口 | 插入 1–5 ms PLC/重复 PCM（交叉淡化） |
-| 20–120 ms | 不校正 |
+| 高于目标 **30 ms** 以上，且连续 5 次评估（≈500 ms）都在带内 | 丢弃 **1 ms**（48 样本） |
+| 低于目标 **10 ms** | 插入 **1 ms**（48 样本） |
 
 规则：
 
-- 只在 `PLAYING` 且没有处于 `RESYNC`/长 PLC 时校正。
-- 单次校正 1–5 ms；校正后至少经过 500 ms 的**音频样本时间**才允许下一次校正（样本计数，不是墙钟定时器）。
-- 校正必须同步调整 `timestamp_offset`，使 `playhead_ts` 仍然对应正确的 RTP 时间线。
-  该偏移**只维护在播放头一侧**（`PlayheadClock`）；抖动缓冲不再保存副本——
-  `pull` 的缺口判定用的就是 `playhead_ts`，把偏移加在播放头上即可让整条媒体
-  时间线平移。旧实现在抖动缓冲里也存了一份 `timestamp_offset`，只写不读，
-  属于误导（2026-10-25 已删除）。
-- 不得用大幅跳变（>10 ms）硬切；不得让校正引入可闻的咔哒声。
-- 允许实现改用受控重采样比率；但必须满足同样的水位目标、无定时器、无累积漂移。
+- **每秒最多 1 ms**：两次回落之间至少间隔 1 s **音频样本时间**（48000 样本），绝不连续触发；
+- **交叉淡化长度 ≥ 1 ms**：丢/插都在 48 样本的升余弦窗内完成，接缝两侧一阶连续，
+  绝不硬切、绝不淡出到零（淡出到零再接入下一帧本身就是一个台阶）；
+- 启动宽限 2 s：水位从 0 爬向目标的过程中不允许回落；
+- 只在真实 PCM 帧上回落（PLC/静音帧没有接缝问题，不做编辑）；
+- 只能在 `PLAYING` 且不处于 `RESYNC`/长 PLC 时回落。
+
+**校正与播放头**
+
+两种手段都必须同步调整播放头偏移，使 `playhead_ts` 始终对应正确的 RTP 时间线。
+该偏移**只维护在播放头一侧**（`PlayheadClock`）；抖动缓冲不保存副本——
+`pull` 的缺口判定用的就是 `playhead_ts`，把偏移加在播放头上即可让整条媒体时间线平移。
+
+- 丢 1 ms → `offset += 48`；插 1 ms → `offset -= 48`；
+- 比率微调 → `offset += 设备帧数 × u`（f64 累积，只把整数部分入账）。
+
+**为什么不用"500 ms 丢/插 5 ms"**
+
+旧实现是纯粹的比例式离散编辑：每次 5 ms，间隔 500 ms。它的三个问题是
+（1）每次编辑都是一次 5 ms 的音频删除/重复，接缝必然可闻；
+（2）它在水位已经偏离之后才动作，水位永远在 120 ms 附近来回；
+（3）它把 5 ms 全部压在单帧尾部，淡出只覆盖 1 ms，剩余 4 ms 是硬切。
+受控重采样把这三条同时解决：连续、提前、无接缝。
 
 ### 7.10 播放头映射
 
@@ -778,9 +833,28 @@ remainder   = num % device_rate
 
 - 输出设备缓冲延迟；
 - 重采样器固定延迟；
-- 声卡报告中“已写入但尚未真正播放”的帧。
+- 声卡报告中"已写入但尚未真正播放"的帧。
 
-这些延迟应作为固定偏移校准一次，或在启动时用 `getTimestamp()`/设备时间戳估计；不得每帧用墙钟重新计算。
+#### 声卡 DMA 缓冲是否包含在 playhead 里
+
+**默认不包含。** cpal 的输出回调每填一次缓冲就把 `played_device_frames` 前移，
+而这段数据还要经过 WASAPI 引擎缓冲 + DMA 才真正出声。二者之差由
+`OutputCallbackInfo::timestamp()` 的 `playback − callback` 给出，代码里记为
+`device_latency_us`（Windows）/ 缺省为 0（Android：播放头本身已是混音器消费位置）。
+
+因此 Windows 端用**可听位置**驱动播放头：
+
+```
+audible_device_frames = played_device_frames − device_latency_frames()
+playhead_ts           = PlayheadClock::update(audible_device_frames)
+```
+
+这样 PLC 的判定点整体推后一个缓冲长度，等于多给网络一个缓冲的补救时间；
+同时"总延迟估算"（见 7.14）才有正确的物理含义。
+
+绝对精度需要**实测校准一次**：见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)。
+校准得到的固定偏移只作为日志/展示的修正量，不参与水位控制——
+水位控制是自洽的（只关心相对的填充变化），不依赖绝对延迟是否准确。
 
 ### 7.11 Windows 接收管线
 
@@ -832,7 +906,7 @@ AudioTrack / 声卡
 - 不使用 40/80 ms 反向 PLC 定时器；PLC 由播放头到期触发。
 - 播放头用 `AudioTrack.getPlaybackHeadPosition()`/`getTimestamp()` 获取；处理 32 位回绕。
 - 若设备不支持 48 kHz，使用受控重采样；`playhead_ts` 按 7.10 换算。
-- 预缓冲：写线程先解码 4 帧写入 AudioTrack，再 `play()`；之后按水位拉取。
+- 预缓冲：写线程先在 AudioTrack 里累积 2 帧（20 ms）再 `play()`；之后按播放头拉取。
 
 ### 7.13 统计
 
@@ -842,10 +916,31 @@ AudioTrack / 声卡
 - 丢包/迟到/重复/乱序数；
 - 抖动缓冲当前水位（ms）；
 - PLC 帧数、连续 PLC 最大值；
-- 漂移校正次数、累计校正样本数；
+- 漂移校正：当前比率微调量（%）、有界回落次数（丢/插分别计）、累计回落样本数；
+- **总延迟估算**（见 7.14）；
 - 解码错误数、超长包丢弃数；
 - 输出欠载次数；
 - 当前 SSRC、当前播放头时间戳。
+
+### 7.14 总延迟估算
+
+接收端唯一能在本地测到的延迟口径：
+
+```
+total_latency_ms = now − arrival_time(playhead_ts 那一帧) + device_latency_ms
+```
+
+- `arrival_time` 由抖动缓冲在**接纳**每个包时记录（128 条环形记录，≈1.28 s 历史）；
+  查询时取"最新一条 `entry_ts ≤ playhead_ts` 的记录"；
+- `device_latency_ms` 是声卡自报的"填缓冲→发声"延迟（见 7.10），Android 端缺省为 0；
+- 它**不包含**发送端采集→发包以及单程网络时延：这两个量在没有跨设备时钟的情况下
+  测不出来，因此这个数字应理解为"这段音频到了本机之后又等了多久"。
+
+要求：
+
+- 实时显示（UI 每次状态刷新读一次原子变量），并每 10 s 落一行日志，
+  同时打印水位与比率微调量——出现"延迟越来越大"时可直接判断是水位涨还是声卡缓冲涨；
+- 不得在音频回调里计算（回调只做一次 `Instant` 差值，写在原子变量里）。
 
 ---
 
@@ -864,6 +959,26 @@ AudioTrack / 声卡
 7. 每个 10 ms 帧推进时间戳 480、**序列号推进 1**（两者同频，不论该帧是否真的发出，见 4.4）。
 8. 超过 1275 字节的 Opus 负载不得发送。
 9. `M=1` 按 4.6 设置。
+10. **1 帧节拍整形**：发送时刻钉在 10 ms 网格上，把采集设备成簇交出的帧摊平。
+    它不是队列——最多只压 1 帧；落后超过 4 帧就重置网格，绝不用连续突发追赶。
+
+发送端节拍整形为什么必要：采集硬件的读接口按"周期"交货（WASAPI 环回常见
+10/20 ms，`AudioRecord` 视缓冲而定），成簇输出的直接后果是接收端水位呈锯齿。
+接收端当然能靠水位控制吸收锯齿，但那部分锯齿会实实在在变成抖动余量需求，
+把目标水位抬高。在源头摊平，比在接收端加缓冲便宜得多。
+
+实现要点（两端一致）：
+
+```
+next_send_at += 10 ms
+wait = next_send_at − now
+wait ≥ 1 ms   → sleep/delay(wait)
+0 < wait < 1 ms → yield
+wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
+```
+
+禁止用"补发"实现追赶：连发两包会让接收端瞬时水位抬高 10 ms，
+这正是要消灭的东西。心跳/静音补齐同理，不得超过实时速率。
 
 ### 8.2 Android 正向发送
 
@@ -893,7 +1008,7 @@ AudioTrack / 声卡
 - Windows 收到相同配置时不得重复调用 `OPUS_SET_*`；比较结构体，只有变化才应用。
 - 正向编码器配置由 Android 本地决定；Windows 不需要知道。
 - 帧长固定 10 ms；任何一方收到 `frame_ms != 10` 都拒绝连接，不做动态切换。
-- 码率 `0` 统一映射为 512 kbps；最大 1000 kbps。
+- 码率 `0`（自动）= 上限 512 kbps；最大 512 kbps；手动五档 64/128/256/384/512。
 
 ### 8.5 发送端会话状态
 
@@ -931,7 +1046,7 @@ AudioTrack / 声卡
 | `UDP_IP_MAX_PACKET` | `1315` | UDP/IP 上限 |
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
-| `JITTER_START_MS` | `40` | 预缓冲 |
+| `JITTER_START_MS` | `30` | 预缓冲 |
 | `JITTER_TARGET_MS` | `60` | 目标水位 |
 | `JITTER_HIGH_MS` | `120` | 高水位 |
 | `JITTER_LOW_MS` | `20` | 低水位 |
@@ -939,8 +1054,17 @@ AudioTrack / 声卡
 | `PLC_MAX_MS` | `120` | PLC 上限 |
 | `MAX_REORDER_PACKETS` | `64` | 重排槽位 |
 | `RESYNC_GAP_MS` | `200` | 重同步阈值 |
-| `BITRATE_AUTO_KBPS` | `512` | 自动码率 |
-| `BITRATE_MAX_KBPS` | `1000` | 最大码率 |
+| `SLIP_SAMPLES` | `48` | 有界回落单次量（1 ms） |
+| `SLIP_FADE_SAMPLES` | `48` | 交叉淡化长度（1 ms） |
+| `SLIP_MIN_INTERVAL_SAMPLES` | `48000` | 回落间隔（1 s） |
+| `RESAMPLE_MAX_ADJUST` | `0.005` | 比率微调上限（±0.5%） |
+| `RATIO_UPDATE_SAMPLES` | `480` | 比率更新周期（10 ms） |
+| `RATIO_SLEW_STEP` | `0.0001` | 比率单次步进 |
+| `RATIO_DEADBAND_MS` | `5` | 比率死区 |
+| `RATIO_FULL_MS` | `20` | 比率满幅点 |
+| `BITRATE_AUTO_KBPS` | `512` | `0` 的兼容映射（= 上限） |
+| `BITRATE_MAX_KBPS` | `512` | 码率上限 |
+| `BITRATE_STEPS_KBPS` | `[64,128,256,384,512]` | 手动档位（UI 滑块） |
 | `KEEPALIVE_INTERVAL_MS` | `1000` | CONNECT 间隔 |
 | `ACK_TIMEOUT_MS` | `3000` | Android 断连 |
 | `PEER_TIMEOUT_MS` | `3000` | Windows 释放绑定 |
@@ -1005,7 +1129,12 @@ AudioTrack / 声卡
 - 16/32 位回绕；
 - 序号冻结后恢复（ACK 中断 / DTX）必须自愈；
 - 序号跨度超过 32767 的断流必须自愈；
-- 漂移校正 ±1–5 ms，播放头侧的 `timestamp_offset` 正确；
+- 比率微调：水位偏离 40 ms 时 200 帧内达到 ±0.5%，回落到目标后归零；
+  单次步进 ≤`RATIO_SLEW_STEP`；播放头的比率偏移按 f64 累积（1000 帧误差 ≤1 样本）；
+- 有界回落：单次 1 ms、间隔 ≥1 s、带边（90/50 ms）不动作、5 次稳定后才动手、
+  启动 2 s 内不动作、丢/插后播放头偏移符号正确；
+- 交叉淡化：丢/插后的帧在 1 kHz 正弦上相邻差不超过信号自身斜率（无台阶），
+  且首末样本与原始帧一致；
 - 水位 20/60/120 ms 边界。
 
 **Opus**
@@ -1038,7 +1167,7 @@ Kotlin 与 Rust 必须对同一组输入产生相同字节：
 - 突发丢失 100–500 ms；
 - 200 ms 时间戳跳变/发送端重启；
 - DTX 静音 1–10 s 后恢复；
-- 512 / 768 / 960 / 1000 kbps；
+- 64 / 128 / 256 / 384 / 512 kbps（五档，滑块）；
 - FEC/DRED 开启与关闭；
 - Windows 44.1 kHz 输出设备；
 - Android 44.1/48 kHz 输出；
@@ -1050,7 +1179,7 @@ Kotlin 与 Rust 必须对同一组输入产生相同字节：
 
 1. 音频路径无 `sleep`、无 PLC 定时器、无重排衰减定时器、无 3 秒漂移 EMA。
 2. 发送端无应用层音频队列；发送线程单帧处理时间稳定。
-3. 接收端稳态水位保持在 40–120 ms；无持续增长。
+3. 接收端稳态水位维持在 55–65 ms（目标 60 ms ± 死区），无持续增长，回落计数为 0。
 4. 丢包时只在播放头到期后 PLC；真实包恢复后 PLC 停止。
 5. DTX 静音不导致断连；恢复时能正确重同步。
 6. 任意 RTP 包不超过 1287 字节；任意 UDP/IP 包不超过 1315 字节。
@@ -1061,65 +1190,21 @@ Kotlin 与 Rust 必须对同一组输入产生相同字节：
 11. 1 小时连续运行无内存增长、无无界队列、无明显漂移。
 12. 两端控制包字节级一致。
 
-### 11.5 实施顺序
+### 11.5 已知限制
 
-建议按以下顺序落地，避免同时改动所有链路：
+**已通过实现解决**（不再列为风险，留作记录）：WASAPI 环回事件驱动、44.1 kHz 设备的播放头换算、
+FEC/DRED 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低于 1275 字节）。
+实测与校准流程见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)。
 
-1. **协议核心 + 测试**
-   - `protocol/protocol.rs`：控制 v3 头、CONNECT/ACK/发现编解码；
-   - `protocol/rtp.rs`：RTP 头、扩展 seq/ts、常量；
-   - Kotlin `Udp2CalProtocol.kt` 镜像；
-   - 先跑通字节级测试，不接音频。
+仍然存在、且**不打算在本版解决**的限制：
 
-2. **正向链路**
-   - Android 发送 RTP；
-   - Windows 主 socket 解复用、校验、抖动缓冲；
-   - Windows 解码线程 + PCM 环 + 播放头；
-   - 先单声道 48 kHz、512 kbps。
-
-3. **反向链路**
-   - Windows 反向发送 RTP；
-   - Android 反向接收、AudioTrack 拉取；
-   - ACK 下发反向 SSRC；
-   - 10 ms PLC。
-
-4. **清理旧路径**
-   - 删除 v2 音频头、`ReorderBuffer`、`Channel`、PCM 队列、定时器、3 秒 EMA、2 ms 轮询、3 秒 `pcm_buf`；
-   - 更新 `docs/PROTOCOL.md` 为历史文档并链接本文；
-   - 更新 `ARCHITECTURE.md`。
-
-### 11.6 迁移清单
-
-| 文件 | 改动 |
-|------|------|
-| `protocol/protocol.rs` | 控制版本 3；15 字节控制头；删除音频字段；CONNECT/ACK/发现负载；测试 |
-| `protocol/rtp.rs` | 新增 RTP 编解码、扩展 seq/ts、包长校验、测试 |
-| `windows/src/protocol.rs` | 重导出新模块；删除 v2 音频接口 |
-| `android/.../Udp2CalProtocol.kt` | 镜像控制 v3 + RTP；删除 `writeAudioHeader`；新增 `writeRtpHeader` |
-| `android/.../UdpSender.kt` | 主 socket 发送 RTP + CONNECT；解析 ACK 负载；维护 `forwardSsrc`/`reverseSsrc`；反向 socket 只收 RTP |
-| `android/.../native/OpusEncoder.kt` | 删除 v2 头和 `seqNum`；负载写到偏移 12；帧长 10 ms |
-| `android/app/src/main/cpp/opus_jni.c` | 最大输出 1275 字节；确认 10 ms 帧；不得截断 |
-| `android/.../native/OpusDecoder.kt` | `frameSize=480`；PLC 480；声道按方向 |
-| `android/app/src/main/cpp/opus_jni_decoder.c` | 解码/PLC 帧长 10 ms（480），不再硬编码 20 ms |
-| `android/.../service/CaptureService.kt` | 删除 `Channel<ShortArray>(3)`、`ShortArrayPool`、双协程；采集线程直接编码发送；控制独立 |
-| `android/.../AudioPlayer.kt` | 删除 `ShortQueue`/高水位 pump；实现按播放头拉取、阻塞 `write`、预缓冲 4 帧 |
-| `windows/src/main.rs` | 解复用 RTP/控制；RTP 校验；抖动缓冲；控制 v3；删除 `recv_timeout(30ms)`、60 ms PLC 计时、`Instant` 重排、3 秒 EMA |
-| `windows/src/decoder.rs` | 固定 48 kHz 单声道正向解码；PLC 每次 480 采样；删除 120 ms PLC 用法 |
-| `windows/src/audio.rs` | 保留无锁 PCM 环；增加 `played_frames`/播放头；删除 3 秒漂移 EMA；水位校正移到解码/抖动缓冲侧 |
-| `windows/src/capture.rs` | 事件驱动环回；删除 2 ms 轮询、`pcm_buf` 3 秒上限；10 ms 组帧；RTP 发送；自动码率 512 |
-| `docs/PROTOCOL.md` | 标记 v2 历史；链接本文 |
-| `docs/ARCHITECTURE.md` | 更新管线、线程、时钟模型 |
-
-### 11.7 已知风险 / 待验证
-
-1. **WASAPI loopback 事件驱动**：静音时可能没有事件；需要确认事件等待与静音补齐策略，不能退化成 2 ms 轮询。
-2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()`/`getTimestamp()` 精度不同；低延迟模式下需实测。
-3. **44.1 kHz 设备**：重采样器延迟和漂移校正需要统一计入 `playhead_ts`，否则 PLC 会提前或滞后。
-4. **FEC/DRED 体积**：高码率 + 冗余可能超过 1275 字节；需要自动降码率/降冗余策略。
-5. **Wi-Fi 抖动**：目标 60 ms 是否足够覆盖现有环境，需要实测；参数可调，但状态机不变。
-6. **Android 蓝牙输出**：蓝牙延迟远大于 60 ms，可能需要单独提高目标水位；不得用定时器补偿。
-7. **干净断代**：v2/v3 不能互通；发布时必须同时升级两端，并在文档/UI 中明确。
-8. **安全**：v3 仍是局域网明文；device_id/SSRC 可伪造；不防窃听/注入。SRTP/认证留待后续版本。
+1. **Android 蓝牙输出**：蓝牙链路延迟远大于 60 ms，且不同编解码器差异巨大。
+   本版不为此提高目标水位（那会让有线用户白白多等），需要时由上层应用自行补偿。
+2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()` 的粒度不同（典型 5–20 ms，
+   低延迟模式下更细）。协议侧只要求播放头单调，不假设其精度。
+3. **Wi-Fi 抖动**：目标水位 60 ms 覆盖常见家用/办公环境；极端拥塞下会增加 PLC 比例，
+   而不是抬水位——抬水位会把延迟永久留在链路上。
+4. **干净断代**：v2/v3 不能互通，发布时必须同时升级两端（见第二章）。
 
 ---
 
@@ -1250,4 +1335,4 @@ UDP/IP 1315 字节
 | PLC | 定时器触发 | 播放头到期触发 |
 | 控制版本 | 0x02 | 0x03 |
 | 兼容 | 仅 v2 | 仅 v3，干净断代 |
-| 最大码率 | 1024 kbps（有超限风险） | 1000 kbps，严格 1275 字节 |
+| 最大码率 | 1024 kbps（有超限风险） | 512 kbps，严格 ≤1275 字节负载 |

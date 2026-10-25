@@ -243,16 +243,16 @@ class Udp2CalProtocolTest {
     }
 
     @Test
-    fun jitter_prebuffersFourFrames() {
+    fun jitter_prebuffersThreeFrames() {
         val jb = Udp2CalProtocol.JitterBuffer()
         insert(jb, 100, 4800L, true, 1)
         assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(4800L, ByteArray(1275)))
         insert(jb, 101, 5280L, false, 2)
-        insert(jb, 102, 5760L, false, 3)
         assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(4800L, ByteArray(1275)))
-        insert(jb, 103, 6240L, false, 4)
-        assertEquals(40, jb.waterMs())
-        assertEquals(listOf(1, 2, 3, 4), pullTags(jb, 4800L, 4))
+        insert(jb, 102, 5760L, false, 3)
+        // JITTER_START_MS = 30 → 连续 3 帧即起播
+        assertEquals(30, jb.waterMs())
+        assertEquals(listOf(1, 2, 3), pullTags(jb, 4800L, 3))
         assertEquals(0, jb.waterMs())
     }
 
@@ -403,91 +403,175 @@ class Udp2CalProtocolTest {
 
     // ═══════ 漂移校正与播放头 ═══════
 
-    @Test
-    fun drift_zeroInBand() {
-        val d = Udp2CalProtocol.DriftController()
-        d.update(60, 0L)
-        for (i in 0 until 1000L) assertEquals(0, d.update(60, 480L * i))
-    }
-
-    @Test
-    fun drift_keepsNormalWaterUntouched() {
-        val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(60, media)
-        repeat(600) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            assertEquals(0, d.update(60, media))
+    /** 按 10 ms 一帧推进，返回期间出现的回落样本数（0 = 未动作） */
+    private fun runDrift(
+        d: Udp2CalProtocol.DriftController,
+        waterMs: Int,
+        frames: Int,
+        media: LongArray,
+    ): List<Int> {
+        val slips = ArrayList<Int>()
+        repeat(frames) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            val u = d.update(waterMs, media[0])
+            if (u.slipSamples != 0) slips.add(u.slipSamples)
         }
-        assertEquals(0L, d.corrections)
+        return slips
     }
 
     @Test
-    fun drift_doesNotTrimBelowFloor() {
+    fun drift_onTargetDoesNothing() {
         val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(150, media)
-        repeat(600) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            assertEquals(0, d.update(150, media))
+        val media = longArrayOf(0)
+        d.update(Udp2CalProtocol.JITTER_TARGET_MS, media[0])
+        val slips = runDrift(d, Udp2CalProtocol.JITTER_TARGET_MS, 1000, media)
+        assertTrue(slips.isEmpty())
+        assertEquals(0.0, d.adjust(), 1e-12)
+        assertEquals(0L, d.slipDrops)
+        assertEquals(0L, d.slipInserts)
+    }
+
+    @Test
+    fun drift_ignoresJitterInsideDeadband() {
+        val d = Udp2CalProtocol.DriftController()
+        val media = longArrayOf(0)
+        d.update(Udp2CalProtocol.JITTER_TARGET_MS, media[0])
+        repeat(2000) { i ->
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            val water = Udp2CalProtocol.JITTER_TARGET_MS + if (i % 2 == 0) 4 else -4
+            assertTrue("死区内不得回落", d.update(water, media[0]).slipSamples == 0)
         }
-        assertEquals(0L, d.corrections)
+        assertEquals(0.0, d.adjust(), 1e-9)
     }
 
     @Test
-    fun drift_drainsExcessWaterAtBoundedRate() {
+    fun drift_ratioIsBoundedAndHasExpectedSign() {
         val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(400, media)
-        var drops = 0
-        repeat(20) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            if (d.update(400, media) == Udp2CalProtocol.DRIFT_MAX_SAMPLES) drops++
+        val media = longArrayOf(0)
+        d.update(100, media[0])
+        var maxAdjust = 0.0
+        repeat(200) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            val a = d.update(100, media[0]).adjust
+            maxAdjust = maxOf(maxAdjust, kotlin.math.abs(a))
+            assertTrue("比率越界: $a", a <= Udp2CalProtocol.RESAMPLE_MAX_ADJUST + 1e-12)
         }
-        assertEquals(20, drops)
+        assertTrue(maxAdjust > Udp2CalProtocol.RESAMPLE_MAX_ADJUST * 0.99)
+        assertTrue("水位偏高时 adjust 必须为正", d.adjust() > 0.0)
     }
 
     @Test
-    fun drift_drainsSlowlyNearFloor() {
+    fun drift_ratioSlewIsGradual() {
         val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(220, media)
-        var drops = 0
-        repeat(20) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            if (d.update(220, media) == Udp2CalProtocol.DRIFT_MAX_SAMPLES) drops++
+        val media = longArrayOf(0)
+        d.update(300, media[0])
+        var prev = 0.0
+        repeat(60) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            val a = d.update(300, media[0]).adjust
+            assertTrue("步进过大: $prev → $a",
+kotlin.math.abs(a - prev) <= Udp2CalProtocol.RATIO_SLEW_STEP + 1e-12)
+            prev = a
         }
-        assertEquals(5, drops)
     }
 
     @Test
-    fun drift_insertsOnlyWhenFalling() {
+    fun drift_ratioDecaysBackToZero() {
         val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(120, media)
-        var action = 0
-        for (k in 1..29L) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            val water = (120 - k * 20).coerceAtLeast(0).toInt()
-            val a = d.update(water, media)
-            if (a != 0) {
-                action = a
-                break
+        val media = longArrayOf(0)
+        d.update(200, media[0])
+        repeat(200) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            d.update(200, media[0])
+        }
+        assertTrue(d.adjust() > 0.004)
+        repeat(400) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            d.update(Udp2CalProtocol.JITTER_TARGET_MS, media[0])
+        }
+        assertEquals(0.0, d.adjust(), 1e-12)
+    }
+
+    @Test
+    fun drift_slipRateIsOneMsPerSecond() {
+        val d = Udp2CalProtocol.DriftController()
+        val media = longArrayOf(0)
+        d.update(200, media[0])
+        val slips = runDrift(d, 200, 1000, media) // 10 s
+        assertTrue("$slips", slips.all { it == Udp2CalProtocol.SLIP_SAMPLES })
+        assertTrue("回落过频: ${slips.size} 次 / 10 s", slips.size <= 9)
+        assertTrue("水位长期偏高却几乎不回落: ${slips.size}", slips.size >= 6)
+    }
+
+    @Test
+    fun drift_slipIsNeverConsecutive() {
+        val d = Udp2CalProtocol.DriftController()
+        val media = longArrayOf(0)
+        d.update(200, media[0])
+        var last = -1L
+        repeat(2000) {
+            media[0] += Udp2CalProtocol.OPUS_FRAME_SAMPLES
+            if (d.update(200, media[0]).slipSamples != 0) {
+                if (last >= 0) {
+                    assertTrue("两次回落间隔仅 ${media[0] - last} 样本",
+media[0] - last >= Udp2CalProtocol.SLIP_MIN_INTERVAL_SAMPLES)
+                }
+                last = media[0]
             }
         }
-        assertEquals(-Udp2CalProtocol.DRIFT_MAX_SAMPLES, action)
+        assertTrue("应至少回落一次", last > 0)
     }
 
     @Test
-    fun drift_ignoresStableLowWater() {
+    fun drift_slipLowBandInserts() {
         val d = Udp2CalProtocol.DriftController()
-        var media = 0L
-        d.update(10, media)
-        repeat(600) {
-            media += Udp2CalProtocol.DRIFT_INTERVAL_SAMPLES
-            assertEquals(0, d.update(10, media))
-        }
-        assertEquals(0L, d.corrections)
+        val media = longArrayOf(0)
+        d.update(Udp2CalProtocol.JITTER_TARGET_MS, media[0])
+        runDrift(d, Udp2CalProtocol.JITTER_TARGET_MS, 400, media)
+        val slips = runDrift(d, 10, 200, media)
+        assertTrue("水位 10 ms 必须触发插入", slips.isNotEmpty())
+        assertTrue("$slips", slips.all { it == -Udp2CalProtocol.SLIP_SAMPLES })
+        assertEquals(0L, d.slipDrops)
+    }
+
+    @Test
+    fun drift_slipBandEdgesAreExact() {
+        val high = Udp2CalProtocol.JITTER_TARGET_MS + Udp2CalProtocol.SLIP_HIGH_MARGIN_MS
+        val low = Udp2CalProtocol.JITTER_TARGET_MS - Udp2CalProtocol.SLIP_LOW_MARGIN_MS
+
+        val d1 = Udp2CalProtocol.DriftController()
+        val m1 = longArrayOf(0)
+        d1.update(Udp2CalProtocol.JITTER_TARGET_MS, m1[0])
+        assertTrue("高带边不得动作", runDrift(d1, high, 400, m1).isEmpty())
+
+        val d2 = Udp2CalProtocol.DriftController()
+        val m2 = longArrayOf(0)
+        d2.update(Udp2CalProtocol.JITTER_TARGET_MS, m2[0])
+        assertTrue("低带边不得动作", runDrift(d2, low, 400, m2).isEmpty())
+
+        val d3 = Udp2CalProtocol.DriftController()
+        val m3 = longArrayOf(0)
+        d3.update(Udp2CalProtocol.JITTER_TARGET_MS, m3[0])
+        assertTrue("越过带边必须动作", runDrift(d3, high + 1, 400, m3).isNotEmpty())
+    }
+
+    @Test
+    fun drift_noSlipDuringWarmup() {
+        val d = Udp2CalProtocol.DriftController()
+        val media = longArrayOf(0)
+        d.update(0, media[0])
+        assertTrue("启动宽限内不得回落", runDrift(d, 0, 190, media).isEmpty())
+    }
+
+    @Test
+    fun drift_slipNeedsStabilityOnHighBand() {
+        val d = Udp2CalProtocol.DriftController()
+        val media = longArrayOf(0)
+        d.update(Udp2CalProtocol.JITTER_TARGET_MS, media[0])
+        runDrift(d, Udp2CalProtocol.JITTER_TARGET_MS, 400, media)
+        assertTrue("300 ms 尖峰不得回落", runDrift(d, 200, 30, media).isEmpty())
+        runDrift(d, Udp2CalProtocol.JITTER_TARGET_MS, 100, media)
+        assertEquals(0L, d.slipDrops)
     }
 
     @Test
@@ -499,6 +583,118 @@ class Udp2CalProtocolTest {
         assertEquals(9600L + 480L, clock.update(1480L))
         clock.notePcmCorrection(240L)
         assertEquals(9600L + 480L + 240L, clock.value())
+    }
+
+    @Test
+    fun playheadClock_accumulatesFractionalRatioCorrection() {
+        val clock = Udp2CalProtocol.PlayheadClock()
+        clock.start(0L, 0L)
+        repeat(100) { clock.noteRatioCorrection(480.0 * 0.005) }
+        val v = clock.value()!!
+        assertTrue("100 帧 × 2.4 样本 ≈ 240，实际 $v", kotlin.math.abs(v - 240L) <= 1L)
+    }
+
+    // ═══════ 受控重采样与交叉淡化回落 ═══════
+
+    @Test
+    fun resampler_passthroughWhenRatioIsOne() {
+        val r = StreamResampler(2)
+        r.setSourceRate(48000, 48000)
+        r.setAdjust(0.0)
+        val pcm = ShortArray(960) { 100 }
+        assertEquals("比率为 1 时应走直通", 0, r.process(pcm, 0, 480))
+    }
+
+    @Test
+    fun resampler_producesExpectedFrameCount() {
+        // 每 10 ms 一帧，跑 100 帧（1 秒音频），检查噪声底与比率方向
+        for ((adjust, expect) in listOf(0.005 to 47761L, -0.005 to 48241L)) {
+            val r = StreamResampler(2)
+            r.setSourceRate(48000, 48000)
+            r.setAdjust(adjust)
+            val pcm = ShortArray(960) { 1000 }
+            var total = 0L
+            repeat(100) { total += r.process(pcm, 0, 480) / 2 }
+            assertTrue("adjust=$adjust 1 秒产出 $total，期望约 $expect",
+kotlin.math.abs(total - expect) <= 3)
+        }
+    }
+
+    @Test
+    fun resampler_clampsAdjust() {
+        val r = StreamResampler(2)
+        r.setSourceRate(48000, 48000)
+        r.setAdjust(9.0)
+        assertEquals(1.0 + Udp2CalProtocol.RESAMPLE_MAX_ADJUST, r.ratio, 1e-12)
+        r.setAdjust(Double.NaN)
+        assertEquals(1.0, r.ratio, 1e-12)
+    }
+
+    @Test
+    fun resampler_isPhaseContinuous() {
+        // 用一条恒定的直流检查插值不会在块边界跳变
+        val r = StreamResampler(2)
+        r.setSourceRate(48000, 48000)
+        r.setAdjust(0.001)
+        val pcm = ShortArray(960) { 500 }
+        repeat(20) {
+            val n = r.process(pcm, 0, 480)
+            for (i in 0 until n) {
+                assertTrue("直流被破坏: ${r.buffer()[i]}", kotlin.math.abs(r.buffer()[i] - 500) <= 1)
+            }
+        }
+    }
+
+    @Test
+    fun slipDrop_keepsEndpointsAndLength() {
+        val frames = 480
+        val k = Udp2CalProtocol.SLIP_FADE_SAMPLES
+        val pcm = ShortArray(frames * 2) { (it / 2).toShort() }
+        val tail = pcm[(frames - 1) * 2]
+        val n = PcmSlip.drop(pcm, frames, k)
+        assertEquals(frames - k, n)
+        assertEquals(0.toShort(), pcm[0])
+        // 淡入终点权重 ≈1：末样本必须保留（容差 1 个量化级以内会被 round 吃掉）
+        assertTrue("末样本 ${pcm[(n - 1) * 2]} vs $tail", kotlin.math.abs(pcm[(n - 1) * 2] - tail) <= 1)
+    }
+
+    @Test
+    fun slipInsert_keepsEndpointsAndLength() {
+        val frames = 480
+        val k = Udp2CalProtocol.SLIP_FADE_SAMPLES
+        val pcm = ShortArray(frames * 2) { (it / 2).toShort() }
+        val out = ShortArray((frames + k) * 2)
+        val n = PcmSlip.insert(pcm, frames, out, k)
+        assertEquals(frames + k, n)
+        assertEquals(0.toShort(), out[0])
+        assertEquals(pcm[(frames - 1) * 2], out[(n - 1) * 2])
+    }
+
+    @Test
+    fun slip_isCrossfadedNotCut() {
+        // 1 kHz 正弦（48 样本一个周期）：交叉淡化后相邻差不得超过信号自身斜率
+        val frames = 480
+        val k = Udp2CalProtocol.SLIP_FADE_SAMPLES
+        val pcm = ShortArray(frames * 2)
+        for (i in 0 until frames) {
+            val v = (kotlin.math.sin(2.0 * Math.PI * 1000.0 * i / 48000.0) * 16000).toInt().toShort()
+            pcm[i * 2] = v; pcm[i * 2 + 1] = v
+        }
+        val n = PcmSlip.drop(pcm, frames, k)
+        // 最大值 16000 × 2π×1000/48000 ≈ 2094，留 30% 余量
+        for (i in 0 until n - 1) {
+            val d = kotlin.math.abs(pcm[(i + 1) * 2] - pcm[i * 2]).toInt()
+            assertTrue("样本 $i 处有台阶: Δ=$d", d <= 2800)
+        }
+    }
+
+    @Test
+    fun slip_ignoresTooShortFrames() {
+        // 帧数 < 3k 时不得动手（宁可少一次校正，也不能把帧切坏）
+        val tiny = ShortArray(100) { 1 } // 50 帧
+        assertEquals(50, PcmSlip.drop(tiny, 50, Udp2CalProtocol.SLIP_FADE_SAMPLES))
+        val out = ShortArray((50 + Udp2CalProtocol.SLIP_FADE_SAMPLES) * 2)
+        assertEquals(50, PcmSlip.insert(tiny, 50, out, Udp2CalProtocol.SLIP_FADE_SAMPLES))
     }
 
     // ═══════ 常量与工具 ═══════
@@ -515,7 +711,7 @@ class Udp2CalProtocolTest {
         assertEquals(1287, Udp2CalProtocol.RTP_MAX_PACKET)
         assertEquals(44043, Udp2CalProtocol.DISCOVER_PORT)
         assertEquals(44044, Udp2CalProtocol.DEFAULT_LISTEN_PORT)
-        assertEquals(40, Udp2CalProtocol.JITTER_START_MS)
+        assertEquals(30, Udp2CalProtocol.JITTER_START_MS)
         assertEquals(60, Udp2CalProtocol.JITTER_TARGET_MS)
         assertEquals(120, Udp2CalProtocol.JITTER_HIGH_MS)
         assertEquals(20, Udp2CalProtocol.JITTER_LOW_MS)
@@ -523,15 +719,40 @@ class Udp2CalProtocolTest {
         assertEquals(120, Udp2CalProtocol.PLC_MAX_MS)
         assertEquals(64, Udp2CalProtocol.MAX_REORDER_PACKETS)
         assertEquals(200, Udp2CalProtocol.RESYNC_GAP_MS)
+        // 码率上限与档位必须与 Rust 端逐项一致：接收端会用它钳制对端下发的值
+        assertEquals(512, Udp2CalProtocol.BITRATE_AUTO_KBPS)
+        assertEquals(512, Udp2CalProtocol.BITRATE_MAX_KBPS)
+        assertArrayEquals(
+            intArrayOf(64, 128, 256, 384, 512),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS
+        )
     }
 
     @Test
-    fun bitrateClampedTo1000() {
+    fun bitrateClampedTo512() {
         assertEquals(512, Udp2CalProtocol.clampBitrateKbps(0))
+        assertEquals(64, Udp2CalProtocol.clampBitrateKbps(64))
         assertEquals(512, Udp2CalProtocol.clampBitrateKbps(512))
-        assertEquals(960, Udp2CalProtocol.clampBitrateKbps(960))
-        assertEquals(1000, Udp2CalProtocol.clampBitrateKbps(1024))
-        assertEquals(1000, Udp2CalProtocol.clampBitrateKbps(99999))
+        // 旧客户端的 768/960/1000/1024 一律压到上限
+        assertEquals(512, Udp2CalProtocol.clampBitrateKbps(768))
+        assertEquals(512, Udp2CalProtocol.clampBitrateKbps(1024))
+        assertEquals(512, Udp2CalProtocol.clampBitrateKbps(99999))
+    }
+
+    @Test
+    fun bitrateSnapsToManualSteps() {
+        for (s in Udp2CalProtocol.BITRATE_STEPS_KBPS) {
+            assertEquals(s, Udp2CalProtocol.snapBitrateKbps(s))
+        }
+        assertEquals("自动不被吸附", 0, Udp2CalProtocol.snapBitrateKbps(0))
+        assertEquals(64, Udp2CalProtocol.snapBitrateKbps(1))
+        assertEquals("等距时取较小档", 64, Udp2CalProtocol.snapBitrateKbps(96))
+        assertEquals(128, Udp2CalProtocol.snapBitrateKbps(97))
+        assertEquals(256, Udp2CalProtocol.snapBitrateKbps(200))
+        assertEquals(256, Udp2CalProtocol.snapBitrateKbps(300))
+        assertEquals(384, Udp2CalProtocol.snapBitrateKbps(330))
+        assertEquals("旧档位必须落到上限", 512, Udp2CalProtocol.snapBitrateKbps(768))
+        assertEquals(512, Udp2CalProtocol.snapBitrateKbps(1000))
     }
 
     @Test

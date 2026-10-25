@@ -1,6 +1,6 @@
 # 系统架构与实现细节
 
-> 相关文档：[协议规范](PROTOCOL.md) · [构建说明](BUILD.md) · [功能特性](FEATURES.md)
+> 相关文档：[协议规范](PROTOCOL_V3_RTP.md) · [构建说明](BUILD.md) · [功能特性](FEATURES.md) · [延迟校准](LATENCY_CALIBRATION.md)
 
 ---
 
@@ -15,7 +15,8 @@ udp2cal/
 │     │  ├─ DiscoveryManager.kt      # 局域网广播发现
 │     │  ├─ UdpSender.kt             # 主 socket：CONNECT + 正向 RTP；独立 ACK 线程；反向 socket 只收 RTP
 │     │  ├─ Udp2CalProtocol.kt       # 控制 v3 + RTP + 抖动缓冲 + 播放头（与 Rust 端逐字节对齐）
-│     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，阻塞写，播放头驱动）
+│     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
+│     │  ├─ StreamResampler.kt       # 反向流的受控重采样 + 有界回落的交叉淡化
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
 │     │  ├─ service/CaptureService.kt# 前台采集服务（采集/控制/反向接收/反向播放 四路并发，无 PCM 队列）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
@@ -23,8 +24,8 @@ udp2cal/
 ├─ opus-src/       # libopus 1.6.1 源码树（Android 与 Windows 共用的唯一副本）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
-│  │  ├─ main.rs       # iced UI、托盘、解复用、控制状态机、抖动缓冲、解码线程
-│  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 固定比率重采样
+│  │  ├─ main.rs       # iced UI、托盘、解复用、控制状态机、解码线程（含两级漂移校正）
+│  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 可微调比率重采样
 │  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
 │  │  ├─ config.rs     # 注册表配置读写
 │  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧）
@@ -46,16 +47,19 @@ udp2cal/
 
 ## 二、技术栈
 
-| 层级 | 技术选型 | 运行时更新策略（免重启） |
+| 层级 | 选型 | 关键实现要点 |
 | --- | --- | --- |
-| **UI 层（Android）** | Jetpack Compose + Material 3 | 采用 `Flow` 细粒度订阅与局部缓存变量；Opus 高级编码设置全参数面板（复杂度/信号/带宽/VBR/FEC/DTX/丢包率） |
-| **UI 层（Windows）** | Iced (Rust) 固定窗口 | 模块化深色卡片布局 + 动态 VU 色彩表（绿/橙/红）+ 实时显示 VB-Cable 检测状态 + P2P 占用状态 + 反向串流状态；`run_with(session_id)` 强制状态隔离 |
-| **网络层** | Kotlin Coroutines + UDP Socket / Rust async | 动态比对 `Prefs` 静默热重连；v3 控制包广播发现；媒体面为标准 RTP |
-| **音频采集** | AudioRecord（isVoiceMode 驱动 VOICE_COMMUNICATION / MIC，固定 48kHz） | **生产-消费双协程** + `ShortArrayPool` 零分配帧复用（池容量 5）；Opus 信号类型变更时自动重建 AudioRecord，保留网络层 |
-| **核心算法** | —（无任何软件音频处理） | 仅维护 `isVoiceMode` 一个布尔状态；硬件降噪由安卓系统全权处理 |
-| **编码层** | libopus (JNI) | `encoderEncodeTo` 直接写入 & 静态 1276B + 动态双重边界守卫 + `@Synchronized` 互斥锁；FEC=2（允许 CELT + FEC）突破 300kbps SILK 天花板 |
-| **发送层** | UDP DatagramSocket | 双缓冲乒乓 + `send(offset,length)` 零拷贝，防脏数据；**独立 ACK 接收线程**（500ms `soTimeout`，收到 `CONNECT_ACK` 即刷新 `lastAckTime`），音频流水线不再被 1ms 超时轮询干扰 |
-| **Windows 音频引擎** | cpal / WASAPI — 全局单例 Audio Worker 守护线程 | 仅在 `init_audio_worker()` 初始化一次，通过 `SyncChannel<AudioMessage>` 接收，UI 启停不影响底层音频线程 |
+| UI（Android） | Jetpack Compose + Material 3 | 全参数设置面板 + 状态卡片；卡片显示**已生效**值（编码器上报），不显示"期望值" |
+| UI（Windows） | iced 0.14（tiny-skia 软件渲染，禁用 wgpu） | 固定窗口、深色卡片、实时电平；单行状态栏按连接状态切换 |
+| 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用 |
+| 采集（Android） | `AudioRecord` 48 kHz 单声道 | `READ_BLOCKING` 累积到整帧再编码；语音模式决定音源与 AEC（创建时定型） |
+| 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
+| 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | DRED + Deep PLC；负载上限 1275 字节，超限丢帧不截断 |
+| 时钟 | 声卡播放头 | 可听位置 = `played_frames − 设备延迟`；规则见协议 7.10 |
+| 输出（Windows） | cpal 0.15 / WASAPI | 无锁 SPSC 环（341 ms）+ 显式 10 ms 设备缓冲 + 事件驱动回调 |
+
+> 这里刻意不列"版本号矩阵"之外的运行时策略：那些属于会随实现漂移的细节，
+> 写在这里必然过时。行为以代码与协议规范为准。
 
 ---
 
@@ -123,7 +127,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 反向编码（PC 环回） | 48 kHz / 立体声 / 10 ms | CONNECT 携带 Opus 参数，PC **仅在变化时**应用 |
 | 采样率 | 48 kHz 固定 | 不协商；PC 输出设备非 48 kHz 由 `AudioWriter` 按固定比率重采样 |
 | 帧长 | 10 ms 固定（480 采样） | `frame_ms != 10` 直接拒绝连接 |
-| 码率 | `0` → 512 kbps，上限 1000 kbps | `clamp_bitrate_kbps()` / `clampBitrateKbps()` 两端一致 |
+| 码率 | 五档 64/128/256/384/512 kbps（默认 256，上限 512）；`0` 仅作协议兼容 | `clamp_bitrate_kbps()` / `snap_bitrate_kbps()` 两端一致 |
 | 传输 | 服务端口 UDP，控制包 + 正向 RTP 同 socket | 首字节解复用 |
 | 接收端 | 单方向一个 `JitterBuffer` + 一个解码实例 | 不需要"5 个采样率解码器" |
 | 发现 | Windows 监听 44043，DISCOVER_REPLY 带 `listen_port` | Android 用该端口连接，不再假定 44044 |
@@ -155,12 +159,14 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 - 单文件上限 2 MiB，超限后轮转为 `udp2cal.1.log`（只保留一轮）
 - 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/SSRC/反向端口变化、
-  反向编码配置变更、发送错误计数、每 30 s 一次的音频统计（块数/重采样/丢样/欠载）
-  与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）
+  反向编码配置变更、发送错误计数、每 30 s 一次的音频统计（块数/重采样/丢样/欠载、
+  总延迟与比率微调）与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）、
+  每 10 s 一行的延迟构成分解（水位 + 声卡 + 回落次数）
 - UI 底部为**单行**状态行，按连接状态切换内容（三种状态互斥，永远只占一行）：
   - 未启动：`广播地址: 255.255.255.255:44043`
   - 已启动未连上：`广播地址…` + `● 广播中`（被占用静默时显示 `● 已静音`）
-  - 已连接：`重采样 N · 丢样 N · 欠载 N` + `● 反向串流已启用`（反向关闭时 `○ 反向串流未启用`）
+  - 已连接：`延迟 N ms · 丢样 N · 欠载 N` + `● 反向串流已启用`（反向关闭时 `○ 反向串流未启用`）
+  - 「延迟」= 正在播放那一帧的"到达本机 → 出声"时长，口径见协议 7.14
 - 连接状态（已连接/已断开）**只在顶部状态点显示**，底部提示行仅承载错误与警告，避免同屏重复
 - 排查用户问题时优先索取该文件
 
@@ -253,54 +259,27 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 线程 | 职责 | 明令禁止 |
 | --- | --- | --- |
 | tokio 接收流（iced subscription） | `recv_from`、解复用、校验、插抖动缓冲、回 ACK | 解码、阻塞等待播放 |
-| `udp2cal-decode` | 按播放头拉取、解码/PLC、漂移校正、写环 | 网络 IO、用定时器当节拍 |
-| `udp2cal-audio`（cpal 回调） | pop PCM、补静音、发布 `played_frames`、unpark | 加锁、分配、调用 Opus、写日志 |
-| `reverse-capture` | WASAPI 环回 → 10 ms 组帧 → Opus → RTP | 应用层积压、等待 ACK |
+| `udp2cal-decode` | 按播放头拉取、解码/PLC、两级漂移校正、重采样、写环 | 网络 IO、用定时器当节拍 |
+| `udp2cal-audio`（cpal 回调） | pop PCM、补静音、发布 `played_frames` 与声卡延迟、unpark | 加锁、分配、调用 Opus、写日志 |
+| `reverse-capture` | WASAPI 环回 → 10 ms 组帧 → 1 帧节拍整形 → Opus → RTP | 应用层积压、等待 ACK |
 | 广播 / 发现线程 | 每秒 `DISCOVER_REPLY`、应答 `DISCOVER_REQ` | 触碰音频路径 |
 
-### 播放头是唯一时钟
+### 关键实现点（规则本身见协议第七章）
 
-```rust
-// 48 kHz 设备
-playhead_ts = playhead_base_ts + played_device_frames + timestamp_offset
-// 非 48 kHz 设备（余数累加，避免整数除法长期漂移）
-num = (played_device_frames - base_frames) * 48000 + remainder
-playhead_ts = last + num / device_rate + timestamp_offset
-remainder   = num % device_rate
-```
+> 参数值（目标水位、回落带、比率上限）、状态机、算法步骤一律以
+> [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) 第七章为准，本节**不复制**——
+> 两处各写一份的结果就是慢慢跑偏。
 
-- `played_device_frames` 只统计**真实 PCM** 被 cpal 回调消费的帧数；回调补的静音不计入，
-  因此预缓冲期间播放头静止，不会"空转"。
-- 每帧的播放/PLC 决策都由 `next_ts` 与 `playhead_ts` 比较得出：
-  `next_ts <= playhead_ts + PLC_LEAD_MS` 才生成 PLC。
-- 解码线程的预解码深度被钉在约 40 ms（`AudioWriter::filled_frames`），
-  生产节奏由声卡消费节奏约束——否则断流时会把整个环填满 PLC 帧，
-  让 `next_ts` 跑到播放头前面几百毫秒，恢复后所有真包都被判成迟到。
-
-### 抖动缓冲（`protocol/rtp.rs`）
-
-- 64 个槽位，按**扩展时间戳**索引；序号用于重复检测，时间戳是播放顺序的权威；
-- 插入路径绝不解码；`M=1` 且跳变 >200 ms 才重同步（跳变小只更新标记）；
-- 水位不足 40 ms 不开始播放；缺口到期才 PLC，连续 12 帧后输出静音但仍留在 PLAYING。
-
-### 趋势驱动的漂移校正（取代 v2 的 3 秒 EMA）
-
-判据是**水位趋势**，不是绝对水位——绝对值判定在"成簇到达"的局域网上会一直生效：
-
-| 条件 | 动作 |
-| --- | --- |
-| 总缓冲 > 120 ms 且连续 3 次评估（≈1.5 s）每次涨 > 10 ms | 丢弃 5 ms PCM（尾部淡出），`timestamp_offset += 240` |
-| 总缓冲 < 20 ms 且连续 3 次评估每次跌 > 10 ms | 插入 5 ms PCM（尾部渐入重复），`timestamp_offset -= 240` |
-| 水位稳定（哪怕停在 200 ms） | **不校正** |
-
-- **总缓冲** = 抖动缓冲里排队的 + 已写进声卡队列但还没播出的（`filled_frames` / `pendingFrames`）。
-  只看抖动缓冲会误判：解码端刻意只预解码 40 ms，其余留在抖动缓冲；
-- 两次校正至少相隔 **500 ms 音频样本时间**（24000 样本），不是墙钟；
-- 不读 `Instant`、不做 EMA、不做重采样比率微调：重采样比率恒为 `source/device`。
-
-> 回归背景：早期实现按绝对水位判定，Windows 侧水位长期 130–180 ms → 每 500 ms 丢 5 ms、
-> 手机侧水位恒 0（PCM 已提前写进 AudioTrack）→ 每 500 ms 插 5 ms，两端都在
-> **永久性 1% 削/补音频**，听感是持续的细微"卡嗒"。
+| 机制 | 位置 | 为什么必须这样 |
+| --- | --- | --- |
+| 播放头取**可听位置** | `main.rs` 解码线程：`audible = played_frames − device_latency_frames()` | `played_frames` 是"交给驱动"的位置，还要过一个引擎缓冲 + DMA 才出声；不减这一项，PLC 会提前一个缓冲长度触发 |
+| 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：cpal 0.15.3 把帧数换算成 `hnsBufferDuration` 时少乘 100 |
+| 预解码深度 ≤40 ms | `main.rs`：`filled_frames() >= max_depth` 就 park 4 ms | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到播放头前面几百毫秒，恢复后真包全被判迟到 |
+| 回调唤醒解码线程 | `audio.rs`：`thread.unpark()` | 播放头前移本身就是"该拉下一帧"的信号，不需要定时器 |
+| 两级漂移校正 | `main.rs` 每帧调 `rtp::DriftController::update` | 第一级改重采样比率（连续、无接缝），第二级 1 ms/s 有界回落兜底 |
+| 比率校正的时间偏移 | `PlayheadClock::note_ratio_correction(f64)` | 每帧只有 2.4 个样本的校正量，逐帧取整会吃掉 17%，水位与播放头会缓慢背道而驰 |
+| flush 只投递请求 | `audio.rs::Ring::request_flush` | `tail` 归消费者所有；生产者直接写会让 `len()` 回绕成 `usize::MAX`，解码线程永久停产（静默死锁） |
+| 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后 >4 帧重置而非补发 |
 
 ### 快速双击防抖
 
@@ -335,8 +314,9 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 | 文档 | 内容 |
 | --- | --- |
 | [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) | **v3 协议规范（现行）**：RTP 媒体面 + 控制面 + 时钟模型 |
-| [PROTOCOL.md](PROTOCOL.md) | v2 协议（历史存档，不兼容） |
 | [BUILD.md](BUILD.md) | 构建流程与产物 |
 | [FEATURES.md](FEATURES.md) | 功能特性与 Opus 参数 |
+| [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟口径与实测校准流程 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史 |
-| [BUGFIX.md](BUGFIX.md) | Bug 根因与修复记录 |
+| [BUGFIX.md](BUGFIX.md) | 现行代码的 Bug 根因档案 |
+| [archive/](archive/) | 历史存档：v2 协议、已完成迁移计划、历次审查报告、v3 之前的修复记录 |

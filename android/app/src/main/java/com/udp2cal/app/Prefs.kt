@@ -6,6 +6,9 @@ import android.content.SharedPreferences
 object Prefs {
     private const val NAME = "udp2cal_prefs"
 
+    /** 码率默认档位（自动档已移除，新装与旧版"自动"都落到这里） */
+    const val DEFAULT_BITRATE_KBPS = 256
+
     /** 主线程 init、工作线程读取；volatile 保证安全发布 */
     @Volatile private lateinit var prefs: SharedPreferences
 
@@ -47,7 +50,11 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_vbr", v).apply()
 
     var opusBitrateKbps: Int
-        get() = prefs.getInt("opus_bitrate_kbps", 0) // 0 = 自动（映射为 512 kbps）；手动 512/768/960/1000
+        // 只有具体档位（64/128/256/384/512），自动档已移除。
+        // 读出时吸附：历史配置里的 768/960/1000 归一到 512，
+        // 旧的"自动(0)"归一到默认 256 —— 否则五档滑块会停在非法位置。
+        get() = Udp2CalProtocol.snapBitrateKbps(prefs.getInt("opus_bitrate_kbps", DEFAULT_BITRATE_KBPS))
+            .takeIf { it > 0 } ?: DEFAULT_BITRATE_KBPS
         set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, Udp2CalProtocol.BITRATE_MAX_KBPS)).apply()
 
     var opusFec: Int

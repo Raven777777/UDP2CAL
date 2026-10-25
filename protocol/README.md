@@ -8,7 +8,7 @@ UDP2CAL **协议 v3** 的 Rust 实现（协议唯一真源）。
 | `rtp.rs` | 媒体面：12 字节 RTP 头、扩展 seq/ts、`JitterBuffer`（播放头拉取 / PLC）、`DriftController`、`PlayheadClock` |
 
 规范文档：[`../docs/PROTOCOL_V3_RTP.md`](../docs/PROTOCOL_V3_RTP.md)
-（v2 已归档在 [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md)，**不可互通**）
+（v2 已归档在 [`../docs/archive/PROTOCOL_V2.md`](../docs/archive/PROTOCOL_V2.md)，**不可互通**）
 
 ```
 cargo test          # 协议单元测试（含附录 B 的全部字节向量）

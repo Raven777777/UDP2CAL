@@ -51,13 +51,14 @@ build.bat doctor --fix                               :: 环境体检与自动修
 | 文档                                           | 内容                              |
 | -------------------------------------------- | ------------------------------- |
 | [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 全部命令、编译产物、常见问题 |
-| [docs/FEATURES.md](docs/FEATURES.md)         | 三端功能特性、Opus 参数详解、界面截图           |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统架构、技术栈、自动协商机制、运行时行为、命名约定      |
-| [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **v3 协议规范（现行）**：RTP 媒体面、控制面、时钟模型 |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | v2 协议（历史存档，不兼容）                |
+| [docs/FEATURES.md](docs/FEATURES.md)         | 两端功能特性、Opus 参数详解、界面截图           |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 项目结构、技术栈、运行时行为、代码落点、命名约定      |
+| [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **协议规范（现行）**：RTP 媒体面、控制面、时钟模型 |
+| [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) | 延迟口径、`playhead_ts` 与 DMA 缓冲、实测校准流程 |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md)       | 版本历史                            |
-| [docs/BUGFIX.md](docs/BUGFIX.md)             | Bug 根因分析与修复记录                   |
+| [docs/BUGFIX.md](docs/BUGFIX.md)             | 现行代码的 Bug 根因档案                  |
 | [docs/LEGAL.md](docs/LEGAL.md)               | 版权声明、GPL-3.0 授权、第三方组件许可         |
+| [docs/archive/](docs/archive/)               | 历史存档：v2 协议、迁移计划、历次审查报告、旧修复记录   |
 
 ---
 

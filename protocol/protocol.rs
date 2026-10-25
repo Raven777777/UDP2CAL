@@ -67,10 +67,24 @@ pub const OPUS_FLAG_VBR_CONSTRAINT: u8 = 0x04;
 pub const OPUS_FLAG_FEC: u8 = 0x08;
 pub const OPUS_FLAGS_RESERVED_MASK: u8 = 0xF0;
 
-/// 自动码率（`bitrate_kbps == 0`）映射值
+/// 线上码率 `0` 的映射值（跨版本兼容）。
+///
+/// 本版客户端不再发送 `0`：Android 设置页只有具体档位，自动档已移除。
+/// 保留它只为兼容旧客户端/旧配置——收到 `0` 时按"用上限"处理，
+/// 因此该值必须恒等于 [`BITRATE_MAX_KBPS`]。
 pub const BITRATE_AUTO_KBPS: u16 = 512;
-/// 码率硬上限：1024 kbps 会产出 1280 字节负载，超过 Opus/RTP 上限
-pub const BITRATE_MAX_KBPS: u16 = 1000;
+/// 码率硬上限。
+///
+/// 产品侧限定 512 kbps（10 ms 帧下 640 字节/帧，远低于 Opus 1275 字节上限，
+/// 留足 VBR 冲高与 FEC 冗余空间）。两端必须用同一个值：接收端会用它钳制
+/// 对端下发的值，跨端不一致会导致"设置显示 512、实际跑 1000"。
+pub const BITRATE_MAX_KBPS: u16 = 512;
+
+/// 手动档位（UI 滑块的五档）。
+///
+/// 协议本身不限制这些值——它只认 [`BITRATE_MAX_KBPS`]；档位是产品约定，
+/// 用于把滑块量化为整数位置，并让历史配置（旧的 768/960/1000）平滑归一。
+pub const BITRATE_STEPS_KBPS: [u16; 5] = [64, 128, 256, 384, 512];
 
 /// Opus 复杂度上限（`0` 表示使用默认值）
 pub const OPUS_COMPLEXITY_MAX: u8 = 10;
@@ -327,19 +341,42 @@ impl ConnectPayload {
         self.opus_flags & OPUS_FLAG_FEC != 0
     }
 
-    /// 生效码率：`0` → 512 kbps；超过 1000 钳制到 1000。
+    /// 生效码率：`0` → [`BITRATE_AUTO_KBPS`]；超过 [`BITRATE_MAX_KBPS`] 钳制到上限。
     pub fn effective_bitrate_kbps(&self) -> u16 {
         clamp_bitrate_kbps(self.bitrate_kbps)
     }
 }
 
-/// 码率归一：`0`=自动→512，上限 1000。
+/// 码率归一：`0`=自动→上限，其余钳制到 [`BITRATE_MAX_KBPS`]。
 pub fn clamp_bitrate_kbps(kbps: u16) -> u16 {
     match kbps {
         0 => BITRATE_AUTO_KBPS,
         k if k > BITRATE_MAX_KBPS => BITRATE_MAX_KBPS,
         k => k,
     }
+}
+
+/// 把任意码率吸附到最近的手动档位（[`BITRATE_STEPS_KBPS`]）。
+///
+/// 只用于 UI/配置归一，**不参与协议**：历史配置里可能有 768/960/1000，
+/// 直接塞进五档滑块会让滑块停在非法位置，吸附后即可自愈。
+/// `0`（自动）原样返回。
+pub fn snap_bitrate_kbps(kbps: u16) -> u16 {
+    if kbps == 0 {
+        return 0;
+    }
+    let k = kbps.min(BITRATE_MAX_KBPS);
+    let mut best = BITRATE_STEPS_KBPS[0];
+    let mut best_d = i32::MAX;
+    for s in BITRATE_STEPS_KBPS {
+        let d = (i32::from(s) - i32::from(k)).abs();
+        // 距离相等时取较小档：宁可少占带宽，也不悄悄把码率抬上去
+        if d < best_d {
+            best_d = d;
+            best = s;
+        }
+    }
+    best
 }
 
 // ═══════════════════════ CONNECT_ACK（类型 4） ═══════════════════════
@@ -664,15 +701,36 @@ mod tests {
     }
 
     #[test]
-    fn bitrate_clamped_to_1000() {
-        assert_eq!(clamp_bitrate_kbps(0), 512);
+    fn bitrate_clamped_to_512() {
+        assert_eq!(clamp_bitrate_kbps(0), 512, "自动 = 上限");
+        assert_eq!(clamp_bitrate_kbps(64), 64);
         assert_eq!(clamp_bitrate_kbps(512), 512);
-        assert_eq!(clamp_bitrate_kbps(960), 960);
-        assert_eq!(clamp_bitrate_kbps(1000), 1000);
-        assert_eq!(clamp_bitrate_kbps(1024), 1000);
-        assert_eq!(clamp_bitrate_kbps(65535), 1000);
+        // 高于上限一律钳制：旧客户端的 768/960/1000/1024 都会被压到 512
+        assert_eq!(clamp_bitrate_kbps(768), 512);
+        assert_eq!(clamp_bitrate_kbps(1000), 512);
+        assert_eq!(clamp_bitrate_kbps(1024), 512);
+        assert_eq!(clamp_bitrate_kbps(65535), 512);
         let p = ConnectPayload { bitrate_kbps: 1024, ..ConnectPayload::default() };
-        assert_eq!(p.effective_bitrate_kbps(), 1000);
+        assert_eq!(p.effective_bitrate_kbps(), 512);
+    }
+
+    #[test]
+    fn bitrate_snaps_to_manual_steps() {
+        // 五个档位原样返回
+        for s in BITRATE_STEPS_KBPS {
+            assert_eq!(snap_bitrate_kbps(s), s);
+        }
+        // 自动（0）不被吸附
+        assert_eq!(snap_bitrate_kbps(0), 0);
+        // 历史配置/任意值吸附到最近档位
+        assert_eq!(snap_bitrate_kbps(1), 64);
+        assert_eq!(snap_bitrate_kbps(96), 64, "等距时取较小档");
+        assert_eq!(snap_bitrate_kbps(97), 128);
+        assert_eq!(snap_bitrate_kbps(200), 256);
+        assert_eq!(snap_bitrate_kbps(300), 256);
+        assert_eq!(snap_bitrate_kbps(330), 384);
+        assert_eq!(snap_bitrate_kbps(768), 512, "旧档位 768 必须落到上限");
+        assert_eq!(snap_bitrate_kbps(1000), 512);
     }
 
     #[test]

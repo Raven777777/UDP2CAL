@@ -4,9 +4,92 @@
 
 ---
 
+## 未发布 — 2026-10-25 · 漂移校正换代：受控重采样 + 有界回落
+
+> 协议**行为**有三处变化：预缓冲门槛 40 → 30 ms、发送端新增 1 帧节拍整形、
+> **码率上限 1000 → 512 kbps**。两端仍需成对升级。
+> 规范同步修订：`PROTOCOL_V3_RTP.md` 4.7 / 7.2 / 7.7 / 7.9 / 7.10 / 7.14 / 8.1 / 九。
+
+**码率与带宽（产品变更）**
+- **取消「自动分配码率」档**。它的语义只是"用上限"，却额外强制开 VBR、关 VBR 约束，
+  对用户来说是不可见的副作用；移除后 VBR 只由 DTX 联动强制
+- 码率默认 **256 kbps**；上限 `BITRATE_MAX_KBPS` 1000 → **512**，两端同值
+  （接收端用它钳制对端下发的值，跨端不一致会出现"界面显示 512、实际跑 1000"）
+- 手动码率从 4 个 Chip（512/768/960/1000）改为**五档滑块**
+  `64 / 128 / 256 / 384 / 512 kbps`（`BITRATE_STEPS_KBPS`）
+- 新增 `snap_bitrate_kbps()` / `snapBitrateKbps()`：把任意值吸附到最近档位
+  （等距取较小档，先钳制后吸附）。`Prefs` 读出时即吸附，历史配置里的
+  768/960/1000 自愈为 512，旧的"自动(0)"自愈为默认 256
+- 音频带宽从 5 个单选按钮改为**五档滑块**（NB/MB/WB/SWB/FB），版式与码率滑块一致
+- 回归测试：`bitrate_clamped_to_512`、`bitrate_snaps_to_manual_steps`（Rust 与 Kotlin 各一套）
+
+**设置即时生效（Android）**
+- 根因：`OpusEncoder.update()` 写好了却**从未被调用**，所有编码参数只在编码器创建时读一次，
+  改设置必须重开采集才生效（文档里"毫秒级热更新"的说法与实际不符）
+- 发送循环每 100 ms 对齐一次 Prefs，参数变化时调 `enc.update()`：
+  码率 / 复杂度 / 带宽 / DTX / VBR / VBR 约束 / FEC / 丢包率 / 信号提示，下一帧生效、不断流
+- 语音↔音乐、测试音开关无法热改（`AudioRecord` 音源、AEC、`AudioTrack` 语音模式都在
+  创建时定型），改为**自动重建采集链路**（复用既有 restart 通道，约 1 s 重连），
+  不再需要用户手动停止再开始
+- `encoderUpdate` 补 `OPUS_SET_DRED_DURATION(fec ? 50 : 0)`：创建路径有、更新路径漏了，
+  导致运行期关 FEC 后 DRED 冗余仍在发（单帧体积不降）
+- 编码器构造改为取**当前 Prefs 快照**并与 `appliedCfg` 共用同一份对象：重建链路时
+  用户可能刚改过设置，用旧入参会把新设置丢掉
+- 状态卡片的「带宽」一行以前恒为 `—`：`CaptureStatus.opusBandwidth` 声明了却
+  **从未赋值**。现在运行时显示已生效值、未运行时显示已配置值；并把原来的
+  「采样率」标签改成「输入采样率」，与编码带宽明确区分（前者是固定 48 kHz 输入）
+
+**根因**
+
+旧实现把时钟漂移当成"离散事件"处理：水位越过阈值就丢/插 5 ms，间隔 500 ms。
+三个后果无法回避——每次编辑都是一次音频删除/重复，5 ms 的接缝只在尾部淡出 1 ms、
+其余 4 ms 是硬切；它只在水位**已经偏离之后**才动作，水位长期在 120–180 ms 徘徊；
+低水位一侧又因为"PCM 已提前写进声卡"而误判，形成永久 1% 的削/补。
+听感就是持续细微的"咔嗒"。
+
+**P1：受控重采样（主力）**
+- 新增 `DriftController`：水位偏差经 150 ms 低通后映射到重采样比率的 ±0.5%，
+  每 10 ms 更新、单次步进 ≤0.0001（1%/s 斜坡），死区 ±5 ms、满幅点 ±20 ms
+- `AudioWriter` 的重采样比率改为 `源/设备 × (1 + adjust)`，相位跨块连续
+- 新增 `PlayheadClock::note_ratio_correction`：比率造成的媒体时间偏移是连续量
+  （u=0.5% 时每帧只有 2.4 个样本），用 f64 累积、只把整数部分入账；
+  逐帧取整会吃掉近 17% 的校正量，表现为水位与播放头缓慢背道而驰
+- Android 侧镜像实现 `StreamResampler`（交错立体声、相位连续）
+
+**P0：有界回落（安全网）**
+- 高带：水位 > 目标 +30 ms 且连续 5 次评估都在带内 → 丢 1 ms
+- 低带：水位 < 目标 −10 ms → 插 1 ms
+- 两次之间至少间隔 1 s 音频样本时间（每秒最多 1 ms），绝不连续触发；
+  启动宽限 2 s；只在真实 PCM 帧上做
+- 新增 `slip_drop` / `slip_insert`：48 样本升余弦交叉淡化，接缝两侧一阶连续。
+  旧的"尾部淡出"被删除——淡出到零再接下一帧本身就是一个台阶
+- 回落方向反了会被测出来：`drift_slip_low_band_inserts` /
+  `drift_slip_rate_is_one_ms_per_second` / `slip_drop_is_crossfaded_not_cut`
+
+**播放头与延迟**
+- 播放头改用**可听位置**：`audible = played_frames − device_latency_frames()`。
+  回调把 PCM 填进 WASAPI 缓冲时 `played` 就前移了，这段数据还要过引擎缓冲 + DMA
+- `device_latency_us` 从 `OutputCallbackInfo::timestamp()` 的 `playback − callback` 实时读取
+- 抖动缓冲新增 128 条到达记录，「总延迟估算」= `now − arrival(playhead_ts) + 声卡延迟`
+- 状态栏显示 `延迟 N ms`；日志每 10 s 打印构成分解；新增
+  [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) 说明如何实测校准一次
+
+**P2：发送端与门槛**
+- 发送端 1 帧节拍整形（Android `sendFrames` / Windows `reverse-capture`）：
+  发送时刻钉在 10 ms 网格，落后 >4 帧重置而非补发；测试音循环原先自带一套节拍，
+  与新整形叠加会导致半速，已删除
+- `JITTER_START_MS` 40 → 30 ms（3 帧）：前提是水位由比率闭环维持，不再需要旧模型的安全垫
+- Windows 输出显式请求 10 ms 缓冲（`BufferSize::Fixed`），驱动拒绝时回落默认值；
+  cpal 0.15.3 的 `buffer_size_to_duration` 有 100× 换算误差，请求值不可信，
+  因此延迟一律以时间戳实测为准
+- Android AudioTrack 缓冲 80 ms → 2 帧（20 ms），`PERFORMANCE_MODE_LOW_LATENCY` 常态化
+  （minSdk 29），反向路径接入重采样
+
+---
+
 ## 未发布 — 2026-10-25 · 第三轮质量审查修复（22 项）
 
-> 审查报告：[CODE_REVIEW_2026-10-25.md](../CODE_REVIEW_2026-10-25.md)。
+> 审查报告：[CODE_REVIEW_2026-10-25.md](archive/CODE_REVIEW_2026-10-25.md)。
 > 本轮全部为缺陷修复，**无新特性**；协议行为有一处收紧（序列号语义），因此
 > Android 与 Windows 仍需成对升级。
 
