@@ -63,6 +63,32 @@ class Ctx:
 
 # ---------------------------------------------------------------- doctor
 
+def _check_projects(logger) -> int:
+    """检查各 Android 工程目录的完整性，返回问题数（doctor 与 --fix 复检共用）"""
+    problems = 0
+    for key, target in config.ANDROID_TARGETS.items():
+        project = Path(target["dir"])
+        if not project.exists():
+            logger.error("{} 目录缺失: {}".format(key, project))
+            problems += 1
+            continue
+        if deps.wrapper_ready(project):
+            logger.ok("{} gradle wrapper 完整".format(project.name))
+        else:
+            logger.warn("{} 缺少 gradle/wrapper".format(project.name))
+            problems += 1
+        sdk_dir_value = deps.read_sdk_dir(project)
+        if sdk_dir_value is None:
+            logger.warn("{} local.properties 未设置 sdk.dir".format(project.name))
+            problems += 1
+        elif not Path(sdk_dir_value).is_dir():
+            logger.warn("{} local.properties 的 sdk.dir 无效: {}".format(project.name, sdk_dir_value))
+            problems += 1
+        else:
+            logger.ok("{} sdk.dir 有效".format(project.name))
+    return problems
+
+
 def doctor(args) -> int:
     logger = make_logger("doctor", getattr(args, "verbose", False))
     logger.banner("UDP2CAL 环境体检")
@@ -137,27 +163,7 @@ def doctor(args) -> int:
         logger.warn("未找到 adb（platform-tools 未安装？）")
 
     logger.section("项目自检")
-    problems = 0
-    for key, target in config.ANDROID_TARGETS.items():
-        project = Path(target["dir"])
-        if not project.exists():
-            logger.error("{} 目录缺失: {}".format(key, project))
-            problems += 1
-            continue
-        if deps.wrapper_ready(project):
-            logger.ok("{} gradle wrapper 完整".format(project.name))
-        else:
-            logger.warn("{} 缺少 gradle/wrapper".format(project.name))
-            problems += 1
-        sdk_dir_value = deps.read_sdk_dir(project)
-        if sdk_dir_value is None:
-            logger.warn("{} local.properties 未设置 sdk.dir".format(project.name))
-            problems += 1
-        elif not Path(sdk_dir_value).is_dir():
-            logger.warn("{} local.properties 的 sdk.dir 无效: {}".format(project.name, sdk_dir_value))
-            problems += 1
-        else:
-            logger.ok("{} sdk.dir 有效".format(project.name))
+    problems = _check_projects(logger)
 
     if getattr(args, "fix", False):
         logger.section("自动修复")
@@ -173,12 +179,15 @@ def doctor(args) -> int:
         if rust and rust.rustup:
             for triple in config.WINDOWS_TARGETS.values():
                 deps.ensure_rust_target(rust, triple, logger)
+        # 修复后必须复检：否则摘要恒为"发现 N 项待处理"，与实际情况不符
+        logger.section("修复后复检")
+        problems = _check_projects(logger)
 
     logger.blank()
     if problems == 0:
         logger.ok("体检完成，未发现阻塞项")
     elif getattr(args, "fix", False):
-        logger.warn("体检完成，发现 {} 项待处理；已尝试自动修复，请重新运行 `build.bat doctor` 确认".format(problems))
+        logger.warn("体检完成，仍有 {} 项无法自动修复，请按上方提示手动处理".format(problems))
     else:
         logger.warn("体检完成，发现 {} 项待处理；可执行 `build.bat doctor --fix`".format(problems))
     logger.info("日志: {}".format(logger.path))

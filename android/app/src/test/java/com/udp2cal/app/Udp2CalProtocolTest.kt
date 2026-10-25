@@ -375,6 +375,32 @@ class Udp2CalProtocolTest {
         assertEquals(baseTs + 480L * 8, jb.nextTs)
     }
 
+    @Test
+    fun jitter_realignsWhenSeqLagsBehindTs() {
+        // 回归：发送端在 ACK 中断 / DTX 期间"时间戳前进、序号冻结"，
+        // 接收端同时用 PLC/静音把 nextSeq 推进了同样的量。恢复包时间戳连续、
+        // 序号却落后——必须按时间戳重新对齐，否则整条后续流会被永久丢弃
+        // （M=1 重同步分支在旧实现里永远不可达）。
+        val jb = Udp2CalProtocol.JitterBuffer()
+        for (i in 0 until 8) insert(jb, i, 480L * i, i == 0, i + 1)
+        pullTags(jb, 0L, 8)
+        for (k in 0 until 50L) jb.pull(480L * (8 + k), ByteArray(1275))
+        assertEquals(58L, jb.nextSeq)
+        assertEquals(480L * 58, jb.nextTs)
+
+        // 恢复包：序号仍是 8（未随静音递增），时间戳正好接上，M=1
+        assertTrue(insert(jb, 8, 480L * 58, true, 9))
+        assertEquals(1L, jb.seqRealign)
+        assertEquals(8L, jb.nextSeq)
+        assertEquals(480L * 58, jb.nextTs)
+
+        // 后续包全部正常接纳并出音
+        for (i in 1..10) assertTrue(insert(jb, 8 + i, 480L * (58 + i), false, 10 + i))
+        val tags = pullTags(jb, 480L * 58, 11)
+        assertEquals(11, tags.size)
+        assertTrue(tags.none { it == 0xFE || it == 0xFF })
+    }
+
     // ═══════ 漂移校正与播放头 ═══════
 
     @Test

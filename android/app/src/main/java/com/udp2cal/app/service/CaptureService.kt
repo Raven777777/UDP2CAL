@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 import java.security.SecureRandom
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.coroutineContext
@@ -225,6 +226,8 @@ class CaptureService : Service() {
                 // ── 网络层 ──
                 val sender = UdpSender(targetIp, targetPort)
                 if (!sender.connect()) {
+                    // 连接失败时 socket 可能已创建：必须显式关闭，否则句柄泄漏
+                    sender.close()
                     fail("网络连接失败")
                     return@launch
                 }
@@ -531,7 +534,14 @@ class CaptureService : Service() {
             // 测试音没有硬件节拍，只能按媒体时间自走
             nextAt += frameNs * len / FRAME
             val waitNs = nextAt - System.nanoTime()
-            if (waitNs > 0) delay(waitNs / 1_000_000)
+            val waitMs = waitNs / 1_000_000
+            if (waitMs > 0) {
+                delay(waitMs)
+            } else {
+                // 落后于节拍时不得用 delay(0) 空转（会占满调度线程），
+                // 交出执行权后继续追赶
+                yield()
+            }
             len
         }
     }
@@ -540,10 +550,10 @@ class CaptureService : Service() {
      * 统一的 10 ms 帧发送循环。
      *
      * 规则（规范 4.3/4.4/8.1）：
-     *   * 每帧时间戳 +480，**无论是否真的发出**；
-     *   * 编码失败/发送失败：序列号仍 +1，让接收端看到缺口并触发 PLC；
-     *   * DTX 空帧（编码返回 0）：不递增序列号；
-     *   * 未连接（无新鲜 ACK）时不编码不发送。
+     *   * 每帧时间戳 +480、序列号 +1，**两者同频，与是否真的发出无关**；
+     *   * 编码失败/发送失败/DTX 空帧：该帧不产出负载，但序列号仍 +1
+     *     （让接收端看到连续的时间线，避免恢复包被判迟到）；
+     *   * 未连接（无新鲜 ACK）时不编码不发送，时间戳与序列号照常推进。
      */
     private suspend fun sendFrames(
         enc: OpusEncoder,
@@ -591,10 +601,15 @@ class CaptureService : Service() {
                         first = false
                     }
                 }
-                // 编码成功（含 DTX 空帧）才推进序列号：DTX 未发包不递增
-                if (n >= 0) seq = (seq + 1) and 0xFFFF
             }
             timestamp += FRAME
+            // 序列号与时间戳**同频**推进：每 10 ms 帧无条件 +1，与是否真的发出无关。
+            //
+            // 历史实现把它放在 `if (n >= 0)` 里（断连期间不递增），而时间戳仍然
+            // 无条件推进。接收端在断流期间会用 PLC/静音推进 nextSeq，滞后量永不
+            // 闭合；恢复包先被"序号迟到"判定拦下，M=1 重同步分支永远不可达 →
+            // 单向音频永久静音（ACK 中断 0.2~3 s 即可触发，且界面仍显示已连接）。
+            seq = (seq + 1) and 0xFFFF
 
             if (now - lastReport >= 1000) {
                 val elapsed = (now - lastReport).coerceAtLeast(1)
@@ -801,9 +816,8 @@ class CaptureService : Service() {
                             val idx = writeLen - 1 - i
                             pcm[idx] = (pcm[idx] * (1f - i.toFloat() / fade)).toInt().toShort()
                         }
+                        // 媒体时间偏移只作用在播放头上：pull 的缺口判定用的就是 playheadTs
                         clock.notePcmCorrection(k.toLong())
-                        linkLock.lock()
-                        try { jitter.notePcmCorrection(k.toLong()) } finally { linkLock.unlock() }
                         mediaSamples += k
                     } else if (adj < 0) {
                         // 水位过低：把尾部渐入重复一次
@@ -815,8 +829,6 @@ class CaptureService : Service() {
                             insertBuf[i] = (src * gain).toInt().toShort()
                         }
                         clock.notePcmCorrection(-insertLen.toLong())
-                        linkLock.lock()
-                        try { jitter.notePcmCorrection(-insertLen.toLong()) } finally { linkLock.unlock() }
                     }
 
                     if (!player.writeBlocking(pcm, 0, writeLen)) return

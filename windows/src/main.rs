@@ -159,10 +159,19 @@ fn jitter() -> &'static Mutex<protocol::rtp::JitterBuffer> {
     JITTER.get_or_init(|| Mutex::new(protocol::rtp::JitterBuffer::new()))
 }
 
-/// 解码线程句柄：网络线程与音频回调据此唤醒它（unpark 为原子置位，无分配）
-static DECODE_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+/// 解码线程句柄：网络线程与复位路径据此唤醒它（unpark 为原子置位，无分配）。
+///
+/// 必须**可替换**：音频初始化失败后重试会创建新的解码线程，而 `OnceLock`
+/// 只能写入一次——重试后 `wake_decoder()` 会一直唤醒已退出的旧线程，新线程
+/// 只能靠 4 ms 轮询兜底（表现为卡顿与延迟上升）。
+static DECODE_THREAD: Mutex<Option<std::thread::Thread>> = Mutex::new(None);
+
+fn set_decode_thread(t: std::thread::Thread) {
+    *DECODE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+}
+
 fn wake_decoder() {
-    if let Some(t) = DECODE_THREAD.get() {
+    if let Some(t) = DECODE_THREAD.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         t.unpark();
     }
 }
@@ -249,7 +258,7 @@ fn init_audio_worker() {
     let _ = std::thread::Builder::new()
         .name("udp2cal-decode".into())
         .spawn(move || {
-            let _ = DECODE_THREAD.set(std::thread::current());
+            set_decode_thread(std::thread::current());
 
             let mut dec = match decoder::OpusDecoder::new() {
                 Ok(d) => d,
@@ -349,11 +358,9 @@ fn init_audio_worker() {
                                         let k = (k as usize).min(n / 2);
                                         keep = n - k;
                                         fade_out(&mut pcm[..keep], 48);
+                                        // 媒体时间偏移只需作用在播放头上：
+                                        // pull 的缺口判定用的就是 playhead_ts
                                         clock.note_pcm_correction(k as i64);
-                                        jitter()
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .note_pcm_correction(k as i64);
                                     }
                                     protocol::rtp::DriftAction::Insert(k) => {
                                         // 水位过低：把尾部 k 个样本渐入重复一次
@@ -364,10 +371,6 @@ fn init_audio_worker() {
                                             insert_buf[i] = pcm[(start + i).min(n - 1)] * gain;
                                         }
                                         clock.note_pcm_correction(-(insert_n as i64));
-                                        jitter()
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .note_pcm_correction(-(insert_n as i64));
                                     }
                                     protocol::rtp::DriftAction::None => {}
                                 }
@@ -858,13 +861,22 @@ impl AppState {
                 Task::none() 
             } 
             Message::StatusUpdate(info) => { 
-                // 只在「无流 → 有流」的那一帧做状态迁移，避免每 500ms 重复清除用户提示
-                if info.bitrate_kbps > 0.0 && !self.connected { 
-                    self.connected = true; 
-                    // 音频真正流动起来后清掉历史错误与断开标记
-                    self.notice.clear(); 
-                    self.status_text.clear(); 
-                } 
+                // 「已连接」= 控制面绑定存在。规范 6.4 明确保活只看控制面，
+                // 不得用"是否收到 RTP"判断存活；历史实现只在 bitrate>0 时置真、
+                // 从不置假，导致 RTP 停止后码率归零而界面仍显示已连接。
+                let bound = p2p_snapshot().is_busy();
+                if bound != self.connected {
+                    self.connected = bound;
+                    if bound {
+                        // 音频真正流动起来后清掉历史错误与断开标记
+                        self.notice.clear();
+                        self.status_text.clear();
+                    } else if self.is_running {
+                        self.last_bitrate = 0.0;
+                        self.last_level_db = -60.0;
+                        self.status_text = "已断开".into();
+                    }
+                }
                 self.last_bitrate = info.bitrate_kbps; 
                 self.last_level_db = info.level_db; 
                 // 诊断：每 30s 落一次盘（音频计数器 + RTP/抖动缓冲计数器）
@@ -1459,17 +1471,20 @@ async fn handle_control(
         logf!("[P2P] CONNECT 参数非法（{reason}），丢弃");
         return;
     }
-    // 反向编码器配置只描述 Windows → Android；内容相同则不下发（避免每秒重置编码器）
-    capture::update_reverse_config(capture::OpusReverseConfig::from(&cfg));
-
     let now = Instant::now();
     let peer = p2p_snapshot();
     let same_device = peer.is_busy() && peer.device_id == header.device_id;
 
     // ── 已被其它设备占用：静默忽略，不回 ACK ──
+    // 注意：反向编码器配置的更新必须放在这道门之后。否则同网段任意主机
+    // 发一个参数合法的 CONNECT 就能改写当前会话的反向编码参数（码率/DTX/FEC），
+    // 属于最小权限缺陷（规范 5.7 第 7 步要求先校验绑定关系）。
     if peer.is_busy() && !same_device {
         return;
     }
+
+    // 反向编码器配置只描述 Windows → Android；内容相同则不下发（避免每秒重置编码器）
+    capture::update_reverse_config(capture::OpusReverseConfig::from(&cfg));
 
     if !same_device {
         // ── 建立绑定 ──
@@ -1507,7 +1522,12 @@ async fn handle_control(
     // forward_ssrc 变化表示新会话：必须重置抖动缓冲/解码器并换反向 SSRC
     let new_session = peer.forward_ssrc != cfg.forward_ssrc;
     let want_reverse = cfg.reverse_port != 0 && REVERSE_ENABLED.load(Ordering::Acquire) != 0;
+    // 源 IP 变化也必须重启反向发送器：手机 Wi-Fi 重连后 IP 可能改变，而
+    // device_id / forward_ssrc / reverse_port 都不变（socket 未重建），
+    // 此时只更新正向 RTP 的绑定地址会让反向音频一直发往旧 IP。
+    let addr_changed = peer.addr.map(|a| a.ip()) != Some(src_addr.ip());
     let reverse_stale = new_session
+        || addr_changed
         || peer.reverse_port != cfg.reverse_port
         || (peer.reverse_ssrc != 0) != want_reverse;
 
@@ -1612,21 +1632,27 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
 
         let mut buf = vec![0u8; 2048];
         let mut last_stats = Instant::now();
+        let mut last_liveness = Instant::now();
         let mut byte_count: u64 = 0;
         let mut packet_count: u64 = 0;
 
         loop {
+            // 控制面保活检查必须**与流量无关**地周期性执行（规范 6.4：保活只看
+            // 控制面，不得用"是否收到 RTP"判断连接存活）。历史实现把它放在
+            // recv 超时分支里：只要 RTP 持续到达，检查就永不执行，绑定永不释放。
+            if last_liveness.elapsed() >= Duration::from_millis(100) {
+                last_liveness = Instant::now();
+                if check_peer_timeout() {
+                    let _ = output.send(Message::Disconnected).await;
+                }
+            }
+
             let recv = tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
 
             let (len, src) = match recv {
                 Ok(Ok(v)) => v,
-                // 超时 / socket 错误：只做控制面保活检查，不看 RTP
-                _ => {
-                    if check_peer_timeout() {
-                        let _ = output.send(Message::Disconnected).await;
-                    }
-                    continue;
-                }
+                // 超时 / socket 错误：下一轮继续做保活检查
+                _ => continue,
             };
 
             match protocol::demux(&buf[..len]) {

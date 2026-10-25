@@ -59,11 +59,15 @@ class UdpSender(
     @Volatile var ackGeneration: Long = 0L; private set
 
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+        var sockLocal: DatagramSocket? = null
+        var revSockLocal: DatagramSocket? = null
         try {
             // 只解析一次；之后每帧发送不再触碰 DNS / IP 解析
             val addr = InetSocketAddress(InetAddress.getByName(host), port)
             val sock = DatagramSocket()
+            sockLocal = sock
             val revSock = DatagramSocket()
+            revSockLocal = revSock
             reverseSock = revSock
             reversePort = revSock.localPort
             forwardSsrc = newSsrc()
@@ -75,7 +79,13 @@ class UdpSender(
             Log.i(TAG, "已连接 $addr，正向 SSRC=${"%08x".format(forwardSsrc)}，反向端口=$reversePort")
             true
         } catch (e: Exception) {
+            // 失败路径必须回收已创建的 socket（第二个 DatagramSocket 抛错时第一个会泄漏）
             Log.e(TAG, "connect 失败", e)
+            try { sockLocal?.close() } catch (_: Exception) {}
+            try { revSockLocal?.close() } catch (_: Exception) {}
+            socket = null
+            reverseSock = null
+            remoteAddr = null
             false
         }
     }

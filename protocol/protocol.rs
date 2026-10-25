@@ -138,7 +138,18 @@ pub fn parse_control(buf: &[u8]) -> Option<(ControlHeader, &[u8])> {
 }
 
 /// 构造成完整控制包（分配新 Vec）
+///
+/// 负载上限 [`CONTROL_MAX_PAYLOAD`]：超限时截断到上限（保证不会构造出非法
+/// 数据报——对端会因 `payload_len` 与布局不符而整包丢弃）。这是**兜底**而非
+/// 正常路径：所有调用方的负载都是定长且远小于 512。开发期用 `debug_assert`
+/// 把误用暴露出来；需要"超限即失败"的语义请改用 [`build_control_to`]。
 pub fn build_control(msg_type: u8, device_id: &[u8; DEVICE_ID_SIZE], payload: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        payload.len() <= CONTROL_MAX_PAYLOAD,
+        "控制负载 {} 字节超过上限 {}，将被截断",
+        payload.len(),
+        CONTROL_MAX_PAYLOAD
+    );
     let len = payload.len().min(CONTROL_MAX_PAYLOAD);
     let mut out = Vec::with_capacity(CONTROL_HEADER_SIZE + len);
     let mut hdr = [0u8; CONTROL_HEADER_SIZE];

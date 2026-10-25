@@ -19,8 +19,50 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 
 /// 单文件上限，超过后轮转一次
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// 轮转目标（只保留一轮）
+const ROTATED_NAME: &str = "udp2cal.1.log";
 
-static LOG: OnceLock<Mutex<File>> = OnceLock::new();
+struct LogFile {
+    file: File,
+    dir: PathBuf,
+    path: PathBuf,
+    /// 已写入字节数（含启动横幅），用于在**运行期**触发轮转
+    bytes: u64,
+}
+
+impl LogFile {
+    /// 追加一行；超限时先轮转。
+    /// 轮转失败只影响日志本身，绝不 panic、绝不影响主流程；
+    /// 同时把计数清零，避免每次写入都重试一次 rename。
+    fn append(&mut self, line: &str) {
+        let len = line.len() as u64;
+        if self.bytes + len > MAX_BYTES && !self.rotate() {
+            self.bytes = 0;
+        }
+        if self.file.write_all(line.as_bytes()).is_ok() {
+            self.bytes += len;
+        }
+    }
+
+    /// 覆盖上一轮备份后重建文件。返回是否成功。
+    fn rotate(&mut self) -> bool {
+        let _ = self.file.flush();
+        // Rust 打开文件时带 FILE_SHARE_DELETE，运行中重命名是允许的
+        if std::fs::rename(&self.path, self.dir.join(ROTATED_NAME)).is_err() {
+            return false;
+        }
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(f) => {
+                self.file = f;
+                self.bytes = 0;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+static LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// 初始化日志文件。失败时静默降级为"仅 stderr"，不影响主流程。
@@ -34,10 +76,10 @@ pub fn init() {
     }
     let path = base.join("udp2cal.log");
 
+    // 启动时文件已超限：直接轮转，避免把上一轮日志和新会话混在一个文件里
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > MAX_BYTES {
-            // 轮转：覆盖上一轮备份，保证目录里最多两个文件
-            let _ = std::fs::rename(&path, base.join("udp2cal.1.log"));
+            let _ = std::fs::rename(&path, base.join(ROTATED_NAME));
         }
     }
 
@@ -48,8 +90,13 @@ pub fn init() {
             std::process::id()
         );
         let _ = file.write_all(banner.as_bytes());
-        let _ = LOG.set(Mutex::new(file));
-        let _ = LOG_PATH.set(path);
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if LOG
+            .set(Mutex::new(LogFile { file, dir: base, path: path.clone(), bytes }))
+            .is_ok()
+        {
+            let _ = LOG_PATH.set(path);
+        }
     }
 }
 
@@ -66,11 +113,11 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
 
     let Some(lock) = LOG.get() else { return };
     // 锁中毒也要继续写：日志丢了比锁丢了更糟
-    let mut file = match lock.lock() {
+    let mut log = match lock.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let _ = file.write_all(line.as_bytes());
+    log.append(&line);
 }
 
 /// 本地时间戳，格式 `2026-10-23 20:55:24.123`

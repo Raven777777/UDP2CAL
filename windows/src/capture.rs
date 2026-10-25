@@ -2,7 +2,7 @@
 //
 // v3 发送端规则（规范第八节）：
 //   * 采集 → 编码 → 立即发送，**没有应用层音频队列**，失败只丢帧并计数；
-//   * 固定 10 ms 帧，每帧时间戳 +480，序列号每包 +1（丢帧也 +1，让接收端看到缺口）；
+//   * 固定 10 ms 帧，时间戳与序列号**都**每帧 +1（不发包的帧同样 +1）；
 //   * SSRC 由控制面生成并随 CONNECT_ACK 下发，本模块只使用；
 //   * 反向 Opus 配置来自 CONNECT，**只在变化时**应用（每秒重配会重置编码器状态）。
 use std::net::{SocketAddr, UdpSocket};
@@ -336,26 +336,31 @@ impl ReverseSender {
                 pcm_buf.drain(..FRAME_INTERLEAVED);
 
                 let encoded = encoder.encode(&frame, &mut payload);
-                // `framed` = 这一帧是否"应当占用一个序列号"：
-                // 编码成功或编码失败都要 +1（让接收端看到缺口）；DTX 空帧不占号。
-                let (len, framed) = match encoded {
-                    Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => (n, true),
+                // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限），
+                // 但**序列号仍然每帧 +1**：序列号与时间戳必须同频推进。
+                //
+                // 历史上这里按"是否发包"决定是否递增序列号（DTX 不递增，符合
+                // 规范 4.4 的字面表述），但接收端在断流/静音期间会用 PLC/静音
+                // 推进 next_seq，滞后量永不闭合；恢复包会先被"序号迟到"判定
+                // 拦下，M=1 重同步分支永远不可达 → 反向音频永久静音。
+                let len = match encoded {
+                    Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => n,
                     Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
                         // 超过 1275 字节：整帧丢弃，绝不截断
                         REVERSE_STATS.oversize.fetch_add(1, Ordering::Relaxed);
-                        (0, true)
+                        0
                     }
-                    Ok(_) => (0, false), // DTX 空帧：时间戳推进，不发包也不占号
+                    Ok(_) => 0, // DTX 空帧：时间戳推进，不发包
                     Err(e) => {
                         let n = REVERSE_STATS.encode_errors.fetch_add(1, Ordering::Relaxed);
                         if n < 3 {
                             logf!("[Reverse] 编码失败: {e:?}");
                         }
-                        (0, true)
+                        0
                     }
                 };
 
-                // 时间戳每帧推进 480（含 DTX / 丢帧），序列号按 `framed` 推进
+                // 时间戳每帧推进 480（含 DTX / 丢帧）
                 timestamp = timestamp.wrapping_add(rtp::FRAME_SAMPLES);
                 if len > 0 {
                     let gap_ms = last_sent.map(|t| t.elapsed().as_millis()).unwrap_or(u128::MAX);
@@ -384,9 +389,8 @@ impl ReverseSender {
                         }
                     }
                 }
-                if framed {
-                    seq = seq.wrapping_add(1);
-                }
+                // 序列号与时间戳同频：每帧 +1（发送失败同样 +1）
+                seq = seq.wrapping_add(1);
             }
 
         }

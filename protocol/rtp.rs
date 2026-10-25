@@ -49,8 +49,6 @@ pub const PLC_MAX_MS: u32 = 120;
 pub const RESYNC_GAP_MS: u32 = 200;
 
 // ── 漂移校正参数（规范 7.9）──
-/// 单次校正下限 1 ms
-pub const DRIFT_MIN_SAMPLES: u32 = FRAME_SAMPLES / 10;
 /// 单次校正上限 5 ms
 pub const DRIFT_MAX_SAMPLES: u32 = FRAME_SAMPLES / 2;
 /// 两次校正之间至少间隔 500 ms 的**音频样本时间**（不是墙钟）
@@ -212,9 +210,9 @@ pub enum InsertResult {
     Started,
     /// 正常入槽
     Inserted,
-    /// 迟到 / 重复 / 时间戳与序号矛盾
+    /// 迟到 / 重复 / 时间戳非法
     Dropped,
-    /// 触发重同步（M=1 且跳变 > 200 ms，或超出重排窗口）
+    /// 触发重同步（时间戳合法而序号落后，或 M=1 且跳变 > 200 ms）
     Resync,
 }
 
@@ -240,6 +238,8 @@ pub struct JitterStats {
     pub duplicate: u64,
     pub overflow: u64,
     pub resyncs: u64,
+    /// 其中因"时间戳合法而序号落后"触发的重新对齐次数（断流/DTX 自愈计数）
+    pub seq_realign: u64,
     pub plc_frames: u64,
     pub max_plc_run: u32,
 }
@@ -269,8 +269,6 @@ pub struct JitterBuffer {
     started: bool,
     playing: bool,
     plc_run: u32,
-    /// 漂移校正造成的媒体时间偏移（样本），由播放线程维护
-    timestamp_offset: i64,
     /// 每次重同步/复位自增，播放线程据此重建解码器状态
     pub epoch: u64,
     pub stats: JitterStats,
@@ -288,7 +286,6 @@ impl JitterBuffer {
             started: false,
             playing: false,
             plc_run: 0,
-            timestamp_offset: 0,
             epoch: 0,
             stats: JitterStats::default(),
         }
@@ -314,10 +311,6 @@ impl JitterBuffer {
 
     pub fn plc_run(&self) -> u32 {
         self.plc_run
-    }
-
-    pub fn timestamp_offset(&self) -> i64 {
-        self.timestamp_offset
     }
 
     /// 从 `next_ts` 起连续可解码的帧数（水位）
@@ -357,7 +350,7 @@ impl JitterBuffer {
         let ext_seq = extend_seq(self.highest_seq, pkt.seq);
         let ext_ts = extend_ts(self.highest_ts, pkt.timestamp);
 
-        // 迟到：播放头已越过该时间戳
+        // 迟到：播放头已越过该时间戳（时间戳是播放顺序的唯一权威）
         if ext_ts < self.next_ts {
             self.stats.late += 1;
             return InsertResult::Dropped;
@@ -367,14 +360,27 @@ impl JitterBuffer {
             self.stats.duplicate += 1;
             return InsertResult::Dropped;
         }
-        // 序号与时间戳矛盾：时间戳是播放顺序的权威，丢弃异常包
+
+        // ── 断点判定（必须先于"序号迟到"判定）──
+        //
+        // 历史实现把 `ext_seq < next_seq` 的丢弃判定放在重同步之前，导致两类
+        // 断流永远无法自愈（时间戳合法且在未来、序号却已落后）：
+        //   1. 发送端在 ACK 中断 / DTX 期间只推进时间戳、不推进序号；
+        //   2. 断流超过 32767 个包（约 5.4 分钟）后 16 位有符号差值回绕。
+        // 由于接收端断流期间会用 PLC/静音推进 next_seq，滞后量永不闭合。
+        // 现在：时间戳合法且未重复 → 说明是真实的新音频，按时间戳重新对齐；
+        // 真正的迟到包在上面的 `ext_ts < next_ts` 已被拦下。
+        let gap_ms = samples_to_ms(ext_ts.saturating_sub(self.next_ts));
         if ext_seq < self.next_seq {
-            self.stats.late += 1;
-            return InsertResult::Dropped;
+            self.rebase(ext_seq, ext_ts);
+            self.store(pkt, ext_seq, ext_ts);
+            self.stats.resyncs += 1;
+            self.stats.seq_realign += 1;
+            self.stats.inserted += 1;
+            return InsertResult::Resync;
         }
 
         // M=1 且时间戳跳变超过阈值 → 重同步；跳变很小只更新标记状态
-        let gap_ms = samples_to_ms(ext_ts.saturating_sub(self.next_ts));
         if pkt.marker && gap_ms > RESYNC_GAP_MS as u64 {
             self.rebase(ext_seq, ext_ts);
             self.store(pkt, ext_seq, ext_ts);
@@ -465,12 +471,10 @@ impl JitterBuffer {
         }
     }
 
-    /// 播放线程校正 PCM 长度后回写媒体时间偏移。
-    ///
-    /// 丢弃 `n` 个样本 → 媒体时间线提前 `n`；插入 `n` 个样本 → 延后 `n`。
-    pub fn note_pcm_correction(&mut self, delta_samples: i64) {
-        self.timestamp_offset += delta_samples;
-    }
+    // 漂移校正造成的媒体时间偏移**只由 `PlayheadClock` 承担**：`pull` 的缺口
+    // 判定用的是播放头（`next_ts <= playhead_ts + lead`），把偏移加在播放头上
+    // 即可让整条媒体时间线随之平移。抖动缓冲不再保存偏移副本——历史上那份
+    // 副本只写不读，纯属误导（规范 7.9 的"同步调整"由播放头完成）。
 
     /// 复位（重连 / SSRC 变化 / 手动停止）
     pub fn reset(&mut self) {
@@ -482,7 +486,6 @@ impl JitterBuffer {
         self.started = false;
         self.playing = false;
         self.plc_run = 0;
-        self.timestamp_offset = 0;
         self.epoch += 1;
     }
 
@@ -1217,14 +1220,62 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_offset_tracks_correction() {
+    fn jb_realigns_when_seq_lags_behind_ts() {
+        // BUG-01/02 回归：发送端在 ACK 中断 / DTX 期间"时间戳前进、序号冻结"，
+        // 接收端同时用 PLC/静音把 next_seq 推进了同样的量。恢复包时间戳连续、
+        // 序号却落后——必须按时间戳重新对齐，而不是把整条后续流判成迟到。
+        let mut jb = JitterBuffer::new();
+        for i in 0..8u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        // 全部播掉（next_seq = 8, next_ts = 3840）
+        pull_tags(&mut jb, 0, 8);
+        // DTX/断流 500 ms：无包，播放头推进 50 帧
+        for k in 0..50u64 {
+            let _ = jb.pull(480 * (8 + k), &mut [0u8; 1275]);
+        }
+        assert_eq!(jb.next_seq(), 58);
+        assert_eq!(jb.next_ts(), 480 * 58);
+
+        // 恢复包：序号仍是 8（未随静音递增），时间戳正好接上，M=1
+        let r = insert(&mut jb, 8, 480 * 58, true, 9);
+        assert_eq!(r, InsertResult::Resync, "序号滞后必须重新对齐而不是丢弃");
+        assert_eq!(jb.stats.seq_realign, 1);
+        assert_eq!(jb.stats.late, 0);
+        assert_eq!(jb.next_seq(), 8);
+        assert_eq!(jb.next_ts(), 480 * 58);
+
+        // 后续包全部正常接纳并出音
+        for i in 1..=10u16 {
+            assert_eq!(
+                insert(&mut jb, 8 + i, 480 * (58 + i as u32), false, 10 + i as u8),
+                InsertResult::Inserted
+            );
+        }
+        let tags = pull_tags(&mut jb, 480 * 58, 11);
+        assert_eq!(tags.len(), 11);
+        assert!(tags.iter().all(|&t| t > 0), "重同步后不得再产生 PLC/静音");
+    }
+
+    #[test]
+    fn jb_long_gap_across_seq_wrap_still_recovers() {
+        // BUG-08 回归：断流跨度超过 32767 个包时，16 位有符号差值会把恢复包
+        // 的序号扩成负数；只要时间戳合法就必须能重新对齐。
         let mut jb = JitterBuffer::new();
         insert(&mut jb, 0, 0, true, 1);
-        assert_eq!(jb.timestamp_offset(), 0);
-        jb.note_pcm_correction(240); // 丢弃 5 ms
-        assert_eq!(jb.timestamp_offset(), 240);
-        jb.note_pcm_correction(-480); // 插入 10 ms
-        assert_eq!(jb.timestamp_offset(), -240);
+        // 播掉一帧，进入 PLAYING
+        let _ = jb.pull(0, &mut [0u8; 1275]);
+        // 断流 40000 帧（约 6.7 分钟）：接收端靠静音推进
+        let gap = 40_000u32;
+        for k in 0..gap as u64 / 8 {
+            let _ = jb.pull(480 * (1 + k * 8), &mut [0u8; 1275]);
+        }
+        // 恢复包时间戳正确接续，序号因回绕看起来"倒退"
+        let resume_ts = 480 * gap;
+        let r = insert(&mut jb, (gap as u16).wrapping_add(1), resume_ts, true, 2);
+        assert_eq!(r, InsertResult::Resync);
+        assert_eq!(jb.next_ts(), resume_ts as u64);
+        assert!(jb.stats.late <= 1, "不得把恢复包判成迟到: {}", jb.stats.late);
     }
 
     // ── 播放头映射 ──

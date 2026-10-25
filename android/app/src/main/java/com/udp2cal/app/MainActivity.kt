@@ -7,9 +7,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -54,10 +56,39 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 麦克风权限被拒（Compose 侧据此弹窗） */
+    private val permissionDenied = mutableStateOf(false)
+
     private val micPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        // 拒绝后必须给出明确指引：否则用户点"开始采集"只会看到
+        // "网络连接失败 / 麦克风初始化失败"，完全看不出根因是权限
+        permissionDenied.value = !granted
         requestNotifIfNeeded()
     }
     private val notifPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    }
+
+    private fun openAppSettings() {
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.fromParts("package", packageName, null)
+                )
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 用户从系统设置返回后重新判定
+        if (permissionDenied.value &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        ) {
+            permissionDenied.value = false
+            requestNotifIfNeeded()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,6 +126,29 @@ class MainActivity : ComponentActivity() {
                             onOpenSettings = { showOpusSettings = true }
                         )
                     }
+                }
+
+                // 麦克风权限被拒：必须明确告知，否则用户只会看到"初始化失败"
+                if (permissionDenied.value) {
+                    AlertDialog(
+                        onDismissRequest = { permissionDenied.value = false },
+                        title = { Text("需要麦克风权限") },
+                        text = {
+                            Text(
+                                "UDP2CAL 需要录音权限才能采集手机音频。" +
+                                    "请在系统设置中允许「麦克风」后返回。"
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                permissionDenied.value = false
+                                openAppSettings()
+                            }) { Text("去设置") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { permissionDenied.value = false }) { Text("稍后") }
+                        }
+                    )
                 }
             }
         }

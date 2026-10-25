@@ -344,7 +344,6 @@ object Udp2CalProtocol {
         var playing = false; private set
         var plcRun = 0; private set
         var epoch = 0L; private set
-        var timestampOffset = 0L; private set
         /** 最近一次重同步的原因（诊断用，仅 rebase 时写入） */
         var lastRebaseReason = ""; private set
 
@@ -357,6 +356,8 @@ object Udp2CalProtocol {
         var late = 0L; private set
         var duplicate = 0L; private set
         var resyncs = 0L; private set
+        /** 其中因"序号滞后但时间戳合法"触发的重新对齐次数（断流/DTX 自愈计数） */
+        var seqRealign = 0L; private set
         var overflow = 0L; private set
         var plcFrames = 0L; private set
         var maxPlcRun = 0; private set
@@ -370,7 +371,8 @@ object Udp2CalProtocol {
             started = false
             playing = false
             plcRun = 0
-            timestampOffset = 0
+            // 必须清空：否则新会话的日志会打印上一次会话的重同步原因（诊断误导）
+            lastRebaseReason = ""
             epoch++
         }
 
@@ -387,10 +389,10 @@ object Udp2CalProtocol {
             return n
         }
 
-        /** 播放线程校正 PCM 后回写媒体时间偏移（丢样本为正，插样本为负） */
-        fun notePcmCorrection(deltaSamples: Long) {
-            timestampOffset += deltaSamples
-        }
+        // 播放线程校正 PCM 后的媒体时间偏移只由 PlayheadClock.notePcmCorrection 承担：
+        // pull 的缺口判定用的是播放头（nextTs <= playheadTs + lead），把偏移加在
+        // 播放头上即可让整条媒体时间线平移。抖动缓冲不再保存副本——历史上那份
+        // 副本只写不读，纯属误导。
 
         /** 网络线程调用。返回 true 表示已进入缓冲（可用于码率统计） */
         fun insert(seq: Int, ts: Long, marker: Boolean, buf: ByteArray, offset: Int, length: Int): Boolean {
@@ -407,9 +409,22 @@ object Udp2CalProtocol {
 
             if (extTs < nextTs) { late++; return false }
             if (findTs(extTs) >= 0) { duplicate++; return false }
-            if (extSeq < nextSeq) { late++; return false }
 
+            // ── 断点判定（必须先于"序号迟到"判定）──
+            // 时间戳合法且未重复 → 说明是真实的新音频。序号落后只可能来自
+            // "发送端断流/DTX 期间只推进时间戳不推进序号"或"断流跨过 16 位
+            // 有符号差值的 32767 边界"。这两种情况下接收端的 nextSeq 已被
+            // PLC/静音推进，滞后量永不闭合；若在此直接丢弃，M=1 重同步分支
+            // 永远不可达，整条流会永久静音。因此按时间戳重新对齐。
             val gapMs = (extTs - nextTs) * 1000L / OPUS_SAMPLE_RATE
+            if (extSeq < nextSeq) {
+                rebase(extSeq, extTs, "序号滞后 ${nextSeq - extSeq} 帧，按时间戳重新对齐")
+                store(extSeq, extTs, buf, offset, length)
+                resyncs++
+                seqRealign++
+                return true
+            }
+
             if (marker && gapMs > RESYNC_GAP_MS.toLong()) {
                 rebase(extSeq, extTs, "M=1 且时间戳跳变 ${gapMs}ms")
                 store(extSeq, extTs, buf, offset, length)

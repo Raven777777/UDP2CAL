@@ -19,13 +19,25 @@ use std::thread::Thread;
 // 音频回调线程绝不能等待互斥锁（优先级反转 → 欠载爆音）。
 // 单生产者（解码线程）写 head，单消费者（音频回调）写 tail，
 // 元素用 AtomicU32 承载 f32 位模式，全部走安全 API，无需 unsafe。
+//
+// ⚠ 所有权铁律：`head` 只由生产者写，`tail` **只由消费者写**。
+// 生产者要丢弃未播数据时必须走 `request_flush()`（写 `flush_to`），
+// 由消费者在下次回调时落地。历史实现让生产者直接写 `tail`，破坏了
+// 这条不变量：`len()` 的 head/tail 两次读取之间若插入一次生产者 flush，
+// 相减会回绕成 `usize::MAX` → `filled_frames()` 恒大于预解码深度 →
+// 解码线程永久停产（静默死锁，无日志）。
 // ═══════════════════════════════════════════════════════════════════
+
+/// `flush_to` 的"无挂起请求"哨兵
+const FLUSH_NONE: usize = usize::MAX;
 
 struct Ring {
     data: Box<[AtomicU32]>,
     mask: usize,
     head: AtomicUsize,
     tail: AtomicUsize,
+    /// 生产者请求的"丢弃到该位置"；由消费者落地，避免生产者写 `tail`
+    flush_to: AtomicUsize,
 }
 
 impl Ring {
@@ -38,6 +50,7 @@ impl Ring {
             mask: cap - 1,
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            flush_to: AtomicUsize::new(FLUSH_NONE),
         }
     }
 
@@ -72,16 +85,47 @@ impl Ring {
         Some(f32::from_bits(bits))
     }
 
+    /// 待播样本数。
+    ///
+    /// `head` 与 `tail` 是两次独立读取，必须做"读 tail → 读 head → 再读 tail"
+    /// 的快照校验：只有两次 tail 一致，`head - tail` 才是有效快照。再做一次
+    /// `saturating_sub` 兜底，绝不允许回绕成极大值。
     #[inline]
     fn len(&self) -> usize {
-        self.head.load(Ordering::Acquire).wrapping_sub(self.tail.load(Ordering::Acquire))
+        loop {
+            let tail = self.tail.load(Ordering::Acquire);
+            let head = self.head.load(Ordering::Acquire);
+            if self.tail.load(Ordering::Acquire) != tail {
+                continue; // tail 在读取期间变化（flush 落地），重读
+            }
+            // 挂起的 flush 尚未落地时按落地后的水位报告，避免解码线程误判"已满"
+            let pending = self.flush_to.load(Ordering::Acquire);
+            let effective = if pending == FLUSH_NONE {
+                tail
+            } else {
+                tail.max(pending.min(head))
+            };
+            return head.saturating_sub(effective);
+        }
     }
 
-    /// 仅由生产者在"停止/重启"时调用：丢弃全部未播放数据
+    /// 仅由生产者调用：请求丢弃当前已入环、尚未播放的数据。
+    /// 实际丢弃由消费者在下次回调时执行（≤1 个回调周期，约 10 ms）。
     #[inline]
-    fn clear(&self) {
+    fn request_flush(&self) {
         let head = self.head.load(Ordering::Acquire);
-        self.tail.store(head, Ordering::Release);
+        self.flush_to.store(head, Ordering::Release);
+    }
+
+    /// 仅由消费者（音频回调）调用：落地挂起的 flush。
+    /// 消费者写自己的 `tail`，维持 `tail <= head` 不变量。
+    #[inline]
+    fn apply_pending_flush(&self) {
+        let target = self.flush_to.swap(FLUSH_NONE, Ordering::Acquire);
+        if target != FLUSH_NONE {
+            let head = self.head.load(Ordering::Acquire);
+            self.tail.store(target.min(head), Ordering::Release);
+        }
     }
 }
 
@@ -90,7 +134,7 @@ pub struct AudioWriter {
     pub device_rate: u32,
     /// 诊断计数器：由 UI 线程读取并展示/落盘（见 main.rs 的 AUDIO_STATS）
     pub stats: Arc<AudioStats>,
-    /// 声卡已真正消费的帧数（只统计真实 PCM，不统计回调补的静音）
+    /// 声卡已真正输出的帧数（含欠载时补的静音：它们同样占据媒体时间线）
     played: Arc<AtomicU64>,
     /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
     waker: Arc<OnceLock<Thread>>,
@@ -146,7 +190,8 @@ impl AudioWriter {
         let _ = self.waker.set(thread);
     }
 
-    /// 声卡已消费的真实帧数（单调递增，32 位回绕由调用方按 u64 处理）
+    /// 声卡真实输出位置（设备帧，单调递增）。
+    /// 欠载补的静音也计入——播放头必须等于"声卡播到哪里"，否则会永久落后。
     #[inline]
     pub fn played_frames(&self) -> u64 {
         self.played.load(Ordering::Acquire)
@@ -169,7 +214,8 @@ impl AudioWriter {
 
     /// 丢弃未播放数据（重连 / 重同步 / 停止）
     pub fn flush(&mut self) {
-        self.ring.clear();
+        // tail 归音频回调所有：这里只能投递请求，由回调落地
+        self.ring.request_flush();
         self.phase = 0.0;
     }
 
@@ -205,9 +251,14 @@ impl AudioWriter {
         }
 
         // ── 相位连续线性插值 ──
+        //
+        // 相位恒在 [0, ratio) 内（循环出口条件保证 `phase >= n_in`，故
+        // `phase - n_in >= 0`），因此不存在"负相位外插"问题。
+        // 块尾若落在 [n_in-1, n_in)，`i1` 会钳到 `last`，等效于把末样本多保持
+        // 一个输出点——这是 ≤1 个样本的保持误差，不可闻，且不影响比率精度。
         let n_in = pcm.len() as f64;
-        self.resample_buf.clear();
         let last = pcm.len() - 1;
+        self.resample_buf.clear();
         let mut phase = self.phase;
         while phase < n_in {
             let idx = phase as usize;
@@ -277,7 +328,9 @@ where
                 let mut filled = 0usize;
                 let mut idx = 0usize;
 
+                // 生产者只能"请求"丢弃（flush），由消费者在这里落地
                 if let Some(ring) = ring.upgrade() {
+                    ring.apply_pending_flush();
                     for _ in 0..need_frames {
                         match ring.pop() {
                             Some(sample) => {
@@ -293,10 +346,12 @@ where
                     }
                 }
 
+                // 播放头 = 声卡**真实输出位置**。欠载时声卡仍在按实时输出静音，
+                // 这些帧同样占据媒体时间线，必须计入：只统计真实 PCM 会让播放头
+                // 永久落后欠载量，抖动缓冲的有效水位被被动抬高，PLC 触发点随之
+                // 推迟，形成"欠载 → 延迟增大 → 更易欠载"的正反馈。
                 if let Some(p) = played.upgrade() {
-                    if filled > 0 {
-                        p.fetch_add(filled as u64, Ordering::Release);
-                    }
+                    p.fetch_add(need_frames as u64, Ordering::Release);
                 }
 
                 if filled < need_frames {
@@ -455,15 +510,75 @@ mod tests {
     }
 
     #[test]
-    fn ring_clear_drops_pending() {
+    fn ring_flush_is_applied_by_consumer() {
         let ring = Ring::with_frames(1024);
         for _ in 0..100 {
             ring.push(0.5);
         }
-        ring.clear();
-        assert_eq!(ring.len(), 0);
+        // 生产者只投递请求：tail 不动（tail 归消费者所有）
+        ring.request_flush();
+        assert_eq!(ring.len(), 0, "挂起 flush 后水位应立即按落地后计算");
+        // 消费者在回调里落地
+        ring.apply_pending_flush();
         assert_eq!(ring.pop(), None);
         assert!(ring.push(0.25));
+        assert_eq!(ring.len(), 1);
+    }
+
+    #[test]
+    fn ring_flush_keeps_data_pushed_after_request() {
+        let ring = Ring::with_frames(1024);
+        for _ in 0..100 {
+            ring.push(0.5);
+        }
+        ring.request_flush();
+        ring.push(0.25); // flush 之后入环的新数据不得被丢弃
+        ring.apply_pending_flush();
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.pop(), Some(0.25));
+    }
+
+    #[test]
+    fn ring_len_never_wraps_under_flush_race() {
+        // 回归：生产者 request_flush 与消费者 pop 并发时，len() 不得回绕。
+        // 历史实现由生产者直接写 tail，len() 会得到 usize::MAX，
+        // 使 filled_frames() 恒大于预解码深度 → 解码线程永久停产。
+        use std::sync::atomic::AtomicBool;
+        let ring = std::sync::Arc::new(Ring::with_frames(4096));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+        let r = ring.clone();
+        let s = stop.clone();
+        let producer = std::thread::spawn(move || {
+            let mut v = 0u32;
+            while !s.load(Ordering::Relaxed) {
+                // 只由生产者写 head 与 flush_to，绝不碰 tail
+                if !r.push(v as f32) || v.is_multiple_of(97) {
+                    r.request_flush();
+                }
+                v = v.wrapping_add(1);
+            }
+        });
+        let r = ring.clone();
+        let s = stop.clone();
+        let consumer = std::thread::spawn(move || {
+            let mut max_len = 0usize;
+            while !s.load(Ordering::Relaxed) {
+                r.apply_pending_flush();
+                let _ = r.pop();
+                max_len = max_len.max(r.len());
+            }
+            max_len
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        producer.join().unwrap();
+        let max_len = consumer.join().unwrap();
+        assert!(
+            max_len <= ring.capacity(),
+            "len() 不得超过容量（实际 {max_len}，容量 {}）",
+            ring.capacity()
+        );
     }
 
     impl AudioWriter {

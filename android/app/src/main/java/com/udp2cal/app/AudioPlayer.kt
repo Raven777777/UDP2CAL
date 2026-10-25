@@ -32,6 +32,16 @@ class AudioPlayer(private val context: Context) {
     @Volatile private var audioTrack: AudioTrack? = null
     private var audioManager: AudioManager? = null
 
+    /**
+     * AudioTrack 的访问互斥。
+     *
+     * `writeBlocking` 由播放协程调用，`flush`/`stop` 由控制协程或收尾路径调用；
+     * `AudioTrack.pause()/flush()/write()` 并发会抛 `IllegalStateException`，
+     * 被 catch 后静默吞掉，表现为反向音频偶发中断且无日志。
+     * 锁序恒为 linkLock → trackLock（trackLock 内绝不反向获取 linkLock）。
+     */
+    private val trackLock = Any()
+
     /** 是否成功启用 VOICE_COMMUNICATION 模式（含 AEC 能力） */
     @Volatile var isVoiceCommActive: Boolean = false
 
@@ -155,27 +165,30 @@ class AudioPlayer(private val context: Context) {
      */
     fun writeBlocking(pcm: ShortArray, offset: Int, length: Int): Boolean {
         if (length <= 0) return true
-        val track = audioTrack ?: return false
-        var off = offset
-        var remaining = length
-        while (remaining > 0) {
-            val n = try {
-                track.write(pcm, off, remaining)
-            } catch (e: Exception) {
-                Log.e(TAG, "write 失败", e)
-                return false
+        return synchronized(trackLock) {
+            val track = audioTrack ?: return@synchronized false
+            var off = offset
+            var remaining = length
+            while (remaining > 0) {
+                val n = try {
+                    track.write(pcm, off, remaining)
+                } catch (e: Exception) {
+                    Log.e(TAG, "write 失败", e)
+                    return@synchronized false
+                }
+                if (n <= 0) return@synchronized false
+                off += n
+                remaining -= n
+                writtenFrames += n / CHANNELS
             }
-            if (n <= 0) return false
-            off += n
-            remaining -= n
-            writtenFrames += n / CHANNELS
+            true
         }
-        return true
     }
 
     /** 已写入但尚未播放的帧数（AudioTrack 缓冲深度） */
-    fun pendingFrames(playedFrames: Long): Long =
+    fun pendingFrames(playedFrames: Long): Long = synchronized(trackLock) {
         (writtenFrames - playedFrames).coerceAtLeast(0)
+    }
 
     /**
      * 已播放的设备帧数（处理 32 位回绕）。
@@ -183,42 +196,51 @@ class AudioPlayer(private val context: Context) {
      * `getPlaybackHeadPosition()` 只在 track flush/reset 时归零，
      * 因此这里用 Int 模运算求增量，天然跨回绕。
      */
-    fun playbackHeadFrames(): Long {
-        val track = audioTrack ?: return headFrames
-        val raw = try {
-            track.playbackHeadPosition
-        } catch (_: Exception) {
-            return headFrames
+    fun playbackHeadFrames(): Long = synchronized(trackLock) {
+        val track = audioTrack
+        if (track == null) {
+            headFrames
+        } else {
+            // 读失败时回落到上次 raw，delta = 0，不推进播放头
+            val raw = try {
+                track.playbackHeadPosition
+            } catch (_: Exception) {
+                headRaw
+            }
+            val delta = raw - headRaw
+            headRaw = raw
+            if (delta > 0) headFrames += delta.toLong()
+            headFrames
         }
-        val delta = raw - headRaw
-        headRaw = raw
-        if (delta > 0) headFrames += delta.toLong()
-        return headFrames
     }
 
     /** 丢弃未播放数据并重置播放头（重同步 / 新会话） */
     fun flush() {
-        val track = audioTrack ?: return
-        try {
-            track.pause()
-            track.flush()
-            track.play()
-        } catch (_: Exception) {
+        synchronized(trackLock) {
+            val track = audioTrack ?: return@synchronized
+            try {
+                track.pause()
+                track.flush()
+                track.play()
+            } catch (_: Exception) {
+            }
+            headRaw = 0
+            headFrames = 0
+            writtenFrames = 0
         }
-        headRaw = 0
-        headFrames = 0
-        writtenFrames = 0
     }
 
     fun stop() {
-        try { audioTrack?.pause() } catch (_: Exception) {}
-        try { audioTrack?.flush() } catch (_: Exception) {}
-        try { audioTrack?.stop() } catch (_: Exception) {}
-        try { audioTrack?.release() } catch (_: Exception) {}
-        audioTrack = null
-        headRaw = 0
-        headFrames = 0
-        writtenFrames = 0
+        synchronized(trackLock) {
+            try { audioTrack?.pause() } catch (_: Exception) {}
+            try { audioTrack?.flush() } catch (_: Exception) {}
+            try { audioTrack?.stop() } catch (_: Exception) {}
+            try { audioTrack?.release() } catch (_: Exception) {}
+            audioTrack = null
+            headRaw = 0
+            headFrames = 0
+            writtenFrames = 0
+        }
         routeToEarpiece(false)
     }
 
