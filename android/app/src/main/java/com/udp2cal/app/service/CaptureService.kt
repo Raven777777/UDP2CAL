@@ -19,7 +19,6 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.udp2cal.app.AudioPlayer
 import com.udp2cal.app.DiscoveryManager
-import com.udp2cal.app.PcmSlip
 import com.udp2cal.app.Prefs
 import com.udp2cal.app.StreamResampler
 import com.udp2cal.app.Udp2CalProtocol
@@ -95,7 +94,7 @@ class CaptureService : Service() {
     private val linkSignal = linkLock.newCondition()
     private val jitter = Udp2CalProtocol.JitterBuffer()
     private val drift = Udp2CalProtocol.DriftController()
-    private val clock = Udp2CalProtocol.PlayheadClock()
+    private val rate = Udp2CalProtocol.RateEstimator()
     @Volatile private var activeReverseSsrc = 0
 
     private data class CaptureParams(
@@ -911,30 +910,31 @@ class CaptureService : Service() {
         val frameSamples = Udp2CalProtocol.OPUS_FRAME_SAMPLES * 2 // 立体声交错
         val pcm = ShortArray(frameSamples)
         val silence = ShortArray(frameSamples)
-        // 有界回落的交叉淡化插入缓冲：一帧 + 1 ms
-        val slipBuf = ShortArray(
-            (Udp2CalProtocol.OPUS_FRAME_SAMPLES + Udp2CalProtocol.SLIP_SAMPLES) * 2
-        )
-        // 受控重采样：媒体 48 kHz、设备 48 kHz，固定比率 1.0，只做 ±0.5% 微调
+        // 受控重采样：媒体 48 kHz、设备 48 kHz，基础比率 1.0，只做 ±0.5% 微调。
+        // 它现在是**唯一**的执行手段（不再有样本级丢/插），重采样器本身是
+        // 多相 FIR，所以比率怎么扫都不会在 12 kHz 处起伏。
         val resampler = StreamResampler(2)
         resampler.setSourceRate(Udp2CalProtocol.OPUS_SAMPLE_RATE, Udp2CalProtocol.OPUS_SAMPLE_RATE)
-        var mediaSamples = 0L
         var lastEpoch = -1L
         var lastLatencyLog = 0L
         var latencyMs = 0
+        // 前馈观测点：只喂"比上次更新的时间戳"
+        var fedTs = 0L
+        var adjust = 0.0
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
         while (coroutineContext.isActive) {
             var code = Udp2CalProtocol.Pull.WAIT
+            var pipeMs = 0
             var waterMs = 0
             var pulledLen = 0
-            var pulledTs = 0L
             var needReset = false
             var reason = ""
             var jbNextTs = 0L
             var jbResyncs = 0L
             var jbOverflow = 0L
             var arrivalNanos = -1L
+            var head = 0L
 
             linkLock.lock()
             try {
@@ -946,17 +946,30 @@ class CaptureService : Service() {
                     jbResyncs = jitter.resyncs
                     jbOverflow = jitter.overflow
                 }
-                val head = player.playbackHeadFrames()
-                val playhead = clock.update(head) ?: jitter.nextTs
-                code = jitter.pull(playhead, payload)
-                // 延迟估算：播放头那一帧是多久以前到达的
-                arrivalNanos = jitter.arrivalNanosAt(playhead)
-                // 漂移校正看总缓冲：抖动缓冲里排队的 + 已写进 AudioTrack 还没播的
-                val queuedMs = (player.pendingFrames(head) * 1000L /
-                    Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
-                waterMs = jitter.waterMs() + queuedMs
+                head = player.playbackHeadFrames()
+                // Android 没有独立 PCM 环：解码输出直接阻塞写进 AudioTrack，
+                // 所以"已解码未播完"的只有播放缓冲这一段，ring 恒为 0。
+                // 生产节流因此天然由 writeBlocking 承担，水位只做缺口判定。
+                val pipeFrames = player.pendingFrames(head)
+                pipeMs = (pipeFrames * 1000L / Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
+                code = jitter.pull(0, pipeMs, payload)
+                // 可听点之前还压着的媒体量（设备帧 → 媒体样本要用当前比率换算）
+                val queuedMedia = (pipeFrames.toDouble() * resampler.ratio).toLong()
+                val audibleTs = (jitter.nextTs - queuedMedia).coerceAtLeast(0L)
+                // 延迟估算：可听点那一帧是多久以前到达的
+                arrivalNanos = jitter.arrivalNanosAt(audibleTs)
+                // 单一口径水位：抖动缓冲 + 解码/播放缓冲（声卡已接手的那段）
+                waterMs = jitter.waterMs() + pipeMs
                 pulledLen = jitter.pulledLength
-                pulledTs = jitter.pulledTs
+                // ── 前馈：最新到达包的时间戳 + 到达时刻 ──
+                val newestTs = jitter.highestTsValue()
+                if (newestTs > fedTs) {
+                    val at = jitter.arrivalNanosAt(newestTs)
+                    if (at > 0L) {
+                        rate.observe(newestTs, at)
+                        fedTs = newestTs
+                    }
+                }
             } finally {
                 linkLock.unlock()
             }
@@ -972,32 +985,40 @@ class CaptureService : Service() {
                     )
                 }
                 dec.reset()
-                clock.reset()
                 drift.reset()
+                // 前馈估计器的基准是 highestTs，重同步会重建它，必须同处复位
+                rate.reset()
                 resampler.reset()
                 player.flush()
-                mediaSamples = 0
+                fedTs = 0
             }
 
-            // ── 漂移校正：比率微调（每 10 ms）+ 有界回落（每秒 ≤1 次）──
-            val du = drift.update(waterMs, mediaSamples)
-            resampler.setAdjust(du.adjust)
+            // ── 比率 = 前馈(管速率) × 反馈(管相位)：两条支路互不污染 ──
+            val ff = rate.feedforward() ?: 0.0
+            val du = drift.update(waterMs, head)
+            adjust = (1.0 + ff) * (1.0 + du) - 1.0
+            // 两支路相合后仍须守比率钳位：前馈和反馈各自钳过了，乘积可能越界。
+            adjust = adjust.coerceIn(
+                -Udp2CalProtocol.RESAMPLE_MAX_ADJUST,
+                Udp2CalProtocol.RESAMPLE_MAX_ADJUST,
+            )
+            resampler.setAdjust(adjust)
 
             // ── 总延迟估算 ──
             // 口径：正在播放的那一帧是多久以前到达本机的。AudioTrack 的播放头
             // 已是"混音器消费到的位置"，所以这个年龄天然包含播放缓冲，
             // 只少一个混音周期（5–20 ms，公开 SDK 无法读出）。
-            if (arrivalNanos > 0) {
+            if (arrivalNanos > 0L) {
                 val ageMs = ((System.nanoTime() - arrivalNanos) / 1_000_000L).toInt()
                 latencyMs = ageMs.coerceAtLeast(0)
                 val now = System.currentTimeMillis()
                 if (now - lastLatencyLog >= 10_000) {
                     lastLatencyLog = now
+                    val ffPpm = ff * 1e6
                     Log.i(
                         TAG,
-                        "反向延迟≈${latencyMs}ms 水位=${waterMs}ms " +
-                            "比率微调=${"%.3f".format(du.adjust * 100)}% " +
-                            "回落=${drift.slipDrops + drift.slipInserts}次"
+                        "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${Udp2CalProtocol.WATER_TARGET_MS}）" +
+                            " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(rate.sigmaPpm())}ppm ${rate.usedBuckets()}桶）"
                     )
                 }
             }
@@ -1005,61 +1026,36 @@ class CaptureService : Service() {
             when (code) {
                 Udp2CalProtocol.Pull.PACKET -> {
                     val n = dec.decode(payload, 0, pulledLen, pcm)
-                    if (n <= 0) continue // 解码失败按丢包处理，播放头到期后 PLC
-                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
-
-                    var frames = n / 2
-                    // 媒体时间按**解码出的帧数**推进（回落不改媒体时间线，只改设备帧数）
-                    val mediaFrames = frames
-                    // 有界回落：只在真实 PCM 帧上做，且必须交叉淡化
-                    var buf = pcm
-                    if (du.slipSamples > 0) {
-                        val nf = PcmSlip.drop(pcm, frames, du.slipSamples)
-                        clock.notePcmCorrection((frames - nf).toLong())
-                        frames = nf
-                    } else if (du.slipSamples < 0) {
-                        val nf = PcmSlip.insert(pcm, frames, slipBuf, -du.slipSamples)
-                        clock.notePcmCorrection(-(nf - frames).toLong())
-                        buf = slipBuf
-                        frames = nf
-                    }
-
-                    // 比率微调：连续量，不留接缝
-                    val produced = resampler.process(buf, 0, frames)
+                    if (n <= 0) continue // 解码失败按丢包处理，水位见底后 PLC
+                    // PLC 帧和真实帧走同一条时间线，所以都过同一个重采样器
+                    val produced = resampler.process(pcm, 0, n / 2)
                     if (produced > 0) {
                         if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
-                        clock.noteRatioCorrection((produced / 2) * du.adjust)
-                    } else {
-                        if (!player.writeBlocking(buf, 0, frames * 2)) return
-                        clock.noteRatioCorrection(frames * du.adjust)
                     }
-                    mediaSamples += mediaFrames
                 }
 
                 Udp2CalProtocol.Pull.PLC -> {
                     val n = dec.plc(pcm)
-                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
                     if (n > 0) {
-                        // PLC 帧同样要过重采样器：它和真实 PCM 走同一条时间线
                         val produced = resampler.process(pcm, 0, n / 2)
                         if (produced > 0) {
                             if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
-                            clock.noteRatioCorrection((produced / 2) * du.adjust)
-                        } else if (!player.writeBlocking(pcm, 0, n)) {
-                            return
                         }
-                        mediaSamples += n / 2
                     } else {
-                        if (!player.writeBlocking(silence, 0, silence.size)) return
-                        mediaSamples += silence.size / 2
+                        // 生成不出 PLC：补静音，同样过重采样器以保持相位连续
+                        val produced = resampler.process(silence, 0, silence.size / 2)
+                        if (produced > 0) {
+                            if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                        }
                     }
                 }
 
                 Udp2CalProtocol.Pull.SILENCE -> {
                     // 连续 PLC 已达上限：输出静音但继续推进媒体时间
-                    if (!clock.isStarted) clock.start(pulledTs, player.playbackHeadFrames())
-                    if (!player.writeBlocking(silence, 0, silence.size)) return
-                    mediaSamples += silence.size / 2
+                    val produced = resampler.process(silence, 0, silence.size / 2)
+                    if (produced > 0) {
+                        if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                    }
                 }
 
                 else -> {

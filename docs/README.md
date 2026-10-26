@@ -1,6 +1,6 @@
 # UDP2CAL 文档中心
 
-> 当前版本 **v1.2.0**（协议 v3）· 本目录是项目技术文档的唯一入口。
+> 当前版本 **v1.3.0**（协议 v3）· 本目录是项目技术文档的唯一入口。
 >
 > UDP2CAL 是双向、低延迟的局域网音频串流系统：Android 手机与 Windows PC 之间
 > 通过**私有控制面 + 标准 RTP/Opus 媒体面**（协议 v3）互传音频流。
@@ -17,6 +17,7 @@
 | 要自己编译 | [BUILD.md](BUILD.md) | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | 要改协议 / 加一端 | [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) | [ARCHITECTURE.md](ARCHITECTURE.md) → [BUGFIX.md](BUGFIX.md) |
 | 要查延迟 / 爆音 | [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | [BUGFIX.md](BUGFIX.md) |
+| 要改音频同步 / 漂移校正 | [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) §7.9–§7.10 | [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5 → [archive/PLAN_ASRC_REFACTOR.md](archive/PLAN_ASRC_REFACTOR.md)（为什么这么设计） |
 | 要发布 / 合规 | [BUILD.md](BUILD.md) §五 · [LEGAL.md](LEGAL.md) | [CHANGELOG.md](CHANGELOG.md) |
 
 ---
@@ -25,15 +26,15 @@
 
 | 文档 | 一句话 | 读者 |
 | --- | --- | --- |
-| [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) | **现行协议规范**：RTP 媒体面、控制面、抖动缓冲与播放头时钟、常量与验收 | 协议实现者 |
+| [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) | **现行协议规范**：RTP 媒体面、控制面、抖动缓冲与水位/比率控制、常量与验收 | 协议实现者 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 项目结构、技术栈、运行时行为、**代码落在哪**、命名约定 | 维护者、二次开发者 |
 | [FEATURES.md](FEATURES.md) | 两端功能清单、Opus 参数说明、界面截图 | 使用者、调参用户 |
 | [BUILD.md](BUILD.md) | 环境要求、`build.bat` 全部命令、产物清单、构建排障 | 首次构建者、发布者 |
-| [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟的三个口径、`playhead_ts` 与 DMA 缓冲、一次实测校准的流程 | 排障者、调优 |
+| [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟口径（`water_ms`/`pipe_ms`/`audible_ts`）、DMA 缓冲、实测校准、P0 高频诊断与**本环境实测基线** | 排障者、调优 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史与重大变更（按版本倒序） | 全部 |
 | [BUGFIX.md](BUGFIX.md) | **现行代码**的 bug 根因档案 | 全部 |
 | [LEGAL.md](LEGAL.md) | 版权、GPL-3.0、第三方组件许可 | 分发者、合规审查 |
-| [archive/](archive/README.md) | 历史存档：v2 协议、迁移计划、旧修复记录、历次审查报告 | 追溯 |
+| [archive/](archive/README.md) | 历史存档：v2 协议、迁移计划、ASRC 重构计划、旧修复记录、历次审查报告 | 追溯 |
 
 ---
 
@@ -49,6 +50,7 @@
 | 用户能感知的功能与调参项 | `FEATURES.md` | — |
 | 某版本改了什么 | `CHANGELOG.md` | 一句话概括 + 链接 |
 | 某个 bug 为什么发生 | `BUGFIX.md` | 一句话概括 + 链接 |
+| 改进路线、阶段划分、验收门 | `archive/PLAN_ASRC_REFACTOR.md`（已完成归档） | 写"见 PLAN §x"，不复制阶段表 |
 | 构建命令与产物 | `BUILD.md` | — |
 
 > 判定标准：**读者会照着它写代码吗？** 会 → 协议规范；只想知道"为什么"或"在哪里" → 其他文档。
@@ -71,6 +73,7 @@ docs/
 ├─ archive/                   # 历史存档（不维护，不作为规范引用；见 archive/README.md）
 │  ├─ PROTOCOL_V2.md                   # v2 协议（与 v3 不互通）
 │  ├─ PLAN_V3_MIGRATION.md             # v2→v3 迁移计划与逐文件清单（已完成）
+│  ├─ PLAN_ASRC_REFACTOR.md            # 音频同步向纯 ASRC 收敛的五阶段计划（已完成）
 │  ├─ BUGFIX_V2_ERA.md                 # v3 重写之前的 bug 记录
 │  ├─ CODE_REVIEW_2026-10-23.md        # 第一轮审查（43 项）
 │  ├─ CODE_REVIEW_ROUND2_2026-10-23.md # 第二轮审查（24 项）

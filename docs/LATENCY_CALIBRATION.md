@@ -1,7 +1,7 @@
 # 总延迟实测校准
 
 > 适用：协议 v3（RTP/Opus，固定 10 ms 帧）。
-> 目标：把"总延迟估算"的绝对值钉准一次，并确认 `playhead_ts` 到底含不含声卡 DMA 缓冲。
+> 目标：把"总延迟估算"的绝对值钉准一次，并确认 `audible_ts` 到底含不含声卡 DMA 缓冲。
 
 ---
 
@@ -9,14 +9,15 @@
 
 | 量 | 含义 | 获取方式 |
 | --- | --- | --- |
-| `water` | 抖动缓冲 + 输出环里排队的音频时长 | 接收端自算（`filled_frames` + `waterMs`） |
+| `water_ms` | 抖动缓冲 + 解码环 + 声卡缓冲（**单一口径**） | 接收端自算：`jb.water_ms() + ring_ms + device_latency_ms` |
 | `device_latency_ms` | 数据填进声卡缓冲到真正发声的时间 | cpal `timestamp().playback − .callback` 实测 |
-| `total_latency` | 正在播放的那一帧"到达本机"到"出声"的时长 | `now − arrival(playhead_ts) + device_latency_ms` |
+| `total_latency` | 正在播放的那一帧"到达本机"到"出声"的时长 | `now − arrival(audible_ts) + device_latency_ms` |
 
-必须明确：**`playhead_ts` 默认不含 DMA 缓冲**。cpal 输出回调每填一次缓冲就把
+必须明确：**`played_frames` 不含 DMA 缓冲**。cpal 输出回调每填一次缓冲就把
 `played_frames` 前移，而这段数据还要经过 WASAPI 引擎缓冲 + DMA 才出声。
-代码里已经用 `device_latency_frames()` 把它扣掉，使播放头对应**可听位置**。
-`device_latency_ms` 就是从回调时间戳实测出来的那个差值。
+代码里把 `device_latency_frames()` 并进 `pipe_ms`，`audible_ts` 用
+`jb.next_ts() − (ring_frames + device_latency_frames) × current_ratio()` 换算，
+因此它对应**可听位置**。`device_latency_ms` 就是从回调时间戳实测出来的那个差值。
 
 `total_latency` **不含**发送端采集→发包与单程网络时延——没有跨设备时钟就测不出来。
 所以它是"这段音频到了本机之后又等了多久"，是个下界。
@@ -28,16 +29,18 @@
 启动后每 10 s 会有一行日志：
 
 ```
-[Latency] 总延迟≈68ms（水位 57ms + 声卡 11ms）比率微调 +0.012% 回落 0 次
+[Latency] 总延迟≈280ms（水位 277ms = 抖动 220 + 解码 44，目标 260）声卡 10ms 比率 -0.005%（反馈 -46ppm / 前馈 +4ppm，σ 13.0ppm，24 桶）
 ```
 
 判读：
 
 | 现象 | 结论 |
 | --- | --- |
-| 水位在 50–65 ms 之间小幅波动 | 正常。受控重采样把水位钉在死区内 |
-| 比率微调长期顶在 ±0.500% | 两端时钟差超过 5000 ppm，或水位一直在被外部因素推走——检查是否有进程在改设备采样率 |
-| 回落计数持续增长 | 重采样没能收住，需要看比率是否已经顶满（正常网络下应为 0） |
+| 水位在 65–75 ms 之间小幅波动，标准差 <3 ms | 正常。PI 把水位钉在目标上（无静差） |
+| 比率长期顶在 ±0.500% | 两端时钟差超过 5000 ppm，或水位在被外部因素推走——检查是否有进程在改设备采样率 |
+| 前馈长期贴 ±20000ppm | 说明不是钟差而是阶跃（改采样率/节拍重置），应走 resync |
+| `σ` 长期很大（>200ppm）或桶数不涨 | 到达时刻观测不足（丢包严重/包间隔异常），前馈在裸奔，只剩 PI |
+| 反馈量长期顶满而前馈≈0 | 有持续偏差没被前馈吸收（前馈窗口没攒够，或 ts 基准刚被 resync 重置） |
 | `声卡 0ms` | cpal 该后端未提供 `playback` 时间戳（换 WASAPI 独占/共享后再看） |
 
 ---
@@ -70,7 +73,7 @@ WASAPI 的 `IAudioClock` 是驱动自己的采样计数，`playback − callback
 4. 在录音里量出"1 kHz 的起始沿"相对录音文件起点的位置——由于录音起点与日志
    不同源，这一步只能测**变化量**：
    - 记下稳态 `total_latency = L1`，以及录音里的相位基准 `P1`；
-   - 临时把 `JITTER_TARGET_MS` 改成 120 重新编译（水位抬高 60 ms），
+   - 临时把 `WATER_TARGET_MS` 改成 320 重新编译（水位抬高 60 ms），
      记录 `total_latency = L2` 与 `P2`；
    - 检查 `(P2 − P1)` 是否 ≈ `(L2 − L1)`。相等即证明播放头换算与
      `device_latency` 的符号、量级都正确。
@@ -97,9 +100,9 @@ displayed_latency = total_latency + C
 | 观测量 | 期望 | 不满足时 |
 | --- | --- | --- |
 | `device_latency_ms` | 10–30 ms（10 ms 缓冲 + 一个混音周期） | 恒 0 → 后端无时间戳，按 20 ms 兜底即可 |
-| 水位变化 Δ 与录音延迟变化 Δ 一致 | \|差\| ≤ 5 ms | 检查是否把 `played_frames` 与 `audible` 混用（差一个 `device_latency`） |
+| 水位变化 Δ 与录音延迟变化 Δ 一致 | \|差\| ≤ 5 ms | 检查是否把 `played_frames` 与 `pipe_ms` 混用（差一个 `device_latency`） |
 | 稳态 `total_latency` | 60–75 ms | >120 ms 先看水位，再看声卡缓冲 |
-| 回落计数（10 s 内） | 0 | 非 0 说明重采样没收住，检查比率是否顶满 |
+| 反馈量（10 s 内） | \|Δu\| 收敛到 100ppm 以内 | 一直顶满说明前馈没工作，检查 `σ`/桶数 |
 
 ---
 
@@ -109,5 +112,46 @@ displayed_latency = total_latency + C
   自洽性检查，不是物理延迟。
 - **不要**为了压低延迟把 `JITTER_START_MS` 调到 20 ms 以下：Wi-Fi 的调度抖动
   经常超过 10 ms，会把延迟换成 PLC 破音。
-- **不要**用离散丢/插去追水位：那是 2026-10 之前的老做法，已被受控重采样取代
-  （见 `PROTOCOL_V3_RTP.md` 7.9）。
+- **不要**用离散丢/插去追水位：那是 2026-10 之前的老做法，代码里已整条删除
+  （`SLIP_*`、`slip_drop`/`slip_insert`、Kotlin `PcmSlip`），现在只有重采样比率
+  一个执行手段（见 `PROTOCOL_V3_RTP.md` 7.9）。
+- **不要**为了"更快收敛"把 `PI_TI_S` 调到 5 s 以下：积分会开始跟着网络抖动走，
+  听感立刻变成慢速颤音。
+
+---
+
+## 5. 高频诊断（P0 基线，实机微调用）
+
+设环境变量 `UDP2CAL_ASRC_DIAG=<采样周期 ms>`（例如 `20`）启动 Windows 端，
+会在 `%LOCALAPPDATA%\UDP2CAL\asrc_diag.csv` 覆盖写出一份最多 300 s 的原始序列：
+
+```
+t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,buckets,played_s,highest_ts,next_ts,plc,underrun
+```
+
+用途（不需要外部设备）：
+
+- `water_ms` 的均值/标准差 → 判断稳态是否真钉在目标、抖动有多大；
+- `adjust_ppm` / `ff_ppm` → 看反馈是否收敛到 0、前馈是否稳定（钟差应是小常数）；
+- `sigma_ppm` 与 `buckets` → 判断前馈有没有可用的观测窗；
+- `plc` 增长 → 供水不足（水位太低或网络抖动超出缓冲）。
+
+### 5.1 已知环境基线（2026-10-26，Android + Wi-Fi + VB-Cable 48 kHz）
+
+| 观测 | 值 | 含义 |
+|------|-----|------|
+| 长期到达率 | 99.99 帧/s | 发送端节拍正常 |
+| 单次到位突发 | 中位 9 帧 = **90 ms**，约每 1.2 s 一次 | 包被 AP/Wi-Fi 成批交付 |
+| 周期性断供 | 每隔几十秒一次 **~200 ms** | 断供期只能依靠 PLC，随后十几帧一起到 |
+| `ff_ppm` | 中位 4，`σ` 中位 13 | 两端晶振差可忽略 |
+| `ring_ms` | 40–49（中位 44） | 解码节流在 `DECODE_LIMIT_MS` 上下正常振荡 |
+| `jb_ms` | 中位 220（170–270，尖峰可达 440） | 本环境必须的抖动缓冲，由断供幅度决定 |
+
+结论：`WATER_TARGET_MS` 必须 ≥ 解码环 + 声卡 + **断供幅度**，本环境为 **260 ms**（总延迟约 275–285 ms）。
+把目标压到 70 ms 会让 PI 永久顶满 `RESAMPLE_MAX_ADJUST`（实测 +3684 ppm，即常年 ~6 音分
+变调）、水位在 120–306 ms 之间慢锯、PLC 升到 3–8 次/分；260 ms 下水位中位 275–284 ms、
+PLC 0.4–1.1 次/分、反馈量中位接近 0，且不再长期贴钳位。换环境后请重跑本节的开环采样，
+按实测断供幅度重定 `WATER_TARGET_MS`，**不要靠压低目标去赢延迟**。
+
+判读捷径：若 `adjust_ppm` 长时间贴在 ±5000，说明目标不可达（或者真有超过 ±0.5% 的钟差）；
+`ff_ppm` 大跳后自行归零属正常（时间线重建，`RATE_JUMP_MAX_SAMPLES` 会作废旧窗口）。

@@ -14,9 +14,9 @@ udp2cal/
 │     │  ├─ MainActivity.kt          # Compose UI + 运行时权限申请
 │     │  ├─ DiscoveryManager.kt      # 局域网广播发现
 │     │  ├─ UdpSender.kt             # 主 socket：CONNECT + 正向 RTP；独立 ACK 线程；反向 socket 只收 RTP
-│     │  ├─ Udp2CalProtocol.kt       # 控制 v3 + RTP + 抖动缓冲 + 播放头（与 Rust 端逐字节对齐）
+│     │  ├─ Udp2CalProtocol.kt       # 控制 v3 + RTP + 抖动缓冲 + 水位/比率控制（与 Rust 端逐字节对齐）
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
-│     │  ├─ StreamResampler.kt       # 反向流的受控重采样 + 有界回落的交叉淡化
+│     │  ├─ StreamResampler.kt       # 反向流的受控重采样（32 相 × 48 抽头多相 FIR）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
 │     │  ├─ service/CaptureService.kt# 前台采集服务（采集/控制/反向接收/反向播放 四路并发，无 PCM 队列）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
@@ -161,7 +161,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 - 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/SSRC/反向端口变化、
   反向编码配置变更、发送错误计数、每 30 s 一次的音频统计（块数/重采样/丢样/欠载、
   总延迟与比率微调）与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）、
-  每 10 s 一行的延迟构成分解（水位 + 声卡 + 回落次数）
+  每 10 s 一行的水位分解（抖动缓冲 + 解码环 + 声卡）、比率与反馈/前馈量
 - UI 底部为**单行**状态行，按连接状态切换内容（三种状态互斥，永远只占一行）：
   - 未启动：`广播地址: 255.255.255.255:44043`
   - 已启动未连上：`广播地址…` + `● 广播中`（被占用静默时显示 `● 已静音`）
@@ -266,18 +266,18 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 ### 关键实现点（规则本身见协议第七章）
 
-> 参数值（目标水位、回落带、比率上限）、状态机、算法步骤一律以
+> 参数值（目标水位、PI 增益、前馈窗、比率上限）、状态机、算法步骤一律以
 > [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) 第七章为准，本节**不复制**——
 > 两处各写一份的结果就是慢慢跑偏。
 
 | 机制 | 位置 | 为什么必须这样 |
 | --- | --- | --- |
-| 播放头取**可听位置** | `main.rs` 解码线程：`audible = played_frames − device_latency_frames()` | `played_frames` 是"交给驱动"的位置，还要过一个引擎缓冲 + DMA 才出声；不减这一项，PLC 会提前一个缓冲长度触发 |
+| 水位只用**一个口径** | `main.rs` 解码线程：`water = jb.water_ms() + ring_ms + device_latency_ms` | 抖动缓冲、解码环、声卡缓冲三段都是"可听点之前压着的媒体量"，加在一起才等于真实排队时长；分开算就会互相打架，需要偏移记账去补 |
 | 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：cpal 0.15.3 把帧数换算成 `hnsBufferDuration` 时少乘 100 |
-| 预解码深度 ≤40 ms | `main.rs`：`filled_frames() >= max_depth` 就 park 4 ms | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到播放头前面几百毫秒，恢复后真包全被判迟到 |
+| 预解码深度 ≤40 ms | `rtp::JitterBuffer::pull`：`ring_ms >= DECODE_LIMIT_MS` 就返回 `Wait` | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到可听点前面几百毫秒，恢复后真包全被判迟到 |
 | 回调唤醒解码线程 | `audio.rs`：`thread.unpark()` | 播放头前移本身就是"该拉下一帧"的信号，不需要定时器 |
-| 两级漂移校正 | `main.rs` 每帧调 `rtp::DriftController::update` | 第一级改重采样比率（连续、无接缝），第二级 1 ms/s 有界回落兜底 |
-| 比率校正的时间偏移 | `PlayheadClock::note_ratio_correction(f64)` | 每帧只有 2.4 个样本的校正量，逐帧取整会吃掉 17%，水位与播放头会缓慢背道而驰 |
+| 前馈管速率 + 反馈管相位 | `rtp::RateEstimator` / `rtp::DriftController` 每帧调用 | 钟差（晶振/温度）是慢变量，用 30 s 观测窗回归出 `r̂` 前馈掉；剩下的相位误差由 PI 修，因此比率工作点永远在 0 附近，不会把抖动放成变调 |
+| 没有播放头，也没有偏移记账 | 旧 `PlayheadClock`（base/余数/offset/`note_*`）已删除 | 一旦存在"设备帧↔媒体时间戳"换算，就必须记住偏移；改为纯水位口径后，`played_frames` 不参与任何播放判定，换算链与三处补丁一起消失 |
 | flush 只投递请求 | `audio.rs::Ring::request_flush` | `tail` 归消费者所有；生产者直接写会让 `len()` 回绕成 `usize::MAX`，解码线程永久停产（静默死锁） |
 | 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后 >4 帧重置而非补发 |
 

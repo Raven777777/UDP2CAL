@@ -4,8 +4,77 @@
 
 ---
 
+## v1.3.0 — 2026-10-26 · ASRC 重构：单一时钟、单一口径、单一手段
+
+> 按 [archive/PLAN_ASRC_REFACTOR.md](archive/PLAN_ASRC_REFACTOR.md) 的 P0–P5 落地。协议**行为**有三处变化：
+> 目标水位口径改为总水位（`JITTER_TARGET_MS` 60 → `WATER_TARGET_MS`，含声卡缓冲）、
+> 目标值按实机测量定为 **260 ms**（总延迟约 275 ms，见下「实机微调」）、
+> 解码节流改由 `rtp::JitterBuffer::pull` 内部按解码缓冲判定。
+> 两端必须成对升级：`JitterBuffer::pull` 签名从「播放头时间戳」改为「两级水位」。
+
+**架构：一个时钟、一个观测量、一个执行手段（P4）**
+- 删除 `PlayheadClock` 全套（base / 余数累加 / `offset` / `offset_frac` / `note_pcm_correction` /
+  `note_ratio_correction`）：不再存在「设备帧 → 媒体时间戳」的换算链，也不再需要记住偏移
+- 删除第二级有界回落：`Slip`、`slip_drop` / `slip_insert`、升余弦淡化几何、8 个 `SLIP_*` 常量、
+  Kotlin `PcmSlip` 全部移除。重采样比率成为唯一执行手段
+- 调度判据全部改为水位：`ring_ms >= DECODE_LIMIT_MS` → 暂停生产；
+  `pipe_ms <= PLC_LEAD_MS` → 补 PLC。`played_frames` 不再参与任何播放判定
+- 水位口径统一为 `water_ms = jb.water_ms() + ring_ms + device_latency_ms`（P1 的遗留不一致：
+  控制目标不含声卡、PLC 截止点却扣了声卡，等效把 60 ms 目标悄悄抬到 70–80 ms）
+- 诊断口径重建：`audible_ts = jb.next_ts() − (ring+device frames) × current_ratio()`
+
+**漂移校正：前馈管速率 + 反馈管相位（P3）**
+- 新增 `RateEstimator`：`(highest_ts, 到达时刻)` 观测对 → 每 1 s 一个桶只留**最小单向时延**
+  （NTP min-filter 同源，排队不影响）→ 30 s 窗最小二乘拟合出钟差 `r̂`（钳 ±2%）与 σ（ppm）。
+  桶数不足 6 个不发布估计；`resync`/epoch 变化与 `highest_ts` 同处 `reset()`
+- `DriftController` 从「死区 + 线性满幅 + 逐次步进」改为**抗饱和 PI**：
+  `PI_KP_PER_MS=0.00005`、`PI_TI_S=10`（≥5 s 才不把抖动积成变调）、`PI_MIN_UPDATE_MS=5`；
+  计时改用**声卡已消费帧数**（断流时媒体时间不前进，用它会冻结积分）；低通与限速都按真实 `dt` 缩放
+- 合成 `ratio = base_ratio × (1+ff) × (1+Δu)`：频率误差被前馈吃掉，反馈只修相位，
+  工作点永远在 0 附近，稳态无静差
+
+**重采样器：两点线性插值 → 多相 FIR（P2）**
+- `audio.rs` / `StreamResampler.kt` 改为 **32 相 × 48 抽头 Kaiser 窗 sinc**（`CUTOFF=0.42`、`β=10`，
+  每相按 DC 归一），每声道保留 49 样本历史，跨块相位连续
+- 删除 `|ratio−1| < 1e-9` 的直通分支：直通与插值两条路径的群延迟不同（≈0.49 ms），
+  切换本身就是一次跳变；恒定群延迟无害，且 12 kHz 幅度响应从 −3 dB 抖动降到 <0.1 dB
+- 新增验收测试：`resampler_12k_amplitude_is_flat`（±0.005 比率下 12 kHz 幅度波动 <0.1 dB）
+
+**实机微调（P0 采样，2026-10-26）**
+- `JitterBuffer::water_ms()` 改用 `highest_ts − next_ts`：旧的「从 `next_ts` 起连续可解帧数」
+  在队首乱序时瞬间塌到 0（3.4 万样本中 39 次），每次都会让 PI 误判「缓冲空了」而反向拉满比率
+- `RateEstimator` 新增 `RATE_JUMP_MAX_SAMPLES`（2 s）：`highest_ts` 突跳（手机重连/断流补齐）
+  而 `epoch` 未必变，旧窗口继续回归会出 ±2000 ppm 假前馈；超限直接整窗作废重算
+- `WATER_TARGET_MS` 70 → **260**：网络长期到达率刚好 100 帧/s（发送端无锅），但会成批交付
+  （中位 9 帧 = 90 ms）且每隔几十秒**断供 ~200 ms**（断供期只能靠 PLC 顶），而比率排水
+  只有 5 ms/s。三轮对比：目标 70 时 PI 永久顶满 +0.5%（+3684 ppm ≈ 常年 6 音分变调）、
+  水位 120–306 ms 慢锯、PLC 3–8 次/分；目标 210 时 PLC 1.7 次/分但尖峰仍能到 500 ms；
+  目标 260 时水位中位 277 ms、max 328 ms、PLC 0.4 次/分、反馈量中位 −46 ppm、从未贴近钳位
+- 环境结论：总延迟里约 230 ms 是本环境（Wi-Fi 省电 + AP 缓冲）必须的抖动缓冲；减小它只能
+  在网络侧动（关手机 Wi-Fi 省电 / 5 GHz / USB 网络共享），不要靠压低目标去「赢」延迟
+
+**诊断（P0）**
+- 新增 `windows/src/diag.rs`：`UDP2CAL_ASRC_DIAG=<周期 ms>` 时把 `ring_ms/pipe_ms/jb_ms/water_ms/
+  adjust_ppm/ff_ppm/sigma_ppm/buckets/played_s/highest_ts/next_ts/plc/underrun` 写入
+  `%LOCALAPPDATA%\UDP2CAL\asrc_diag.csv`（最多 300 s），供实机调参用
+
+**日志**
+- 10 s 延迟行改为：`[Latency] 总延迟≈Nms（水位 W = 抖动 A + 解码 B，目标 260）声卡 C ms
+  比率 ±x.xxx%（反馈 ±a ppm / 前馈 ±b ppm，σ c ppm，d 桶）`
+- 30 s 统计行去掉「有界回落」，改为反馈/前馈量与估计器精度
+
+**测试**
+- Rust（protocol）56 项、Windows 20 项、Kotlin 50 项全绿；
+  新增 PI 闭环仿真（`plant_step`）、估计器合成观测（`feed_estimator`）、调度阈值序断言
+
+---
+
 ## 未发布 — 2026-10-25 · 漂移校正换代：受控重采样 + 有界回落
 
+> **已被上一条的 v1.3.0 ASRC 重构取代**：本节引入的「有界回落」（`SLIP_*`、PcmSlip）
+> 已整条删除，两点线性插值也已换为多相 FIR。保留本节仅为追溯当时的产品变更
+> （码率、预缓冲门槛、发送端节拍整形），这三项仍然有效。
+>
 > 协议**行为**有三处变化：预缓冲门槛 40 → 30 ms、发送端新增 1 帧节拍整形、
 > **码率上限 1000 → 512 kbps**。两端仍需成对升级。
 > 规范同步修订：`PROTOCOL_V3_RTP.md` 4.7 / 7.2 / 7.7 / 7.9 / 7.10 / 7.14 / 8.1 / 九。

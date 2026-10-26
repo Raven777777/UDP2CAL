@@ -1,16 +1,19 @@
 ﻿// 无锁 PCM 环 + cpal 输出回调
 //
-// v3 的时钟模型只有一条规则：**声卡播放头是唯一音频时钟**。
-// 因此本模块只做四件事：
+// v3 的时钟模型只有一条规则：**声卡是唯一音频时钟**。因此本模块只做四件事：
 //   1. 提供一个无锁 SPSC 环，解码线程写、音频回调读；
-//   2. 在回调里统计"真正交给声卡播放的帧数"（`played_frames`），供播放头换算；
+//   2. 在回调里统计"真正交给声卡的帧数"（`played_frames`）与声卡自报的
+//      "回调 → 实际发声"延迟（`device_latency_us`）——水位口径的一部分；
 //   3. 把 48 kHz 媒体流按设备采样率做相位连续重采样，比率可被解码线程
-//      在 ±0.5% 内微调（漂移校正的**主力手段**，见 `set_ratio_adjust`）；
-//   4. 上报声卡自报的"回调 → 实际发声"延迟（`device_latency_us`），
-//      用于回答"playhead_ts 到底含不含 DMA 缓冲"。
+//      在 ±0.5% 内微调（漂移校正的**唯一手段**，见 `set_ratio_adjust`）；
+//   4. 把"还剩多少毫秒没播"如实报出来（`filled_frames`），供调度与控制器用。
 //
-// 离散的丢/插不在这里决策：由解码线程根据抖动缓冲水位决定，
-// 并通过 `PlayheadClock::note_pcm_correction` 回写媒体时间偏移。
+// 重采样是多相 FIR（`RESAMPLE_PHASES` × `RESAMPLE_TAPS`）：两点线性插值的
+// 幅度响应是 |cos(ω/2)|，相位扫到半个样本时 12 kHz 掉 3 dB、24 kHz 全陷；
+// 而比率微调一启动相位就一直在扫。多相 FIR 的误差只取决于相位表密度，
+// 与比率无关，也不存在"比率恰好为 1 就直通"的特例。
+//
+// 本模块**不做**任何离散丢样/插样：水位只由比率这一条连续量控制。
 use crate::protocol::rtp;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
@@ -150,16 +153,20 @@ pub struct AudioWriter {
     /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
     waker: Arc<OnceLock<Thread>>,
 
-    // ── 相位连续流式重采样器 ──
-    phase: f64,
+    // ── 相位连续多相 FIR 重采样器 ──
+    /// 当前输出点落在输入上的连续位置（源样本，可为负＝仍落在历史段）
+    pos: f64,
     /// 固定比率 = 源采样率 / 设备采样率（不含微调）
     base_ratio: f64,
     /// 比率微调量（±0.005），由漂移控制器每 10 ms 写入一次
     adjust: f64,
     /// 当前输入采样率（0 = 尚未收到数据）
     source_rate: u32,
-
-    // ── 复用重采样缓冲区，消除高频堆分配 ──
+    /// 上一块的尾段（`RESAMPLE_HIST` 个源样本），供跨块插值
+    hist: Vec<f32>,
+    /// `hist ++ pcm` 拼接缓冲，复用避免高频分配
+    work: Vec<f32>,
+    /// 复用输出缓冲区，消除高频堆分配
     resample_buf: Vec<f32>,
 }
 
@@ -230,16 +237,9 @@ impl AudioWriter {
         ((self.device_latency_frames() * 1000) / self.device_rate.max(1) as u64) as u32
     }
 
-    /// 环里还能放下多少帧（设备帧）
-    #[inline]
-    #[allow(dead_code)]
-    pub fn space_frames(&self) -> usize {
-        self.ring.capacity().saturating_sub(self.ring.len())
-    }
-
     /// 环里已排队、尚未被声卡消费的帧数（设备帧）。
     /// 解码线程用它把"预解码深度"钉在几十毫秒内——这正是把 PLC
-    /// 与播放头绑定的前提：生产速度必须被消费速度约束。
+    /// 与水位绑定的前提：生产速度必须被消费速度约束。
     #[inline]
     pub fn filled_frames(&self) -> usize {
         self.ring.len()
@@ -249,7 +249,16 @@ impl AudioWriter {
     pub fn flush(&mut self) {
         // tail 归音频回调所有：这里只能投递请求，由回调落地
         self.ring.request_flush();
-        self.phase = 0.0;
+        self.reset_filter();
+    }
+
+    /// 清空重采样器状态：相位归零、历史段置零（新数据从静音淡入）
+    fn reset_filter(&mut self) {
+        self.pos = 0.0;
+        for s in self.hist.iter_mut() {
+            *s = 0.0;
+        }
+        self.work.clear();
     }
 
     /// 设置重采样比率微调量（±0.5%）。
@@ -271,7 +280,7 @@ impl AudioWriter {
 
     /// 当前生效的重采样比率（含微调）
     #[inline]
-    fn current_ratio(&self) -> f64 {
+    pub fn current_ratio(&self) -> f64 {
         (self.base_ratio * (1.0 + self.adjust)).clamp(1e-6, 1e6)
     }
 
@@ -290,7 +299,9 @@ impl AudioWriter {
             self.source_rate = source_rate;
             let r = source_rate as f64 / self.device_rate as f64;
             self.base_ratio = if (0.1..10.0).contains(&r) { r } else { 1.0 };
-            self.phase = 0.0;
+            // 换源采样率＝换了一条输入时间线：清空历史段与相位
+            self.pos = 0.0;
+            self.hist.iter_mut().for_each(|v| *v = 0.0);
         }
         let ratio = self.current_ratio();
 
@@ -298,37 +309,48 @@ impl AudioWriter {
             self.stats.resampled.fetch_add(1, Ordering::Relaxed);
         }
 
-        if (ratio - 1.0).abs() < 1e-9 {
-            let mut written = 0usize;
-            for &s in pcm {
-                if self.ring.push(s) {
-                    written += 1;
-                } else {
-                    self.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            return written;
-        }
-
-        // ── 相位连续线性插值 ──
+        // ── 多相 FIR 插值 ──
         //
-        // 相位恒在 [0, ratio) 内（循环出口条件保证 `phase >= n_in`，故
-        // `phase - n_in >= 0`），因此不存在"负相位外插"问题。
-        // 块尾若落在 [n_in-1, n_in)，`i1` 会钳到 `last`，等效于把末样本多保持
-        // 一个输出点——这是 ≤1 个样本的保持误差，不可闻，且不影响比率精度。
-        let n_in = pcm.len() as f64;
-        let last = pcm.len() - 1;
+        // 输入先与上一块的尾段拼成 `work`；`pos` 是当前输出点落在输入上的连续
+        // 位置（可为负＝仍落在历史段）。只有当抽头窗口完全落在已知数据内时才
+        // 发出样本，因此不存在外插，也不需要"比率恰好为 1 就直通"的分支。
+        let n = pcm.len();
+        self.work.clear();
+        self.work.extend_from_slice(&self.hist);
+        self.work.extend_from_slice(pcm);
+
         self.resample_buf.clear();
-        let mut phase = self.phase;
-        while phase < n_in {
-            let idx = phase as usize;
-            let frac = phase - idx as f64;
-            let i0 = idx.min(last);
-            let i1 = (idx + 1).min(last);
-            self.resample_buf.push((pcm[i0] as f64 + (pcm[i1] - pcm[i0]) as f64 * frac) as f32);
-            phase += ratio;
+        let mut pos = self.pos;
+        if n > RESAMPLE_HALF + 1 {
+            // 窗口右端不得越出本块：base <= n - HALF - 1
+            let limit = n as f64 - RESAMPLE_HALF as f64 - 1.0;
+            let table = coef_table();
+            while pos < limit {
+                let base = pos.floor();
+                // pcm[i] 在 work 中的下标是 i + RESAMPLE_HIST，
+                // 而抽头窗口从下标 base + 1 - HALF 开始
+                let w0 = base as isize + (RESAMPLE_HIST as isize + 1 - RESAMPLE_HALF as isize);
+                let frac = pos - base;
+                let phase = ((frac * RESAMPLE_PHASES as f64) as usize).min(RESAMPLE_PHASES - 1);
+                let coefs = &table[phase];
+                let w0 = w0 as usize;
+                let mut acc = 0.0f32;
+                for (j, &c) in coefs.iter().enumerate() {
+                    acc += c * self.work[w0 + j];
+                }
+                self.resample_buf.push(acc);
+                pos += ratio;
+            }
         }
-        self.phase = phase - n_in;
+        self.pos = pos - n as f64;
+        // 防御：连续收到极小输入块时 `pos` 会一路后退，钳在历史段范围内
+        let floor_pos = -((RESAMPLE_HALF + 1) as f64);
+        if self.pos < floor_pos {
+            self.pos = floor_pos;
+        }
+        // 保存尾段作为下一块的历史
+        let len = self.work.len();
+        self.hist.copy_from_slice(&self.work[len - RESAMPLE_HIST..]);
 
         let mut written = 0usize;
         for &s in &self.resample_buf {
@@ -343,62 +365,82 @@ impl AudioWriter {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 有界回落的 PCM 编辑（P0 安全网）
+// 多相 FIR 插值表
 //
-// 两条铁律：
-//   1. 交叉淡化长度 ≥ 1 ms（48 样本），丢和插都只能在淡化区内完成；
-//   2. 接缝处必须一阶连续 —— 权重用升余弦，两端导数为零，不会留下折角。
-//
-// 几何（以 n=480、k=48 为例）：
-//   丢：把 x[p..p+k] 与 x[p+k..p+2k] 在 k 个样本内交叉，输出 n-k 个样本；
-//   插：把 x[p+k..] 整体后移 k，并在 k 个样本内从 x[p..] 交叉到 x[p-k..]，
-//       输出 n+k 个样本（信号在此"停顿" 1 ms 再继续）。
-// 两种编辑都从上一帧末样本平滑接上、并平滑交接下一帧首样本。
+// 为什么不用两点线性插值：它的幅度响应是 |cos(ω/2)|，相位差半个样本时
+// 12 kHz 掉 3 dB、24 kHz 全陷。而比率微调让相位以 u×Fs 持续扫掠，于是
+// 那 3 dB 变成常年高频颤动（u=0.5% 时约 240 Hz）。多相 FIR 把插值误差
+// 变成纯相位表密度问题（1/(2×32) = 0.016 样本），与比率无关，
+// 12 kHz 的幅度误差约 0.003 dB。
 // ═══════════════════════════════════════════════════════════════════
 
-/// 升余弦淡入权重：`i` 从 0 到 k-1 → 权重从 ≈0 到 ≈1
-#[inline]
-fn fade_weight(i: usize, k: usize) -> f32 {
-    0.5 - 0.5 * (std::f32::consts::PI * (i as f32 + 1.0) / (k as f32 + 1.0)).cos()
+/// 相位分辨率
+const RESAMPLE_PHASES: usize = 32;
+/// 每相抽头数（偶数，对称）
+const RESAMPLE_TAPS: usize = 48;
+/// 半窗长
+const RESAMPLE_HALF: usize = RESAMPLE_TAPS / 2;
+/// 归一化截止频率（cycles/sample）：0.42 × 48 kHz = 20.2 kHz，
+/// 加上过渡带后阻带起点约 0.49，折返分量落在带外
+const RESAMPLE_CUTOFF: f64 = 0.42;
+/// Kaiser 窗 β（≈100 dB 阻带）
+const RESAMPLE_BETA: f64 = 10.0;
+/// 历史样本数：≥ HALF+1，保证相位滑到 −(HALF+1) 时仍有数据
+const RESAMPLE_HIST: usize = RESAMPLE_TAPS + 1;
+
+type CoefTable = [[f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
+
+/// 零阶修正贝塞尔函数（Kaiser 窗用）。级数展开即可，β ≤ 10 时收敛极快。
+fn bessel_i0(x: f64) -> f64 {
+    let y = x * x / 4.0;
+    let mut sum = 1.0f64;
+    let mut term = 1.0f64;
+    for k in 1..40 {
+        term *= y / (k as f64 * k as f64);
+        sum += term;
+        if term < sum * 1e-17 {
+            break;
+        }
+    }
+    sum
 }
 
-/// 丢弃 `k` 个样本（每声道），在帧尾 `k` 个样本内交叉淡化。
-///
-/// 就地压缩 `pcm`，返回新长度 `n - k`。样本数不足 `3k` 时不动，
-/// 原样返回 `n`（调用方据此判断这次回落是否真的生效）。
-pub fn slip_drop(pcm: &mut [f32], k: usize) -> usize {
-    let n = pcm.len();
-    if k == 0 || n < 3 * k {
-        return n;
-    }
-    let p = n - 2 * k;
-    for i in 0..k {
-        let w = fade_weight(i, k);
-        pcm[p + i] = pcm[p + i] * (1.0 - w) + pcm[p + i + k] * w;
-    }
-    pcm.copy_within(p + 2 * k..n, p + k);
-    n - k
-}
-
-/// 插入 `k` 个样本（每声道）：把 `pcm[..n]` 重写进 `out`，在帧中间
-/// 做 `k` 个样本的交叉淡化，返回新长度 `n + k`。
-///
-/// `out` 至少需要 `n + k` 个位置；条件不满足时退化为原样拷贝并返回 `n`。
-pub fn slip_insert(pcm: &[f32], out: &mut [f32], k: usize) -> usize {
-    let n = pcm.len();
-    if k == 0 || n < 3 * k || out.len() < n + k {
-        let take = n.min(out.len());
-        out[..take].copy_from_slice(&pcm[..take]);
-        return take;
-    }
-    let p = n / 2;
-    out[..p].copy_from_slice(&pcm[..p]);
-    for i in 0..k {
-        let w = fade_weight(i, k);
-        out[p + i] = pcm[p + i] * (1.0 - w) + pcm[p + i - k] * w;
-    }
-    out[p + k..n + k].copy_from_slice(&pcm[p..n]);
-    n + k
+/// 生成/取用相位表（首次调用时计算，之后只读）
+fn coef_table() -> &'static CoefTable {
+    static TABLE: OnceLock<CoefTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let win_norm = bessel_i0(RESAMPLE_BETA);
+        let mut table = [[0.0f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
+        let w = 2.0 * RESAMPLE_CUTOFF;
+        for (p, coefs) in table.iter_mut().enumerate() {
+            let frac = p as f64 / RESAMPLE_PHASES as f64;
+            let mut sum = 0.0f64;
+            for (j, c) in coefs.iter_mut().enumerate() {
+                // 抽头 j 对应的输入样本与插值中心的距离（单位：样本）
+                let x = j as f64 - (RESAMPLE_HALF as f64 - 1.0) - frac;
+                let sinc = if x.abs() < 1e-9 {
+                    1.0
+                } else {
+                    (std::f64::consts::PI * w * x).sin() / (std::f64::consts::PI * w * x)
+                };
+                let u = x / RESAMPLE_HALF as f64;
+                let win = if u.abs() >= 1.0 {
+                    0.0
+                } else {
+                    bessel_i0(RESAMPLE_BETA * (1.0 - u * u).sqrt()) / win_norm
+                };
+                let h = w * sinc * win;
+                *c = h as f32;
+                sum += h;
+            }
+            // 每相单独归一：保证 DC 增益精确为 1，否则会留下低频起伏
+            let inv = 1.0 / sum;
+            for c in coefs.iter_mut() {
+                *c = (*c as f64 * inv) as f32;
+            }
+        }
+        table
+    })
 }
 
 /// 优先选择 f32，其次 i16/u16/i32；同等格式下优先单声道（回调会复制到所有声道）
@@ -612,10 +654,12 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             played,
             device_latency_us,
             waker,
-            phase: 0.0,
+            pos: 0.0,
             base_ratio: 1.0,
             adjust: 0.0,
             source_rate: 0,
+            hist: vec![0.0; RESAMPLE_HIST],
+            work: Vec::with_capacity(RESAMPLE_HIST + 4096),
             resample_buf: Vec::with_capacity(4096),
         }),
         Ok(Err(e)) => Err(e),
@@ -760,50 +804,98 @@ mod tests {
                 played: Arc::new(AtomicU64::new(0)),
                 device_latency_us: Arc::new(AtomicU64::new(0)),
                 waker: Arc::new(OnceLock::new()),
-                phase: 0.0,
+                pos: 0.0,
                 base_ratio: 1.0,
                 adjust: 0.0,
                 source_rate: 0,
+                hist: vec![0.0; RESAMPLE_HIST],
+                work: Vec::new(),
                 resample_buf: Vec::new(),
             }
         }
     }
 
+    // ── 多相 FIR 重采样 ──
+
+    const RATE_12K: f32 = 12_000.0;
+    const FS: f32 = 48_000.0;
+
+    /// 12 kHz 正弦（每样本 0.25 周，采样点恰好落在 0/±1 上：
+    /// 两点线性插值在相位 0.5 时对它正好 −3 dB，是最能暴露问题的信号）
+    fn tone_12k(len: usize, start: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (2.0 * std::f32::consts::PI * RATE_12K * (start + i) as f32 / FS).sin())
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f64 {
+        if x.is_empty() {
+            return 0.0;
+        }
+        (x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64).sqrt()
+    }
+
     #[test]
-    fn same_rate_write_is_one_to_one() {
+    fn same_rate_write_passes_dc_exactly() {
+        // DC 增益必须精确为 1（每相单独归一），否则水位标定会带系统偏差
         let mut aw = AudioWriter::for_test(48000);
         let pcm = vec![0.1f32; 480];
-        assert_eq!(aw.write(&pcm, 48000), 480);
-        assert_eq!(aw.ring.len(), 480);
-        assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 0);
+        let mut produced = 0usize;
+        for _ in 0..10 {
+            produced += aw.write(&pcm, 48000);
+        }
+        assert!(produced > 0);
+        let mut ring = Vec::new();
+        while let Some(v) = aw.ring.pop() {
+            ring.push(v);
+        }
+        // 前 25 个样本落在"历史静音 → 信号"的过渡里，其余必须是 0.1
+        for (i, v) in ring.iter().enumerate().skip(200) {
+            assert!((v - 0.1).abs() < 1e-6, "样本 {i} = {v}");
+        }
+    }
+
+    #[test]
+    fn resampler_outputs_expected_frame_rate() {
+        // 48000 源 → 48000 设备：比率 1，输出只慢一个固定群延迟（HALF+1 样本）
+        let mut aw = AudioWriter::for_test(48000);
+        let pcm = vec![0.1f32; 480];
+        let mut total = 0i64;
+        for _ in 0..100 {
+            total += aw.write(&pcm, 48000) as i64;
+        }
+        assert!((total - 47_975).abs() <= 3, "1 秒内产出 {total}");
     }
 
     #[test]
     fn forty_four_one_device_upsamples_48k_input() {
-        // 48 kHz 源 → 44.1 kHz 设备：480 样本应产出约 441 帧
+        // 48 kHz 源 → 44.1 kHz 设备：1 秒 48000 样本应产出约 44100 帧
         let mut aw = AudioWriter::for_test(44100);
         let pcm = vec![0.1f32; 480];
-        aw.write(&pcm, 48000);
-        let produced = aw.ring.len();
-        assert!((produced as i64 - 441).abs() <= 2, "produced={produced}");
-        assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 1);
+        let mut total = 0i64;
+        for _ in 0..100 {
+            total += aw.write(&pcm, 48000) as i64;
+        }
+        assert!((total - 44_077).abs() <= 4, "1 秒内产出 {total}");
+        assert_eq!(aw.stats.resampled.load(Ordering::Relaxed), 100);
     }
 
     #[test]
     fn resampler_keeps_phase_across_blocks() {
+        // 块间相位必须连续：连续 10 块的总产出不得因取整而漏帧
         let mut aw = AudioWriter::for_test(44100);
         let pcm = vec![0.1f32; 480];
+        let mut total = 0i64;
         for _ in 0..10 {
-            aw.write(&pcm, 48000);
+            total += aw.write(&pcm, 48000) as i64;
         }
-        let produced = aw.ring.len();
-        assert!((produced as i64 - 4_410).abs() <= 4, "produced={produced}");
+        assert!((total - 4_386).abs() <= 4, "10 帧产出 {total}");
     }
 
     #[test]
     fn ratio_adjust_changes_produced_frames() {
         // adjust > 0 → 比率变大 → 每秒**少**产出约 240 帧（水位回落）
-        for (adjust, expect) in [(0.005f64, 47761i64), (-0.005, 48241)] {
+        fn one_second(adjust: f64) -> i64 {
             let mut aw = AudioWriter::for_test(48000);
             aw.set_ratio_adjust(adjust);
             let pcm = vec![0.1f32; 480];
@@ -811,10 +903,61 @@ mod tests {
             for _ in 0..100 {
                 total += aw.write(&pcm, 48000) as i64;
             }
+            total
+        }
+        let fast = one_second(0.005);
+        let slow = one_second(-0.005);
+        // 两个方向的差值必须等于 2×0.5%×48000 ≈ 480 帧（固定群延迟自动抵消）
+        assert!((slow - fast - 480).abs() <= 3, "fast={fast} slow={slow}");
+        assert!((fast - 47_737).abs() <= 4, "fast={fast}");
+        assert!((slow - 48_217).abs() <= 4, "slow={slow}");
+    }
+
+    #[test]
+    fn resampler_12k_amplitude_is_flat() {
+        // P2 验收门：12 kHz 处幅度波动 < 0.1 dB（≈1.15%）。
+        // 两点线性插值在这里会掉 3 dB，且随比率扫掠变成常年颤动。
+        for adjust in [0.0f64, 0.001, -0.001, 0.005, -0.005] {
+            let mut aw = AudioWriter::for_test(48000);
+            aw.set_ratio_adjust(adjust);
+            let mut total = 0usize;
+            for block in 0..50 {
+                let pcm = tone_12k(480, block * 480);
+                total += aw.write(&pcm, 48000);
+            }
+            let mut ring = Vec::new();
+            while let Some(v) = aw.ring.pop() {
+                ring.push(v);
+            }
+            assert_eq!(ring.len(), total);
+            // 跳过前 480 个样本（历史静音淡入段），其余按 RMS 折算幅度
+            let body = &ring[480..];
+            let amp = rms(body) * std::f64::consts::SQRT_2;
+            let err_db = 20.0 * (amp / 1.0).abs().log10().abs().max(1e-12);
             assert!(
-                (total - expect).abs() <= 3,
-                "adjust={adjust} 1 秒内产出 {total}，期望约 {expect}"
+                err_db < 0.1,
+                "adjust={adjust}: 12 kHz 幅度 {amp:.6}（{err_db:.3} dB）"
             );
+        }
+    }
+
+    #[test]
+    fn resampler_has_no_click_at_block_boundaries() {
+        // 相位连续 + 多相插值 ⇒ 块与块之间不得出现台阶
+        let mut aw = AudioWriter::for_test(48000);
+        aw.set_ratio_adjust(0.003);
+        for block in 0..20 {
+            let pcm = tone_12k(480, block * 480);
+            aw.write(&pcm, 48000);
+        }
+        let mut ring = Vec::new();
+        while let Some(v) = aw.ring.pop() {
+            ring.push(v);
+        }
+        // 12 kHz 在 48 kHz 下的最大相邻差 ≈ 2π×12k/48k ≈ 1.57
+        for i in 200..ring.len() - 1 {
+            let d = (ring[i + 1] - ring[i]).abs();
+            assert!(d <= 1.75, "样本 {i} 处有台阶: Δ={d}");
         }
     }
 
@@ -837,96 +980,13 @@ mod tests {
         assert_eq!(aw.device_latency_frames(), 48000, "异常时间戳必须被钳到 1 s");
     }
 
-    // ── 有界回落的交叉淡化 ──
-
-    /// 用一条 480 样本的正弦测"接缝处是否有台阶"：
-    /// 回落前后都必须保持一阶连续（相邻样本差不超过正弦自身的最大斜率 + 容差）。
-    fn assert_smooth(sig: &[f32], from: usize, to: usize, max_step: f32) {
-        for i in from..to {
-            let d = (sig[i + 1] - sig[i]).abs();
-            assert!(d <= max_step, "样本 {i} 处有台阶: Δ={d} > {max_step}");
-        }
-    }
-
     #[test]
-    fn slip_drop_is_crossfaded_not_cut() {
-        // 1 kHz 正弦，480 样本/帧
-        let n = 480usize;
-        let k = rtp::SLIP_FADE_SAMPLES;
-        let mut pcm: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin() * 0.5)
-            .collect();
-        let tail = pcm[n - 1];
-        let new_len = slip_drop(&mut pcm, k);
-        assert_eq!(new_len, n - k);
-        // 1 kHz 在 48 kHz 下的最大相邻差 ≈ 0.5 × 2π×1000/48000 ≈ 0.0655
-        assert_smooth(&pcm, 0, new_len - 1, 0.09);
-        // 末样本必须等于原帧末样本：不丢音频尾巴，也不与下一帧错位
-        assert!((pcm[new_len - 1] - tail).abs() < 1e-4);
-    }
-
-    #[test]
-    fn slip_drop_removes_exactly_k_samples() {
-        let mut pcm = vec![0.0f32; 480];
-        for (i, s) in pcm.iter_mut().enumerate() {
-            *s = i as f32;
-        }
-        let k = 48usize;
-        let n = slip_drop(&mut pcm, k);
-        assert_eq!(n, 432);
-        // 末样本保留（淡入权重约 0.999，误差 < 0.05 个 LSB 的量化级）
-        assert!((pcm[431] - 479.0).abs() < 0.1, "末样本 {}", pcm[431]);
-        // 前段原样
-        assert_eq!(pcm[0], 0.0);
-        assert_eq!(pcm[383], 383.0);
-    }
-
-    #[test]
-    fn slip_insert_is_crossfaded_not_cut() {
-        let n = 480usize;
-        let k = rtp::SLIP_FADE_SAMPLES;
-        let pcm: Vec<f32> = (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48000.0).sin() * 0.5)
-            .collect();
-        let mut out = vec![0.0f32; n + k];
-        let new_len = slip_insert(&pcm, &mut out, k);
-        assert_eq!(new_len, n + k);
-        assert_smooth(&out, 0, new_len - 1, 0.09);
-        assert_eq!(out[new_len - 1], pcm[n - 1], "末样本必须与原帧一致");
-        assert_eq!(out[0], pcm[0]);
-    }
-
-    #[test]
-    fn slip_ignores_frames_too_short_for_fade() {
-        // 帧长 < 3k 时不得动手（宁可少一次校正，也不能把帧切坏）
-        let mut tiny = vec![1.0f32; 100];
-        assert_eq!(slip_drop(&mut tiny, rtp::SLIP_FADE_SAMPLES), 100);
-        let out_len = {
-            let mut out = vec![0.0f32; 100 + rtp::SLIP_FADE_SAMPLES];
-            slip_insert(&tiny, &mut out, rtp::SLIP_FADE_SAMPLES)
-        };
-        assert_eq!(out_len, 100);
-    }
-
-    #[test]
-    fn slip_fade_weights_are_monotone() {
-        let k = rtp::SLIP_FADE_SAMPLES;
-        let mut prev = fade_weight(0, k);
-        assert!(prev < 0.02, "淡入起点必须接近 0");
-        for i in 1..k {
-            let w = fade_weight(i, k);
-            assert!(w > prev, "权重必须单调递增");
-            prev = w;
-        }
-        assert!(prev > 0.98, "淡入终点必须接近 1");
-    }
-
-    #[test]
-    fn flush_clears_ring_and_phase() {
+    fn flush_clears_ring_and_resampler() {
         let mut aw = AudioWriter::for_test(48000);
         aw.write(&vec![0.1f32; 480], 48000);
         aw.flush();
         assert_eq!(aw.ring.len(), 0);
-        assert_eq!(aw.space_frames(), aw.ring.capacity());
+        assert_eq!(aw.pos, 0.0);
+        assert!(aw.hist.iter().all(|&v| v == 0.0));
     }
 }

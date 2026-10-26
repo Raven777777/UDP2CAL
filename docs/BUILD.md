@@ -79,7 +79,7 @@ build.bat android --modern --abi armeabi-v7a --release
 
 | 特性 | 生效位置 | 运行时条件 | 说明 |
 |------|---------|-----------|------|
-| 经典 PLC | 解码端 | 播放头到期 | 缺口在 `next_ts <= playhead_ts + PLC_LEAD_MS` 时补一帧 480 采样；连续 12 帧后转静音但仍留在 PLAYING。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡播放头决定（协议 7.8） |
+| 经典 PLC | 解码端 | 水位见底 | 缺口在 `pipe_ms <= PLC_LEAD_MS`（可听点之前只剩 20 ms 媒体量）时补一帧 480 采样；连续 12 帧后转静音但仍留在 PLAYING。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡消费节奏决定（协议 7.5/7.8） |
 | 抖动缓冲 | `protocol/rtp.rs` | 自动 | 固定 64 槽、按扩展时间戳索引；序号只用于重复检测。v3 **不再**动态扩缩重排窗口 |
 | **Wi-Fi 省电锁（Android）** | CaptureService | 采集期间 | 采集期间持有 `WIFI_MODE_FULL_LOW_LATENCY` WifiLock，阻止网卡进入省电聚合（周期性 100~500ms 延迟簇的根源），停止采集释放 |
 | Deep PLC | 解码端 | 解码复杂度 ≥ 5 | 两端在解码器创建时设置（Windows `OpusDecoder::new()`、Android `opus_jni_decoder.c`）；v3 固定单解码器 48 kHz 单声道 |

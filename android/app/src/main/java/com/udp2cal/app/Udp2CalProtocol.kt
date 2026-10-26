@@ -68,42 +68,55 @@ object Udp2CalProtocol {
     const val MAX_REORDER_PACKETS = 64
     /** 到达时刻追踪深度：128 × 10 ms ≈ 1.28 s，远大于任何可用水位 */
     const val ARRIVAL_TRACE = 128
-    /** 预缓冲启动阈值（3 帧 = 30 ms）。离散丢/插让位给受控重采样后可下探到 30 ms */
+    /** 预缓冲启动阈值（3 帧 = 30 ms）。去掉离散丢/插后可下探到 30 ms */
     const val JITTER_START_MS = 30
-    const val JITTER_TARGET_MS = 60
-    const val JITTER_HIGH_MS = 120
-    const val JITTER_LOW_MS = 20
+    /**
+     * 目标总水位（16.5 帧）——**单一口径**：抖动缓冲 + PCM 环 + 声卡缓冲。
+     *
+     * 旧实现把声卡缓冲排除在外，实际总水位因此被悄悄抬到 70–80 ms，
+     * "目标 60 ms"这句话失去意义。现在三者同口径相加，这个数就是
+     * "从可听点往后还压着多少音频"，也是控制器唯一的输入。
+     *
+     * 为什么是 165 而不是 70：实机（Wi-Fi + Android 发送端）测到包成批交付——
+     * 单次到位 ≥6 帧的突发 229 次，中位 9 帧（90 ms），约每 1.2 s 一次，
+     * 而长期到达率刚好 100.00 帧/s。排掉 90 ms 富余只靠比率（±0.5% = 5 ms/s）
+     * 要 18 s，所以水位会在 120–200 ms 游走：目标设 70 时 PI 永久顶满 +0.5%
+     * （实测中位 +5006 ppm），成了"常年变调 + 慢锯"而不是闭环。
+     * 165 ≈ 实测可达稳态（解码环 44 + 声卡 10 + 抖动缓冲 ~110）。
+     */
+    const val WATER_TARGET_MS = 260
+    /** 解码缓冲深度上限：超过就暂停生产（生产节奏必须由声卡消费节奏约束） */
+    const val DECODE_LIMIT_MS = 40
     const val PLC_LEAD_MS = 20
     const val PLC_MAX_MS = 120
     const val RESYNC_GAP_MS = 200
 
-    // ═══════ 漂移校正参数（与 Rust rtp.rs 一一对应）═══════
-    /** 有界回落的单次量：1 ms */
-    const val SLIP_SAMPLES = 48
-    /** 交叉淡化长度：1 ms，丢/插都只能在淡化区内完成 */
-    const val SLIP_FADE_SAMPLES = 48
-    /** 回落高带：高于目标 30 ms */
-    const val SLIP_HIGH_MARGIN_MS = 30
-    /** 回落低带：低于目标 10 ms */
-    const val SLIP_LOW_MARGIN_MS = 10
-    /** 回落最小间隔：1 秒音频样本时间 —— 每秒最多 1 ms */
-    const val SLIP_MIN_INTERVAL_SAMPLES = 48000L
-    /** 回落评估周期：100 ms 音频样本时间 */
-    const val SLIP_EVAL_SAMPLES = 4800L
-    /** 高带"稳定"判据：连续 5 次评估 */
-    const val SLIP_STABLE_ROUNDS = 5
-    /** 启动宽限：前 2 秒只做比率微调 */
-    const val SLIP_WARMUP_SAMPLES = 96000L
-    /** 重采样比率微调上限（±0.5%） */
+    // ═══════ ASRC 参数（与 Rust rtp.rs 一一对应）═══════
+    /** 重采样比率微调上限（±0.5%）。超出范围只能靠整帧重同步 */
     const val RESAMPLE_MAX_ADJUST = 0.005
-    /** 比率更新周期：每 10 ms（1 帧） */
-    const val RATIO_UPDATE_SAMPLES = 480L
-    /** 单次比率更新最大步进（1%/s 的斜坡） */
+    /** 单次比率更新最大步进（1%/s 的斜坡，防变调台阶） */
     const val RATIO_SLEW_STEP = 0.0001
-    const val RATIO_DEADBAND_MS = 5.0
-    const val RATIO_FULL_MS = 20.0
-    /** 水位一阶低通系数（τ ≈ 150 ms） */
+    /** 比例增益：每 1 ms 水位偏差给 50 ppm（20 ms → 1000 ppm） */
+    const val PI_KP_PER_MS = 0.00005
+    /** 积分时间常数（秒）：必须 ≥5 s，否则会把网络抖动积成变调 */
+    const val PI_TI_S = 10.0
+    /** 单次评估的最小时间跨度（ms）：更密的调用只累计时间，不评估 */
+    const val PI_MIN_UPDATE_MS = 5.0
+    /** 水位一阶低通系数（τ ≈ 150 ms，带宽 ≈1 Hz） */
     const val WATER_SMOOTH_ALPHA = 0.065
+    /** 速率前馈观测窗（秒）与桶数（每桶 1 s，桶内只留最小单向时延） */
+    const val RATE_WINDOW_S = 30.0
+    const val RATE_BUCKETS = 30
+    /** 起算所需的最少桶数：没攒够宁可不出估计 */
+    const val RATE_MIN_BUCKETS = 6
+    /**
+     * 单次观测允许的最大媒体跳变：超过它说明时间线被重建（重同步、发送端
+     * 重启、断流后补齐），旧窗口的 t_local 与 media 已不可比，必须作废重算。
+     * 正常相邻两包只差 480 样本，这里给 2 s 的宽松门限。Rust 侧逐字同构。
+     */
+    const val RATE_JUMP_MAX_SAMPLES = OPUS_SAMPLE_RATE * 2L
+    /** 前馈钳位（±2%）：超出说明不是钟差，而是别的问题 */
+    const val RATE_FEEDFORWARD_MAX = 0.02
 
     // ═══════ 控制头 ═══════
 
@@ -393,6 +406,9 @@ object Udp2CalProtocol {
         var nextTs = 0L; private set
         private var highestSeq = 0L
         private var highestTs = 0L
+
+        /** 已收到的最高媒体时间戳（前馈速率估计的观测点） */
+        fun highestTsValue(): Long = highestTs
         var started = false; private set
         var playing = false; private set
         var plcRun = 0; private set
@@ -447,7 +463,18 @@ object Udp2CalProtocol {
             return -1L
         }
 
-        fun waterMs(): Int = contiguousFrames() * OPUS_FRAME_MS
+        /**
+         * 当前水位（毫秒）：**已到达但还没播出去的媒体量**。
+         *
+         * 用 `highestTs − nextTs` 而不是 `contiguousFrames()`：后者在"队首那一帧
+         * 还没到"（乱序/迟到）时会瞬间塌到 0，而后面明明还压着十几帧——当成控制
+         * 信号会让 PI 误以为缓冲空了、反向拉满比率。Rust 侧逐字同构。
+         */
+        fun waterMs(): Int {
+            if (highestTs < nextTs) return 0
+            val frames = ((highestTs - nextTs) / OPUS_FRAME_SAMPLES + 1).coerceAtMost(MAX_REORDER_PACKETS.toLong())
+            return (frames * OPUS_FRAME_MS).toInt()
+        }
 
         fun contiguousFrames(): Int {
             var n = 0
@@ -460,10 +487,8 @@ object Udp2CalProtocol {
             return n
         }
 
-        // 播放线程校正 PCM 后的媒体时间偏移只由 PlayheadClock.notePcmCorrection 承担：
-        // pull 的缺口判定用的是播放头（nextTs <= playheadTs + lead），把偏移加在
-        // 播放头上即可让整条媒体时间线平移。抖动缓冲不再保存副本——历史上那份
-        // 副本只写不读，纯属误导。
+        // 播放决策只看水位：没有播放头、没有媒体时间偏移，也没有任何
+        // "设备帧 → 媒体时间戳"的换算（规范 §二）。
 
         /** 网络线程调用。返回 true 表示已进入缓冲（可用于码率统计） */
         fun insert(seq: Int, ts: Long, marker: Boolean, buf: ByteArray, offset: Int, length: Int): Boolean {
@@ -520,10 +545,20 @@ object Udp2CalProtocol {
         }
 
         /**
-         * 播放线程调用：按播放头拉取下一帧。
+         * 播放线程调用：按**缓冲水位**拉取下一帧（规范 §二）。
+         *
+         * 两个入参是同一个量的两种口径：
+         * * [ringMs]：已解码、已写进 PCM 环但还没被声卡接手的媒体量；
+         * * [pipeMs]：`ringMs` + 声卡已接手还没播完的。
+         *
+         * 生产节流只约束我们自己可控的那段（PCM 环）；缺口判定必须用
+         * `pipeMs`——只有可听点真的逼近缺口时才该补 PLC。
+         * Android 端写 AudioTrack 是阻塞的（没有独立 PCM 环），
+         * 因此 [ringMs] 恒为 0，节拍由 `writeBlocking` 与水位数共同保证。
+         *
          * @return [Pull] 常量；[pulledLength]/[pulledTs] 描述本帧
          */
-        fun pull(playheadTs: Long, out: ByteArray): Int {
+        fun pull(ringMs: Int, pipeMs: Int, out: ByteArray): Int {
             pulledLength = 0
             if (!started) return Pull.WAIT
             if (!playing) {
@@ -532,6 +567,8 @@ object Udp2CalProtocol {
             }
             val idx = findTs(nextTs)
             if (idx >= 0) {
+                // 解码缓冲已够深：生产节奏必须由声卡消费节奏约束
+                if (ringMs >= DECODE_LIMIT_MS) return Pull.WAIT
                 val len = slotLen[idx]
                 System.arraycopy(slotData[idx], 0, out, 0, len)
                 slotValid[idx] = false
@@ -541,8 +578,8 @@ object Udp2CalProtocol {
                 plcRun = 0
                 return Pull.PACKET
             }
-            val lead = (PLC_LEAD_MS * OPUS_FRAME_SAMPLES / OPUS_FRAME_MS).toLong()
-            if (nextTs <= playheadTs + lead) {
+            // 可听点之前还压着的媒体量已经见底，才生成补偿
+            if (pipeMs <= PLC_LEAD_MS) {
                 pulledTs = nextTs
                 advance()
                 val maxRun = PLC_MAX_MS / OPUS_FRAME_MS
@@ -618,186 +655,243 @@ object Udp2CalProtocol {
     }
 
     /**
-     * 漂移 / 延迟校正器（与 Rust `rtp::DriftController` 同语义）。
+     * 速率前馈估计器（与 Rust `rtp::RateEstimator` 同语义）。
      *
-     * **第一级：受控重采样（主力）** —— 水位偏差经低通后按比例映射到重采样
-     * 比率的 ±0.5%，每 10 ms 更新一次，单次步进 ≤0.0001。比率是连续量，
-     * 不会在 PCM 里留下任何接缝。
+     * 前馈管速率、反馈管相位（规范 §四）。两条支路互不污染，所以各自可以挑
+     * 最合适的传感器：
      *
-     * **第二级：有界回落（安全网）** —— 只有水位持续跑出回落带（高于目标
-     * 30 ms 且稳定 / 低于目标 10 ms）才做一次 1 ms 的丢/插，每秒最多一次，
-     * 且必须交叉淡化。
+     * * 前馈用 **(RTP 扩展时间戳, 到达时刻)**：时间戳按 480/包推进，丢包不会
+     *   让它少算——它是发送端媒体时间线的无偏观测；用"已收样本数"则每丢一包
+     *   少 480，估计值被丢包率直接带偏；
+     * * 反馈用 **缓冲水位**：闭环量只能留在闭环里。
      *
-     * @return [DriftUpdate]：`adjust` 为比率微调；`slipSamples > 0` 表示丢弃
-     *         该样本数、`< 0` 表示插入该样本数、`0` 表示不动作。
+     * 观测对取"最新到达的那个包"的时间戳与到达时刻，两者来自同一条记录，
+     * 因此不含播放/解码节奏的抖动；再用最小延迟滤波（每桶只留最小单向时延）
+     * 剔掉排队造成的正向偏移——排队只会让单向时延变大，最小值几乎不受影响
+     * （NTP min-filter / WebRTC 自适应最小延迟同源）。
      */
-    class DriftController {
+    class RateEstimator {
+        private var started = false
+        /** 观测窗起点（`System.nanoTime()`） */
+        private var t0 = 0L
+        private var ts0 = 0L
+        private var lastTs = 0L
+        private val bucketEpoch = LongArray(RATE_BUCKETS) { Long.MAX_VALUE }
+        private val bucketT = DoubleArray(RATE_BUCKETS)
+        private val bucketMinU = DoubleArray(RATE_BUCKETS) { Double.POSITIVE_INFINITY }
+        private var ff: Double? = null
+        private var sigmaPpm = 0.0
+        private var used = 0
+
+        /** 累计观测数（诊断） */
+        var observations = 0L; private set
+
+        fun reset() {
+            started = false
+            t0 = 0
+            ts0 = 0
+            lastTs = 0
+            bucketEpoch.fill(Long.MAX_VALUE)
+            bucketMinU.fill(Double.POSITIVE_INFINITY)
+            ff = null
+            sigmaPpm = 0.0
+            used = 0
+        }
+
+        /** 当前前馈估计（无量纲速率残差）；窗口未攒够时为 null */
+        fun feedforward(): Double? = ff
+
+        fun feedforwardPpm(): Double? = ff?.times(1e6)
+
+        /** 估计的 1σ（ppm），供日志判断可信度 */
+        fun sigmaPpm(): Double = sigmaPpm
+
+        /** 参与拟合的桶数 */
+        fun usedBuckets(): Int = used
+
+        /**
+         * 观测一个包：[ts] 是它的 RTP 扩展时间戳，[arrivedNanos] 是它进入
+         * 接收端的本地单调时刻。重复喂同一个时间戳会被忽略。
+         */
+        fun observe(ts: Long, arrivedNanos: Long) {
+            if (!started) {
+                // 首个观测只建立基准：窗口从"现在"起算
+                started = true
+                t0 = arrivedNanos
+                ts0 = ts
+                lastTs = ts
+                return
+            }
+            if (ts == lastTs) return
+            // 基准之后又出现更早的时间戳：只可能是重同步换了基准，
+            // 调用方本应 reset()；这里直接忽略，不污染现有窗口。
+            if (ts < ts0) return
+            if (ts - lastTs > RATE_JUMP_MAX_SAMPLES) {
+                // 时间线被重建（重同步/发送端重启/断流补齐）：旧窗口的
+                // (t_local, media) 对已经不可比，接着用会让回归斜率变成垃圾
+                // （实测会出现 ±2000 ppm 的假前馈）。从这一包重新起算。
+                reset()
+                started = true
+                t0 = arrivedNanos
+                ts0 = ts
+                lastTs = ts
+                return
+            }
+            lastTs = ts
+            observations++
+
+            val tLocal = (arrivedNanos - t0).toDouble() / 1e9
+            val media = (ts - ts0).toDouble() / OPUS_SAMPLE_RATE
+            // u 只随两侧钟差变化：网络排队只会让它变大，最小延迟滤波正为此
+            val u = tLocal - media
+
+            val bucketS = RATE_WINDOW_S / RATE_BUCKETS
+            val epoch = (tLocal / bucketS).toLong()
+            val idx = (epoch % RATE_BUCKETS).toInt()
+            if (bucketEpoch[idx] != epoch) {
+                bucketEpoch[idx] = epoch
+                bucketT[idx] = (epoch + 0.5) * bucketS
+                bucketMinU[idx] = u
+            } else if (u < bucketMinU[idx]) {
+                bucketMinU[idx] = u
+            }
+            fit(epoch)
+        }
+
+        /** 最小二乘拟合桶最小值（只有 30 个点，每次观测重算代价可忽略） */
+        private fun fit(curEpoch: Long) {
+            var n = 0
+            var sx = 0.0
+            var sy = 0.0
+            for (i in 0 until RATE_BUCKETS) {
+                if (!live(i, curEpoch)) continue
+                n++
+                sx += bucketT[i]
+                sy += bucketMinU[i]
+            }
+            used = n
+            if (n < RATE_MIN_BUCKETS) {
+                // 窗口还没攒够：宁可不出估计，也不要拿噪声去改比率
+                ff = null
+                sigmaPpm = 0.0
+                return
+            }
+            val mx = sx / n
+            val my = sy / n
+            var sxx = 0.0
+            var sxy = 0.0
+            for (i in 0 until RATE_BUCKETS) {
+                if (!live(i, curEpoch)) continue
+                val dx = bucketT[i] - mx
+                sxx += dx * dx
+                sxy += dx * (bucketMinU[i] - my)
+            }
+            if (sxx <= 0.0) {
+                ff = null
+                sigmaPpm = 0.0
+                return
+            }
+            val slope = sxy / sxx
+            var ss = 0.0
+            for (i in 0 until RATE_BUCKETS) {
+                if (!live(i, curEpoch)) continue
+                val r = bucketMinU[i] - (my + slope * (bucketT[i] - mx))
+                ss += r * r
+            }
+            val dof = (n - 2.0).coerceAtLeast(1.0)
+            // 残差标准差 → 斜率标准差：σ_slope = s / √Sxx
+            sigmaPpm = kotlin.math.sqrt(ss / dof) / kotlin.math.sqrt(sxx) * 1e6
+            // u = 本地时间 − 媒体时间 的斜率：媒体时钟快 → u 变小 → 斜率 < 0
+            // → 速率残差 = −斜率
+            ff = (-slope).coerceIn(-RATE_FEEDFORWARD_MAX, RATE_FEEDFORWARD_MAX)
+        }
+
+        /** 该桶是否仍在当前窗口内（被回收的桶 epoch 落后一整圈） */
+        private fun live(i: Int, curEpoch: Long): Boolean =
+            bucketEpoch[i] != Long.MAX_VALUE &&
+                bucketMinU[i].isFinite() &&
+                curEpoch - bucketEpoch[i] < RATE_BUCKETS.toLong()
+    }
+
+    /**
+     * 漂移校正器：**抗饱和 PI**（与 Rust `rtp::DriftController` 同语义）。
+     *
+     * 输入是单一口径的总水位（抖动缓冲 + PCM 环 + 声卡缓冲）。为什么是 PI
+     * 而不是纯比例：纯比例必然留下静差（水位永远差一点、比率永远差一截），
+     * "稳态比率残差 <20 ppm"只有积分项能做到。为什么积分时间常数必须 ≥5 s：
+     * 积分项看到的是同一个带网络抖动的水位，时间常数太小会把抖动积成变调。
+     *
+     * 计时用**声卡已消费帧数**而不是媒体样本数：断流期间媒体样本不前进，
+     * 墙钟却在走，用媒体样本计时会让积分项在断流时"冻结"，恢复后补偿过头。
+     */
+    class DriftController(private val deviceRate: Int = OPUS_SAMPLE_RATE) {
         private var water = 0.0
         private var adjust = 0.0
+        private var integral = 0.0
         private var primed = false
-        private var lastRatio = 0L
-        private var lastEval = 0L
-        private var lastSlip = 0L
-        private var streak = 0
+        private var lastDevice = 0L
 
+        /** 评估次数（诊断） */
         var ratioUpdates = 0L; private set
-        var slipDrops = 0L; private set
-        var slipInserts = 0L; private set
-        var slippedSamples = 0L; private set
 
         fun reset() {
             water = 0.0
             adjust = 0.0
+            integral = 0.0
             primed = false
-            lastRatio = 0
-            lastEval = 0
-            lastSlip = 0
-            streak = 0
+            lastDevice = 0
         }
 
         fun adjust(): Double = adjust
 
-        fun update(waterMs: Int, mediaSamples: Long): DriftUpdate {
+        /** 低通后的水位（诊断：与瞬时水位对比可看出控制器有多"钝"） */
+        fun water(): Double = water
+
+        /** 积分项（诊断：长期顶满说明比率钳位不够用） */
+        fun integral(): Double = integral
+
+        /**
+         * [waterMs] 为单一口径总水位，[deviceFrames] 为声卡已消费的设备帧数。
+         * 返回新的比率微调量：水位偏高 → 正数 → 每秒产出的设备帧变少。
+         */
+        fun update(waterMs: Int, deviceFrames: Long): Double {
+            val rate = deviceRate.coerceAtLeast(1)
+            val dframes = deviceFrames - lastDevice
+            if (dframes <= 0L) return adjust
+            val dtMs = dframes * 1000.0 / rate
+            // 太密的调用只累计时间，不评估：低通与积分都按真实 dt 缩放
+            if (dtMs < PI_MIN_UPDATE_MS) return adjust
+            lastDevice = deviceFrames
+
             if (!primed) {
                 primed = true
                 water = waterMs.toDouble()
-                lastRatio = mediaSamples
-                lastEval = mediaSamples
-                lastSlip = mediaSamples
-                return DriftUpdate.NONE
+                return adjust
             }
 
-            // ── 第一级：比率微调（每 10 ms 一次）──
-            if (mediaSamples - lastRatio >= RATIO_UPDATE_SAMPLES) {
-                lastRatio = mediaSamples
-                water += WATER_SMOOTH_ALPHA * (waterMs - water)
-                val err = water - JITTER_TARGET_MS
-                val mag = kotlin.math.abs(err)
-                val want = if (mag <= RATIO_DEADBAND_MS) {
-                    0.0
-                } else {
-                    val k = ((mag - RATIO_DEADBAND_MS) / (RATIO_FULL_MS - RATIO_DEADBAND_MS))
-                        .coerceAtMost(1.0)
-                    kotlin.math.sign(err) * RESAMPLE_MAX_ADJUST * k
-                }
-                val step = (want - adjust).coerceIn(-RATIO_SLEW_STEP, RATIO_SLEW_STEP)
-                adjust = (adjust + step).coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
-                ratioUpdates++
-            }
+            // ── 水面低通（τ≈150 ms，带宽≈1 Hz：滤掉 10 ms 帧量化噪声）──
+            val steps = (dtMs / OPUS_FRAME_MS).coerceAtLeast(1e-3)
+            val alpha = 1.0 - Math.pow(1.0 - WATER_SMOOTH_ALPHA, steps)
+            water += alpha * (waterMs - water)
 
-            // ── 第二级：有界回落 ──
-            return DriftUpdate(adjust, evaluateSlip(waterMs, mediaSamples))
-        }
+            val err = water - WATER_TARGET_MS
+            // ── 比例项 ──
+            val p = (err * PI_KP_PER_MS).coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
+            // ── 积分项（抗饱和：输出顶满且误差还在往同方向顶时冻结）──
+            val ki = PI_KP_PER_MS / PI_TI_S
+            val iNext = (integral + ki * err * (dtMs / 1000.0))
+                .coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
+            val want = p + iNext
+            val saturated = kotlin.math.abs(want) >= RESAMPLE_MAX_ADJUST
+            if (!saturated || err * iNext < 0.0) integral = iNext
 
-        private fun evaluateSlip(waterMs: Int, mediaSamples: Long): Int {
-            if (mediaSamples - lastEval < SLIP_EVAL_SAMPLES) return 0
-            lastEval = mediaSamples
-
-            if (mediaSamples < SLIP_WARMUP_SAMPLES) {
-                streak = 0
-                return 0
-            }
-
-            val high = JITTER_TARGET_MS + SLIP_HIGH_MARGIN_MS
-            val low = JITTER_TARGET_MS - SLIP_LOW_MARGIN_MS
-            if (waterMs > high) streak++ else streak = 0
-
-            // 速率闸门：每秒最多 1 ms，绝不连续触发
-            if (mediaSamples - lastSlip < SLIP_MIN_INTERVAL_SAMPLES) return 0
-
-            if (streak >= SLIP_STABLE_ROUNDS) {
-                streak = 0
-                lastSlip = mediaSamples
-                slipDrops++
-                slippedSamples += SLIP_SAMPLES
-                return SLIP_SAMPLES
-            }
-            if (waterMs < low) {
-                streak = 0
-                lastSlip = mediaSamples
-                slipInserts++
-                slippedSamples += SLIP_SAMPLES
-                return -SLIP_SAMPLES
-            }
-            return 0
-        }
-    }
-
-    /** 一次漂移校正评估的产物 */
-    class DriftUpdate(val adjust: Double, val slipSamples: Int) {
-        companion object {
-            val NONE = DriftUpdate(0.0, 0)
-        }
-    }
-
-    /**
-     * 播放头：把 AudioTrack 已播放的设备帧数映射到 48 kHz RTP 时间线。
-     *
-     * AudioTrack 固定以 48 kHz 创建（设备内部重采样由系统完成），
-     * 因此设备帧与媒体样本 1:1；换算在这里仍然按 7.10 的公式保留余数处理。
-     */
-    class PlayheadClock(private val deviceRate: Int = OPUS_SAMPLE_RATE) {
-        private var baseTs = 0L
-        private var lastDeviceFrames = 0L
-        private var lastValue = 0L
-        private var remainder = 0L
-        private var offset = 0L
-        /** 比率微调造成的不足一个样本的残余（逐帧取整会吃掉近 17% 的校正量） */
-        private var offsetFrac = 0.0
-        var isStarted = false; private set
-
-        fun start(baseTs: Long, playedFrames: Long) {
-            this.baseTs = baseTs
-            this.lastValue = baseTs
-            this.lastDeviceFrames = playedFrames
-            this.remainder = 0
-            this.offset = 0
-            this.offsetFrac = 0.0
-            isStarted = true
-        }
-
-        fun update(playedFrames: Long): Long? {
-            if (!isStarted) return null
-            if (playedFrames < lastDeviceFrames) return lastValue + offset
-            val delta = playedFrames - lastDeviceFrames
-            lastDeviceFrames = playedFrames
-            if (delta > 0) {
-                val num = delta * OPUS_SAMPLE_RATE + remainder
-                lastValue += num / deviceRate
-                remainder = num % deviceRate
-            }
-            return lastValue + offset
-        }
-
-        fun value(): Long? = if (isStarted) lastValue + offset else null
-
-        /** 有界回落：丢 PCM → delta > 0 让播放头前移 */
-        fun notePcmCorrection(deltaSamples: Long) {
-            offset += deltaSamples
-        }
-
-        /**
-         * 重采样比率微调造成的媒体时间偏移（**连续量**，每帧调用）。
-         * 比率乘 `(1+u)` 后每个设备帧要多算 `u` 个媒体样本，必须用小数累积。
-         */
-        fun noteRatioCorrection(samples: Double) {
-            if (!samples.isFinite()) return
-            offsetFrac += samples
-            val whole = offsetFrac.toLong()
-            if (whole != 0L) {
-                offset += whole
-                offsetFrac -= whole
-            }
-        }
-
-        fun reset() {
-            isStarted = false
-            baseTs = 0
-            lastValue = 0
-            lastDeviceFrames = 0
-            remainder = 0
-            offset = 0
-            offsetFrac = 0.0
+            // ── 斜率限制（1%/s，按真实 dt 缩放）：不让比例项跳变成变调 ──
+            val target = want.coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
+            val slew = RATIO_SLEW_STEP * steps.coerceAtLeast(1.0)
+            val step = (target - adjust).coerceIn(-slew, slew)
+            adjust = (adjust + step).coerceIn(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST)
+            ratioUpdates++
+            return adjust
         }
     }
 }
