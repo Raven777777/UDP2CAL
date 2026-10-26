@@ -32,6 +32,9 @@ class UdpSender(
 
         /** ACK 有效期：超过该窗口未收到新 ACK 即视为断连 */
         const val ACK_WINDOW_MS = 3000L
+
+        /** DSCP EF（46）= IP TOS 字节 0xB8：音频流的最高转发优先级 */
+        const val DSCP_EF_TOS = 0xB8
     }
 
     // 跨线程访问：connect()/close() 在 IO 线程，send() 在采集线程，
@@ -66,6 +69,14 @@ class UdpSender(
             val addr = InetSocketAddress(InetAddress.getByName(host), port)
             val sock = DatagramSocket()
             sockLocal = sock
+            // ── DSCP EF（A2）：正向 RTP 流标记最高优先级 ──
+            // 让接入点把音频排在其他流量前，抑制排队抖动。设置可能被系统
+            // 拒绝（权限/厂商策略），失败不影响功能，仅记录。
+            try {
+                sock.trafficClass = DSCP_EF_TOS
+            } catch (e: Exception) {
+                Log.w(TAG, "正向套接字 DSCP 标记失败：${e.message}")
+            }
             val revSock = DatagramSocket()
             revSockLocal = revSock
             reverseSock = revSock

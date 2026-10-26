@@ -141,6 +141,12 @@ def doctor(args) -> int:
                     logger.ok("target {} 已安装".format(triple))
                 else:
                     logger.warn("target {} 未安装（可用 doctor --fix 补齐）".format(triple))
+            # Android 端的协议层同样由 Rust 交叉编译（libudp2cal_protocol.so）
+            for abi, triple in config.ANDROID_RUST_TARGETS.items():
+                if triple in targets:
+                    logger.ok("target {} 已安装（Android {}）".format(triple, abi))
+                else:
+                    logger.warn("target {} 未安装（Android {} 构建需要；可用 doctor --fix 补齐）".format(triple, abi))
     else:
         logger.error("未找到 Rust（https://rustup.rs）")
 
@@ -178,6 +184,8 @@ def doctor(args) -> int:
                 deps.ensure_local_properties(project, sdks[0], logger)
         if rust and rust.rustup:
             for triple in config.WINDOWS_TARGETS.values():
+                deps.ensure_rust_target(rust, triple, logger)
+            for triple in config.ANDROID_RUST_TARGETS.values():
                 deps.ensure_rust_target(rust, triple, logger)
         # 修复后必须复检：否则摘要恒为"发现 N 项待处理"，与实际情况不符
         logger.section("修复后复检")

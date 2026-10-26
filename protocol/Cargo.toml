@@ -1,9 +1,20 @@
 [package]
 name = "udp2cal-protocol"
-version = "1.3.0"
+version = "1.5.0"
 edition = "2021"
 description = "UDP2CAL 协议 v3：控制面 + RTP/Opus 媒体面 (Rust实现)"
 
 [lib]
 name = "udp2cal_protocol"
 path = "protocol.rs"
+# cdylib：Android 端 libudp2cal_protocol.so / host 端 udp2cal_protocol.dll，
+# 让 Kotlin 直接复用这份实现（见 `docs/PROTOCOL_V3_RTP.md` §12）。
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+jni = ["dep:jni-sys"]
+
+[dependencies]
+# 只用到 JNI 函数表本身，不需要 jni crate 的封装层
+jni-sys = { version = "0.3", optional = true }

@@ -2,6 +2,7 @@ package com.udp2cal.app
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import com.udp2cal.app.native.ProtocolNative
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -408,6 +409,137 @@ class Udp2CalProtocolTest {
         assertTrue(tags.none { it == 0xFE || it == 0xFF })
     }
 
+    /**
+     * VBR 下包长会在 40–100 字节之间跳。曾经的实现把"上一次收包长度"当成
+     * 拉取缓冲的容量：紧跟一个短包之后，一帧更长的音频会被判成 WAIT
+     * （时间轴不前进，播放线程空转 → 断音）。这里用 1/100 字节交替的载荷守住。
+     */
+    @Test
+    fun jitter_pullSurvivesVariablePayloadLengths() {
+        val jb = Udp2CalProtocol.JitterBuffer()
+        val out = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
+        val short = ByteArray(1) { 0x11 }
+        val long = ByteArray(100) { 0x22 }
+        // 三帧连续 → 预缓冲满足，第一次 pull 就进 PLAYING
+        assertTrue(jb.insert(100, 4800L, false, short, 0, short.size))
+        assertTrue(jb.insert(101, 5280L, false, long, 0, long.size))
+        assertTrue(jb.insert(102, 5760L, false, short, 0, short.size))
+
+        assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pull(0, 40, out))
+        assertEquals(1, jb.pulledLength)
+        assertEquals(0x11, out[0].toInt() and 0xFF)
+
+        // 队首换成 100 字节帧：容量必须自动补齐，否则这里返回 WAIT
+        assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pull(0, 40, out))
+        assertEquals(100, jb.pulledLength)
+        assertEquals(0x22, out[0].toInt() and 0xFF)
+        jb.close()
+    }
+
+    // ═══════ 阶跃吸收（方案 C） ═══════
+
+    @Test
+    fun jitter_skipFramesAdvancesTheTimeline() {
+        val jb = Udp2CalProtocol.JitterBuffer()
+        for (i in 0 until 12) insert(jb, 100 + i, 4800L + 480L * i, i == 0, i + 1)
+        assertEquals(120, jb.waterMs())
+        assertEquals(listOf(1), pullTags(jb, 0, 1))
+        // 跳 4 帧：时间线前移 40 ms，不产生 PLC，不计入 epoch
+        val epoch = jb.epoch
+        assertEquals(4, jb.skipFrames(4))
+        assertEquals(120 - 10 - 40, jb.waterMs())
+        assertEquals(4L, jb.stepTrims)
+        assertEquals(0L, jb.plcFrames)
+        assertEquals(epoch, jb.epoch)
+        // 跳过的帧确实不会被再抬出来：下一帧是第 6 个包的 tag
+        assertEquals(listOf(6), pullTags(jb, 0, 1))
+    }
+
+    @Test
+    fun jitter_skipFramesNeverRunsPastArrivedMedia() {
+        val jb = Udp2CalProtocol.JitterBuffer()
+        for (i in 0 until 4) insert(jb, i, 480L * i, i == 0, i + 1)
+        // 先进 PLAYING（ringMs >= DECODE_LIMIT_MS 让 pull 返回 WAIT、不推进播放头）
+        val out = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
+        assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(Udp2CalProtocol.DECODE_LIMIT_MS, 0, out))
+        assertTrue(jb.playing)
+        // 只到了 4 帧（40 ms），要求跳 12 帧：只能跳到最后一帧之前（最新那帧必须留着）
+        assertEquals(480L * 3, jb.highestTsValue())
+        val skipped = jb.skipFrames(12)
+        assertEquals(3, skipped)
+        assertEquals(jb.highestTsValue(), jb.nextTs)
+        assertEquals(Udp2CalProtocol.OPUS_FRAME_MS, jb.waterMs())
+        assertEquals(3L, jb.stepTrims)
+        assertEquals(0L, jb.plcFrames)
+    }
+
+    @Test
+    fun jitter_skipFramesNeedsAPlayingBuffer() {
+        val jb = Udp2CalProtocol.JitterBuffer()
+        insert(jb, 0, 0L, true, 1)
+        insert(jb, 1, 480L, false, 2)
+        // 未进入 PLAYING（不足 JITTER_START_MS）：水位还在爬升，不能当阶跃
+        assertTrue(!jb.playing)
+        assertEquals(0, jb.skipFrames(1))
+        assertEquals(0L, jb.stepTrims)
+    }
+
+    @Test
+    fun stepAbsorberIgnoresNormalWaterNoise() {
+        val a = Udp2CalProtocol.StepAbsorber()
+        // 稳态：水位在目标 ±2 帧内跳，总量远低于 target+EXCESS
+        for (w in intArrayOf(150, 160, 140, 155, 145, 150)) {
+            val d = a.decide(w, 44, true, 150)
+            assertEquals(0, d.frames)
+            assertTrue(!d.limited)
+        }
+        assertEquals(0L, a.hits)
+    }
+
+    @Test
+    fun stepAbsorberTrimsOnASingleBatchGrowth() {
+        val a = Udp2CalProtocol.StepAbsorber()
+        assertEquals(0, a.decide(150, 44, true, 150).frames)
+        // 一次补齐 120 ms → 命中"增长 > 80 ms"，水位总量 314 → 跳上限 12 帧
+        val d = a.decide(270, 44, true, 150)
+        assertTrue(!d.limited)
+        assertEquals(Udp2CalProtocol.PLC_MAX_MS / Udp2CalProtocol.OPUS_FRAME_MS, d.frames)
+        assertEquals(1L, a.hits)
+    }
+
+    @Test
+    fun stepAbsorberTrimsWhenWaterExceedsTargetWindow() {
+        val a = Udp2CalProtocol.StepAbsorber()
+        // 没有大增长，但总量超过 target + STEP_TRIM_EXCESS_MS
+        assertEquals(0, a.decide(190, 60, true, 150).frames)
+        assertEquals(12, a.decide(210, 60, true, 150).frames)
+    }
+
+    @Test
+    fun stepAbsorberRespectsThePerMinuteLimit() {
+        val a = Udp2CalProtocol.StepAbsorber()
+        var trimmed = 0
+        var limited = 0
+        repeat(Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN + 2) {
+            // 每轮先回到目标附近，再制造一次 120 ms 阶跃
+            a.decide(150, 44, true, 150)
+            val d = a.decide(270, 44, true, 150)
+            if (d.frames == 0) return@repeat
+            if (d.limited) limited++ else trimmed++
+        }
+        assertEquals(Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN, trimmed)
+        assertTrue("超限必须只记录不裁剪", limited >= 1)
+    }
+
+    @Test
+    fun stepAbsorberOnlyActsOncePlaying() {
+        val a = Udp2CalProtocol.StepAbsorber()
+        // 预缓冲期水位从 0 爬升：不得当成阶跃
+        assertEquals(0, a.decide(210, 44, false, 150).frames)
+        assertEquals(0L, a.hits)
+        // 同一水位在 PLAYING 下也不算"增长"，但总量 254 已过 target+100
+        assertEquals(11, a.decide(210, 44, true, 150).frames)
+    }
     // ═══════ 漂移校正：抗饱和 PI ═══════
 
     /** 按 10 ms 一帧推进（计时用**设备帧**，与播放端一致），返回最终比率微调 */
@@ -831,8 +963,8 @@ class Udp2CalProtocolTest {
         assertEquals(44043, Udp2CalProtocol.DISCOVER_PORT)
         assertEquals(44044, Udp2CalProtocol.DEFAULT_LISTEN_PORT)
         assertEquals(30, Udp2CalProtocol.JITTER_START_MS)
-        // 目标水位含声卡缓冲（单一口径），并按实机批次交付特征定到 210
-        assertEquals(260, Udp2CalProtocol.WATER_TARGET_MS)
+        // 目标水位含声卡缓冲（单一口径），按实机批次交付特征定到 150
+        assertEquals(150, Udp2CalProtocol.WATER_TARGET_MS)
         assertEquals(40, Udp2CalProtocol.DECODE_LIMIT_MS)
         assertTrue(Udp2CalProtocol.PLC_LEAD_MS < Udp2CalProtocol.DECODE_LIMIT_MS)
         assertTrue(Udp2CalProtocol.DECODE_LIMIT_MS < Udp2CalProtocol.WATER_TARGET_MS)
@@ -888,5 +1020,92 @@ class Udp2CalProtocolTest {
     fun deviceIdToString_isLowerCaseHex() {
         val id = bytes(0x0A, 0x1B, 0x2C, 0x3D, 0x4E, 0x5F, 0x60, 0x7F)
         assertEquals("0a1b2c3d4e5f607f", Udp2CalProtocol.deviceIdToString(id))
+    }
+
+    // ═══════ 单一真源：Kotlin 常量必须与 Rust 导出的常量逐项一致 ═══════
+
+    /**
+     * 行为已经全部由 Rust 提供，常量却仍要在 Kotlin 里留一份（编译期需要）。
+     * 这个测试是防漂移的闸门：任何一边改了数值而另一边没改，这里立刻红。
+     */
+    @Test
+    fun nativeConstantsMatchKotlinConstants() {
+        // `UDP2CAL_WATER_TARGET_MS` 会覆盖 Rust 侧的默认目标水位（见 docs/PROTOCOL_V3_RTP.md §7.10.1），
+        // 所以期望值按覆盖后的钳位结果算；没设环境变量时就是 Kotlin 常量本身。
+        val expectedWaterTarget = System.getenv("UDP2CAL_WATER_TARGET_MS")
+            ?.trim()?.toIntOrNull()
+            ?.coerceIn(Udp2CalProtocol.WATER_TARGET_MIN_MS, Udp2CalProtocol.WATER_TARGET_MAX_MS)
+            ?: Udp2CalProtocol.WATER_TARGET_MS
+        val expected = longArrayOf(
+            Udp2CalProtocol.CONTROL_VERSION.toLong(),
+            Udp2CalProtocol.CONTROL_HEADER_SIZE.toLong(),
+            Udp2CalProtocol.CONTROL_MAX_PAYLOAD.toLong(),
+            Udp2CalProtocol.DEVICE_ID_SIZE.toLong(),
+            Udp2CalProtocol.DISCOVER_PORT.toLong(),
+            Udp2CalProtocol.DEFAULT_LISTEN_PORT.toLong(),
+            Udp2CalProtocol.TYPE_DATA.toLong(),
+            Udp2CalProtocol.TYPE_CONNECT.toLong(),
+            Udp2CalProtocol.TYPE_DISCOVER_REQ.toLong(),
+            Udp2CalProtocol.TYPE_DISCOVER_REPLY.toLong(),
+            Udp2CalProtocol.TYPE_CONNECT_ACK.toLong(),
+            Udp2CalProtocol.TYPE_MAX_KNOWN.toLong(),
+            Udp2CalProtocol.CONNECT_PAYLOAD_SIZE.toLong(),
+            Udp2CalProtocol.CONNECT_ACK_PAYLOAD_SIZE.toLong(),
+            Udp2CalProtocol.DEVICE_NAME_MAX.toLong(),
+            Udp2CalProtocol.RTP_HEADER_SIZE.toLong(),
+            Udp2CalProtocol.OPUS_PAYLOAD_TYPE.toLong(),
+            Udp2CalProtocol.OPUS_SAMPLE_RATE.toLong(),
+            Udp2CalProtocol.OPUS_FRAME_MS.toLong(),
+            Udp2CalProtocol.OPUS_FRAME_SAMPLES.toLong(),
+            Udp2CalProtocol.OPUS_MAX_PAYLOAD.toLong(),
+            Udp2CalProtocol.RTP_MAX_PACKET.toLong(),
+            Udp2CalProtocol.UDP_IP_MAX_PACKET.toLong(),
+            Udp2CalProtocol.BITRATE_AUTO_KBPS.toLong(),
+            Udp2CalProtocol.BITRATE_MAX_KBPS.toLong(),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS[0].toLong(),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS[1].toLong(),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS[2].toLong(),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS[3].toLong(),
+            Udp2CalProtocol.BITRATE_STEPS_KBPS[4].toLong(),
+            Udp2CalProtocol.MAX_REORDER_PACKETS.toLong(),
+            Udp2CalProtocol.ARRIVAL_TRACE.toLong(),
+            Udp2CalProtocol.JITTER_START_MS.toLong(),
+            expectedWaterTarget.toLong(),
+            Udp2CalProtocol.WATER_TARGET_MIN_MS.toLong(),
+            Udp2CalProtocol.WATER_TARGET_MAX_MS.toLong(),
+            Udp2CalProtocol.DECODE_LIMIT_MS.toLong(),
+            Udp2CalProtocol.PLC_LEAD_MS.toLong(),
+            Udp2CalProtocol.PLC_MAX_MS.toLong(),
+            Udp2CalProtocol.RESYNC_GAP_MS.toLong(),
+            Udp2CalProtocol.STEP_TRIM_GROWTH_MS.toLong(),
+            Udp2CalProtocol.STEP_TRIM_EXCESS_MS.toLong(),
+            Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN.toLong()
+        )
+        val actual = ProtocolNative.constants()
+        assertEquals("常量个数", expected.size, actual.size)
+        for (i in expected.indices) {
+            assertEquals("第 $i 项常量与 Rust 不一致", expected[i], actual[i])
+        }
+        // 水位目标走 Rust 的 `water_target_ms()`（环境变量可覆盖），默认值必须相同
+        assertEquals(expectedWaterTarget, ProtocolNative.waterTargetMs())
+    }
+
+    @Test
+    fun nativeRealConstantsMatchKotlinConstants() {
+        val expected = doubleArrayOf(
+            Udp2CalProtocol.RESAMPLE_MAX_ADJUST,
+            Udp2CalProtocol.RATIO_SLEW_STEP,
+            Udp2CalProtocol.PI_KP_PER_MS,
+            Udp2CalProtocol.PI_TI_S,
+            Udp2CalProtocol.PI_MIN_UPDATE_MS,
+            Udp2CalProtocol.WATER_SMOOTH_ALPHA,
+            Udp2CalProtocol.RATE_WINDOW_S,
+            Udp2CalProtocol.RATE_FEEDFORWARD_MAX
+        )
+        val actual = ProtocolNative.constantsReal()
+        assertEquals("浮点常量个数", expected.size, actual.size)
+        for (i in expected.indices) {
+            assertEquals("第 $i 项浮点常量与 Rust 不一致", expected[i], actual[i], 0.0)
+        }
     }
 }

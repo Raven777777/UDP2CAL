@@ -918,6 +918,8 @@ class CaptureService : Service() {
         var lastEpoch = -1L
         var lastLatencyLog = 0L
         var latencyMs = 0
+        // 阶跃吸收（方案 C）：与 Windows 端同一套判据与限额
+        val step = Udp2CalProtocol.StepAbsorber()
         // 前馈观测点：只喂"比上次更新的时间戳"
         var fedTs = 0L
         var adjust = 0.0
@@ -935,6 +937,12 @@ class CaptureService : Service() {
             var jbOverflow = 0L
             var arrivalNanos = -1L
             var head = 0L
+            // 阶跃吸收的本 tick 结论（锁内决定，锁外记日志）
+            var stepBefore = 0
+            var stepWant = 0
+            var stepSkipped = 0
+            var stepTotal = 0L
+            var stepLimited = false
 
             linkLock.lock()
             try {
@@ -952,6 +960,29 @@ class CaptureService : Service() {
                 // 生产节流因此天然由 writeBlocking 承担，水位只做缺口判定。
                 val pipeFrames = player.pendingFrames(head)
                 pipeMs = (pipeFrames * 1000L / Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
+
+                // ── 阶跃吸收（方案 C）：先吃掉"一次补齐"的台阶，再按水位拉取 ──
+                // 判据：本 tick 内 jitter 水位涨过 STEP_TRIM_GROWTH_MS，或总水位越过
+                // target + STEP_TRIM_EXCESS_MS。命中则整帧硬重同步：丢掉 n 帧、时间线
+                // 前移，**不**产生 PLC（样本级丢插会留下接缝，v1.3.0 已删，别加回来）。
+                val beforeWater = jitter.waterMs()
+                val beforeTotal = beforeWater + pipeMs
+                val decision = step.decide(
+                    beforeWater,
+                    pipeMs,
+                    jitter.playing,
+                    // 与漂移控制器同源：目标水位以控制器里的为准
+                    drift.targetMs(),
+                )
+                if (decision.frames > 0) {
+                    stepBefore = beforeTotal
+                    stepWant = decision.frames
+                    stepLimited = decision.limited
+                    stepSkipped =
+                        if (decision.limited) 0 else jitter.skipFrames(decision.frames)
+                    stepTotal = jitter.stepTrims
+                }
+
                 code = jitter.pull(0, pipeMs, payload)
                 // 可听点之前还压着的媒体量（设备帧 → 媒体样本要用当前比率换算）
                 val queuedMedia = (pipeFrames.toDouble() * resampler.ratio).toLong()
@@ -988,9 +1019,33 @@ class CaptureService : Service() {
                 drift.reset()
                 // 前馈估计器的基准是 highestTs，重同步会重建它，必须同处复位
                 rate.reset()
+                step.reset()
                 resampler.reset()
                 player.flush()
                 fedTs = 0
+            }
+
+            // 阶跃吸收的日志（锁外：Log 会走 binder）。水位一律用**总水位**
+            // （jitter + pipe）口径，与判据一致；限额分支每 60 s 窗口只放行一条：
+            // 被压制时水位不会自己降下来，不节流就是 ≈200 条/秒。
+            if (stepWant > 0) {
+                if (stepLimited) {
+                    if (step.takeLimitedLog()) {
+                        Log.w(
+                            TAG,
+                            "[Step] 水位 ${stepBefore}ms（目标 ${drift.targetMs()}）" +
+                                "命中阶跃吸收，但每分钟 ${Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN} 次限额已满" +
+                                "（本窗口已用 ${step.trimsInWindow()} 次）：本次只记录不裁剪"
+                        )
+                    }
+                } else if (stepSkipped > 0) {
+                    Log.i(
+                        TAG,
+                        "[Step] 阶跃吸收：整帧跳 $stepSkipped / $stepWant 帧" +
+                            "（${stepSkipped * Udp2CalProtocol.OPUS_FRAME_MS}ms），" +
+                            "水位 ${stepBefore}→${waterMs}ms，累计 $stepTotal 帧"
+                    )
+                }
             }
 
             // ── 比率 = 前馈(管速率) × 反馈(管相位)：两条支路互不污染 ──
@@ -1017,7 +1072,7 @@ class CaptureService : Service() {
                     val ffPpm = ff * 1e6
                     Log.i(
                         TAG,
-                        "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${Udp2CalProtocol.WATER_TARGET_MS}）" +
+                        "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${drift.targetMs()}）" +
                             " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(rate.sigmaPpm())}ppm ${rate.usedBuckets()}桶）"
                     )
                 }
@@ -1070,6 +1125,8 @@ class CaptureService : Service() {
                 }
             }
         }
+        // 播放循环退出，把原生句柄还回去（本循环每连接新建一个）
+        step.close()
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1120,6 +1177,11 @@ class CaptureService : Service() {
     override fun onDestroy() {
         stopCapture()
         serviceScope.cancel()
+        // 原生句柄用完之后必须归还：JitterBuffer/DriftController/RateEstimator 的
+        // 状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
+        runCatching { jitter.close() }
+        runCatching { drift.close() }
+        runCatching { rate.close() }
         super.onDestroy()
     }
 }

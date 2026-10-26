@@ -23,6 +23,10 @@
 
 pub mod rtp;
 
+/// JNI 绑定（Android 端复用本 crate 的唯一实现，见 `docs/PROTOCOL_V3_RTP.md` §12）。
+#[cfg(feature = "jni")]
+pub mod jni;
+
 // ═══════════════════════ 常量 ═══════════════════════
 
 pub const CONTROL_VERSION: u8 = 0x03;
@@ -439,13 +443,28 @@ impl DiscoverReply {
         out
     }
 
+    /// 解析负载，规则与 Android/Kotlin 侧完全一致（v1.5.0 起两端共用本实现）：
+    /// * 长度 ≥2，`listen_port` 必须非零；
+    /// * 设备名 ≤[`DEVICE_NAME_MAX`] 字节；
+    /// * 非法 UTF-8 不整包拒收，按 U+FFFD 替换（发送端截断在字符边界，实际不会触发）；
+    /// * 空名回落为 `"UDP2CAL PC"`，避免 UI 出现一行空白。
     pub fn decode(p: &[u8]) -> Option<Self> {
         if p.len() < 2 {
             return None;
         }
         let listen_port = u16::from_be_bytes([p[0], p[1]]);
-        let name = std::str::from_utf8(&p[2..]).ok()?;
-        Some(Self { listen_port, device_name: name.to_string() })
+        if listen_port == 0 {
+            return None;
+        }
+        let raw = &p[2..];
+        if raw.len() > DEVICE_NAME_MAX {
+            return None;
+        }
+        let name = String::from_utf8_lossy(raw).into_owned();
+        Some(Self {
+            listen_port,
+            device_name: if name.is_empty() { "UDP2CAL PC".to_string() } else { name },
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "udp2cal"
-version = "1.3.0"
+version = "1.5.0"
 edition = "2021"
 description = "UDP2CAL - 局域网音频串流Windows接收端"
 build = "build.rs"
@@ -21,6 +21,7 @@ udp2cal-protocol = { path = "../protocol" }
 iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia", "image"] }
 tokio = { version = "1.40", features = ["net", "sync", "rt", "macros", "time"] }
 cpal = "0.15"
+socket2 = "0.6"
 windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_Com",

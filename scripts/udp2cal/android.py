@@ -163,6 +163,18 @@ def build(ctx, logger) -> int:
     else:
         logger.detail("已禁用依赖自动安装")
 
+    # 协议层已合并为一份 Rust 实现，Gradle 在 preBuild 交叉编译 `protocol/`；
+    # 缺工具链时提前给出能看懂的错误，而不是让 Gradle 报进程启动失败。
+    rust = envmod.detect_rust()
+    if rust is None:
+        logger.error("未找到 Rust 工具链（Android 端协议层需把 protocol/ 编成 libudp2cal_protocol.so）")
+        logger.hint("安装: https://rustup.rs  (winget install Rustlang.Rustup)")
+        return 1
+    logger.ok("Rust: {}".format(rust.version or rust.cargo))
+    rust_triple = config.ANDROID_RUST_TARGETS.get(ctx.abi, "aarch64-linux-android")
+    if not deps.ensure_rust_target(rust, rust_triple, logger, env=None):
+        logger.hint("也可手动执行: rustup target add {}".format(rust_triple))
+        return 1
     logger.step(2, 3, "Gradle assemble{} ({})".format(build_type, ctx.abi))
     task = "assemble{}".format(build_type)
     base_cmd = ["gradlew.bat", task, "-PtargetAbi={}".format(ctx.abi), "--console=plain"]

@@ -1,6 +1,6 @@
 # UDP2CAL 文档中心
 
-> 当前版本 **v1.3.0**（协议 v3）· 本目录是项目技术文档的唯一入口。
+> 当前版本 **v1.5.0**（协议 v3）· 本目录是项目技术文档的唯一入口。
 >
 > UDP2CAL 是双向、低延迟的局域网音频串流系统：Android 手机与 Windows PC 之间
 > 通过**私有控制面 + 标准 RTP/Opus 媒体面**（协议 v3）互传音频流。
@@ -50,7 +50,7 @@
 | 用户能感知的功能与调参项 | `FEATURES.md` | — |
 | 某版本改了什么 | `CHANGELOG.md` | 一句话概括 + 链接 |
 | 某个 bug 为什么发生 | `BUGFIX.md` | 一句话概括 + 链接 |
-| 改进路线、阶段划分、验收门 | `archive/PLAN_ASRC_REFACTOR.md`（已完成归档） | 写"见 PLAN §x"，不复制阶段表 |
+| 改进路线、阶段划分、验收门 | `archive/PLAN_ASRC_REFACTOR.md`、`archive/PROPOSAL_LATENCY_V1.4.md`（均已完成归档） | 写"见 PLAN/PROPOSAL §x"，不复制阶段表 |
 | 构建命令与产物 | `BUILD.md` | — |
 
 > 判定标准：**读者会照着它写代码吗？** 会 → 协议规范；只想知道"为什么"或"在哪里" → 其他文档。
@@ -72,6 +72,7 @@ docs/
 ├─ LEGAL.md                   # 许可证与合规
 ├─ archive/                   # 历史存档（不维护，不作为规范引用；见 archive/README.md）
 │  ├─ PROTOCOL_V2.md                   # v2 协议（与 v3 不互通）
+│  ├─ PROPOSAL_LATENCY_V1.4.md        # 延迟优化提案：DSCP EF + 水位 150 + 阶跃吸收（v1.4.0 已落地）
 │  ├─ PLAN_V3_MIGRATION.md             # v2→v3 迁移计划与逐文件清单（已完成）
 │  ├─ PLAN_ASRC_REFACTOR.md            # 音频同步向纯 ASRC 收敛的五阶段计划（已完成）
 │  ├─ BUGFIX_V2_ERA.md                 # v3 重写之前的 bug 记录

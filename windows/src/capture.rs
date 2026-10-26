@@ -27,6 +27,10 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+/// DSCP EF（46）→ IP TOS 字节 0xB8。反向音频流的转发优先级最高，
+/// 让 Wi-Fi 接入点 / 路由器把它排在其他流量前面，抑制排队抖动。
+const DSCP_EF_TOS: u32 = 0xB8;
+
 /// 每声道 480 采样 = 10 ms @ 48 kHz
 const FRAME_MONO: usize = 480;
 /// 立体声交错样本数（一帧）
@@ -252,6 +256,16 @@ impl ReverseSender {
                 return;
             }
         };
+
+        // ── DSCP EF 标记（A2）──
+        // 设置本身可能被组策略拦下（DisableUserTOSSetting=1）或需要管理员，
+        // 失败不影响功能：仅告警，继续用默认优先级发送。
+        match socket2::SockRef::from(&send_sock).set_tos_v4(DSCP_EF_TOS) {
+            Ok(()) => logf!("[Reverse] 发送套接字已标记 DSCP EF（TOS=0xB8）"),
+            Err(e) => logf!(
+                "[Reverse] DSCP 标记失败（{e}）：需管理员权限或 DisableUserTOSSetting=0；音频仍可正常发送"
+            ),
+        }
 
         let capture = match LoopbackCapture::new() {
             Some(c) => c,

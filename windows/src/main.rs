@@ -304,6 +304,10 @@ fn init_audio_worker() {
             let device_rate = aw.device_rate;
             let mut drift = protocol::rtp::DriftController::new(device_rate);
             let mut rate = protocol::rtp::RateEstimator::new();
+            // 阶跃吸收（方案 C）：判据与限额与 Android 端同构
+            let mut step = protocol::rtp::StepAbsorber::new();
+            // 实际生效的目标水位（环境变量可覆盖，两端各自读各自的）
+            let water_target = protocol::rtp::water_target_ms();
             let mut payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
             let silence_frame = [0.0f32; protocol::rtp::FRAME_SAMPLES as usize];
             let mut last_epoch = 0u64;
@@ -328,6 +332,7 @@ fn init_audio_worker() {
                         jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
                         drift.reset();
                         rate.reset();
+                        step.reset();
                         dec.reset();
                         aw.flush();
                         fed_ts = 0;
@@ -346,6 +351,7 @@ fn init_audio_worker() {
                     dec.reset();
                     drift.reset();
                     rate.reset();
+                    step.reset();
                     aw.flush();
                     fed_ts = 0;
                 }
@@ -361,8 +367,37 @@ fn init_audio_worker() {
                 // 把解码缓冲折回媒体样本，才知道"此刻出声的那一帧"是哪个时间戳
                 let queued_media = (pipe_frames as f64 * aw.current_ratio()) as u64;
 
-                let (pull, jb_water, next_ts, newest_ts, arrival, newest, plc_frames) = {
+                let (
+                    pull,
+                    jb_water,
+                    next_ts,
+                    newest_ts,
+                    arrival,
+                    newest,
+                    plc_frames,
+                    trims,
+                    step_hit,
+                ) = {
                     let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+
+                    // ── 阶跃吸收（方案 C）：先吃掉“一次补齐”的台阶，再按水位拉取 ──
+                    // 判据：本 tick 内 jb 水位涨过 STEP_TRIM_GROWTH_MS，或总水位
+                    // 越过 target + STEP_TRIM_EXCESS_MS。命中则整帧硬重同步：丢掉
+                    // n 帧、时间线前移，**不**产生 PLC（样本级丢插会留下接缝，
+                    // v1.3.0 已删，别加回来）。
+                    let before_water = jb.water_ms();
+                    let before_total = before_water.saturating_add(pipe_ms);
+                    let decision = step.decide(before_water, pipe_ms, jb.is_playing(), water_target);
+                    let mut hit: Option<(u32, u32, u32, bool)> = None;
+                    if decision.frames > 0 {
+                        let skipped = if decision.limited {
+                            0
+                        } else {
+                            jb.skip_frames(decision.frames)
+                        };
+                        hit = Some((before_total, decision.frames, skipped, decision.limited));
+                    }
+
                     let r = jb.pull(ring_ms, pipe_ms, &mut payload);
                     let next_ts = jb.next_ts();
                     let highest = jb.highest_ts();
@@ -375,9 +410,39 @@ fn init_audio_worker() {
                         jb.arrival_of(audible_ts),
                         jb.arrival_of(highest),
                         jb.stats.plc_frames,
+                        jb.stats.step_trims,
+                        hit,
                     )
                 };
                 let water = jb_water.saturating_add(pipe_ms);
+
+                // 阶跃吸收的日志（锁外：logf 会写盘）。水位一律用**总水位**
+                // （jb + pipe）口径，与判据一致；否则“跳了 120 ms 只掉 76 ms”
+                // 会把人带坑里。限额分支每 60 s 窗口只放行一条：被压制时水位
+                // 不会自己降下来，不节流就是 ≈250 条/秒。
+                if let Some((before, want, skipped, limited)) = step_hit {
+                    if limited {
+                        if step.take_limited_log() {
+                            logf!(
+                                "[Step] 水位 {}ms（目标 {}）命中阶跃吸收，但每分钟 {} 次限额已满（本窗口已用 {} 次）：本次只记录不裁剪",
+                                before,
+                                water_target,
+                                protocol::rtp::STEP_TRIM_MAX_PER_MIN,
+                                step.trims_in_window()
+                            );
+                        }
+                    } else if skipped > 0 {
+                        logf!(
+                            "[Step] 阶跃吸收：整帧跳 {} / {} 帧（{}ms），水位 {}→{}ms，累计 {} 帧",
+                            skipped,
+                            want,
+                            skipped * protocol::rtp::FRAME_MS,
+                            before,
+                            water,
+                            trims
+                        );
+                    }
+                }
 
                 // ── 前馈：管速率 ──
                 // 观测量是"发送端媒体时间线 vs 本地 Instant"的最小延迟，与解码
@@ -447,12 +512,12 @@ fn init_audio_worker() {
 
                 if diag.due() {
                     diag.row(format_args!(
-                        "{},{},{},{},{},{:.0},{:.1},{:.1},{},{:.3},{},{},{},{}",
+                        "{},{},{},{},{},{:.0},{:.1},{:.1},{},{:.3},{},{},{},{},{}",
                         ring_ms,
                         pipe_ms,
                         jb_water,
                         water,
-                        protocol::rtp::WATER_TARGET_MS,
+                        water_target,
                         adjust * 1e6,
                         ff * 1e6,
                         rate.sigma_ppm(),
@@ -462,6 +527,7 @@ fn init_audio_worker() {
                         next_ts,
                         plc_frames,
                         audio_stats().snapshot().underrun,
+                        trims,
                     ));
                 }
 
@@ -483,18 +549,19 @@ fn init_audio_worker() {
                 if last_latency_log.elapsed() >= Duration::from_secs(10) {
                     last_latency_log = Instant::now();
                     logf!(
-                        "[Latency] 总延迟≈{}ms（水位 {}ms = 抖动 {} + 解码 {}，目标 {}）声卡 {}ms 比率 {:+.3}%（反馈 {:+.0}ppm / 前馈 {:+.1}ppm，σ {:.1}ppm，{} 桶）",
+                        "[Latency] 总延迟≈{}ms（水位 {}ms = 抖动 {} + 解码 {}，目标 {}）声卡 {}ms 比率 {:+.3}%（反馈 {:+.0}ppm / 前馈 {:+.1}ppm，σ {:.1}ppm，{} 桶，阶跃裁剪 {} 帧）",
                         LATENCY_MS.load(Ordering::Relaxed),
                         water,
                         jb_water,
                         pipe_ms,
-                        protocol::rtp::WATER_TARGET_MS,
+                        water_target,
                         aw.device_latency_ms(),
                         adjust * 100.0,
                         du * 1e6,
                         ff * 1e6,
                         rate.sigma_ppm(),
                         rate.used_buckets(),
+                        trims,
                     );
                 }
             }

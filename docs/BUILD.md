@@ -21,6 +21,7 @@
 | JDK | 17~22 |
 | Android SDK | API 35 |
 | NDK | 27.0.12077973 |
+| Rust 工具链 | `cargo` 在 `PATH`（或 `CARGO` 环境变量），且已装交叉 target：`rustup target add aarch64-linux-android` |
 
 > 构建脚本会自动检查 JDK / SDK / gradle wrapper，并修正 `local.properties`；产物复制到项目根目录。
 
@@ -72,6 +73,32 @@ build.bat android --modern --abi armeabi-v7a --release
   3. `./opus`（上游兜底，本副本中不存在）
 - Windows 端 CMake 构建配置**强制 Release**：dev profile 下 CMake 默认 Debug（/MDd 调试 CRT），Opus 1.6.x 会引入 `__imp__CrtDbgReportW` 等调试 CRT 符号，与 rustc 链接的 /MD 发行版 CRT 不兼容，导致 `LNK2001/LNK1120` 链接失败。
 - `audiopus` 0.3.0-rc.0 的预生成绑定兼容 1.6.1 的 C ABI；1.6 新增 API（Opus HD 等）未暴露，且本项目不使用。
+
+### 协议层共用（Android 用同一份 Rust 实现）
+
+Android 不再手写协议副本，而是把 `protocol/` 编成 `libudp2cal_protocol.so` 被 Kotlin 通过 JNI 调用
+（设计见 [ARCHITECTURE.md](ARCHITECTURE.md)「协议单一实现」）。Gradle 已全部接好，无需额外命令：
+
+| 任务 | 作用 |
+|------|------|
+| `cargoBuildAndroidProtocol` | 用 NDK 的 `clang.exe` 交叉编译 `protocol/ --features jni --target aarch64-linux-android` |
+| `syncRustJniLibs` | 把 `.so` 同步到 `android/app/build/rustJniLibs/<abi>/`，`preBuild` 依赖它 |
+| `cargoBuildHostProtocol` | 编宿主 `udp2cal_protocol.dll`，供 `testDebugUnitTest` 直接跑同一套 JNI 符号 |
+
+手工验证（可选）：
+
+```bat
+rustup target add aarch64-linux-android      :: -PtargetAbi=armeabi-v7a 时再加 armv7-linux-androideabi
+cd protocol && cargo build --release --features jni
+cargo test --offline
+```
+
+> cargo 默认联网（首次构建需下载 `jni-sys`）；缓存已暖的机器可加 `-PcargoOffline` 完全离线：
+> `gradlew :app:assembleRelease -PcargoOffline`。
+
+> 交叉编译不用 NDK 的 `aarch64-linux-android29-clang` 包装脚本（在 Windows 上是 `.sh`/`.cmd`，Rust
+> 启动不了），而是直接用 `clang.exe` + `--target` + `--sysroot`。注意 sysroot 在
+> `ndk/<ver>/toolchains/llvm/prebuilt/windows-x86_64/sysroot`，**`ndk/<ver>/sysroot` 不存在**。
 
 ### Opus ML 特性（Deep PLC + DRED）
 
@@ -169,3 +196,7 @@ scripts/
 | Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本会检查 wrapper；必要时删除 `~/.gradle/caches` 后重试 |
 | `lintVitalAnalyzeRelease` 报 `IncompatibleClassChangeError: KaCallableMemberCall` | AGP 8.7 的 lint 与 Kotlin 2.0 分析 API 不兼容（Google issue 374783344），崩溃点为 `NullSafeMutableLiveData` 检查 | 已在 `app/build.gradle.kts` 禁用该检查；升级到 AGP 8.8.2+ 后可删除该行恢复 |
 | `--proxy` 构建报 `'127.0.0.1' 不是内部或外部命令` | `-Dhttp.nonProxyHosts` 中的 `\|` 被 cmd 当作管道符 | 已修复（`scripts/udp2cal/proxy.py` 为该参数加引号）；旧脚本可改用 `--proxy direct` 绕过 |
+| `A problem occurred starting process 'command 'cargo''` | Gradle 继承了 Git Bash 的 POSIX `PATH`，Java 解析不了；或 `PATH` 里根本没有 cargo | 用 cmd 构建（`build.bat android`），或设 `CARGO=<绝对路径>`；脚本已自动按 `~/.cargo/bin/cargo.exe` 定位 |
+| `ld.lld: error: cannot open crtbegin_so.o` / `unable to find library -lc` | `RUSTFLAGS` 里的 `--sysroot` 指到了 `ndk/<ver>/sysroot`（不存在） | 改为 `ndk/<ver>/toolchains/llvm/prebuilt/windows-x86_64/sysroot`；`build.gradle.kts` 已修正 |
+| Android 单元测试报 `UnsatisfiedLinkError: no udp2cal_protocol in java.library.path` | 宿主 `.dll` 未编或路径未传入 | `./gradlew :app:cargoBuildHostProtocol` 后重跑；测试任务已自动 `dependsOn` 并设 `java.library.path` |
+| Release 包运行时报 `UnsatisfiedLinkError: native method not found` | R8 把 `ProtocolNative` 类/方法改名了（JNI 符号名含类名与方法名） | `android/app/proguard-rules.pro` 里保留 `-keep class com.udp2cal.app.native.ProtocolNative { *; }`，勿删 |

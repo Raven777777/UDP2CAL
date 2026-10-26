@@ -26,7 +26,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 | `android/`         | Android 客户端（Kotlin + Jetpack Compose），全参数 Opus 面板                                 | Android 10 (API 29)+        |
 | `opus-src/`        | libopus 1.6.1 源码树（Android JNI 与 Windows 共用的唯一副本，勿在其内部另存副本）                            | —                           |
 | `vendor/`          | `audiopus` / `audiopus_sys` 本地副本（含本地扩展，经 `[patch.crates-io]` 引用，勿用上游覆盖）                | —                           |
-| `protocol/`        | 协议 v3 crate：控制面 + RTP 媒体面（协议唯一真源）                                            | —                           |
+| `protocol/`        | 协议 v3 crate：控制面 + RTP 媒体面（协议唯一真源；Android 端经 JNI 复用同一份实现）                          | —                           |
 
 ---
 
@@ -40,7 +40,7 @@ build.bat doctor --fix                               :: 环境体检与自动修
 
 不带参数运行 `build.bat` 可进入交互式菜单。
 
-**开发**：Windows Rust 1.96+、VS Build Tools 2022、CMake 3.22+；Android JDK 17~22、Android SDK 35、NDK 27.0.12077973
+**开发**：Windows Rust 1.96+、VS Build Tools 2022、CMake 3.22+；Android JDK 17~22、Android SDK 35、NDK 27.0.12077973，外加 Rust `aarch64-linux-android` target（协议层交叉编译成 `libudp2cal_protocol.so`，见 [docs/BUILD.md](docs/BUILD.md)）
 
 ---
 

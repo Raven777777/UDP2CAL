@@ -1,6 +1,6 @@
 # UDP2CAL 协议 v3：RTP/Opus 媒体 + 控制面
 
-> **状态：已实现（v1.3.0）。**
+> **状态：已实现（v1.5.0）。**
 > 本文档描述 v3 的线格式与接收端时钟模型；`protocol/`、`windows/`、`android/` 均已按本文实现，
 > v2 代码路径已删除（`archive/PROTOCOL_V2.md` 仅作历史存档）。
 >
@@ -8,6 +8,7 @@
 > - 媒体承载：**标准 RTP/AVP，RTP version 2**
 > - 适用范围：Android ↔ Windows，局域网 / 点对点，单向或双向实时音频
 > - 协议真源：`protocol/protocol.rs`（控制面） + `protocol/rtp.rs`（媒体面 / 抖动缓冲 / 播放头）
+>   —— Android 不再有 Kotlin 副本，它通过 JNI 调用同一份 Rust 实现（见 [ARCHITECTURE.md](ARCHITECTURE.md)）
 > - 相关文档：[v2 协议（历史）](archive/PROTOCOL_V2.md) · [架构说明](ARCHITECTURE.md)
 >
 > 本文使用 RFC 2119 风格的关键词：**必须（MUST）**、**不得（MUST NOT）**、**应该（SHOULD）**、**可以（MAY）**。
@@ -560,7 +561,11 @@ Reconnecting ──(ACK)──> Connected
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
 | `JITTER_START_MS` | 30 ms | 预缓冲启动阈值（3 帧连续） |
-| `WATER_TARGET_MS` | 260 ms | 目标**总**水位（单一口径：抖动缓冲 + PCM 环 + 声卡缓冲）。取值由实测断供幅度决定，见 §7.10.1 |
+| `WATER_TARGET_MS` | 150 ms | 目标**总**水位（单一口径：抖动缓冲 + PCM 环 + 声卡缓冲）。**两端必须同值**；取值由实测断供幅度决定，见 §7.10.1 |
+| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
+| `STEP_TRIM_GROWTH_MS` | 80 ms | 阶跃判据一：单次 tick 内抖动缓冲水位增长超过即判为阶跃，见 §7.10.2 |
+| `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据二：总水位 > `target + 100` ms 即判为超预算 |
+| `STEP_TRIM_MAX_PER_MIN` | 3 | 60 s 窗口内最多裁剪次数，超限只记录不裁剪 |
 | `DECODE_LIMIT_MS` | 40 ms | 解码缓冲深度上限：到顶就暂停生产（生产节奏由声卡消费节奏约束） |
 | `PLC_LEAD_MS` | 20 ms | 可听点见底的判据：`pipe_ms <= 20` 才允许补 PLC |
 | `PLC_MAX_MS` | 120 ms | 连续 PLC 上限（12 帧） |
@@ -860,10 +865,14 @@ audible_ts   = jb.next_ts() − queued_media
 绝对精度仍需**实测校准一次**（见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)），
 但校准值只作为日志/展示的修正量，不参与水位控制——水位控制只关心相对填充变化。
 
-### 7.10.1 为什么 `WATER_TARGET_MS` 是 260 ms
+### 7.10.1 为什么 `WATER_TARGET_MS` 是 150 ms（以及它为什么会被环境改变）
 
-这个数不是拍脑袋定的，而是 P0 实机打点（`UDP2CAL_ASRC_DIAG=20`，每轮 300 s，
-Android 发送端 + Wi-Fi + VB-Cable）量出来的。关键发现是网络**周期性断供**：
+这个数**不是算出来的**，而是由网络环境决定的：它要盖住「一次断供有多深」，而断供深度
+只取决于链路环境（Wi-Fi 省电、AP 缓冲、手机扫描），不是协议能拍的常数。换环境就要重新
+定值——这一点 v1.3.0 与 v1.4.0 相同，变的是环境。
+
+**v1.3.0 的 260 ms 从哪来**：P0 实机打点（`UDP2CAL_ASRC_DIAG=20`，每轮 300 s，
+Android 发送端 + Wi-Fi + VB-Cable）发现网络**周期性断供**：
 
 | 观测量 | 实测值 |
 |--------|--------|
@@ -873,9 +882,11 @@ Android 发送端 + Wi-Fi + VB-Cable）量出来的。关键发现是网络**周
 | 时钟差（前馈） | 中位 4 ppm，`σ` 中位 13 ppm（两端晶振几乎一样） |
 | 发送端整形 | 已是 10 ms 网格（`CaptureService.sendFrames`），不是发送端攒批 |
 
-所以目标水位必须盖住**断供幅度**（~200 ms），而不是批次大小（90 ms）：
-断供期间水位往下掉，水位不够就直接变成 PLC；而补回来的富余只能靠比率排水
-（±0.5% = 5 ms/s，200 ms 要 40 s）。三轮实测：
+关键约束是**排水速度**：比率微调上限 `RESAMPLE_MAX_ADJUST = ±0.005`，即 5 ms/s，
+排掉 200 ms 富余要 40 s，这 40 s 里偏差一直贴着钳位（≈±8.6 音分），听感就是变调。
+所以目标水位必须**全量吸收**断供幅度，而不是靠比率慢慢排——这才是 260 ms 的唯一理由：
+它不是「想要的延迟」，而是「比率排不动的部分必须一次性预留在缓冲里」。
+v1.3.0 三轮实测（尚未关扫描的环境）：
 
 | 目标水位 | 实测 `water_ms` | PLC | `adjust` 中位 | 贴 ±0.5% 钳位 |
 |---------|----------------|-----|--------------|--------------|
@@ -888,10 +899,90 @@ Android 发送端 + Wi-Fi + VB-Cable）量出来的。关键发现是网络**周
 网络本身会波动：同一配置重跑一次，水位中位仍在 275–284 ms，但最大尖峰会在 328–490 ms
 之间变（断供幅度变了）。
 
-**代价与取舍**：稳态总延迟约 275 ms。想更短只有两条路——把网络的断供幅度降下来
-（关手机 Wi-Fi 省电 / 用 5 GHz / 有线或 USB 网络共享），或抬高 `RESAMPLE_MAX_ADJUST`
-用变调换排水速度（规范 §八 明确不做后者）。这个参数是**唯一**跟环境相关的常数，
-换环境后应重跑 P0 打点重新定值。
+**v1.4.0 为什么可以降到 150 ms**：v1.4.0 把「环境前提」写进了发布流程——先关掉 vivo 全频段
+扫描（`adb shell pm disable-user --user 0 com.vivo.multinlp`，见 `CHANGELOG.md` v1.4.0 的
+A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600–1100 ms 停摆，正是 v1.3.0
+必须预留水位的那档断供。关掉之后 4 次长跑里 **0 次 >200 ms**，稳态最大空档只有 **68–90 ms**
+（就是 AP 成批交付那一档）。按安全系数 1.6 取 `68–90 × 1.6 ≈ 140 ms`，落到 10 ms 网格即
+**150 ms**：
+
+| 组成 | 值 | 说明 |
+|------|-----|------|
+| 解码 / PCM 环 | 44 ms | 被 `DECODE_LIMIT_MS = 40` 钉住：门开一帧 → 49，再排空 |
+| 声卡缓冲 | ≈10 ms | VB-Cable 无 playback 时间戳时可能为 0 |
+| 抖动缓冲余量 | ≈96 ms | 覆盖 68–90 ms 的稳态空档并留一点头寸 |
+| **合计（目标总水位）** | **150 ms** | 比 v1.3.0 低 110 ms |
+
+原来靠水位预留的那部分（每隔几十秒一次的 ~200 ms 台阶）改由 §7.10.2 的**阶跃吸收**当场
+吃掉：台阶到达时直接前移时间线，而不是让 PI 顶 40 s 钳位。
+
+**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 150`；环境变量
+`UDP2CAL_WATER_TARGET_MS` 可覆盖，允许区间
+`WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位，进程内首次读取后缓存
+（`protocol::rtp::water_target_ms()`）。取值经 `DriftController::with_target()` 注入，PI 的
+`err` 仍只对比这一个量。Android 端保持常量 150，**两端必须同值**：一端改了另一端没改，
+等于给水位控制换了个参考点，水位会长期偏在目标之外并顶钳位。
+
+这个参数仍是**唯一**跟环境相关的常数：换路由器、换手机、对方装新 App 都可能重新引入扫描源
+或改变空档幅度，此时应重跑 P0 打点按实测最大空档 ×1.5–1.6 重新定值；现场调参优先用
+`UDP2CAL_WATER_TARGET_MS`（不必重编译），确定后回写常量并同步 Android。
+
+### 7.10.2 阶跃吸收（step trim）
+
+**问题**：即使关掉扫描，AP 仍可能把十到二十帧一次性补齐，一个 tick 内把水位顶高 100–200 ms。
+比率排水只有 5 ms/s，排 100 ms 要 20 s，期间 `adjust_ppm` 一直贴 ±5000（≈±8.6 音分）——
+这就是听感上的"音调漂移"。这类**阶跃**不能交给 PI，只能用整帧硬重同步当场吃掉。
+
+**判据**（`StepAbsorber::decide` / `Udp2CalProtocol.StepAbsorber`，两端同一套阈值与限额）：
+
+- 单次 tick 内 `jb.water_ms()` 增长 > `STEP_TRIM_GROWTH_MS`（80 ms）→ 判为阶跃；或
+- 总水位 `jb + pipe` > `target + STEP_TRIM_EXCESS_MS`（`target + 100` ms）→ 判为超预算。
+
+命中任一即裁剪。第一条只看抖动缓冲的增长（`pipe` 的增长是解码器正常生产，不是阶跃），
+第二条看总水位。
+
+**裁多少**：
+
+```text
+n = ceil((jb_water_ms + pipe_ms − target) / FRAME_MS)   # 只跳到目标，向上取整到整帧
+n = min(n, PLC_MAX_MS / FRAME_MS)                       # 上限 12 帧（120 ms）
+```
+
+**限额与边界**：
+
+- 每 60 s 最多裁剪 `STEP_TRIM_MAX_PER_MIN`（3）次；超限时 `StepDecision.frames` 仍有值但
+  `limited = true`，调用方**只记录不裁剪**——参数过激时听感是"跳音"，宁可让水位高一会儿。
+- 首次 `decide` 只登记水位基准（`primed`），不下结论：启动时 `last_water_ms = 0` 会把正常
+  水位当成一次巨大阶跃。
+- `can_trim`（= `jb.is_playing()`）为 false 时只更新基准、不裁剪：预缓冲期水位本来就在爬升。
+- `JitterBuffer::skip_frames(n)`（Kotlin `skipFrames(n)`）只推进播放头 + 清槽位，**不产生
+  任何 PLC 样本**，也不推进 `epoch`（解码器与重采样器无需重建）；跳完 `plc_run = 0`，新的
+  一段从下一帧重新起算。
+- 播放头**不得越过已到达的最新媒体**：`next_ts >= highest_ts` 立即停，返回真正跳过的帧数
+  （可能小于 `n`）。
+- 计入独立计数器 `stats.step_trims`（Kotlin `stepTrims`），**不**计入 `plc_frames`；限额
+  预算按“发出一次裁剪”计（`StepAbsorber::trims_in_window` / `trimsInWindow()`），实际跳过
+  了多少帧只看 `step_trims`——两个数分叉是正常的（播放头被 `highest_ts` 截短时）。
+- 被限额压制时水位并不会自己降下来，所以判据会**每个 tick 再次命中**；限额日志用
+  `take_limited_log()` / `takeLimitedLog()` 做闸门，**每个 60 s 窗口只打一条**，否则
+  Windows ≈250 条/s、Android ≈200 条/s 会把日志轮转刷爆。
+- `StepAbsorber` 是纯判定器：只看数字、不碰缓冲，所以决策与 `skip_frames` 可以在同一把锁里
+  完成，日志在外面打。
+
+**接入点**（两端都在拉取之前判定，日志前缀 `[Step]`）：
+
+- Windows：`windows/src/main.rs` 解码循环，`jb.pull` 之前；`UDP2CAL_ASRC_DIAG` 的诊断 CSV
+  末列 `trims` 就是累计跳过的整帧数；
+- Android：`android/.../service/CaptureService.kt` 的 `reversePlayLoop`，`jitter.pull` 之前，
+  在 `linkLock` 内。
+
+**为什么不回到样本级丢/插**：v1.3.0 已整条删除 `SLIP_*`（见 7.9），样本级回落会在 PCM 上
+留接缝；阶跃只能用整帧级硬重同步，一次跳 10–120 ms。每分钟 ≤3 次的限额就是它的听感预算。
+
+**已知代价**：每次裁剪是一次 10–120 ms 的时间跳，只在"环境变了/链路抖了一下"时发生。
+若 `trims` 持续增长，说明 `WATER_TARGET_MS` 相对该环境偏低（或判据对该环境过激），
+应先重定目标而不是放宽限额。
+
 ### 7.11 Windows 接收管线
 
 ```
@@ -954,6 +1045,8 @@ AudioTrack / 声卡
 - 丢包/迟到/重复/乱序数；
 - 抖动缓冲当前水位（ms）；
 - PLC 帧数、连续 PLC 最大值；
+- 阶跃吸收：累计跳过的整帧数（`step_trims`，**单独计数**，不进 `plc_frames`）、当前 60 s 窗口
+  内已用次数（`StepAbsorber::trims_in_window` / `trimsInWindow()`，两端都在限额日志里打印）；
 - 漂移校正：当前比率微调量（%）、反馈量（ppm）、前馈量 `r̂`（ppm）、其标准差 σ（ppm）、
   观测桶数；
 - **总延迟估算**（见 7.14）；
@@ -1065,6 +1158,32 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 - 恢复发送时 `M=1`；
 - 重连/换 SSRC 时重置 `seq/ts` 和抖动缓冲。
 
+### 8.6 DSCP EF 标记（QoS）
+
+两端都给**发出方向的 RTP** 打 DSCP 46（EF），让 AP/交换机把它排进语音队列；
+接收方向的 socket 不标记（TOS 只对出包有意义）。
+
+| 端 | 位置 | 做法 |
+|----|------|------|
+| Android | `android/app/src/main/java/com/udp2cal/app/UdpSender.kt` | 正向 `DatagramSocket` 设 `trafficClass = 0xB8`（常量 `DSCP_EF_TOS = 0xB8`，即 46 << 2） |
+| Windows | `windows/src/capture.rs` | 反向发送 socket 上 `socket2::SockRef::from(&send_sock).set_tos_v4(0xB8)`（常量 `DSCP_EF_TOS: u32 = 0xB8`）；失败只告警，不影响功能 |
+
+TOS 字节 = DSCP << 2，所以 46 → `0xB8`；不要写 46 本身。
+Windows 默认会把应用设置的 TOS 清零，需要放行（二选一，均需管理员）：
+
+```powershell
+# 方案 1：组策略式 DSCP 标记（推荐，不改系统全局状态）
+New-NetQosPolicy -Name UDP2CAL -AppPathNameMatchCondition udp2cal.exe -DSCPAction 46
+
+# 方案 2：允许应用自行设置 TOS（注册表，重启后生效）
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUserTOSSetting /t REG_DWORD /d 0 /f
+```
+
+刻意不用 DSCP 34（AF41）：实测 PC 下行方向反而劣化（超额 13.8%，p99 41.9 ms）。
+验证只能间接：标记生效后空口超额延迟从 ~25%（p99 38 ms）降到 ~7%（p99 17 ms），表现为
+diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP 是否真的尊重 DSCP 无法从
+本机确认；标记无效只是回到尽力而为，不会引入错误。
+
 ---
 
 ## 九、常量汇总
@@ -1086,7 +1205,12 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
 | `JITTER_START_MS` | `30` | 预缓冲（3 帧） |
-| `WATER_TARGET_MS` | `260` | 目标总水位（抖动缓冲 + PCM 环 + 声卡） |
+| `WATER_TARGET_MS` | `150` | 目标总水位（抖动缓冲 + PCM 环 + 声卡）；两端必须同值 |
+| `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 端运行时覆盖目标水位的环境变量 |
+| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 覆盖值允许区间，越界钳位 |
+| `STEP_TRIM_GROWTH_MS` | `80` | 单 tick 抖动缓冲增长超过即判为阶跃 |
+| `STEP_TRIM_EXCESS_MS` | `100` | 总水位 > `target + 100` 即判为超预算 |
+| `STEP_TRIM_MAX_PER_MIN` | `3` | 阶跃裁剪的每分钟限额（超限只记录） |
 | `DECODE_LIMIT_MS` | `40` | 解码缓冲深度上限（生产节流） |
 | `PLC_LEAD_MS` | `20` | 可听点见底判据 |
 | `PLC_MAX_MS` | `120` | PLC 上限 |
@@ -1165,6 +1289,12 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 - 迟到包；
 - 丢包 + PLC 10 ms × N；
 - 连续 PLC 上限；
+- `skip_frames(n)`：只推进时间线 + 清槽，不产生任何 PLC 样本、不计入 `plc_frames`、
+  不推进 `epoch`；不得越过 `highest_ts`（跳不满时返回实际帧数）；未进入 PLAYING 时不动作；
+  成功后 `plc_run` 归零且计入 `stats.step_trims`；
+- `StepAbsorber`：稳态噪声不触发；单次增长 > `STEP_TRIM_GROWTH_MS` 触发；总水位 >
+  `target + STEP_TRIM_EXCESS_MS` 触发；首次 `decide` 只登记基准；`can_trim = false` 时不下结论；
+  每 60 s 最多 `STEP_TRIM_MAX_PER_MIN` 次，超限时 `limited = true` 且不裁剪；
 - `M=1` + 200 ms 跳变重同步；
 - 16/32 位回绕；
 - 序号冻结后恢复（ACK 中断 / DTX）必须自愈；
@@ -1190,17 +1320,16 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 - 超过 1275 字节的包被拒绝；
 - DTX 1–2 字节包可解码。
 
-### 11.2 跨语言一致性
+### 11.2 跨端一致性
 
-Kotlin 与 Rust 必须对同一组输入产生相同字节：
+v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.md)「协议单一实现」）：Kotlin 通过 JNI
+调用同一份代码，不再存在"两份实现跑偏"。一致性由三道闸门看守：
 
-- RTP 头示例（4.8）；
-- CONNECT/ACK 示例（5.8）；
-- DISCOVER_REPLY 示例；
-- seq/ts 回绕；
-- 控制头字节。
-
-建议把十六进制向量放在两端测试中，任何一端改动都必须同时更新。
+- `Udp2CalProtocolTest`（62 例）在桌面 JVM 上加载 `udp2cal_protocol.dll`，与 Android 真机跑的是
+  **同一份机器码**：字节向量、回绕、边界全部照旧；
+- `nativeConstantsMatchKotlinConstants` / `nativeRealConstantsMatchKotlinConstants`：Rust 导出的
+  43 个整数常量与 8 个浮点常量必须与 Kotlin 的 `const val` 逐项相等（Kotlin 常量仅为编译期需要）；
+- 附录 B 的十六进制向量仍是跨版本（v3 各实现）的互通基准：换实现、换语言时以它为准。
 
 ### 11.3 集成测试
 
@@ -1225,10 +1354,12 @@ Kotlin 与 Rust 必须对同一组输入产生相同字节：
 
 1. 音频路径无 `sleep`、无 PLC 定时器、无重排衰减定时器、无 3 秒漂移 EMA。
 2. 发送端无应用层音频队列；发送线程单帧处理时间稳定。
-3. 接收端稳态总水位维持在 `WATER_TARGET_MS` 附近（实测中位 277 ms / 目标 260 ms，网络断供
-   幅度决定不可能更紧）；无持续增长；30 min 内无单向漂移；稳态比率残差 <20 ppm（实测反馈量
-   中位 −46 ppm）。强抖动网络下“水位标准差 <3 ms”不可达——那是网络交付节奏的函数，不是
-   控制器的函数（实测 sd 31 ms）。
+3. 接收端稳态总水位维持在 `WATER_TARGET_MS` 附近。v1.4.0 验收口径（关闭扫描后的环境）：
+   `water_ms` 中位 150±20 ms、标准差 <25 ms；`adjust_ppm` 贴 ±5000（顶满）的时间占比 <5%；
+   PLC <2 次/分；端到端总延迟 ≤190 ms。无持续增长；30 min 内无单向漂移；稳态比率残差
+   <20 ppm。强抖动网络下水位数标准差做不到 <10 ms（实测 31–64 ms）——那是网络交付节奏
+   的函数，不是控制器的函数，所以验收取 25 ms；超出上述目标时应先按 §7.10.1 重定
+   `WATER_TARGET_MS`，而不是放宽验收。
 4. 丢包时只在可听点见底（`pipe_ms <= PLC_LEAD_MS`）后 PLC；真实包恢复后 PLC 停止。
 5. DTX 静音不导致断连；恢复时能正确重同步。
 6. 任意 RTP 包不超过 1287 字节；任意 UDP/IP 包不超过 1315 字节。
@@ -1251,8 +1382,10 @@ FEC/DRED 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍�
    本版不为此提高目标水位（那会让有线用户白白多等），需要时由上层应用自行补偿。
 2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()` 的粒度不同（典型 5–20 ms，
    低延迟模式下更细）。协议侧只要求播放头单调，不假设其精度。
-3. **Wi-Fi 抖动**：目标水位 60 ms 覆盖常见家用/办公环境；极端拥塞下会增加 PLC 比例，
-   而不是抬水位——抬水位会把延迟永久留在链路上。
+3. **Wi-Fi 抖动**：150 ms 的目标水位覆盖关闭扫描后的常见家用/办公环境（稳态空档
+   68–90 ms），偶发台阶由阶跃吸收（§7.10.2）兜住。若环境重新出现数百毫秒级断供，
+   表现会转向 PLC 与阶跃裁剪，而不是自动抬水位——抬水位会把延迟永久留在链路上；
+   此时应用 `UDP2CAL_WATER_TARGET_MS` 现场重定目标（§7.10.1）。
 4. **干净断代**：v2/v3 不能互通，发布时必须同时升级两端（见第二章）。
 
 ---

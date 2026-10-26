@@ -30,6 +30,11 @@ ANDROID_TARGETS = {
 }
 
 ANDROID_ABIS = ("arm64-v8a", "armeabi-v7a")
+# 协议层（`protocol/`）由 Rust 交叉编译成 `libudp2cal_protocol.so`，每个 ABI 对应一个 rust target
+ANDROID_RUST_TARGETS = {
+    "arm64-v8a": "aarch64-linux-android",
+    "armeabi-v7a": "armv7-linux-androideabi",
+}
 ANDROID_BUILD_TYPES = ("Release", "Debug")
 ANDROID_BUILD_TOOLS = "35.0.0"
 ANDROID_CMAKE_VERSION = "3.22.1"

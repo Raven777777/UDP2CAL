@@ -19,7 +19,7 @@ const MAX_SECONDS: f64 = 300.0;
 
 /// 列名（与 `main.rs` 解码循环里 `row()` 的字段顺序一一对应）
 const HEADER: &str = "t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,\
-buckets,played_s,highest_ts,next_ts,plc,underrun\n";
+buckets,played_s,highest_ts,next_ts,plc,underrun,trims\n";
 
 /// 采样落盘器（单例由调用方持有，避免全局锁）
 pub struct AsrcDiag {

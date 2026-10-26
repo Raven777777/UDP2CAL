@@ -29,14 +29,16 @@
 启动后每 10 s 会有一行日志：
 
 ```
-[Latency] 总延迟≈280ms（水位 277ms = 抖动 220 + 解码 44，目标 260）声卡 10ms 比率 -0.005%（反馈 -46ppm / 前馈 +4ppm，σ 13.0ppm，24 桶）
+[Latency] 总延迟≈170ms（水位 150ms = 抖动 96 + 解码 44，目标 150）声卡 10ms 比率 -0.005%（反馈 -46ppm / 前馈 +4ppm，σ 13.0ppm，24 桶，阶跃裁剪 0 帧）
 ```
+
+（示例数值，实际以本机日志为准。）
 
 判读：
 
 | 现象 | 结论 |
 | --- | --- |
-| 水位在 65–75 ms 之间小幅波动，标准差 <3 ms | 正常。PI 把水位钉在目标上（无静差） |
+| 水位在 130–170 ms 之间小幅波动，标准差 <25 ms | 正常。PI 把水位钉在目标上（无静差） |
 | 比率长期顶在 ±0.500% | 两端时钟差超过 5000 ppm，或水位在被外部因素推走——检查是否有进程在改设备采样率 |
 | 前馈长期贴 ±20000ppm | 说明不是钟差而是阶跃（改采样率/节拍重置），应走 resync |
 | `σ` 长期很大（>200ppm）或桶数不涨 | 到达时刻观测不足（丢包严重/包间隔异常），前馈在裸奔，只剩 PI |
@@ -73,8 +75,10 @@ WASAPI 的 `IAudioClock` 是驱动自己的采样计数，`playback − callback
 4. 在录音里量出"1 kHz 的起始沿"相对录音文件起点的位置——由于录音起点与日志
    不同源，这一步只能测**变化量**：
    - 记下稳态 `total_latency = L1`，以及录音里的相位基准 `P1`；
-   - 临时把 `WATER_TARGET_MS` 改成 320 重新编译（水位抬高 60 ms），
-     记录 `total_latency = L2` 与 `P2`；
+   - 临时**抬高或降低**目标水位 60 ms 左右，记录 `total_latency = L2` 与 `P2`；
+     Windows 侧不必重编译：`set UDP2CAL_WATER_TARGET_MS=210` 重启即生效（允许区间
+     80–600 ms，越界钳位），测完清掉变量回到默认 150。本步只涉及 PC 作为接收端的
+     目标，不受 Android 侧常量影响；但长期改值必须同步两端（`WATER_TARGET_MS` 必须同值）。
    - 检查 `(P2 − P1)` 是否 ≈ `(L2 − L1)`。相等即证明播放头换算与
      `device_latency` 的符号、量级都正确。
 5. 若二者差一个常数 `C`，把 `C` 记为**该机器的展示修正量**：
@@ -101,7 +105,7 @@ displayed_latency = total_latency + C
 | --- | --- | --- |
 | `device_latency_ms` | 10–30 ms（10 ms 缓冲 + 一个混音周期） | 恒 0 → 后端无时间戳，按 20 ms 兜底即可 |
 | 水位变化 Δ 与录音延迟变化 Δ 一致 | \|差\| ≤ 5 ms | 检查是否把 `played_frames` 与 `pipe_ms` 混用（差一个 `device_latency`） |
-| 稳态 `total_latency` | 60–75 ms | >120 ms 先看水位，再看声卡缓冲 |
+| 稳态 `total_latency` | v1.4.0 验收 ≤190 ms（水位 150 上下波动） | 明显超出先看水位，再看声卡缓冲 |
 | 反馈量（10 s 内） | \|Δu\| 收敛到 100ppm 以内 | 一直顶满说明前馈没工作，检查 `σ`/桶数 |
 
 ---
@@ -126,7 +130,7 @@ displayed_latency = total_latency + C
 会在 `%LOCALAPPDATA%\UDP2CAL\asrc_diag.csv` 覆盖写出一份最多 300 s 的原始序列：
 
 ```
-t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,buckets,played_s,highest_ts,next_ts,plc,underrun
+t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,buckets,played_s,highest_ts,next_ts,plc,underrun,trims
 ```
 
 用途（不需要外部设备）：
@@ -134,9 +138,13 @@ t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,buckets
 - `water_ms` 的均值/标准差 → 判断稳态是否真钉在目标、抖动有多大；
 - `adjust_ppm` / `ff_ppm` → 看反馈是否收敛到 0、前馈是否稳定（钟差应是小常数）；
 - `sigma_ppm` 与 `buckets` → 判断前馈有没有可用的观测窗；
-- `plc` 增长 → 供水不足（水位太低或网络抖动超出缓冲）。
+- `plc` 增长 → 供水不足（水位太低或网络抖动超出缓冲）；
+- `trims` 增长 → 阶跃吸收在干活（一次补齐被整帧跳掉，不计入 `plc`）；稳态下应接近不增长，
+  持续增长说明目标对该环境偏低或判据过激（见 `PROTOCOL_V3_RTP.md` §7.10.2）。
 
-### 5.1 已知环境基线（2026-10-26，Android + Wi-Fi + VB-Cable 48 kHz）
+### 5.1 已知环境基线
+
+**v1.3.0（2026-10-26，未关手机扫描，Android + Wi-Fi + VB-Cable 48 kHz）**
 
 | 观测 | 值 | 含义 |
 |------|-----|------|
@@ -147,11 +155,23 @@ t_s,ring_ms,pipe_ms,jb_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigma_ppm,buckets
 | `ring_ms` | 40–49（中位 44） | 解码节流在 `DECODE_LIMIT_MS` 上下正常振荡 |
 | `jb_ms` | 中位 220（170–270，尖峰可达 440） | 本环境必须的抖动缓冲，由断供幅度决定 |
 
-结论：`WATER_TARGET_MS` 必须 ≥ 解码环 + 声卡 + **断供幅度**，本环境为 **260 ms**（总延迟约 275–285 ms）。
-把目标压到 70 ms 会让 PI 永久顶满 `RESAMPLE_MAX_ADJUST`（实测 +3684 ppm，即常年 ~6 音分
-变调）、水位在 120–306 ms 之间慢锯、PLC 升到 3–8 次/分；260 ms 下水位中位 275–284 ms、
-PLC 0.4–1.1 次/分、反馈量中位接近 0，且不再长期贴钳位。换环境后请重跑本节的开环采样，
-按实测断供幅度重定 `WATER_TARGET_MS`，**不要靠压低目标去赢延迟**。
+当时结论：`WATER_TARGET_MS` 必须 ≥ 解码环 + 声卡 + **断供幅度**，故定为 **260 ms**
+（总延迟约 275–285 ms）。把目标压到 70 ms 会让 PI 永久顶满 `RESAMPLE_MAX_ADJUST`
+（实测 +3684 ppm，即常年 ~6 音分变调）、水位在 120–306 ms 之间慢锯、PLC 升到 3–8 次/分；
+260 ms 下水位中位 275–284 ms、PLC 0.4–1.1 次/分、反馈量中位接近 0，且不再长期贴钳位。
+
+**v1.4.0（关扫描 + DSCP EF + 阶跃吸收）**：上表那 200 ms 级的断供来自手机全频段扫描
+（`com.vivo.multinlp`，每 60–120 s 占用无线 1.85 s）。`adb shell pm disable-user --user 0
+com.vivo.multinlp` 之后 4 次长跑 **0 次 >200 ms**，稳态空档只剩 68–90 ms，因此目标降到
+**150 ms**（环 44 + 声卡 ~10 + 抖动余量 ~96 —— 安全系数 1.6 × 68–90 ≈ 140 → 取 150）。
+v1.4.0 验收口径：`water_ms` 中位 150±20 ms、标准差 <25 ms、`adjust_ppm` 顶满占比 <5%、
+PLC <2 次/分、端到端总延迟 ≤190 ms。偶发的一次补齐不再靠水位全量预留，而由阶跃吸收
+（`trims` 列）当场吃掉。
+
+换环境后仍要重跑本节的开环采样（`UDP2CAL_ASRC_DIAG=20`），目标取「实测最大空档 ×1.5–1.6」。
+Windows 侧可直接用 `UDP2CAL_WATER_TARGET_MS`（允许 80–600 ms，越界钳位，首次读取后缓存）
+现场试，定值后回写常量并同步 Android（`WATER_TARGET_MS` **两端必须同值**）。
+**不要靠压低目标去赢延迟。**
 
 判读捷径：若 `adjust_ppm` 长时间贴在 ±5000，说明目标不可达（或者真有超过 ±0.5% 的钟差）；
 `ff_ppm` 大跳后自行归零属正常（时间线重建，`RATE_JUMP_MAX_SAMPLES` 会作废旧窗口）。

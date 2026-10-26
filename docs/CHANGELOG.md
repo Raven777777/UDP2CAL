@@ -4,6 +4,136 @@
 
 ---
 
+## v1.5.0 — 2026-10-26 · 协议单一实现：Android 改调 Rust（JNI），删掉 1059 行 Kotlin 副本
+
+> v1.4.0 及之前，协议行为在 `protocol/rtp.rs` + `protocol/protocol.rs` 与
+> `android/.../Udp2CalProtocol.kt` 里各写了一遍。两份实现靠人眼对照，每次调参（如 v1.4.0 的
+> 阶跃吸收）都要改两处并人工比较，稍不留神就变成"一端能连、另一端静音"。本版把 Android
+> 变成**同一份 Rust 实现的调用方**，桌面 JVM 单测与真机跑的是同一份机器码。
+> **线格式未改**：与 v1.4.0 完全互通，旧客户端不受影响。
+
+**新增**
+- `protocol/jni.rs`：`#[cfg(feature = "jni")]` 的 JNI 表面，71 个
+  `Java_com_udp2cal_app_native_ProtocolNative_*` 符号；crate 新增 `cdylib`，一份代码同时产出
+  Android 的 `libudp2cal_protocol.so` 与桌面的 `udp2cal_protocol.dll`。
+  - 纯函数：控制头 / CONNECT / CONNECT_ACK / DISCOVER_REPLY / RTP 头 / 码率钳位与吸附；
+  - 对象：`JitterBuffer`、`StepAbsorber`、`RateEstimator`、`DriftController` 均为 `jlong` 句柄
+    （`Box::into_raw` + `Mutex`，`close()`/`finalize()` 释放）；
+  - 时钟桥：`clockSync(System.nanoTime())` 记下 `(Instant, java_nanos)` 基准，`arrivalNanosAt` 与
+    `RateEstimator::observe` 双向换算，不需要 `GetJavaVM`；
+  - 常量：`constants()` 导出 43 个整数、`constantsReal()` 导出 8 个浮点。
+- `android/.../native/ProtocolNative.kt`（218 行）：`external fun` 声明 + `System.loadLibrary`。
+- 两个防漂移测试：`nativeConstantsMatchKotlinConstants`、`nativeRealConstantsMatchKotlinConstants`
+  把 Rust 导出的常量与 Kotlin `const val` 逐项比对。
+
+**变更**
+- `android/.../Udp2CalProtocol.kt`：1059 行 → 492 行，只剩常量、DTO 打包/解包与句柄转发；
+  `generateDeviceId` / `deviceIdToString` 保留在 Kotlin（`SecureRandom` 与格式化不属于协议行为）。
+- `protocol/rtp.rs`：补上 `last_rebase_reason`（Kotlin 早就有、Rust 缺，统一后必须对齐），
+  `ARRIVAL_TRACE` 改为 `pub`（常量导出需要）。
+- `protocol/protocol.rs`：`DiscoverReply::decode` 改为与 Kotlin 既有行为完全一致（`port != 0`、
+  名字 ≤254 字节、UTF-8 宽松解码、空名回落 `"UDP2CAL PC"`）——统一实现不能顺手改可见行为。
+- `android/app/build.gradle.kts`：新增 `cargoBuildAndroidProtocol`（NDK `clang.exe` 交叉编译）、
+  `syncRustJniLibs`（`.so` 进 `build/rustJniLibs/<abi>/`，`preBuild` 依赖）、`cargoBuildHostProtocol`
+  （桌面 dll，`java.library.path` 指向 `protocol/target/release`）。
+- `android/app/proguard-rules.pro`：新增 `-keep com.udp2cal.app.native.ProtocolNative`——
+  JNI 符号名由**类名+方法名**拼成（`Java_com_udp2cal_app_native_ProtocolNative_*`），
+  R8 一改名就是运行期 `UnsatisfiedLinkError: native method not found`（`minifyEnabled = true` 时必现）。
+- `CaptureService.kt`：`onDestroy()` 与反向播放循环结束时 `close()` 原生句柄（jitter/drift/rate/step），
+  句柄状态在 Rust 堆上，不归还就是泄漏。
+
+**构建前提**
+- Android 构建现在需要 Rust 工具链 + `rustup target add aarch64-linux-android`（见 [BUILD.md](BUILD.md)）。
+- 交叉编译用 `clang.exe` + `-C link-arg=--target=aarch64-linux-android29` +
+  `-C link-arg=--sysroot=<ndk>/toolchains/llvm/prebuilt/windows-x86_64/sysroot`；NDK r23+ 没有
+  `ndk/<ver>/sysroot` 这个目录。
+
+**审查修复（同一版本的收尾回合）**
+- 拉取缓冲容量被"上一次收包长度"绑架：`read_bytes` 精确缩容后，VBR 下紧跟一个短包就会
+  把后续更长的帧判成 `WAIT`（时间轴不前进、播放线程空转 → 断音）。改为 `ensure_payload_capacity()`
+  在 insert/pull 两侧都补齐到 `OPUS_MAX_PAYLOAD`，并加回归用例
+  `jitter_pullSurvivesVariablePayloadLengths`（1/100 字节交替；去掉修复后此用例必红，已实测）。
+- `DriftController.close()` 未清零句柄且 `finalize()` 会二次 `close()` → 双释放（发生在 finalizer
+  线程，堆损坏无栈可查）。四个句柄类统一成 `if (handle != 0L) { destroy; handle = 0L }`。
+- `new_string` 改走 `NewString`（UTF-16）而不是 `NewStringUTF`（Modified UTF-8）：对端设备名
+  含 emoji 等补充平面字符时，后者在 CheckJNI 下会 abort。
+- `buildControl` 补 `payload` 为 null 的检查（ART 对 null 数组取长度会解引用空指针）。
+- 时钟桥从 `OnceLock` 改为可覆盖的 `Mutex<Option<_>>`：`clockSync` 若晚于任何一次导出调用，
+  旧写法会把基准永久钉成 `java_nanos = 0`，让 `arrivalNanosAt` 返回"库加载后经过的纳秒"，
+  进而毒化前馈速率估计（音质劣化但看起来一切正常）。未同步时现在返回 `-1`。
+- `instant_from_nanos` 正方向改用 `checked_add`（原 `Instant + Duration` 在越界时 panic，
+  跨 `extern "system"` 就是 abort）。
+- `dcUpdate` 的 `device_frames` 加 `max(0)` 守卫；`jbArrivalNanosAt` 的 `ts` 同理。
+- `writeRtpHeader` 改为返回 `Boolean`，目标数组过小时不再静默写旧头。
+- `CaptureService.onDestroy()` 与反向播放循环退出时 `close()` 原生句柄（jitter/drift/rate/step），
+  并让 `[Step]`/`[Latency]` 日志打印 `drift.targetMs()`（Rust 侧可被环境变量覆盖）。
+- `protocol/jni.rs` 的 `*_ref` 返回 `Option<&'static _>`（句柄由 `Box::into_raw` 保证存活到 destroy）。
+- Gradle：`ndkVersion = ndkVersionStr`（避免两处写死后不一致）；NDK 工具链按主机选择
+  `windows-x86_64`/`linux-x86_64`/`darwin-x86_64` 并在缺失时明确报错；`cargoExe()` 增加 PATH 扫描与
+  找不到时的明确提示；交叉编译改用 `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`（不覆盖用户 `RUSTFLAGS`）。
+- `proguard-rules.pro` 保留 `ProtocolNative`（见上）。
+
+**验证**
+- `cd protocol && cargo test --offline` → 67 passed（含新增的 `last_rebase_reason` 与 DISCOVER 解码用例）。
+- `./gradlew :app:testDebugUnitTest` → **62 passed / 0 failed**，全部跑在 Rust 实现上
+  （含 9 个 `skip_frames`/`StepAbsorber` 与两个常量一致性测试）。
+- `./gradlew :app:assembleDebug` → APK 内含 `lib/arm64-v8a/libudp2cal_protocol.so`
+  （ELF aarch64、Android 29、NDK r27）。
+- `cd windows && cargo build --offline` → 无变化（Windows 端本就依赖 `protocol` crate）。
+
+---
+
+## v1.4.0 — 2026-10-26 · 环境为前提的延迟回收：DSCP EF + 目标水位 150 + 阶跃吸收
+
+> v1.3.0 把 `WATER_TARGET_MS` 定在 260 ms，是因为手机每 60–120 s 做一次全频段扫描
+> （`com.vivo.multinlp`，每次约占无线 1.85 s），造成双向 600–1100 ms 停摆。关掉扫描后稳态
+> 空档只剩 68–90 ms，260 ms 里约 110 ms 是纯多出来的延迟。本版把环境前提写进发布流程，
+> 并给降下来的水位配一个**阶跃吸收**兑底。两端仍需成对升级。
+
+**环境前提（A1，纯操作项，代码无改动）**
+- 关闭 vivo 全频段扫描：`adb shell pm disable-user --user 0 com.vivo.multinlp`
+  （恢复用 `adb shell pm enable com.vivo.multinlp`）。实测 4 次长跑 0 次 >200 ms，
+  最大空档 68–90 ms。**不关扫描，本版的 150 ms 目标不可达。**
+
+**新增**
+- DSCP EF 标记（双端 TOS `0xB8` = DSCP 46）：Android `UdpSender.kt` 给正向 RTP 的
+  `DatagramSocket` 设 `trafficClass = 0xB8`（`DSCP_EF_TOS`）；Windows `capture.rs` 给反向发送
+  socket 加 `socket2::SockRef::from(&send_sock).set_tos_v4(0xB8)`（`DSCP_EF_TOS: u32`），
+  失败只告警。接收侧不标记；Windows 侧还需 `New-NetQosPolicy -DSCPAction 46` 或注册表
+  `DisableUserTOSSetting=0` 才会真正放行。实测空口超额延迟 ~25%（p99 38 ms）→ ~7%
+  （p99 17 ms）
+- 阶跃吸收（方案 C）：`JitterBuffer::skip_frames` / Kotlin `skipFrames` 做整帧硬重同步，
+  只推进播放头 + 清槽，**不产生任何 PLC 样本**，且不得越过已到达的最新媒体
+  （`next_ts >= highest_ts` 即停）；新判定器 `StepAbsorber` / `StepDecision`（只看数字不碰
+  缓冲，首次 `decide` 只登记基准，`can_trim = jb.is_playing()`）；新常量
+  `STEP_TRIM_GROWTH_MS = 80`、`STEP_TRIM_EXCESS_MS = 100`、`STEP_TRIM_MAX_PER_MIN = 3`
+  （超限只记录不裁剪）；新统计 `JitterStats.step_trims` / `stepTrims`（不计入 `plcFrames`）
+- 诊断：`UDP2CAL_ASRC_DIAG` 的 CSV 新增末列 `trims`（累计跳过的整帧数），共 16 列
+- `UDP2CAL_WATER_TARGET_MS`（仅 Windows）：现场覆盖目标水位，允许 80–600 ms，越界钳位，
+  进程内首次读取后缓存（`protocol::rtp::water_target_ms()`），经
+  `DriftController::with_target()` 注入
+
+**变更**
+- `WATER_TARGET_MS` 260 → **150**（两端同值）：关扫描后断供幅度从 ~200 ms 降到 68–90 ms，
+  ×1.6 安全系数 ≈ 140 ms → 取 150 = 解码环 44 + 声卡 ~10 + 抖动余量 ~96；剩下的单次台阶
+  交给阶跃吸收，不再靠水位全量预留（原来 ±0.5% 的排水速度排 200 ms 要 40 s，那 40 s 就是变调）
+- 验收口径改为：`water_ms` 中位 150±20 ms、标准差 <25 ms、`adjust_ppm` 顶满占比 <5%、
+  PLC <2 次/分、端到端总延迟 ≤190 ms
+
+**文档**
+- `PROTOCOL_V3_RTP.md`：§7.2 参数表（含阶跃三常量与水位覆盖区间）、§7.10.1 重写为
+  “由网络环境决定”、新增 §7.10.2 阶跃吸收、§8.6 DSCP 标记、§7.13 统计、常量汇总与 §11 验收同步
+- `LATENCY_CALIBRATION.md`：§2 日志示例与判读、§3.2 目标水位 A/B 做法（改用环境变量）、
+  §3.4 判定表、§5 诊断列（`trims`）、§5.1 基线与结论（260 → 150，含 v1.4.0 口径）
+- `archive/PROPOSAL_LATENCY_V1.4.md`：状态改为“已落地”，新增 §11 落地记录（A1/A2/B/C/测试逐条对应）；v1.5.0 起归档
+
+**测试**
+- Rust（`protocol`）新增 9 项：`skip_frames` × 3、`StepAbsorber` × 5、水位常量 × 1；
+  既有调度阈值序测试补上 `DECODE_LIMIT_MS < WATER_TARGET_MS` 断言
+- Kotlin（`Udp2CalProtocolTest`）新增 8 个对应用例，常量断言改为 150
+
+---
+
 ## v1.3.0 — 2026-10-26 · ASRC 重构：单一时钟、单一口径、单一手段
 
 > 按 [archive/PLAN_ASRC_REFACTOR.md](archive/PLAN_ASRC_REFACTOR.md) 的 P0–P5 落地。协议**行为**有三处变化：

@@ -14,12 +14,13 @@ udp2cal/
 │     │  ├─ MainActivity.kt          # Compose UI + 运行时权限申请
 │     │  ├─ DiscoveryManager.kt      # 局域网广播发现
 │     │  ├─ UdpSender.kt             # 主 socket：CONNECT + 正向 RTP；独立 ACK 线程；反向 socket 只收 RTP
-│     │  ├─ Udp2CalProtocol.kt       # 控制 v3 + RTP + 抖动缓冲 + 水位/比率控制（与 Rust 端逐字节对齐）
+│     │  ├─ Udp2CalProtocol.kt       # 协议常量与 DTO 胶水（行为全部由 Rust 提供，见「协议单一实现」）
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
 │     │  ├─ StreamResampler.kt       # 反向流的受控重采样（32 相 × 48 抽头多相 FIR）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
 │     │  ├─ service/CaptureService.kt# 前台采集服务（采集/控制/反向接收/反向播放 四路并发，无 PCM 队列）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
+│     │     native/ProtocolNative.kt # 协议层的 external fun 声明（加载 libudp2cal_protocol.so）
 │     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c（JNI 封装）
 ├─ opus-src/       # libopus 1.6.1 源码树（Android 与 Windows 共用的唯一副本）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
@@ -32,7 +33,7 @@ udp2cal/
 │  │  ├─ firewall.rs   # 防火墙规则
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
-├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp.rs 媒体面
+├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp.rs 媒体面 + jni.rs JNI 表面
 ├─ docs/           # 项目文档（本目录）
 ├─ build.bat       # 统一构建入口（Windows / Android / ADB / 体检）
 ├─ scripts/        # 构建脚本实现（Python 3.8+）
@@ -42,6 +43,49 @@ udp2cal/
 ├─ LICENSE
 └─ README.md
 ```
+
+---
+
+### 协议单一实现：Rust + JNI（v1.5.0）
+
+v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/protocol.rs` 的手工移植副本
+（1059 行）。两份实现靠人眼对照，改一处忘一处就会以"一端能连、另一端静音"的形式暴露。v1.5.0 起
+协议行为只有一份：
+
+| 位置 | 角色 |
+| --- | --- |
+| `protocol/protocol.rs`、`protocol/rtp.rs` | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
+| `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，71 个 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
+| `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
+| `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
+
+三个接线点：
+
+1. **句柄**：`JitterBuffer` / `StepAbsorber` / `RateEstimator` / `DriftController` 在 Kotlin 侧只是一个
+   `Long`；Rust 用 `Box::into_raw` 造对象、`*Destroy` 收回。`JitterBuffer` 会被接收线程
+   （`insert`）与播放线程（`pull`）同时使用，故内部包一层 `Mutex`——纯 Kotlin 版本在这里是
+   数据竞争。Kotlin 侧 `AutoCloseable.close()`（句柄清零）+ `finalize()` 兜底
+   （minSdk 29 没有 `java.lang.ref.Cleaner`），`CaptureService` 在停机时主动 `close()`。
+2. **时钟桥**：Rust 的到达时刻用 `Instant`，Kotlin 用 `System.nanoTime()`。`clockSync(System.nanoTime())`
+   在库加载时记下 `(Instant, java_nanos)` 基准，`arrivalNanosAt` 与 `RateEstimator::observe` 双向换算——
+   两端都是单调时钟，不需要 `GetJavaVM`。
+3. **常量**：Kotlin 仍需 `const val`（编译期），但值由测试看守：`nativeConstantsMatchKotlinConstants`
+   与 `nativeRealConstantsMatchKotlinConstants` 把 Rust 导出的 43 个整数 + 8 个浮点常量逐项比对。
+
+构建接线（`android/app/build.gradle.kts`）：
+
+- `cargoBuildAndroidProtocol`（Exec）：用 NDK 的 `clang.exe` 交叉编译
+  `protocol/ --features jni --target aarch64-linux-android`，链接器经
+  `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` + `CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS`
+  （`-C link-arg=--target=aarch64-linux-android29 -C link-arg=--sysroot=…`）指定；用 per-target 变量
+  是为了不覆盖用户自己的 `RUSTFLAGS`；
+- `syncRustJniLibs`（Sync）：把 `libudp2cal_protocol.so` 放到 `build/rustJniLibs/<abi>/`，`preBuild` 依赖它；
+- `cargoBuildHostProtocol`（Exec）：宿主 `cargo build --release --features jni` 产出
+  `udp2cal_protocol.dll`，单元测试用 `java.library.path` 指向 `protocol/target/release`——
+  **同一套符号直接跑在 JVM 上**。
+
+好处不只是"少写代码"，而是**测试也统一了**：`Udp2CalProtocolTest` 的 62 个用例现在验证的是 Rust 实现，
+桌面 JVM 与 Android 真机跑的是同一份机器码，协议回归不再需要"两端各跑一遍再人工比对"。
 
 ---
 
