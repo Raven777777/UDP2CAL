@@ -312,11 +312,12 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
     env: Env,
     _this: jobject,
 ) -> jdoubleArray {
-    let v: [jdouble; 8] = [
+    let v: [jdouble; 9] = [
         crate::rtp::RESAMPLE_MAX_ADJUST,
         crate::rtp::RATIO_SLEW_STEP,
         crate::rtp::PI_KP_PER_MS,
         crate::rtp::PI_TI_S,
+        crate::rtp::PI_INTEGRAL_MAX,
         crate::rtp::PI_MIN_UPDATE_MS,
         crate::rtp::WATER_SMOOTH_ALPHA,
         crate::rtp::RATE_WINDOW_S,

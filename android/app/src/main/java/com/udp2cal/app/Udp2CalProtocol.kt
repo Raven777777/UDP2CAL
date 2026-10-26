@@ -95,8 +95,9 @@ object Udp2CalProtocol {
 
     const val RESAMPLE_MAX_ADJUST = 0.005
     const val RATIO_SLEW_STEP = 0.0001
-    const val PI_KP_PER_MS = 0.00005
-    const val PI_TI_S = 10.0
+    const val PI_KP_PER_MS = 0.00002
+    const val PI_TI_S = 90.0
+    const val PI_INTEGRAL_MAX = 0.0015
     const val PI_MIN_UPDATE_MS = 5.0
     const val WATER_SMOOTH_ALPHA = 0.065
     const val RATE_WINDOW_S = 30.0

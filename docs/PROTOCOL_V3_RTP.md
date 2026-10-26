@@ -1,6 +1,6 @@
 # UDP2CAL 协议 v3：RTP/Opus 媒体 + 控制面
 
-> **状态：已实现（v1.5.0）。**
+> **状态：已实现（v1.5.1）。**
 > 本文档描述 v3 的线格式与接收端时钟模型；`protocol/`、`windows/`、`android/` 均已按本文实现，
 > v2 代码路径已删除（`archive/PROTOCOL_V2.md` 仅作历史存档）。
 >
@@ -573,8 +573,9 @@ Reconnecting ──(ACK)──> Connected
 | `RESYNC_GAP_MS` | 200 ms | 触发重同步的时间戳跳变阈值 |
 | `RESAMPLE_MAX_ADJUST` | ±0.005 | 重采样比率微调上限（±0.5%） |
 | `RATIO_SLEW_STEP` | 0.0001 | 单次比率步进（1%/s 斜坡，按真实 dt 缩放） |
-| `PI_KP_PER_MS` | 0.00005 | 反馈比例增益：每 1 ms 水位偏差给 50 ppm |
-| `PI_TI_S` | 10 s | 积分时间常数（**必须 ≥5 s**，否则把网络抖动积成变调） |
+| `PI_KP_PER_MS` | 0.00002 | 反馈比例增益：每 1 ms 水位偏差给 20 ppm（1 音分=578 ppm） |
+| `PI_TI_S` | 90 s | 积分时间常数（双积分器 ζ=√(K·KP·Ti)/2；90 s → ζ≈0.67） |
+| `PI_INTEGRAL_MAX` | 0.0015 | 积分项权限（±1500 ppm），限住长饱和后的余振 |
 | `PI_MIN_UPDATE_MS` | 5 ms | 单次评估的最小时间跨度；更密的调用只累计时间 |
 | `WATER_SMOOTH_ALPHA` | 0.065 | 水位一阶低通系数（τ≈150 ms，带宽≈1 Hz） |
 | `RATE_WINDOW_S` / `RATE_BUCKETS` | 30 s / 30 | 前馈观测窗与桶数（每桶 1 s，桶内只留最小单向时延） |
@@ -772,14 +773,25 @@ PREBUFFER ──(连续 >= 3 帧)──> PLAYING
 water   = 抖动缓冲 + PCM 环 + 声卡已接手未播（ms）      # 单一口径，见 7.10
 err     = 低通(water) − WATER_TARGET_MS
 p       = clamp(err × PI_KP_PER_MS, ±RESAMPLE_MAX_ADJUST)
-i_next  = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±RESAMPLE_MAX_ADJUST)
+i_next  = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MAX)
           抗饱和：p+i 已到钳位且 err 与 i 同号时不累加（否则饱和后积分一直堆）
 Δu      = 限速后的 clamp(p + i, ±RESAMPLE_MAX_ADJUST)
           单次限速 RATIO_SLEW_STEP × (dt/10ms)      # 约 1%/s
 ```
 
-- 比例增益 `PI_KP_PER_MS = 0.00005`：20 ms 偏差只给 1000 ppm，抖动不会被放大成变调。
-- 积分时间 `PI_TI_S = 10 s`（**必须 ≥5 s**）：再快就把网络抖动积成变调。
+- 比例增益 `PI_KP_PER_MS = 0.00002`：20 ms 偏差只给 400 ppm（≈0.7 音分，1 音分=578 ppm），
+  抖动不会被放大成变调。**这个增益同时决定水位回归速度**（`d水位/dt = −1000·adjust`），
+  所以 20 ms 偏差对应 0.4 ms/s：慢是可接受的，大偏差交给阶跃吸收和 PLC 兜底。
+- 积分时间 `PI_TI_S = 90 s`。水位本身是速率差的**纯积分**，在它上面再叠积分就是双积分器：
+  闭环 `s² + K_plant·KP·s + K_plant·KI`，阻尼比 `ζ = √(K_plant·KP·Ti)/2`。
+  v1.5.0 的 `KP=5e-5 / Ti=10 s` 得 ζ≈0.35——欠阻尼，网络每次抖动都会把它敲响，
+  振铃周期几十秒、幅度顶到 ±0.5%（8.6 音分），听感正是"几十秒一次循环的变调"；
+  改成 `KP=2e-5 / Ti=90 s` 后 ζ≈0.67，同一串抖动台阶下 30 s 窗口的峰峰值从
+  7808 ppm（13.5 音分）降到 1729 ppm（3.0 音分）。回归用例：
+  `rtp::tests::drift_jitter_steps_do_not_become_a_pitch_cycle`。
+- 积分权限 `PI_INTEGRAL_MAX = 0.0015`（±1500 ppm ≈2.6 音分）：积分只吃前馈残余的**长期**
+  速率差，不需要也不该覆盖满幅——给它 ±0.5% 的话，一次长时间饱和之后要把 8.6 音分的
+  变调花几十秒吐回来，又是一轮变调。
 - 计时用**声卡已消费帧数**而不是媒体样本数：断流时媒体时间不前进，用它会冻结积分。
 - 低通按真实 `dt` 缩放：`alpha = 1 − (1 − WATER_SMOOTH_ALPHA)^(dt/10ms)`，带宽≈1 Hz。
 - PI 无静差：稳态水位回到目标，不存在旧的"±300 ppm 残余比率"。
@@ -1218,8 +1230,9 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | `RESYNC_GAP_MS` | `200` | 重同步阈值 |
 | `RESAMPLE_MAX_ADJUST` | `0.005` | 比率微调上限（±0.5%） |
 | `RATIO_SLEW_STEP` | `0.0001` | 比率单次步进（1%/s） |
-| `PI_KP_PER_MS` | `0.00005` | 反馈比例增益 |
-| `PI_TI_S` | `10.0` | 积分时间常数（≥5 s） |
+| `PI_KP_PER_MS` | `0.00002` | 反馈比例增益 |
+| `PI_TI_S` | `90.0` | 积分时间常数 |
+| `PI_INTEGRAL_MAX` | `0.0015` | 积分项权限（1500 ppm） |
 | `PI_MIN_UPDATE_MS` | `5.0` | 评估最小时间跨度 |
 | `WATER_SMOOTH_ALPHA` | `0.065` | 水位低通（τ≈150 ms） |
 | `RATE_WINDOW_S` / `RATE_BUCKETS` | `30.0` / `30` | 前馈观测窗 / 桶数 |

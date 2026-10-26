@@ -4,7 +4,35 @@
 
 ---
 
-## v1.5.0 — 2026-10-26 · 协议单一实现：Android 改调 Rust（JNI），删掉 1059 行 Kotlin 副本
+## v1.5.1 — 2026-10-26 · 漂移环重新整定：消掉“几十秒一次循环的变调”
+
+> v1.5.0 上线后现场反馈：跳变中断没了，但“30 s 周期循环的变调”出来了。
+> 根因不是前馈（实测 ff 估计标准差 8 ppm、相邻窗口最大跳变 11 ppm），而是**水位反馈环
+> 欠阻尼**：水位是速率差的纯积分，在它上面再套 PI 就是双积分器，
+> `ζ = √(K_plant·KP·Ti)/2`。旧参数 `KP=5e-5 / Ti=10 s` → ζ≈0.35，网络每次抖动
+> 都会把这个环敲响，振铃周期几十秒、幅度顶到 ±0.5%（**8.6 音分**）。
+
+**变更（`protocol/rtp.rs`，Android 侧经 JNI 自动同构）**
+- `PI_KP_PER_MS`：`0.00005` → `0.00002`。20 ms 水位偏差从 1000 ppm 降到 400 ppm（0.7 音分）。
+  它同时决定水位回归速度（`d水位/dt = −1000·adjust`）：20 ms 偏差 = 0.4 ms/s，
+  慢无损——大偏差由阶跃吸收（整帧裁剪）与 PLC 兜底，不需要靠变调去追。
+- `PI_TI_S`：`10.0` → `90.0`，ζ 从 0.35 提到 0.67（240 s 量级的振铃边界）。
+- 新增 `PI_INTEGRAL_MAX = 0.0015`：积分项权限从 ±`RESAMPLE_MAX_ADJUST`（±5000 ppm）
+  收窄到 ±1500 ppm。积分只吃前馈残余的**长期**速率差；给它满幅的话，一次长饱和之后
+  要把 8.6 音分的变调慢慢吐回来，又是一轮变调。
+- JNI `constantsReal()` 由 8 项变 9 项（新增 `PI_INTEGRAL_MAX`），Kotlin 常量与
+  防漂移测试同步。
+
+**测试**
+- 新增 `rtp::tests::drift_jitter_steps_do_not_become_a_pitch_cycle`：对闭环喂固定伪随机
+  抖动台阶（每 5 s 一次、0–25 ms），要求任意 30 s 窗口内 `adjust` 峰峰值 < 2000 ppm。
+  旧参数下同一序列是 **7808 ppm（13.5 音分）**，新参数下 **1729 ppm（3.0 音分）**。
+- `drift_closed_loop_tracks_a_clock_skew` 跑满 900 s（整定时间随 Ti 变长），
+  `drift_ratio_has_expected_sign_and_stays_bounded` 改为断言“积分权限长满”
+  而不是“顶到 ±0.5% 钳位”。
+- 验证：`cargo test` 68 passed；Android `testDebugUnitTest` 62 passed。
+
+---
 
 > v1.4.0 及之前，协议行为在 `protocol/rtp.rs` + `protocol/protocol.rs` 与
 > `android/.../Udp2CalProtocol.kt` 里各写了一遍。两份实现靠人眼对照，每次调参（如 v1.4.0 的

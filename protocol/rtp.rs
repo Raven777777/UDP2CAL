@@ -132,15 +132,28 @@ pub const RATIO_UPDATE_SAMPLES: u64 = FRAME_SAMPLES as u64;
 /// 单次比率更新的最大步进。0.0001/10 ms = 1%/s，
 /// 到达 ±0.5% 满幅需要 0.5 s——既是变调不可闻的斜坡，也足够跟上真实漂移。
 pub const RATIO_SLEW_STEP: f64 = 0.0001;
-/// 比例增益：水位偏差每 1 ms → 0.005% 比率。
+/// 比例增益：水位偏差每 1 ms → 0.002% 比率。
 ///
-/// 刻意比旧的"偏差 20 ms 即 0.5%"小 5 倍：速率差已经由前馈吃掉，比例项
-/// 只处理慢变化；放大它会直接把这个闭环变成"抖动 → 变调"的调制器
-/// （规范 §六 风险 2）。20 ms 偏差 → 1000 ppm。
-pub const PI_KP_PER_MS: f64 = 0.00005;
-/// 积分时间常数（秒）。规范 §六 风险 2 要求 ≥5 s；取 10 s 让积分项只吸收
-/// 前馈的残余误差，不被网络抖动牵着走。`KI = KP / Ti`。
-pub const PI_TI_S: f64 = 10.0;
+/// 速率差已经由前馈吃掉，比例项只处理慢变化；放大它会直接把这个闭环变成
+/// "抖动 → 变调"的调制器（规范 §六 风险 2，1 音分 = 578 ppm）：
+/// 20 ms 偏差 → 400 ppm ≈ 0.7 音分，听不出来；30 ms → 600 ppm。
+/// 代价是水位回归目标的时间常数 `1/(K_plant·KP)` = 50 s——慢没关系，
+/// 大偏差由阶跃吸收（整帧裁剪）和 PLC 兜底，不需要靠变调去追。
+pub const PI_KP_PER_MS: f64 = 0.00002;
+/// 积分时间常数（秒）。
+///
+/// 水位是速率差的纯积分（`d水位/dt = −1000·adjust`），在它上面再套一个
+/// 积分，闭环就是 `s² + K_plant·KP·s + K_plant·KI`——**双积分器**：
+/// ζ = √(K_plant·KP·Ti)/2。Ti=10 s 时 ζ≈0.22（旧值 5e-5 时 ζ≈0.35），
+/// 网络抖动每次都会把这个环敲响，振铃周期几十秒、幅度顶到 ±0.5%（8.6 音分），
+/// 听感就是"几十秒一次循环的变调"。取 90 s 让 ζ≈0.67、振铃幅度小一个量级。
+pub const PI_TI_S: f64 = 90.0;
+/// 积分项权限（±0.15% = ±1500 ppm ≈ 2.6 音分）。
+///
+/// 积分只负责吃掉前馈残余的**长期**速率差（晶振偏置），不需要也能不该
+/// 覆盖满幅：给它 ±0.5% 的话，一次长时间饱和之后积分要把 8.6 音分的变调
+/// 慢慢吐回来，又是几十秒的变调。
+pub const PI_INTEGRAL_MAX: f64 = 0.0015;
 /// 水位一阶低通系数（每次更新 10 ms，等效时间常数 ≈ 150 ms）
 pub const WATER_SMOOTH_ALPHA: f64 = 0.065;
 /// PI 的最小更新间隔（ms）：更短的间隔只累计、不评估
@@ -1303,10 +1316,11 @@ impl DriftController {
         // ── 比例项 ──
         let p = (err * PI_KP_PER_MS).clamp(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST);
 
-        // ── 积分项（抗饱和：输出顶满且误差还在往同方向顶时冻结）──
+        // ── 积分项（权限 ±PI_INTEGRAL_MAX，且抗饱和：输出顶满且误差还在
+        //    往同方向顶时冻结）──
         let ki = PI_KP_PER_MS / PI_TI_S;
         let i_next = (self.integral + ki * err * (dt_ms / 1000.0))
-            .clamp(-RESAMPLE_MAX_ADJUST, RESAMPLE_MAX_ADJUST);
+            .clamp(-PI_INTEGRAL_MAX, PI_INTEGRAL_MAX);
         let want = p + i_next;
         let saturated = want.abs() >= RESAMPLE_MAX_ADJUST;
         if !saturated || err * i_next < 0.0 {
@@ -1680,22 +1694,35 @@ mod tests {
         let mut d = DriftController::new(48_000);
         let mut dev = 0u64;
         d.update(high, dev);
-        // KP 只有 50 ppm/ms，40 ms 偏差 → 2000 ppm；要顶到 0.5% 的钳位
-        // 必须等积分项长起来（Ti = 10 s，约 15 s 到位）
-        for _ in 0..4000 {
+        // KP 只有 20 ppm/ms，40 ms 偏差 → 800 ppm；积分项权限只有 1500 ppm
+        // （Ti = 90 s，约 170 s 长满），所以比率实际封顶在 +0.23% 附近。
+        for _ in 0..20_000 {
             dev += 480;
             let u = d.update(high, dev);
             assert!(u.abs() <= RESAMPLE_MAX_ADJUST + 1e-12, "比率越界: {u}");
             assert!(u >= -1e-12, "水位偏高时 adjust 不得为负: {u}");
         }
-        assert!(d.adjust() > RESAMPLE_MAX_ADJUST * 0.99, "高水位应把比率顶到上限");
+        assert!(
+            d.integral() >= PI_INTEGRAL_MAX - 1e-9,
+            "高水位应把积分项推到权限上限: {}",
+            d.integral()
+        );
+        assert!(
+            d.adjust() >= PI_INTEGRAL_MAX * 0.99,
+            "高水位应把比率推到积分权限之上: {}",
+            d.adjust()
+        );
         // 反方向对称
         let low = WATER_TARGET_MS - 60;
         let mut d = DriftController::new(48_000);
         let mut dev = 0u64;
         d.update(low, dev);
-        let a = run_pi(&mut d, low, 4000, &mut dev);
-        assert!(a < -RESAMPLE_MAX_ADJUST * 0.99, "缺水应把比率顶到下限: {a}");
+        let a = run_pi(&mut d, low, 20_000, &mut dev);
+        assert!(
+            a <= -PI_INTEGRAL_MAX * 0.99,
+            "缺水应把比率推到积分权限之下: {a}"
+        );
+        assert!(a > -RESAMPLE_MAX_ADJUST, "不得越过钳位: {a}");
     }
 
     #[test]
@@ -1754,7 +1781,9 @@ mod tests {
         let mut water = WATER_TARGET_MS as f64;
         d.update(water as u32, dev);
         let skew = 300e-6;
-        for _ in 0..12_000u64 {
+        // Ti = 90 s、KP = 20 ppm/ms → ζ≈0.67、ω_n≈0.015 rad/s，
+        // 整定时间 ≈4/(ζ·ω_n) ≈ 400 s，所以这里跑 900 s。
+        for _ in 0..90_000u64 {
             dev += 480;
             let a = d.update(water as u32, dev);
             // 发送端比本机快 skew → 每 10 ms 多进来 10×skew 的媒体
@@ -1781,7 +1810,7 @@ mod tests {
         d.update(300, dev);
         run_pi(&mut d, 300, 30_000, &mut dev); // 300 s 极端高水位
         assert!(
-            d.integral().abs() <= RESAMPLE_MAX_ADJUST + 1e-12,
+            d.integral().abs() <= PI_INTEGRAL_MAX + 1e-12,
             "积分项溢出: {}",
             d.integral()
         );
@@ -1806,6 +1835,57 @@ mod tests {
             worst = worst.max(d.update(w, dev).abs());
         }
         assert!(worst < 0.0005, "抖动被放大成变调: {worst}");
+    }
+
+    #[test]
+    fn drift_jitter_steps_do_not_become_a_pitch_cycle() {
+        // 现场症状（v1.5.0 调参）：网络抖动每次都会敲响"水位 → 比率"环。
+        // 水位是速率差的纯积分，再套一个积分就是双积分器：振铃周期几十秒，
+        // 幅度顶到 ±0.5%（8.6 音分），听感就是"几十秒一次循环的变调"。
+        //
+        // 这里用固定的伪随机抖动台阶（每 5 s 一次、幅度 0–25 ms）喂闭环，
+        // 要求任意 30 s 窗口内 adjust 的峰峰值 < 2000 ppm（≈3.5 音分）。
+        // 实测：旧调参（KP=5e-5 / Ti=10 / 积分权限 ±0.5%）在同一序列上是
+        // 7808 ppm ≈ 13.5 音分——正是现场"几十秒一次循环的变调"。
+        let mut d = DriftController::new(48_000);
+        let mut dev = 0u64;
+        let mut water = WATER_TARGET_MS as f64;
+        d.update(water as u32, dev);
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut next_step_at = 50u64;
+        let mut hist: Vec<f64> = Vec::new();
+        for i in 0..60_000u64 {
+            // 600 s
+            if i == next_step_at {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = ((seed >> 33) as f64) / ((1u64 << 31) as f64); // 0..1
+                let sign = if (seed >> 20) & 1 == 1 { 1.0 } else { -1.0 };
+                water = (water + sign * 25.0 * r).clamp(0.0, 640.0);
+                next_step_at = i + 500; // 5 s
+            }
+            dev += 480;
+            let a = d.update(water as u32, dev);
+            water = plant_step(water, a);
+            hist.push(a);
+        }
+        // 后半段每 30 s 取一个窗口，看峰峰值
+        let mut worst = 0.0f64;
+        let mut start = 30_000usize;
+        while start + 3000 <= hist.len() {
+            let seg = &hist[start..start + 3000];
+            let hi = seg.iter().copied().fold(f64::MIN, f64::max);
+            let lo = seg.iter().copied().fold(f64::MAX, f64::min);
+            worst = worst.max(hi - lo);
+            start += 1000;
+        }
+        assert!(
+            worst < 0.002,
+            "抖动被放大成周期性变调（30 s 峰峰 {:.0} ppm ≈ {:.1} 音分）",
+            worst * 1e6,
+            worst * 1e6 / 578.0
+        );
     }
 
     #[test]

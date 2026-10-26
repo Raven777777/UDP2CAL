@@ -574,25 +574,33 @@ class Udp2CalProtocolTest {
         val d = Udp2CalProtocol.DriftController()
         val dev = longArrayOf(0)
         d.update(high, dev[0])
-        // KP 只有 50 ppm/ms：40 ms 偏差 → 2000 ppm；要顶到 0.5% 的钳位
-        // 必须等积分项长起来（Ti = 10 s，约 15 s 到位）
-        repeat(4000) {
+        // KP 只有 20 ppm/ms：40 ms 偏差 → 800 ppm；积分项权限只有 1500 ppm
+        // （Ti = 90 s，约 170 s 长满），所以比率实际封顶在 +0.23% 附近。
+        repeat(20_000) {
             dev[0] += 480
             val u = d.update(high, dev[0])
             assertTrue("比率越界: $u", kotlin.math.abs(u) <= Udp2CalProtocol.RESAMPLE_MAX_ADJUST + 1e-12)
             assertTrue("水位偏高时 adjust 不得为负: $u", u >= -1e-12)
         }
         assertTrue(
-            "高水位应把比率顶到上限: ${d.adjust()}",
-            d.adjust() > Udp2CalProtocol.RESAMPLE_MAX_ADJUST * 0.99
+            "高水位应把积分项推到权限上限: ${d.integral()}",
+            d.integral() >= Udp2CalProtocol.PI_INTEGRAL_MAX - 1e-9
+        )
+        assertTrue(
+            "高水位应把比率推到积分权限之上: ${d.adjust()}",
+            d.adjust() >= Udp2CalProtocol.PI_INTEGRAL_MAX * 0.99
         )
         // 反方向对称
         val low = Udp2CalProtocol.WATER_TARGET_MS - 60
         val d2 = Udp2CalProtocol.DriftController()
         val dev2 = longArrayOf(0)
         d2.update(low, dev2[0])
-        val a = runPi(d2, low, 4000, dev2)
-        assertTrue("缺水应把比率顶到下限: $a", a < -Udp2CalProtocol.RESAMPLE_MAX_ADJUST * 0.99)
+        val a = runPi(d2, low, 20_000, dev2)
+        assertTrue(
+            "缺水应把比率推到积分权限之下: $a",
+            a <= -Udp2CalProtocol.PI_INTEGRAL_MAX * 0.99
+        )
+        assertTrue("不得越过钳位: $a", a > -Udp2CalProtocol.RESAMPLE_MAX_ADJUST)
     }
 
     @Test
@@ -650,7 +658,9 @@ class Udp2CalProtocolTest {
         var water = Udp2CalProtocol.WATER_TARGET_MS.toDouble()
         d.update(water.toInt(), dev[0])
         val skew = 300e-6
-        repeat(12_000) {
+        // Ti = 90 s、KP = 20 ppm/ms → ζ≈0.67、ω_n≈0.015 rad/s，
+        // 整定时间 ≈4/(ζ·ω_n) ≈ 400 s，所以这里跑 900 s。
+        repeat(90_000) {
             dev[0] += 480
             val a = d.update(water.toInt(), dev[0])
             // 发送端比本机快 skew → 每 10 ms 多进来 10×skew 的媒体
@@ -1097,6 +1107,7 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.RATIO_SLEW_STEP,
             Udp2CalProtocol.PI_KP_PER_MS,
             Udp2CalProtocol.PI_TI_S,
+            Udp2CalProtocol.PI_INTEGRAL_MAX,
             Udp2CalProtocol.PI_MIN_UPDATE_MS,
             Udp2CalProtocol.WATER_SMOOTH_ALPHA,
             Udp2CalProtocol.RATE_WINDOW_S,
