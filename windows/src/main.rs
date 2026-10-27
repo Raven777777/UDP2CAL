@@ -2051,18 +2051,25 @@ fn udp_receiver_stream(
         64,
         move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
             let bind_addr = format!("{}:{}", listen_ip, listen_port);
-            let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = output
-                        .send(Message::EngineError(format!(
-                            "监听 {bind_addr} 失败：{}（端口可能被占用）",
-                            e.kind()
-                        )))
-                        .await;
-                    return;
-                }
-            };
+            // 用 `(host, port)` 元组解析，而不是把上面那个字符串拿去做 bind：
+            // `format!("{}:{}")` 对 IPv6 会拼出 "::1:44044"（缺方括号，非法
+            // socket 地址），而 UI 是接受 IPv6 监听地址的（main.rs 的校验
+            // 只拦非法字符）。`ToSocketAddrs` 对 IPv4/IPv6/主机名三种形态
+            // 都正确，`bind_addr` 只用于报错展示。
+            // 端口已是 1..=65535（config::load 归一 + UI 校验），`as u16` 安全。
+            let socket =
+                match tokio::net::UdpSocket::bind((listen_ip.as_str(), listen_port as u16)).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = output
+                            .send(Message::EngineError(format!(
+                                "监听 {bind_addr} 失败：{}（端口被占用或地址不可用）",
+                                e.kind()
+                            )))
+                            .await;
+                        return;
+                    }
+                };
 
             // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
             let mut retries = 60;
