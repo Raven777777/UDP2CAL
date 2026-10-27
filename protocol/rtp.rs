@@ -711,6 +711,25 @@ impl JitterBuffer {
         }
     }
 
+    /// 前瞻当前播放位（`next_ts`）的包，**不消费**它。
+    ///
+    /// 用途：Opus 的带内 FEC（RFC 6716 §4.4 的 LBRR 冗余）。某一帧丢失时，
+    /// 重建它所需的冗余数据藏在**下一个包**里，所以接收端必须先看到下一个包
+    /// 才能决定怎么填这个洞。这里只读不写：不改 `next_ts` / `next_seq`，
+    /// 也不让槽位失效——随后 [`pull`](Self::pull) 仍会正常取出同一个包。
+    ///
+    /// 返回 `None` 表示该帧的包还没到（或 `out` 放不下）。
+    pub fn peek_current(&self, out: &mut [u8]) -> Option<usize> {
+        let idx = self.find_ts(self.next_ts)?;
+        let len = self.slots[idx].len as usize;
+        if out.len() < len {
+            return None;
+        }
+        let base = idx * OPUS_MAX_PAYLOAD;
+        out[..len].copy_from_slice(&self.data[base..base + len]);
+        Some(len)
+    }
+
     /// 阶跃裁剪用：按播放顺序取出下一帧，但**由调用方解码后丢弃 PCM**。
     ///
     /// 这是 [`JitterBuffer::pull`] 的无节流版本：不看 `ring_ms`，也不要求
@@ -1822,6 +1841,46 @@ mod tests {
             jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]),
             Pull::Packet { len: 1, ts: 2400 }
         );
+    }
+
+    #[test]
+    fn peek_current_returns_the_playhead_packet_without_consuming_it() {
+        let mut jb = JitterBuffer::new();
+        insert(&mut jb, 0, 4800, true, 1);
+        insert(&mut jb, 1, 5280, false, 2);
+        insert(&mut jb, 2, 5760, false, 3);
+        insert(&mut jb, 3, 6240, false, 4);
+        // 播放位先推到第 3 个包（tag 3）
+        assert_eq!(pull_tags(&mut jb, 0, 2), vec![1, 2]);
+
+        let water_before = jb.water_ms();
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        assert_eq!(jb.peek_current(&mut out), Some(1));
+        assert_eq!(out[0], 3);
+        // 前瞻是纯读：水位不变，重复调用返回同一个包
+        assert_eq!(jb.water_ms(), water_before);
+        assert_eq!(jb.peek_current(&mut out), Some(1));
+        // 之后仍按序播放同一个包 —— 这正是 FEC 需要的行为
+        assert_eq!(pull_tags(&mut jb, 0, 2), vec![3, 4]);
+        // 播放位越过所有包之后就没得前瞻了
+        assert_eq!(jb.peek_current(&mut out), None);
+    }
+
+    #[test]
+    fn peek_current_is_none_when_the_packet_is_missing_or_output_is_small() {
+        let mut jb = JitterBuffer::new();
+        insert(&mut jb, 0, 0, true, 1);
+        insert(&mut jb, 1, 480, false, 2);
+        insert(&mut jb, 2, 960, false, 3);
+        insert(&mut jb, 3, 1440, false, 4);
+        assert_eq!(pull_tags(&mut jb, 0, 3), vec![1, 2, 3]); // next_ts = 1440
+                                                             // 输出缓冲放不下 → None（不得截断成半包给解码器）
+        assert_eq!(jb.peek_current(&mut [0u8; 0]), None);
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        assert_eq!(jb.peek_current(&mut out), Some(1));
+        // 缺口处还没到的包同样是 None：调用方据此退回 PLC
+        assert_eq!(pull_tags(&mut jb, 0, 1), vec![4]); // next_ts = 1920（永远不到）
+        assert_eq!(jb.peek_current(&mut out), None);
     }
 
     #[test]
