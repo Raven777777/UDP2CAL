@@ -33,6 +33,23 @@
 //! * `reObserve` 把 Java 纳秒换算回 `Instant`。
 //!
 //! 两侧速率完全同源，基准偏差只有一次读时钟的几微秒，长期不漂移。
+//!
+//! ## unsafe 契约
+//!
+//! 本文件的 `unsafe` 全部来自 JNI 的 C ABI。下列论证适用于本文件的**每一个**
+//! `unsafe fn`，逐条写在这里而不是在 70 多个入口点上重复：
+//!
+//! 1. **`Env` 与引用只在本次调用内有效**：JVM 保证 native 方法执行期间 `env`、
+//!    `this` 与参数引用合法。本模块不把 `env`/`jobject`/`jbyteArray` 存进任何
+//!    全局或结构体，因此不存在跨调用悬垂。
+//! 2. **函数表非空**：`JNINativeInterface_` 的函数指针由 JVM 在创建/附着线程时
+//!    填满，JNI 规范要求非空，故 `f.GetXxx.unwrap()(...)` 不会 panic（见 [`fns`]）。
+//! 3. **句柄生命周期归 Kotlin 侧**：`Box::into_raw` 只出现在 `*Create`，
+//!    `Box::from_raw` 只出现在对应的 `*Destroy` 且均先判 `h != 0`。重复 destroy
+//!    或使用已释放句柄属于 Kotlin 侧契约违反（见 `docs/PROTOCOL_V3_RTP.md` §12），
+//!    Rust 侧无法在不引入全局句柄注册表的前提下防御——那属于 L3 设计变更，未做。
+//! 4. **跨边界数组搬运先校验边界**：所有 `Get/SetXxxArrayRegion` 都先取
+//!    `GetArrayLength`，再用 `i64` 相加比较（不用 `jint` 相加），越界直接返回失败。
 
 // 这里全是 JNI 入口点，安全边界由 JVM 侧保证（参数由 `external fun` 声明约束，
 // 句柄由 `Box::into_raw`/`Box::from_raw` 成对管理），不需要 Rust API 文档里的
@@ -69,6 +86,9 @@ type Handle = jlong;
 
 #[inline]
 unsafe fn fns(env: Env) -> &'static JNINativeInterface_ {
+    // SAFETY: `env` 由 JVM 在本次 native 调用期间保证有效且非空；它指向的
+    // `JNINativeInterface_` 在 JVM 生命周期内不可变且一直存活，因此返回
+    // `'static` 引用是成立的（实际只在本模块内按本次调用的作用域使用）。
     &**env
 }
 
@@ -80,6 +100,8 @@ fn null<T>() -> *mut T {
 // ═══════════════════════ 数组/字符串搬运 ═══════════════════════
 
 /// 把 `arr[offset .. offset+len)` 拷进 `out`；越界返回 false。
+///
+/// 边界校验全部用 `i64` 相加，避开 `offset + len` 的 `jint` 溢出。
 unsafe fn read_bytes(env: Env, arr: jbyteArray, offset: jint, len: jint, out: &mut Vec<u8>) -> bool {
     if arr.is_null() || offset < 0 || len < 0 {
         return false;
@@ -682,9 +704,15 @@ struct DeviceRateHandle {
 
 #[inline]
 unsafe fn lock<'a, T>(cell: &'a Mutex<T>) -> MutexGuard<'a, T> {
+    // SAFETY: `cell` 是句柄内部的 `Mutex`，调用方已确保句柄有效（见模块头部
+    // unsafe 契约第 3 条）；`MutexGuard` 的生命周期被约束为 `'a`，不会超出引用。
     // 中毒恢复：JNI 侧不允许把 panic 传染成永久不可用
     cell.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+// 句柄解引用（`jb_ref`/`rate_ref`/`step_ref`/`drift_ref`/`device_rate_ref`）：
+// 要求 `h` 来自对应的 `*Create` 且尚未被 `*Destroy` 释放。签名为方便标成
+// `&'static`，实际有效期不超过本次 JNI 调用——调用点都只在本函数体内用完。
 
 unsafe fn jb_ref(h: Handle) -> Option<&'static JbHandle> {
     if h == 0 {
@@ -736,6 +764,8 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbCreat
             pulled_ts: 0,
         }),
     });
+    // SAFETY: `Box::into_raw` 把所有权交给 Kotlin 侧（见模块头部 unsafe
+    // 契约第 3 条）；此后 Rust 侧不再持有该指针。
     Box::into_raw(handle) as Handle
 }
 
@@ -746,6 +776,8 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbDestr
     h: Handle,
 ) {
     if h != 0 {
+        // SAFETY: `h` 必须来自 `jbCreate` 且未被释放过（Kotlin 侧 `close()` 保证
+        // 只调用一次）；`jlong` → `*mut JbHandle` 还原的是同一个分配。
         drop(Box::from_raw(h as *mut JbHandle));
     }
 }
