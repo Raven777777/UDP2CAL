@@ -13,7 +13,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Union
 
 from . import config
 
@@ -57,11 +57,23 @@ def needs_shell(program: str) -> bool:
     return program.lower().endswith((".bat", ".cmd"))
 
 
-def build_command(cmd: Sequence[str]) -> List[str]:
-    """.bat/.cmd 需要包一层 cmd /c，否则 CreateProcess 无法直接执行。"""
+def build_command(cmd: Sequence[str]) -> Union[str, List[str]]:
+    """返回可直接交给 `subprocess` 的命令行。
+
+    `.bat`/`.cmd` 需要包一层 `cmd /c`，否则 CreateProcess 无法直接执行。
+
+    返回 `str` 时表示已按 cmd.exe 的规则拼好（Windows 上传 `str` 给 Popen 会
+    原样交给 CreateProcess，不再二次转义）。
+
+    cmd.exe 的引号规则：命令串里**超过两个**引号时，cmd 会剥掉首尾各一个再解析。
+    因此 `["cmd", "/c", bat, "--flag", "a b"]` 被 list2cmdline 拼成
+    `cmd /c "C:\\..\\sp ace\\gw.bat" --flag "a b"` 后，cmd 先剥引号再按空格切分，
+    会在 bat 路径的空格处断开（实测报错 `'C:/Users/.../sp' is not recognized`）。
+    官方写法是把整条命令再包一层引号：`cmd /c ""bat" "arg with space""`。
+    """
     parts = [str(c) for c in cmd]
     if parts and needs_shell(parts[0]):
-        return ["cmd", "/c"] + parts
+        return 'cmd /c "{}"'.format(subprocess.list2cmdline(parts))
     return parts
 
 
@@ -90,6 +102,11 @@ def _terminate(proc: subprocess.Popen) -> None:
             pass
 
 
+def _display(cmd: Sequence[str]) -> str:
+    """把命令还原成便于写日志的一行（不做 cmd 包装）。"""
+    return subprocess.list2cmdline([str(c) for c in cmd])
+
+
 def run(
     cmd: Sequence[str],
     logger=None,
@@ -111,8 +128,7 @@ def run(
         quiet: 为 True 时不回显输出（仅用于探测类命令）。
     """
     argv = build_command(cmd)
-    displayed = subprocess.list2cmdline(argv)
-
+    displayed = argv if isinstance(argv, str) else _display(cmd)
     try:
         proc = subprocess.Popen(
             argv,
@@ -123,12 +139,12 @@ def run(
             stderr=subprocess.STDOUT,
         )
     except FileNotFoundError:
-        msg = "找不到可执行文件: {}".format(argv[0])
+        msg = "找不到可执行文件: {}".format(cmd[0])
         if logger:
             logger.error(msg)
         return RunResult(code=127, lines=[msg], command=displayed)
     except OSError as exc:
-        msg = "无法启动进程: {} ({})".format(argv[0], exc)
+        msg = "无法启动进程: {} ({})".format(cmd[0], exc)
         if logger:
             logger.error(msg)
         return RunResult(code=126, lines=[msg], command=displayed)
@@ -171,10 +187,10 @@ def capture(cmd: Sequence[str], cwd: Path | str | None = None, env: dict | None 
             timeout=timeout,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-        return RunResult(code=127, lines=[], command=subprocess.list2cmdline(argv))
+        return RunResult(code=127, lines=[], command=_display(cmd))
 
     text = _decode(proc.stdout or b"")
-    return RunResult(code=proc.returncode, lines=text.splitlines(), command=subprocess.list2cmdline(argv))
+    return RunResult(code=proc.returncode, lines=text.splitlines(), command=_display(cmd))
 
 
 def clean_env(extra: dict | None = None, unset: Iterable[str] = ()) -> dict:
