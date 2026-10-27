@@ -4,6 +4,55 @@
 
 ---
 
+## 未发布 — 2026-10-28 · 传输层调优（借鉴 Sunshine）+ 反馈门控 + 双端 FEC 重建
+
+> 三件事互不重叠：**发送节拍真正落在 10 ms 网格上**、**反馈只在水温有意义的时刻评估**、
+> **丢帧先尝试用下一个包重建而不是直接 PLC**。规则与实测见
+> [PROTOCOL_V3_RTP.md](PROTOCOL_V3_RTP.md) §8.7 与 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5.2。
+
+**发送节奏**
+- 反向发送改用 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 高精度定时器（新增 `windows/src/hires.rs`），
+  创建失败自动退回 WASAPI 事件等待并记日志；**不调** `timeBeginPeriod`（进程级全局状态）。
+- 节拍槽位迟到半个帧就重锚，重锚值取 `now + 10 ms`（`capture.rs::slot_is_late`/`advance_slot`）。
+  线程启动偏移与一次卡顿不再被逐帧复制成永久 15.8 ms 偏移：实测 `[Pacer]` 迟到
+  11204/15788/17927 µs → 21/300/1000 µs。重锚的帧不再计入迟到统计，另计 `重锚=`。
+- 收发套接字缓冲放大到 1 MiB（Windows 正向 recv / 反向 send，Android 双向；失败只告警）。
+
+**播放端**
+- PCM 环满时改为丢弃**未播的旧数据**（`audio.rs::Ring::push_latest`，复用既有 flush 通道），
+  不再只丢新样本把满载延迟永久保留；`[Audio] 统计` 新增 `满丢旧数据=`。
+- 反馈支路只在真的出声时评估（`!rtp_idle && playing`，Windows 与 Android 同源）：预缓冲阶段的
+  低水位不再把 PI 积分压到 `-PI_INTEGRAL_MAX` 负饱和（日志指纹 `反馈 -1100ppm`），起播后不必再花
+  约 80 s 退饱和。`rtp.rs` 增加回归测试 `prebuffer_phase_winds_up_the_integral_to_the_negative_stop`。
+
+**Opus 带内 FEC 落到实处（两个方向）**
+- 丢帧时先用**下一个包**的 LBRR 冗余重建该帧，下一个包也没到才退回 PLC。前瞻入口：
+  `JitterBuffer::peek_current`（Rust）/ `jbPeek`（JNI）；解码入口 `OpusDecoder::decode_fec` /
+  `decoderDecodeFec`（C）。
+- 实测同一音源：FEC 重建与原始帧的平均绝对误差 **0.0064**，PLC 外推 **0.297**（约 1/46）。
+- `opus_decode(fec = 1)` 会填满调用方给的输出容量，两端都只交一帧（480/声道）并要求"必须恰好一帧"。
+- 可观测：Windows `[RTP]` 行与 Android `反向延迟` 行各带 `FEC=`，与 `PLC` 此消彼长。
+
+**配置与诊断**
+- 注册表 `listen_port` 载入时钳到 1–65535（越界回落 44044），与下游 `as u16` 一致；防火墙规则与
+  DISCOVER_REPLY 不再出现回绕端口。
+- 配置保存失败不再静默（提示 + 日志）；音频线程创建失败会置 `DeviceFailed` 并记日志。
+- 新增 panic hook（`logger.rs::install_panic_hook`）：线程名 + `file:line:col` + backtrace 落日志，
+  GUI 子系统下 stderr 不可见的问题不再导致"线程静默死亡"。
+- 日志轮转失败时原地截断（Windows 的追加句柄不允许 `SetEndOfFile`，改用新句柄 truncate），
+  日志体积重新有上限。
+- 监听地址支持 IPv6 字面量（`UdpSocket::bind((ip, port))`；旧写法把 `::1` 拼成非法的 `::1:44044`）。
+
+**同批审查修复**
+- WASAPI 环回初始化失败时不再泄漏事件句柄；混音格式 `nBlockAlign` 与声道/位深不一致直接拒绝
+  （偏小会越界读）；`frames == 0` 分支补 `ReleaseBuffer`；反向配置变更不再持锁写日志。
+- 反向重采样器在 ≥144 kHz 环回端点上的越界 panic 修复（`consumed` 未夹 `frames - 1`）。
+- 反向发送器 `join` 移出槽位锁（旧写法在 UI 线程与网络任务里持锁等线程退出，等于冻结窗口）。
+- `device_rate` 作除数前 `.max(1)`；码率统计删掉只为等价分支存在的死计数器。
+- Android `onDestroy` 先等 `reverseRxJob` 退出再释放原生句柄（旧顺序可在停止时触发原生 UAF/SIGSEGV）。
+
+---
+
 ## 未发布 — 2026-10-27 · 接收时钟/播放控制重构（按 Plan.md 评审整改）
 
 > 目标不是“再调一次 PI”，而是把**设备钟差**、**网络抖动**、**播放缺口**三件事拆开：

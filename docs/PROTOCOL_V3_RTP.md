@@ -1138,7 +1138,8 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 8. 超过 1275 字节的 Opus 负载不得发送。
 9. `M=1` 按 4.6 设置。
 10. **1 帧节拍整形**：发送时刻钉在 10 ms 网格上，把采集设备成簇交出的帧摊平。
-    它不是队列——最多只压 1 帧；落后超过 4 帧就重置网格，绝不用连续突发追赶。
+    它不是队列——最多只压 1 帧；迟到超过半个帧就重锚网格（见下方实现要点），
+    绝不用连续突发把落后的时间补回来。
 
 发送端节拍整形为什么必要：采集硬件的读接口按"周期"交货（WASAPI 环回常见
 10/20 ms，`AudioRecord` 视缓冲而定），成簇输出的直接后果是接收端水位呈锯齿。
@@ -1262,6 +1263,13 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | 节拍迟到统计 | `windows/src/capture.rs` 的 `ReverseStats.late_*` 与 `reanchors`，30 s 汇总 | 实际发送时刻 − 计划时刻的 min/avg/max，**不做 EWMA**；迟到超过半个帧（该重锚）的帧不计入，只累加 `重锚=` 计数 | 只报 min/max/avg 才能看见偶发的百毫秒级卡顿；EWMA 会把卡顿抹平。反过来，一次 8 s 的无声间隔也不该被当成"迟到"——它描述的是停顿多久，不是网格多准，混进来会把均值从 0.3 ms 拉到 4.2 ms（实测）。日志行 `[Pacer] 30s` |
 | 抖动缓冲满即覆盖最旧槽 | `protocol/rtp.rs` `JitterBuffer::store` | 槽位满时覆盖序号最小的槽 | 等价于 Sunshine 的 `drop_oldest`：宁可少一段历史，也不让播放头被旧包拖住 |
 | Opus 带内 FEC 重建（两个方向） | Windows 接收：`windows/src/main.rs`（`Pull::Plc` 分支）、`protocol/rtp.rs` `JitterBuffer::peek_current`、`windows/src/decoder.rs` `OpusDecoder::decode_fec`；Android 接收：`CaptureService.kt` 的 `Pull.PLC` 分支、`ProtocolNative.jbPeek`、`cpp/opus_jni_decoder.c` `decoderDecodeFec` | 丢帧时先用**下一个包**里的 LBRR 冗余重建该帧（`opus_decode(..., fec = 1)`），下一个包也还没到才退回 PLC；`peek_current` 只读不消费，同一个包随后照常解码 | 实测一次 >100 ms 的到达停顿会连丢 3 帧 = 30 ms PLC，听感就是“音量塌一下”。同一测试音源实测：FEC 重建与原始帧的平均绝对误差 0.0064，PLC 外推是 0.297（约 1/46）。前提是发送端开了 in-band FEC；没开时 libopus 自动退化成 PLC，所以接收端不需要先知道对端配置。`opus_decode(fec = 1)` 会把调用方给的输出缓冲填满（传 5760 就返回 5760），因此必须只交 480 采样，否则多出的帧会被当成“这一帧”写进播放环。计数见 Windows 的 `[RTP]` 行 `FEC=` 与 Android 的 `反向延迟` 行 `FEC=n` |
+
+**实测（v1.5.1，同一条 Wi-Fi 链路、同一台机器）**：加高精度定时器之前 `[Pacer]` 迟到
+`min/avg/max=11204/15788/17927 µs`（稳定 15.8 ms ≈ 一个系统 tick，且槽位偏移一旦形成就逐帧复制）；
+加定时器后为 `21/300/1000 µs`，`重锚` 只在空闲期无声或线程被抢占时 +1。目标水位 150 → 总延迟
+156–168 ms；目标 80 → 83–99 ms。默认值仍取 150：同一链路上出现过一次 >100 ms 的到达停顿，
+目标 80（抖动缓冲只有 30–50 ms）会把那次停顿放大成 7–10 帧 PLC。实测明细见
+[LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5.2。
 
 **刻意不做**（视频专属，或与“100 包/秒、每 10 ms 一包”的节拍无关）：
 

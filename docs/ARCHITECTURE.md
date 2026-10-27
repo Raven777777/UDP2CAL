@@ -29,8 +29,11 @@ udp2cal/
 │  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 可微调比率重采样
 │  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
 │  │  ├─ config.rs     # 注册表配置读写
-│  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧）
+│  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧；含带内 FEC 重建）
+│  │  ├─ diag.rs       # ASRC 高频诊断 CSV（`UDP2CAL_ASRC_DIAG`，默认关闭）
 │  │  ├─ firewall.rs   # 防火墙规则
+│  │  ├─ hires.rs      # 高精度可等待定时器（反向发送节拍）
+│  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
 ├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp.rs 媒体面 + jni.rs JNI 表面
@@ -328,7 +331,14 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 前馈管设备钟差 + 反馈管长期残差 | `rtp::DeviceRateEstimator` / `rtp::DriftController` | 前馈观测 `(设备帧, QPC)`，测的是媒体时钟相对**声卡设备时钟**的频差；反馈对 4 s 低通后的水位做慢 PI，只修长期残差。网络攒批不进入前馈，因此不会变成变调 |
 | 没有播放头，也没有偏移记账 | 旧 `PlayheadClock`（base/余数/offset/`note_*`）已删除 | 一旦存在"设备帧↔媒体时间戳"换算，就必须记住偏移；改为纯水位口径后，`played_frames` 不参与任何播放判定，换算链与三处补丁一起消失 |
 | flush 只投递请求 | `audio.rs::Ring::request_flush` | `tail` 归消费者所有；生产者直接写会让 `len()` 回绕成 `usize::MAX`，解码线程永久停产（静默死锁） |
-| 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后 >4 帧重置而非补发 |
+| 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后不补发（补发就是突发） |
+| 节拍等待用高精度定时器 | `hires.rs::HiResTimer`（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`） | Windows 默认定时器分辨率 15.6 ms，会把 10 ms 网格量化成 15.6 ms 的稳定偏移（实测 avg 迟到 15.8 ms）。不调 `timeBeginPeriod`：那是进程级全局状态 |
+| 迟到半个帧就重锚 | `capture.rs::slot_is_late` + `advance_slot`（重锚值 `now + gap`） | 偏移一旦形成会被每帧复制、永远到不了"落后 4 帧"的旧阈值；重锚返回 `now` 又会让积压帧当轮连发 |
+| 重锚帧不计入迟到统计 | `capture.rs::ReverseStats.reanchors` | 迟到量描述"网格多准"，不是"停顿多久"：一次 8 s 无声间隔曾把窗口均值从 0.3 ms 拉到 4.2 ms |
+| PCM 环满丢最旧 | `audio.rs::Ring::push_latest` + 既有 flush 通道 | 只丢新样本等于把满载延迟永久保留；丢掉未播的旧数据才能把水位压回目标（`满丢旧数据=` 计数） |
+| 反馈只在出声时评估 | `main.rs` 解码线程 `feedback_on = !rtp_idle && playing` | 预缓冲阶段水位必然低于目标，PI 会把积分压到负饱和（实测 -1100 ppm），起播后要花 ~80 s 退饱和 |
+| Opus 带内 FEC 重建 | `rtp::JitterBuffer::peek_current` → `decoder.rs::OpusDecoder::decode_fec`（Android 侧 `ProtocolNative.jbPeek` → `decoderDecodeFec`） | 丢帧的 LBRR 冗余在**下一个包**里，所以补洞前必须能前瞻而不消费；FEC 模式下 `opus_decode` 会填满调用方容量，只能给一帧 |
+| 收发缓冲放大到 1 MiB | `capture.rs` 反向 send、`main.rs` 正向 recv、`UdpSender.kt` 双向 | 突发补齐时让内核吸收峰峰差，用户态少一次丢包 |
 
 ### 快速双击防抖
 

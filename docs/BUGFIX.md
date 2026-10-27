@@ -9,6 +9,30 @@
 
 ---
 
+## 2026-10-28 — 传输层调优 / 反馈门控 / FEC 重建（10 项）
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | Windows 反向 | `[Pacer]` 迟到稳定在 15.8 ms，10 ms 网格被打散，积压帧偶发连发 | ①`std::thread::sleep`/WASAPI 事件超时受系统定时器分辨率（15.6 ms）限制；②槽位偏移一旦形成就被逐帧复制，永远到不了"落后 4 帧"的旧重置阈值 | 新增 `hires.rs` 高精度可等待定时器；槽位迟到半个帧就重锚（`slot_is_late`/`advance_slot`），重锚值取 `now + gap` 而非 `now`（否则当轮连发） |
+| 2 | Windows 反向 | `[Pacer]` 出现过 `max=7968153us` 的假迟到，把窗口均值从 0.3 ms 拉到 4.2 ms | 迟到统计把"停顿多久"当成"网格多准"：PC 空闲 8 s 后恢复放音，第一帧的槽位还是 8 s 前那个 | 重锚的帧只累加 `reanchors`，不计入 `late_*`；日志加 `重锚=` |
+| 3 | 三端 | 预缓冲阶段反馈积分被压到 `-PI_INTEGRAL_MAX`（日志指纹 `反馈 -1100ppm`），起播后需 ~80 s 退饱和，水位长期偏高 | 反馈支路只判 `rtp_idle`，没判"是否真的在出声"；预缓冲时水位必然低于目标，PI 一路积分到负饱和 | 改为 `!rtp_idle && playing`（Windows `jb.is_playing()`、Android `jitter.playing`），不出声时冻结并 `reset()` |
+| 4 | Windows 播放 | PCM 环长期满载，可听位置永久落后一个环容量 | `Ring::push` 满时丢**新**样本：环保持满载，多出的延迟再也散不掉 | `Ring::push_latest`：满时投递 `request_flush` 丢未播旧数据（`tail` 仍归消费者），计 `满丢旧数据` |
+| 5 | 双端接收 | 一次 >100 ms 的到达停顿会连丢 3 帧 = 30 ms PLC，听感"音量塌一下" | 接收端只有 PLC 一条补洞路径，而 Opus 的 LBRR 冗余就在**下一个包**里，却没有"前瞻不消费"的入口 | `JitterBuffer::peek_current` / `jbPeek` + `decode_fec` / `decoderDecodeFec`：先 FEC 重建，下一个包也没到才 PLC |
+| 6 | 双端接收 | FEC 重建会把 5760 采样写进 480 采样的时间线（延迟棘轮） | `opus_decode(fec = 1)` 会用调用方的输出容量决定返回长度（传多少填多少） | 只交一帧（480/声道）容量，并要求返回恰好一帧，否则按失败退回 PLC |
+| 7 | Windows 捕获 | 环回初始化失败时事件句柄泄漏，每 500 ms 重试泄漏 2 个句柄 | `client.GetService().ok()?` / `client.Start().ok()?` 在 `Self` 构造前提前返回，`CreateEventW` 的句柄没人 `CloseHandle` | 两个失败分支显式 `CloseHandle` 并记 Win32 错误码 |
+| 8 | Windows 捕获 | 混音格式 `nBlockAlign` 偏小时按 `frame_count * channels` 造切片会越界读 | `parse_mix_format` 校验了 tag/bits/channels/rate/subformat，唯独没校验 `nBlockAlign` | `nBlockAlign != channels * bytes_per_sample` 直接拒绝；另补 `frames == 0` 分支的 `ReleaseBuffer` |
+| 9 | Windows 反向 | ≥144 kHz 环回端点下捕获线程 panic（反向永久静音） | 重采样循环退出条件是 `floor(phase) >= frames-1`，但最后一步 `phase += ratio` 可越过 `frames`，`consumed` 未夹 `frames - 1` | `consumed = (self.phase as usize).min(frames - 1)` + 高比率回归测试 |
+| 10 | Windows / Android | 停止时偶发 SIGSEGV（原生 use-after-free） | `onDestroy` 只 join 采集/播放协程就 `jitter.close()`，而唯一调 `jbInsert` 的反向接收协程不在 join 集合 | 先 `join(reverseRxJob)`（依赖 `udpSender.close()` 唤醒阻塞的 `receive()`），1 s 未退出则**保留**原生句柄并记日志 |
+
+### 验证
+
+- 反向节拍：`[Pacer]` 迟到 `11204/15788/17927 µs` → `21/300/1000 µs`（现场日志，同一台机器）。
+- FEC 重建质量：单测对比同一测试音源，平均绝对误差 0.0064（FEC）vs 0.297（PLC）。
+- 门控：`rtp.rs` 回归测试 `prebuffer_phase_winds_up_the_integral_to_the_negative_stop` 断言 120 s 低水位喂入后积分到负饱和。
+- 门禁：protocol 80 tests / windows 42 单测 + 2 集成 / android `assembleDebug`（含 CMake）全绿，两 crate clippy 0 警告。
+
+---
+
 ## 2026-10-27 — 控制面会话绑定与反向链路自愈
 
 | # | 模块 | 问题 | 根因 | 修复 |
