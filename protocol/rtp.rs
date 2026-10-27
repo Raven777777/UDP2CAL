@@ -438,6 +438,11 @@ pub struct JitterBuffer {
     next_ts: u64,
     highest_seq: u64,
     highest_ts: u64,
+    /// 当前时间线的起始序号（首包或最近一次重同步），与 `base_inserted` 配套
+    /// 用来算丢包估计。
+    base_seq: u64,
+    /// 建立 `base_seq` 那一刻的 `stats.inserted` 快照。
+    base_inserted: u64,
     started: bool,
     playing: bool,
     plc_run: u32,
@@ -463,6 +468,8 @@ impl JitterBuffer {
             next_ts: 0,
             highest_seq: 0,
             highest_ts: 0,
+            base_seq: 0,
+            base_inserted: 0,
             started: false,
             playing: false,
             plc_run: 0,
@@ -502,6 +509,30 @@ impl JitterBuffer {
 
     pub fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// 期望包数（自上次重同步/复位起）：发送端序号跨度。
+    ///
+    /// 发送端的序号每发一个 RTP 包才 +1（RFC 3550；DTX / 发送失败不占号），
+    /// 所以 `highest_seq − base_seq + 1` 就是这段时间里发送端真正发过的包数。
+    pub fn expected_packets(&self) -> u64 {
+        if !self.started {
+            return 0;
+        }
+        self.highest_seq.saturating_sub(self.base_seq) + 1
+    }
+
+    /// 估计丢包数（自上次重同步/复位起）：`期望包数 − 成功入槽包数`。
+    ///
+    /// 差额包含**没到达**的包，也包含到达了但没能入槽的包（迟到 `stats.late`、
+    /// 超窗 `stats.overflow`、重复 `stats.duplicate`）——要区分“网络真丢”与
+    /// “本地丢弃”就看那几个计数。重同步会重置基准，所以它描述的是**当前
+    /// 时间线**，不是进程生命周期。
+    ///
+    /// 分母用 [`Self::expected_packets`]；两者都为 0 时不要相除。
+    pub fn lost_estimate(&self) -> u64 {
+        self.expected_packets()
+            .saturating_sub(self.stats.inserted.saturating_sub(self.base_inserted))
     }
 
     /// 已见过的最大媒体时间戳（发送端媒体时间线的最新位置）。
@@ -791,6 +822,8 @@ impl JitterBuffer {
         self.next_ts = 0;
         self.highest_seq = 0;
         self.highest_ts = 0;
+        self.base_seq = 0;
+        self.base_inserted = 0;
         self.started = false;
         self.playing = false;
         self.plc_run = 0;
@@ -814,6 +847,8 @@ impl JitterBuffer {
         self.next_ts = ts;
         self.highest_seq = seq;
         self.highest_ts = ts;
+        self.base_seq = seq;
+        self.base_inserted = self.stats.inserted;
         self.started = true;
         self.playing = false;
         self.plc_run = 0;
@@ -1795,6 +1830,37 @@ mod tests {
         insert(&mut jb, 3, 1440, false, 13);
         insert(&mut jb, 1, 480, false, 11);
         assert_eq!(pull_tags(&mut jb, 0, 4), vec![10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn jb_lost_estimate_counts_sequence_holes() {
+        let mut jb = JitterBuffer::new();
+        // 首包：期望 1、入槽 1 → 不丢
+        assert_eq!(insert(&mut jb, 100, 0, true, 1), InsertResult::Started);
+        assert_eq!(jb.expected_packets(), 1);
+        assert_eq!(jb.lost_estimate(), 0);
+
+        insert(&mut jb, 101, 480, false, 2);
+        // 跳过 102：序号跨度 3 但只入槽 2 个 → 丢 1
+        insert(&mut jb, 103, 1440, false, 3);
+        assert_eq!(jb.expected_packets(), 4);
+        assert_eq!(jb.lost_estimate(), 1);
+        assert_eq!(jb.stats.inserted, 3);
+
+        // 迟到/重复包不影响期望，也不让估计变小（它们本来就没入槽）
+        let _ = jb.pull(0, 0, &mut [0u8; OPUS_MAX_PAYLOAD]);
+        assert_eq!(insert(&mut jb, 101, 480, false, 9), InsertResult::Dropped);
+        assert_eq!(jb.lost_estimate(), 1);
+
+        // 重同步重置基准：新时间线从重同步包开始算
+        insert(&mut jb, 900, 96_000, true, 4);
+        assert_eq!(jb.expected_packets(), 1);
+        assert_eq!(jb.lost_estimate(), 0);
+
+        // reset 后未起播：两个量都为 0（分母不能拿来相除）
+        jb.reset();
+        assert_eq!(jb.expected_packets(), 0);
+        assert_eq!(jb.lost_estimate(), 0);
     }
 
     #[test]

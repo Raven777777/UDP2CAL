@@ -1330,9 +1330,14 @@ impl AppState {
                 if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
                     self.last_stats_log = Instant::now();
                     let s = audio_stats().snapshot();
-                    let (j, water) = {
+                    let (j, water, lost, expected) = {
                         let jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
-                        (jb.stats, jb.water_ms())
+                        (
+                            jb.stats,
+                            jb.water_ms(),
+                            jb.lost_estimate(),
+                            jb.expected_packets(),
+                        )
                     };
                     let peer = p2p_snapshot();
                     logf!(
@@ -1354,6 +1359,19 @@ impl AppState {
                         j.received, j.bytes, j.late, j.duplicate, j.overflow, j.resyncs,
                         j.plc_frames, j.max_plc_run,
                         FEC_FRAMES.swap(0, Ordering::Relaxed), water, peer.forward_ssrc
+                    );
+                    // 丢包估计 = 序号跨度 − 成功入槽数（自上次重同步起）：把“真丢”
+                    // 与本地丢弃（迟到/溢出的计数在旁边）分开看，才谈得上调水位/开 FEC。
+                    let loss_pct = if expected > 0 {
+                        lost as f64 * 100.0 / expected as f64
+                    } else {
+                        0.0
+                    };
+                    logf!(
+                        "[RTP] 丢包≈{}/{}（{:.1}%）：分子含未到达与到达但未入槽（迟到/溢出/重复）",
+                        lost,
+                        expected,
+                        loss_pct
                     );
                     logf!(
                         "[RTP] 丢包/非法包={} 累计接收={}",
