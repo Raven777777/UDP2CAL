@@ -216,6 +216,11 @@ class UdpSender(
         if (ackThread != null) return
         running = true
         ackThread = Thread({
+            // ACK 每秒才来一个，但阻塞 recv 一旦被后台任务挤出调度，读到的就是
+            // 晚一拍的 ACK（`isAckFresh` 窗口 3 s，抖动直接表现为“已断开”）。
+            // 用 AUDIO 而不是 URGENT_AUDIO：它是控制面，不该排在采集/播放线程之上。
+            // 专用线程、随会话存活，不需要还原优先级。
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
             val buf = ByteArray(2048)
             val pkt = DatagramPacket(buf, buf.size)
             while (running) {

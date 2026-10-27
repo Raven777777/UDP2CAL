@@ -947,54 +947,70 @@ class CaptureService : Service() {
         var byteCount = 0L
         var lastReport = System.currentTimeMillis()
 
-        while (coroutineContext.isActive) {
-            pkt.length = buf.size
-            try {
-                sock.receive(pkt)
-            } catch (e: Exception) {
-                if (!coroutineContext.isActive || sock.isClosed) break
-                // 不忙等：socket 持续报错时也要让出线程，避免占满 IO 调度器
-                delay(10)
-                continue
-            }
-            val len = pkt.length
-            if (expectedIp != null && pkt.address?.hostAddress != expectedIp) continue
-            val rtp = Udp2CalProtocol.parseRtp(buf, len) ?: continue
-            val ssrc = activeReverseSsrc
-            if (ssrc == 0 || rtp.ssrc != ssrc) continue
-
-            val nowMono = SystemClock.elapsedRealtime()
-            linkLock.lock()
-            try {
-                // 长时间没有 RTP（Windows 暂停播放/端点重建）后，本地静音已经
-                // 把 nextTs 推到接近墙钟。恢复的第一个包必须先重置时间线，
-                // 否则会被当作 late 丢掉，听起来就是“恢复后一直没声音”。
-                if (lastReversePacketAt != 0L &&
-                    nowMono - lastReversePacketAt > REVERSE_IDLE_RESET_MS
-                ) {
-                    Log.i(TAG, "反向 RTP 空闲 ${nowMono - lastReversePacketAt}ms，重置抖动缓冲")
-                    jitter.reset()
+        // 接收线程是音频数据通路上游：被后台线程抢占一次就等于丢包。
+        // Dispatchers.IO 的线程是共享复用的，退出时必须还原优先级，否则会把
+        // URGENT_AUDIO 留在池线程上。还原只在协程仍跑在同一个线程时生效
+        // （只有 socket 报错路径会 delay 而可能换线程）。
+        val rxTid = android.os.Process.myTid()
+        val rxPreviousPriority = android.os.Process.getThreadPriority(rxTid)
+        android.os.Process.setThreadPriority(
+            rxTid, android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
+        )
+        try {
+            while (coroutineContext.isActive) {
+                pkt.length = buf.size
+                try {
+                    sock.receive(pkt)
+                } catch (e: Exception) {
+                    if (!coroutineContext.isActive || sock.isClosed) break
+                    // 不忙等：socket 持续报错时也要让出线程，避免占满 IO 调度器
+                    delay(10)
+                    continue
                 }
-                lastReversePacketAt = nowMono
-                jitter.insert(
-                    rtp.seq, rtp.timestamp, rtp.marker,
-                    buf, rtp.payloadOffset, rtp.payloadLength
-                )
-                linkSignal.signalAll()
-            } finally {
-                linkLock.unlock()
-            }
-            byteCount += len
+                val len = pkt.length
+                if (expectedIp != null && pkt.address?.hostAddress != expectedIp) continue
+                val rtp = Udp2CalProtocol.parseRtp(buf, len) ?: continue
+                val ssrc = activeReverseSsrc
+                if (ssrc == 0 || rtp.ssrc != ssrc) continue
 
-            val now = System.currentTimeMillis()
-            if (now - lastReport >= 1000) {
-                if (activeReverseSsrc != 0) {
-                    _status.value = _status.value.copy(
-                        reverseBitrateKbps = byteCount * 8f / (now - lastReport)
+                val nowMono = SystemClock.elapsedRealtime()
+                linkLock.lock()
+                try {
+                    // 长时间没有 RTP（Windows 暂停播放/端点重建）后，本地静音已经
+                    // 把 nextTs 推到接近墙钟。恢复的第一个包必须先重置时间线，
+                    // 否则会被当作 late 丢掉，听起来就是“恢复后一直没声音”。
+                    if (lastReversePacketAt != 0L &&
+                        nowMono - lastReversePacketAt > REVERSE_IDLE_RESET_MS
+                    ) {
+                        Log.i(TAG, "反向 RTP 空闲 ${nowMono - lastReversePacketAt}ms，重置抖动缓冲")
+                        jitter.reset()
+                    }
+                    lastReversePacketAt = nowMono
+                    jitter.insert(
+                        rtp.seq, rtp.timestamp, rtp.marker,
+                        buf, rtp.payloadOffset, rtp.payloadLength
                     )
+                    linkSignal.signalAll()
+                } finally {
+                    linkLock.unlock()
                 }
-                byteCount = 0
-                lastReport = now
+                byteCount += len
+
+                val now = System.currentTimeMillis()
+                if (now - lastReport >= 1000) {
+                    if (activeReverseSsrc != 0) {
+                        _status.value = _status.value.copy(
+                            reverseBitrateKbps = byteCount * 8f / (now - lastReport)
+                        )
+                    }
+                    byteCount = 0
+                    lastReport = now
+                }
+            }
+        } finally {
+            val exitTid = android.os.Process.myTid()
+            if (exitTid == rxTid) {
+                android.os.Process.setThreadPriority(exitTid, rxPreviousPriority)
             }
         }
     }
