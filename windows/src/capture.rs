@@ -696,8 +696,17 @@ impl StereoResampler {
             self.phase += self.ratio;
         }
 
-        // 丢弃已经完全消费的整帧，保留 1 帧给下一块做插值
-        let consumed = self.phase as usize;
+        // 丢弃已经完全消费的整帧，保留 1 帧给下一块做插值。
+        //
+        // `consumed` 必须钳到 `frames - 1`：循环的退出条件是
+        // `floor(phase) >= frames - 1`，而最后一步
+        // `phase += ratio` 可以越过 `frames`。ratio > 2（44.1k 以上回环端点，
+        // 例如 176.4k / 192k / 384k）时 `consumed` 会等于 `frames + 1..`，
+        // `drain(0..consumed * 2)` 的末端下标越过 `in_buf.len()` → panic，
+        // 捕获线程直接死掉且反向音频永久静音。钳位同时也保证
+        // `phase - consumed >= 0`，不会出现负相位（`as usize` 饱和到 0 后
+        // 做负 frac 外插）。
+        let consumed = (self.phase as usize).min(frames - 1);
         if consumed > 0 {
             self.in_buf.drain(0..consumed * 2);
             self.phase -= consumed as f64;
@@ -1007,6 +1016,37 @@ mod tests {
             total += out.len() / 2;
         }
         assert!((total as i64 - 4_800).abs() <= 4, "total={total}");
+    }
+
+    /// 回归：高采样率回环端点（ratio > 2）下逐帧步进会越过 `frames`，
+    /// 曾经的 `drain(0..consumed * 2)` 直接 panic 掉整个捕获线程。
+    /// 覆盖 144k/176.4k/192k/384k 的典型 packet 帧数与相邻的 ±1 帧。
+    #[test]
+    fn resampler_high_ratio_never_overruns() {
+        for &src_hz in &[144_000u32, 176_400, 192_000, 384_000] {
+            for &(base, span) in &[(64usize, 32usize), (3_840, 4), (7_680, 4)] {
+                for frames in base.saturating_sub(span)..=base + span {
+                    let mut rs = StereoResampler::new(src_hz, 48_000);
+                    let input = vec![0.25f32; frames * 2];
+                    let mut out = Vec::new();
+                    rs.process(&input, &mut out);
+                    assert_eq!(out.len() % 2, 0, "输出必须是整帧");
+                    assert!(
+                        rs.phase >= 0.0,
+                        "相位不能为负（src={src_hz} frames={frames}）：{}",
+                        rs.phase
+                    );
+                    // 输出的帧数不得超过本次可用输入能支撑的量（多留 1 帧余量）
+                    let ratio = src_hz as f64 / 48_000.0;
+                    let max_out = (frames as f64 / ratio).ceil() as usize + 2;
+                    assert!(
+                        out.len() / 2 <= max_out,
+                        "src={src_hz} frames={frames} out={} max={max_out}",
+                        out.len() / 2
+                    );
+                }
+            }
+        }
     }
 
     #[test]
