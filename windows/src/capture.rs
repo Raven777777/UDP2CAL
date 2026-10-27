@@ -29,7 +29,9 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, SetThreadPriority, WaitForSingleObject, THREAD_PRIORITY_HIGHEST,
+};
 
 /// DSCP EF（46）→ IP TOS 字节 0xB8。反向音频流的转发优先级最高，
 /// 让 Wi-Fi 接入点 / 路由器把它排在其他流量前面，抑制排队抖动。
@@ -331,6 +333,16 @@ impl ReverseSender {
         let handle = std::thread::Builder::new()
             .name("reverse-capture".into())
             .spawn(move || {
+                // 发送线程的节拍是 10 ms 网格：被后台线程抢占一次就表现为
+                // 一个 ≥10 ms 的发送空档，接收端对应一个 PLC 帧（可闻）。
+                // 提到 HIGHEST 而不进 MMCSS：单次调用、不新增 crate feature，
+                // 失败（受限权限/组策略）只告警，继续用默认优先级。
+                // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
+                unsafe {
+                    if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+                        logf!("[Reverse] 发送线程提权失败（{e}），继续用默认优先级");
+                    }
+                }
                 Self::run_loop(target, ssrc, &running_clone, &alive_clone);
             })
             .ok();
