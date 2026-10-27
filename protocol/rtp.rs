@@ -954,7 +954,6 @@ impl StepDecision {
 /// 调用方还必须把“刚发生过 PLC/欠载”的缓冲排除在裁剪之外（`can_trim=false`）：
 /// 欠载后的高水位多半是恢复回填，不是真的多压了音频。
 pub struct StepAbsorber {
-    last_water_ms: u32,
     /// 第一次 `decide` 只登记基准，不把启动爬升当成积压
     primed: bool,
     /// 连续超额开始时刻；跌破阈值/不可裁剪时清零
@@ -970,7 +969,6 @@ pub struct StepAbsorber {
 impl StepAbsorber {
     pub fn new() -> Self {
         Self {
-            last_water_ms: 0,
             primed: false,
             over_since: None,
             window_start: Instant::now(),
@@ -980,9 +978,8 @@ impl StepAbsorber {
         }
     }
 
-    /// 复位（重连 / 重同步 / 停止）：清掉"上一次增长量"与限额窗口
+    /// 复位（重连 / 重同步 / 停止）：清掉判据基准与限额窗口
     pub fn reset(&mut self) {
-        self.last_water_ms = 0;
         self.primed = false;
         self.over_since = None;
         self.window_start = Instant::now();
@@ -1030,7 +1027,6 @@ impl StepAbsorber {
         target_ms: u32,
         now: Instant,
     ) -> StepDecision {
-        self.last_water_ms = jb_water_ms;
         if !self.primed {
             self.primed = true;
             return StepDecision::NONE;
