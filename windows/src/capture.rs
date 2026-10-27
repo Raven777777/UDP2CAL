@@ -992,6 +992,17 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
         _ => return None,
     };
 
+    // 读取侧按 `frame_count * channels` 造切片，即假定每声道每帧占
+    // `wBitsPerSample/8` 字节。若驱动的 `nBlockAlign` 与这个假定不一致：
+    // 偏小 → 切片长度大于真实步进，越界读相邻内存（UB）；
+    // 偏大 → 把下一帧的字节当样本，输出夹带垃圾。
+    // 环回端点用的是共享模式的混音格式，正常驱动总是自洽，但格式来自外部，
+    // 不能假设。
+    let bytes_per_sample = bits as usize / 8;
+    if wf.nBlockAlign as usize != channels * bytes_per_sample {
+        return None;
+    }
+
     Some(CaptureFormat {
         channels,
         kind,
@@ -1068,6 +1079,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn parse_mix_format_rejects_inconsistent_block_align() {
+        // 读取侧按 frame_count * channels 造切片，nBlockAlign 必须与之相符。
+        let base = WAVEFORMATEX {
+            wFormatTag: 3,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            wBitsPerSample: 32,
+            nBlockAlign: 8,
+            nAvgBytesPerSec: 48_000 * 8,
+            cbSize: 0,
+        };
+        // SAFETY: 栈上 WAVEFORMATEX，指针有效且生命周期覆盖调用。
+        let ok = unsafe { parse_mix_format(&base as *const WAVEFORMATEX) };
+        assert!(ok.is_some(), "自洽的 2ch/f32 应被接受");
+
+        let mut small = base;
+        small.nBlockAlign = 4; // 小于 2ch * 4B → 会越界读
+                               // SAFETY: 同上。
+        let small = unsafe { parse_mix_format(&small as *const WAVEFORMATEX) };
+        assert!(small.is_none(), "nBlockAlign 偏小必须拒绝");
+
+        let mut large = base;
+        large.nBlockAlign = 16; // 大于 2ch * 4B → 会读到相邻帧
+                                // SAFETY: 同上。
+        let large = unsafe { parse_mix_format(&large as *const WAVEFORMATEX) };
+        assert!(large.is_none(), "nBlockAlign 偏大必须拒绝");
     }
 
     #[test]
