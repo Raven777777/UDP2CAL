@@ -494,6 +494,7 @@ fn init_audio_worker() {
                     plc_frames,
                     trims,
                     step_hit,
+                    playing,
                 ) = {
                     let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
 
@@ -543,6 +544,7 @@ fn init_audio_worker() {
                         jb.stats.plc_frames,
                         jb.stats.step_trims,
                         hit,
+                        jb.is_playing(),
                     )
                 };
                 let water = jb_water.saturating_add(pipe_ms);
@@ -597,7 +599,13 @@ fn init_audio_worker() {
                 // 长时间没有新 RTP 时冻结反馈并复位积分：否则 `pull` 推进播放头后
                 // water≈0，PI 会一路积到 −0.5%，恢复出声时带明显音高偏移。
                 let rtp_idle = last_packet_at.elapsed() > Duration::from_millis(500);
-                let du = if rtp_idle {
+                // 反馈只在**真的在出声**时才评估：预缓冲阶段水位必然低于目标，
+                // 照常喂 PI 会把积分一路压到负饱和（`PI_INTEGRAL_MAX`），开播后
+                // 只能按 ≈3 ppm/s 慢慢退，稳态水位因此被顶在目标之上 10–30 ms
+                // 长达数分钟。现场日志指纹就在这里：开播瞬间 `反馈 -1100ppm`，
+                // 之后 -457 → -294 → +21 → +65 缓慢爬升。
+                let feedback_on = !rtp_idle && playing;
+                let du = if !feedback_on {
                     if !idle_feedback {
                         idle_feedback = true;
                         drift.reset();

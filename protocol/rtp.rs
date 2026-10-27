@@ -1990,6 +1990,29 @@ mod tests {
     }
 
     #[test]
+    fn prebuffer_phase_winds_up_the_integral_to_the_negative_stop() {
+        // 预缓冲阶段（抖动缓冲还没攒够、还没出声）水位必然低于目标。
+        // 若照常喂 PI，积分会一路被压到负饱和，开播后只能按 `ki·diff·dt`
+        // （≈3 ppm/s）慢慢退，稳态水位因此被顶在目标之上 10–30 ms 长达数分钟。
+        // 现场日志指纹：开播瞬间 `反馈 -1100ppm`，之后 -457 → -294 → +21 → +65。
+        // 因此调用方必须以“是否在出声”为门控（Windows 解码线程已如此）。
+        let mut d = DriftController::new(48_000);
+        let mut dev = 0u64;
+        d.update(0, dev); // 起播瞬间：水位 0
+                          // 120 s 的“水位远低于目标”（预缓冲 + 断流）：积分以 ≈12 ppm/s 往下积，
+                          // 约 82 s 触到 -1000 ppm 的权限下限。
+        for _ in 0..12_000 {
+            dev += 480; // 10 ms
+            d.update(40, dev);
+        }
+        assert!(
+            d.integral() <= -PI_INTEGRAL_MAX + 1e-9,
+            "低水位应把积分项压到负饱和: {}",
+            d.integral()
+        );
+    }
+
+    #[test]
     fn drift_ratio_has_expected_sign_and_stays_bounded() {
         // 水位高出目标 40 ms：比率向上顶，但绝不越过 ±0.5%
         let high = WATER_TARGET_MS + 40;
