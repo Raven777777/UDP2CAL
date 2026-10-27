@@ -122,9 +122,34 @@ fn is_bound_peer_source(
     peer.is_busy() && peer.device_id == device_id && peer.addr == Some(src)
 }
 
+/// 控制包只有消息类型已知且设备 ID 非全零时才允许进入状态机。
+///
+/// 设备 ID 不是认证凭据，但协议规范明确把全零定义为无效值；若放行，
+/// Busy 状态会建立一个以后永远无法被同一 ID 正常识别的绑定。
+fn is_valid_control_header(header: &protocol::ControlHeader) -> bool {
+    header.is_known_type() && protocol::is_valid_device_id(&header.device_id)
+}
+
 #[cfg(test)]
 mod control_binding_tests {
     use super::*;
+
+    #[test]
+    fn control_header_rejects_all_zero_device_id() {
+        let valid_id = [1u8; protocol::DEVICE_ID_SIZE];
+        let valid = protocol::ControlHeader::new(protocol::TYPE_CONNECT, 15, valid_id);
+        assert!(is_valid_control_header(&valid));
+
+        let zero_id = protocol::ControlHeader::new(
+            protocol::TYPE_CONNECT,
+            15,
+            [0u8; protocol::DEVICE_ID_SIZE],
+        );
+        assert!(!is_valid_control_header(&zero_id));
+
+        let unknown_type = protocol::ControlHeader::new(protocol::TYPE_DATA, 0, valid_id);
+        assert!(!is_valid_control_header(&unknown_type));
+    }
 
     #[test]
     fn v3_binding_requires_exact_source_endpoint() {
@@ -857,7 +882,10 @@ pub fn start_broadcast_listener() {
                 continue;
             };
             // 只接受空负载的 DISCOVER_REQ；Busy / 未启动一律不回
-            if hdr.msg_type != protocol::TYPE_DISCOVER_REQ || !payload.is_empty() {
+            if !is_valid_control_header(&hdr)
+                || hdr.msg_type != protocol::TYPE_DISCOVER_REQ
+                || !payload.is_empty()
+            {
                 continue;
             }
             if APP_RUNNING.load(Ordering::Acquire) == 0 || p2p_snapshot().is_busy() {
@@ -1948,7 +1976,7 @@ async fn handle_control(
     output: &mut iced::futures::channel::mpsc::Sender<Message>,
 ) {
     // 0（已废弃）与 5..=255（保留）都不是本端要处理的消息
-    if !header.is_known_type() || header.msg_type != protocol::TYPE_CONNECT {
+    if !is_valid_control_header(header) || header.msg_type != protocol::TYPE_CONNECT {
         return;
     }
 
