@@ -919,6 +919,23 @@ class CaptureService : Service() {
     }
 
     /**
+     * 写 PCM；AudioTrack 失效时原地重建并重试，而不是让播放协程永久退出。
+     * 长时间静音欠载后部分设备会回收 track，重建后链路无需整条重连。
+     */
+    private suspend fun writeOrRecover(player: AudioPlayer, pcm: ShortArray, length: Int): Boolean {
+        var failures = 0
+        while (coroutineContext.isActive) {
+            if (player.writeBlocking(pcm, 0, length)) return true
+            failures++
+            if (failures == 1 || failures % 50 == 0) {
+                Log.w(TAG, "反向 AudioTrack 写入失败（连续 $failures 次），重建后重试")
+            }
+            if (!player.recover()) delay(100) else delay(20)
+        }
+        return false
+    }
+
+    /**
      * 反向播放：播放头是唯一时钟。
      *
      * 预缓冲 4 帧后开始写；每帧的播放/PLC 决策完全由 `playhead_ts` 决定，
@@ -930,10 +947,12 @@ class CaptureService : Service() {
         // 否则反向串流会永久沉默。
         var player = audioPlayer
         var dec = reverseDecoder
-        var waitedMs = 0
-        while ((player == null || dec == null) && coroutineContext.isActive && waitedMs < 3000) {
+        // 首次启动时麦克风/AudioTrack 可能比 ACK 晚很久才就绪（冷启动、
+        // 权限/音频服务初始化）。这里不能用固定超时：一旦超时退出，
+        // 之后 activeReverseSsrc 不再变化，就再也不会重启播放协程，
+        // 表现为"首次连接反向没声音，重连一次才好"。
+        while ((player == null || dec == null) && coroutineContext.isActive) {
             delay(10)
-            waitedMs += 10
             player = audioPlayer
             dec = reverseDecoder
         }
@@ -1137,7 +1156,7 @@ class CaptureService : Service() {
                     // PLC 帧和真实帧走同一条时间线，所以都过同一个重采样器
                     val produced = resampler.process(pcm, 0, n / 2)
                     if (produced > 0) {
-                        if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                        if (!writeOrRecover(player, resampler.buffer(), produced)) return
                     }
                 }
 
@@ -1146,13 +1165,13 @@ class CaptureService : Service() {
                     if (n > 0) {
                         val produced = resampler.process(pcm, 0, n / 2)
                         if (produced > 0) {
-                            if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
                         }
                     } else {
                         // 生成不出 PLC：补静音，同样过重采样器以保持相位连续
                         val produced = resampler.process(silence, 0, silence.size / 2)
                         if (produced > 0) {
-                            if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
                         }
                     }
                 }
@@ -1161,7 +1180,7 @@ class CaptureService : Service() {
                     // 连续 PLC 已达上限：输出静音但继续推进媒体时间
                     val produced = resampler.process(silence, 0, silence.size / 2)
                     if (produced > 0) {
-                        if (!player.writeBlocking(resampler.buffer(), 0, produced)) return
+                        if (!writeOrRecover(player, resampler.buffer(), produced)) return
                     }
                 }
 

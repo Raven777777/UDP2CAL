@@ -9,6 +9,22 @@
 
 ---
 
+## 2026-10-27 — 反向串流生命周期与版本号
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | Android | 首次启动连接后反向串流没声音，重连一次才正常 | `reversePlayLoop` 等 `audioPlayer/reverseDecoder` 最多 3 s；冷启动时麦克风/AudioTrack 初始化可能更久，超时后协程永久退出，而 `activeReverseSsrc` 没变，控制面不会再次启动它 | 去掉固定超时，等待到播放器/解码器就绪或协程取消 |
+| 2 | Windows/Android | Windows 停止播放音频后，手机反向串流断开，需要重连 | 端点空闲 2 s 后反向发送器停止补静音 → 接收端欠载/重同步；Android 长时间欠载后 `AudioTrack.write` 失败会让播放协程直接 `return`，此后无人重启 | Windows 空闲时持续按 10 ms 节拍发静音；Android `AudioTrack` 失效时原地重建并重试写入 |
+| 3 | Android | 高级设置底部版本号一直显示 `v1.2.0` | 文本硬编码 | 改为读取 `PackageInfo.versionName`（`build.gradle.kts` 的 `versionName`） |
+
+### 验证
+
+- `protocol`：`cargo test` 74 passed。
+- `windows`：`cargo check` 通过。
+- `android`：`:app:testDebugUnitTest` 63 passed（JDK 17）。
+
+---
+
 ## 2026-10-25 — 第三轮质量审查（22 项）
 
 ### 概述

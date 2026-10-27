@@ -39,8 +39,9 @@ const FRAME_MONO: usize = 480;
 const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
 /// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
 const MAX_FRAME_BACKLOG: usize = FRAME_INTERLEAVED * 4;
-/// 静音补齐上限：连续 2 s 无数据后停止补帧（DTX 语义），恢复出声时重新开始
-const MAX_SILENCE_FRAMES: u32 = 200;
+// 静音补齐不设上限：端点空闲时仍按 10 ms 节拍发静音，保持接收端播放链
+// 与 AudioTrack 持续供数。若停止发包，接收端会欠载/重同步，恢复出声时
+// 表现为"反向串流断开、必须重连"。静音包体积极小，常年发送成本可忽略。
 /// 帧长（毫秒）：静音补齐的墙钟节拍基准
 const FRAME_MS: u32 = rtp::FRAME_MS;
 /// WASAPI 事件等待上限：超时仅用于"静音补齐"判断，不用于播放节拍
@@ -313,7 +314,6 @@ impl ReverseSender {
         let mut first_packet = true;
         let mut last_sent: Option<Instant> = None;
         let mut last_sent_ts: Option<u32> = None;
-        let mut silence_run: u32 = 0;
         // 端点最近一次真正给出数据的时间：只有它够久没更新时才补静音。
         // 缺少这个判据时，事件等待超时与"事件带回 20 ms 数据"会同时成立，
         // 结果每秒多发 3~4 帧，接收端缓冲十几秒就被灌满 → 周期性重同步（破音）。
@@ -353,7 +353,8 @@ impl ReverseSender {
                 WAIT_TIMEOUT_MS
             };
             let t_wait = Instant::now();
-            let signaled = capture.wait(wait_ms);
+            // 事件是否触发只影响延迟；静音补齐仍按 last_data_at/墙钟节拍判断。
+            let _ = capture.wait(wait_ms);
             REVERSE_STATS
                 .wait_us
                 .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -364,7 +365,6 @@ impl ReverseSender {
                 .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
 
             if got_data {
-                silence_run = 0;
                 last_data_at = Instant::now();
                 last_frame_at = Instant::now();
                 resampler.process(&loopback, &mut resampled);
@@ -379,14 +379,13 @@ impl ReverseSender {
                     let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(v);
                 }
-            } else if !signaled
-                && silence_run < MAX_SILENCE_FRAMES
-                && last_data_at.elapsed() > Duration::from_millis(200)
+            } else if last_data_at.elapsed() > Duration::from_millis(200)
                 && last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64)
             {
                 // 端点空闲超过 200 ms 才补静音，且严格按 10 ms 墙钟节拍——
                 // 这是"静音补齐"，不是播放定时器，也绝不允许超过实时速率。
-                silence_run += 1;
+                // 不设上限：停止发包会让接收端欠载/重同步，恢复出声时看起来
+                // 像"反向串流断开"。持续静音包同时保持接收端 AudioTrack 供数。
                 last_frame_at = Instant::now();
                 pcm_buf.extend(std::iter::repeat(0i16).take(FRAME_INTERLEAVED));
             }

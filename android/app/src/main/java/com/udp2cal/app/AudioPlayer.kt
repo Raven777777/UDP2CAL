@@ -59,7 +59,13 @@ class AudioPlayer(private val context: Context) {
     /** 已写入 AudioTrack 的累计帧数（含尚未播出的部分） */
     private var writtenFrames: Long = 0
 
+    /** 最近一次成功启动的参数，供 AudioTrack 失效后原地重建 */
+    @Volatile private var startedVoiceMode: Boolean = true
+    @Volatile private var startedSessionId: Int = 0
+
     fun start(audioSessionId: Int = 0, voiceMode: Boolean = true): Boolean {
+        startedVoiceMode = voiceMode
+        startedSessionId = audioSessionId
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
 
         val minBufSize = AudioTrack.getMinBufferSize(
@@ -264,6 +270,32 @@ class AudioPlayer(private val context: Context) {
             headFrames = 0
             writtenFrames = 0
         }
+    }
+
+    /**
+     * AudioTrack 被系统回收/失效后原地重建。
+     *
+     * 长时间静音欠载后，部分设备会让 `write()` 返回错误；上层不能因此永久
+     * 退出反向播放协程，否则只能整条链路重连。这里复用最近一次启动参数
+     * （语音模式 / AEC sessionId）重建 track，调用方随后重试写入。
+     */
+    fun recover(): Boolean {
+        Log.w(TAG, "AudioTrack 失效，尝试原地重建")
+        // 保留累计播放头：DriftController 用 device_frames 做差分，若重建后
+        // 归零会被 saturating_sub 卡死直到重新追平旧计数。新 track 从 0 开始
+        // 计数，这里把旧累计值作为基准，后续 raw 增量继续累加。
+        val baseHead = synchronized(trackLock) { headFrames }
+        stop()
+        val ok = start(startedSessionId, startedVoiceMode)
+        if (ok) {
+            synchronized(trackLock) {
+                headRaw = 0
+                headFrames = baseHead
+                // 旧 track 未播出的数据已丢弃，新 track 初始欠载为 0
+                writtenFrames = baseHead
+            }
+        }
+        return ok
     }
 
     fun stop() {

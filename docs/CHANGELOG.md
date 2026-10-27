@@ -38,6 +38,12 @@
 - 总延迟改为 `now − arrival(audible_ts)`，不再重复加 `device_latency_ms`。
 - 文档/验收补充设备钟差、攒批、丢包/断流、设备缓冲深度四类矩阵，测试信号改用 PRBS/扫频/脉冲。
 
+**小修（反向链路生命周期）**
+- 首次启动反向无声：播放协程不再等待 `audioPlayer/reverseDecoder` 3 s 后永久退出，改为等待到就绪。
+- Windows 停止播放后反向断开：端点空闲时不再发 2 s 静音就停流，而是持续按 10 ms 节拍补静音，
+  避免接收端欠载/重同步；Android 侧 `AudioTrack.write` 失败时原地重建并重试，不再让播放协程退出。
+- Android 高级设置版本号改为读取 `versionName`，不再硬编码 `v1.2.0`。
+
 **验证**
 - `cd protocol && cargo test`：74 passed；`cargo check --features jni` 通过。
 - Windows `cargo check` 通过。
