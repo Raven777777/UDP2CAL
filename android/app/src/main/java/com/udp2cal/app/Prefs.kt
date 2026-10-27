@@ -24,6 +24,11 @@ object Prefs {
         get() = prefs.getInt("target_port", 44044)
         set(v) = prefs.edit().putInt("target_port", v).apply()
 
+    /** Last discovered Windows identity; blank for manually configured targets. */
+    var targetDeviceId: String
+        get() = prefs.getString("target_device_id", "") ?: ""
+        set(v) = prefs.edit().putString("target_device_id", v).apply()
+
     var testToneMode: Boolean
         get() = prefs.getBoolean("test_tone", false)
         set(v) = prefs.edit().putBoolean("test_tone", v).apply()

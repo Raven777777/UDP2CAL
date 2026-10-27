@@ -5,6 +5,7 @@
 
 | 文件 | 是什么 | 为什么在这里 |
 | --- | --- | --- |
+| [CONTROL_PLANE_REMEDIATION.md](CONTROL_PLANE_REMEDIATION.md) | 私有控制面 / 网络架构审查快照、首批整改记录与剩余风险 | 首轮整改已归档；v4 认证、媒体保护和实机验证未完成；恢复工作时需按当前代码重新审查 |
 | [PROPOSAL_LATENCY_V1.4.md](PROPOSAL_LATENCY_V1.4.md) | 延迟优化提案（关扫描 + DSCP EF + 目标水位 150 + 阶跃吸收） | 已于 v1.4.0 落地，现行真源是协议 §7.10 与 [LATENCY_CALIBRATION.md](../LATENCY_CALIBRATION.md) |
 | [PROTOCOL_V2.md](PROTOCOL_V2.md) | v2 私有协议（20 ms 帧、自定义音频头） | v3 干净断代，与现行协议**不可互通** |
 | [PLAN_V3_MIGRATION.md](PLAN_V3_MIGRATION.md) | v2→v3 的落地顺序与逐文件改动清单 | 迁移已于 v1.2.0 完成 |

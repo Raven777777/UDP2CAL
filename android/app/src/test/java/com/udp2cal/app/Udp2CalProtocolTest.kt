@@ -28,6 +28,17 @@ class Udp2CalProtocolTest {
     // ═══════ 控制面 ═══════
 
     @Test
+    fun ackPeerValidation_requiresIpPortAndDiscoveredIdentity() {
+        val windowsId = bytes(8, 7, 6, 5, 4, 3, 2, 1)
+        assertTrue(isExpectedAckPeer("192.0.2.2", 44044, "192.0.2.2", 44044, windowsId, windowsId))
+        assertFalse(isExpectedAckPeer("192.0.2.3", 44044, "192.0.2.2", 44044, windowsId, windowsId))
+        assertFalse(isExpectedAckPeer("192.0.2.2", 44045, "192.0.2.2", 44044, windowsId, windowsId))
+        assertFalse(isExpectedAckPeer("192.0.2.2", 44044, "192.0.2.2", 44044, deviceId, windowsId))
+        // 手动配置未知身份时，仍严格约束源 IP/端口，但无法声称身份已认证。
+        assertTrue(isExpectedAckPeer("192.0.2.2", 44044, "192.0.2.2", 44044, deviceId, null))
+    }
+
+    @Test
     fun controlHeader_matchesSpecVectorB4() {
         val packet = Udp2CalProtocol.buildControl(
             Udp2CalProtocol.TYPE_CONNECT, deviceId, ByteArray(15)

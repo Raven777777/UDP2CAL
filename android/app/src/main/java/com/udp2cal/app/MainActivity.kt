@@ -210,7 +210,10 @@ fun MainScreen(
     ) {
         Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
 
-        OutlinedTextField(value = targetIp, onValueChange = { targetIp = it },
+        OutlinedTextField(value = targetIp, onValueChange = {
+            if (it != targetIp) Prefs.targetDeviceId = ""
+            targetIp = it
+        },
             label = { Text("目标 IP") }, singleLine = true,
             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
                 if (!fs.isFocused) { Prefs.targetIp = targetIp }
@@ -240,7 +243,10 @@ fun MainScreen(
                 }
             })
 
-        OutlinedTextField(value = targetPort, onValueChange = { targetPort = it },
+        OutlinedTextField(value = targetPort, onValueChange = {
+            if (it != targetPort) Prefs.targetDeviceId = ""
+            targetPort = it
+        },
             label = { Text("端口") }, singleLine = true,
             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
                 if (!fs.isFocused) { Prefs.targetPort = targetPort.toIntOrNull() ?: 44044 }
@@ -277,6 +283,7 @@ fun MainScreen(
                                 targetPort = device.port.toString()
                                 Prefs.targetIp = device.ip
                                 Prefs.targetPort = device.port
+                                Prefs.targetDeviceId = Udp2CalProtocol.deviceIdToString(device.deviceId)
                                 errorMsg = "已选择: ${device.ip}:${device.port} (${device.deviceName})"
                                 showDeviceDialog = false
                             },

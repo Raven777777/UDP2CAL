@@ -23,6 +23,16 @@ import java.security.SecureRandom
  *   * ACK 由独立线程阻塞接收，音频线程只读 `lastAckTime`/`reverseSsrc`；
  *   * `send` 不做协程切换：UDP send 是微秒级系统调用，每帧额外调度只会引入抖动。
  */
+internal fun isExpectedAckPeer(
+    sourceIp: String?,
+    sourcePort: Int,
+    expectedIp: String?,
+    expectedPort: Int,
+    sourceDeviceId: ByteArray,
+    expectedDeviceId: ByteArray?
+): Boolean = sourceIp == expectedIp && sourcePort == expectedPort &&
+    (expectedDeviceId == null || sourceDeviceId.contentEquals(expectedDeviceId))
+
 class UdpSender(
     private val host: String,
     private val port: Int
@@ -43,6 +53,7 @@ class UdpSender(
     @Volatile private var deviceId: ByteArray? = null
     @Volatile private var remoteAddr: InetSocketAddress? = null
     @Volatile private var remoteIp: String? = null
+    @Volatile private var expectedRemoteDeviceId: ByteArray? = null
     private var ackThread: Thread? = null
 
     @Volatile private var running = false
@@ -85,6 +96,12 @@ class UdpSender(
             socket = sock
             remoteAddr = addr
             remoteIp = addr.address?.hostAddress
+            expectedRemoteDeviceId = Prefs.targetDeviceId
+                .takeIf { it.length == Udp2CalProtocol.DEVICE_ID_SIZE * 2 }
+                ?.chunked(2)
+                ?.mapNotNull { it.toIntOrNull(16)?.toByte() }
+                ?.takeIf { it.size == Udp2CalProtocol.DEVICE_ID_SIZE }
+                ?.toByteArray()
             deviceId = DiscoveryManager.getOrCreateDeviceId()
             startAckLoop()
             Log.i(TAG, "已连接 $addr，正向 SSRC=${"%08x".format(forwardSsrc)}，反向端口=$reversePort")
@@ -162,8 +179,11 @@ class UdpSender(
                 val len = pkt.length
                 val hdr = Udp2CalProtocol.parseControl(buf, len) ?: continue
                 if (hdr.msgType != Udp2CalProtocol.TYPE_CONNECT_ACK.toInt()) continue
-                // 源地址必须是目标主机
-                if (remoteIp != null && pkt.address?.hostAddress != remoteIp) continue
+                // ACK 必须来自已配置的确切端点；发现选择时还要匹配 Windows device_id。
+                if (!isExpectedAckPeer(
+                        pkt.address?.hostAddress, pkt.port, remoteIp, port,
+                        hdr.deviceId, expectedRemoteDeviceId
+                    )) continue
                 val ack = Udp2CalProtocol.ConnectAckPayload.decode(
                     buf, Udp2CalProtocol.CONTROL_HEADER_SIZE, hdr.payloadLen
                 ) ?: continue
@@ -188,6 +208,7 @@ class UdpSender(
         reverseSock = null
         socket = null
         remoteAddr = null
+        expectedRemoteDeviceId = null
         lastAckTime = 0L
         reverseSsrc = 0
         forwardSsrc = 0

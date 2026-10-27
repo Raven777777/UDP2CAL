@@ -112,6 +112,32 @@ impl P2pState {
     }
 }
 
+/// A v3 device ID is public, so an established binding is the exact peer endpoint,
+/// not merely the ID. Endpoint migration is reserved for an authenticated protocol.
+fn is_bound_peer_source(peer: &P2pState, device_id: [u8; protocol::DEVICE_ID_SIZE], src: SocketAddr) -> bool {
+    peer.is_busy() && peer.device_id == device_id && peer.addr == Some(src)
+}
+
+#[cfg(test)]
+mod control_binding_tests {
+    use super::*;
+
+    #[test]
+    fn v3_binding_requires_exact_source_endpoint() {
+        let id = [7u8; protocol::DEVICE_ID_SIZE];
+        let original: SocketAddr = "192.0.2.10:50000".parse().unwrap();
+        let mut peer = P2pState::new();
+        peer.state = DEVICE_BUSY;
+        peer.device_id = id;
+        peer.addr = Some(original);
+
+        assert!(is_bound_peer_source(&peer, id, original));
+        assert!(!is_bound_peer_source(&peer, id, "192.0.2.11:50000".parse().unwrap()));
+        assert!(!is_bound_peer_source(&peer, id, "192.0.2.10:50001".parse().unwrap()));
+        assert!(!is_bound_peer_source(&peer, [8u8; protocol::DEVICE_ID_SIZE], original));
+    }
+}
+
 static P2P_STATE: OnceLock<Mutex<P2pState>> = OnceLock::new();
 
 fn p2p_lock() -> std::sync::MutexGuard<'static, P2pState> {
@@ -1604,6 +1630,13 @@ async fn handle_control(
     let peer = p2p_snapshot();
     let same_device = peer.is_busy() && peer.device_id == header.device_id;
 
+    // v3 device_id 是公开标识，不是认证凭据。绑定期间固定完整源端点；
+    // 未认证的地址/端口变化不能迁移绑定或刷新保活。合法网络切换需等待超时后重连。
+    if same_device && !is_bound_peer_source(&peer, header.device_id, *src_addr) {
+        logf!("[P2P] 已绑定设备从新端点发起 CONNECT，拒绝未认证的端点迁移");
+        return;
+    }
+
     // ── 已被其它设备占用：静默忽略，不回 ACK ──
     // 注意：反向编码器配置的更新必须放在这道门之后。否则同网段任意主机
     // 发一个参数合法的 CONNECT 就能改写当前会话的反向编码参数（码率/DTX/FEC），
@@ -1651,12 +1684,7 @@ async fn handle_control(
     // forward_ssrc 变化表示新会话：必须重置抖动缓冲/解码器并换反向 SSRC
     let new_session = peer.forward_ssrc != cfg.forward_ssrc;
     let want_reverse = cfg.reverse_port != 0 && REVERSE_ENABLED.load(Ordering::Acquire) != 0;
-    // 源 IP 变化也必须重启反向发送器：手机 Wi-Fi 重连后 IP 可能改变，而
-    // device_id / forward_ssrc / reverse_port 都不变（socket 未重建），
-    // 此时只更新正向 RTP 的绑定地址会让反向音频一直发往旧 IP。
-    let addr_changed = peer.addr.map(|a| a.ip()) != Some(src_addr.ip());
     let reverse_stale = new_session
-        || addr_changed
         || peer.reverse_port != cfg.reverse_port
         || (peer.reverse_ssrc != 0) != want_reverse;
 

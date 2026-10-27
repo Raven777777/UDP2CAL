@@ -1,6 +1,6 @@
 # 系统架构与实现细节
 
-> 相关文档：[协议规范](PROTOCOL_V3_RTP.md) · [构建说明](BUILD.md) · [功能特性](FEATURES.md) · [延迟校准](LATENCY_CALIBRATION.md)
+> 相关文档：[协议规范](PROTOCOL_V3_RTP.md) · [控制面审查归档](archive/CONTROL_PLANE_REMEDIATION.md) · [构建说明](BUILD.md) · [功能特性](FEATURES.md) · [延迟校准](LATENCY_CALIBRATION.md)
 
 ---
 
@@ -84,8 +84,13 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
   `udp2cal_protocol.dll`，单元测试用 `java.library.path` 指向 `protocol/target/release`——
   **同一套符号直接跑在 JVM 上**。
 
-好处不只是"少写代码"，而是**测试也统一了**：`Udp2CalProtocolTest` 的 62 个用例现在验证的是 Rust 实现，
+好处不只是"少写代码"，而是**测试也统一了**：`Udp2CalProtocolTest` 的用例验证的是 Rust 实现，
 桌面 JVM 与 Android 真机跑的是同一份机器码，协议回归不再需要"两端各跑一遍再人工比对"。
+
+**边界：共享的是线格式与协议算法，不是连接状态机或身份安全。** Android 的 ACK 生命周期在
+`UdpSender.kt` / `CaptureService.kt`，Windows 的会话绑定在 `windows/src/main.rs`；设备选择、重连、超时、
+端点更新和安全决策仍可能出现平台差异。v3 的 `device_id` 是公开标识而非凭证；更详细的差异和整改状态见
+[控制面审查归档](archive/CONTROL_PLANE_REMEDIATION.md)。
 
 ---
 
@@ -95,7 +100,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | --- | --- | --- |
 | UI（Android） | Jetpack Compose + Material 3 | 全参数设置面板 + 状态卡片；卡片显示**已生效**值（编码器上报），不显示"期望值" |
 | UI（Windows） | iced 0.14（tiny-skia 软件渲染，禁用 wgpu） | 固定窗口、深色卡片、实时电平；单行状态栏按连接状态切换 |
-| 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用 |
+| 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用；Windows 防火墙仅对 Private profile 放行 |
 | 采集（Android） | `AudioRecord` 48 kHz 单声道 | `READ_BLOCKING` 累积到整帧再编码；语音模式决定音源与 AEC（创建时定型） |
 | 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
 | 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | DRED + Deep PLC；负载上限 1275 字节，超限丢帧不截断 |
@@ -174,7 +179,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 码率 | 五档 64/128/256/384/512 kbps（默认 256，上限 512）；`0` 仅作协议兼容 | `clamp_bitrate_kbps()` / `snap_bitrate_kbps()` 两端一致 |
 | 传输 | 服务端口 UDP，控制包 + 正向 RTP 同 socket | 首字节解复用 |
 | 接收端 | 单方向一个 `JitterBuffer` + 一个解码实例 | 不需要"5 个采样率解码器" |
-| 发现 | Windows 监听 44043，DISCOVER_REPLY 带 `listen_port` | Android 用该端口连接，不再假定 44044 |
+| 发现 | Windows 监听 44043，DISCOVER_REPLY 带 `listen_port` | Android 用该端口连接，不再假定 44044；IPv4 广播仅覆盖本地广播域 |
 | 保活 | Android 每 1 s CONNECT；PC 3 s 无 CONNECT 释放绑定；Android 3 s 无 ACK 断连 | **只看控制面**，不看 RTP |
 | 模式切换 | 语音↔音乐重建 AudioRecord/AudioTrack，网络层与 SSRC 一并重建 | 允许短暂中断，不做"保网络层"的特殊分支 |
 

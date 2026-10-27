@@ -110,14 +110,15 @@ RTP 的合法首字节在 v3 中实际上只有 `0x80`（V=2、P=0、X=0、CC=0�
 |------|---------|
 | Android → Windows 控制 | `device_id` 必须等于当前绑定设备；源 IP/端口必须与 CONNECT 来源一致 |
 | Android → Windows 正向 RTP | 源 IP/端口必须与 CONNECT 来源一致；SSRC 必须等于 CONNECT 中的 `forward_ssrc`；PT 必须为 111 |
-| Windows → Android ACK | `device_id` 必须是已发现的 Windows；源地址必须是该 Windows |
+| Windows → Android ACK | 若通过发现选择接收端，`device_id` 必须匹配该设备；源 IP/端口必须与已配置目标端点一致。手工输入地址时无法验证预先未知的 Windows `device_id` |
 | Windows → Android 反向 RTP | 源 IP 必须是 Windows 控制对端；SSRC 必须等于 ACK 中的 `reverse_ssrc`；源端口允许临时端口 |
 
 说明：
 
 - 正向 RTP 与 CONNECT 共用 Android 主 socket，因此源端口稳定；Windows 可以按“源 IP + 源端口”绑定。
 - 反向 RTP 的源端口由 Windows 临时 socket 决定，不能按端口绑定；Android 只校验源 IP + SSRC。
-- `device_id` 只用于控制面，不出现在 RTP 中。
+- `device_id` 只用于控制面，不出现在 RTP 中。它是公开标识，不是认证凭据。
+- v3 绑定期间 Windows 固定 CONNECT 的完整源 IP/端口；来源端点改变时不得仅凭相同 `device_id` 迁移绑定。端点变化需旧绑定超时释放后重新连接。
 - 这些校验只防误连和普通串流，不构成密码学安全；详见第 12 节。
 
 ### 3.4 MTU 与分片
@@ -343,7 +344,7 @@ CONNECT 负载固定 15 字节：
 | 9 | 1 | `signal` | `0`=auto，`1`=voice，`2`=music |
 | 10 | 1 | `bandwidth` | `0`=NB，`1`=MB，`2`=WB，`3`=SWB，`4`=FB |
 | 11 | 1 | `opus_flags` | bit0=VBR，bit1=DTX，bit2=VBR 约束，bit3=FEC；bit4–7 保留为 0 |
-| 12 | 2 | `bitrate_kbps` (u16 BE) | 反向 Opus 目标码率；`0`=自动（512 kbps）；最大 1000 |
+| 12 | 2 | `bitrate_kbps` (u16 BE) | 反向 Opus 目标码率；`0`=自动（512 kbps）；最大 512 kbps |
 | 14 | 1 | `packet_loss` | 预期丢包率 `0..100`（百分比） |
 
 规则：
@@ -351,12 +352,15 @@ CONNECT 负载固定 15 字节：
 - 负载长度必须恰好 15 字节；不足或超出都丢弃。
 - `payload_type != 111` 或 `frame_ms != 10`：拒绝该 CONNECT。
 - `forward_ssrc == 0`：拒绝该 CONNECT。
+- `complexity` 仅接受 `0..=10`（`0` 表示默认）；`signal` 仅接受 `0..=2`；`bandwidth` 仅接受 `0..=4`；`packet_loss` 仅接受 `0..=100`。超出范围即拒绝 CONNECT，不得钳制后继续建立/刷新绑定。
+- `opus_flags` 的 bit4–7 必须为 0；任一保留位非零即拒绝 CONNECT。
 - `reverse_port == 0`：Windows 不启动反向发送；ACK 中 `reverse_ssrc=0`。
-- `bitrate_kbps > 1000`：拒绝或钳制到 1000；不得按 1024 kbps 发送。
+- `bitrate_kbps > 512`：钳制到 512 kbps（`BITRATE_MAX_KBPS`）；不得按超过 512 kbps 的值配置编码器。
 - Android 每次发送完整 15 字节 CONNECT；不再有“首包只发 2 字节”的 v2 行为。
 - 连接期间每 1 秒发送一次 CONNECT，作为保活和参数同步。
 - 同一设备、同一 `forward_ssrc` 的周期 CONNECT 不重置 Windows 抖动缓冲。
 - `forward_ssrc` 变化表示新会话：Windows 必须重置正向抖动缓冲/解码器，并更新绑定。
+- Busy 状态下，同一 `device_id` 的 CONNECT 只有在源 IP 与源端口均与当前绑定完全一致时才可刷新/更新会话；v3 不提供认证端点迁移。来源端点变化时丢弃该 CONNECT，不更新绑定或保活；旧绑定超时释放后才可从新端点重新连接。
 - CONNECT 同时携带反向 Opus 配置；Windows 只在配置变化时重新应用，避免每秒重置编码器状态。
 
 ### 5.5 CONNECT_ACK（类型 4）
@@ -372,7 +376,7 @@ ACK 负载固定 6 字节：
 规则：
 
 - Windows 收到每个合法 CONNECT 后立即回复 ACK。
-- ACK 的 `device_id` 是 Windows 的设备 ID。
+- ACK 的 `device_id` 是 Windows 的设备 ID。Android 必须验证源端口等于所配置的 Windows 监听端口；若接收端由发现列表选取，还必须验证 ACK device_id。手工填写地址时若没有可信的发现身份，只能验证地址/端口，不能据此声称对端已认证。
 - ACK 的目标地址是 CONNECT 的源 IP/端口（Android 主 socket）。
 - `reverse_ssrc=0` 时，Android 不得启动反向接收解码；已有反向播放应停止并清空缓冲。
 - `reverse_ssrc` 非零且发生变化时，Android 必须重置反向抖动缓冲/解码器；旧 SSRC 的包丢弃。

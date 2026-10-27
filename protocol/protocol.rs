@@ -329,6 +329,21 @@ impl ConnectPayload {
         if self.forward_ssrc == 0 {
             return Err("forward_ssrc == 0");
         }
+        if self.complexity > OPUS_COMPLEXITY_MAX {
+            return Err("complexity > 10");
+        }
+        if self.signal > 2 {
+            return Err("signal > 2");
+        }
+        if self.bandwidth > 4 {
+            return Err("bandwidth > 4");
+        }
+        if self.opus_flags & !0x0f != 0 {
+            return Err("reserved opus_flags bits are non-zero");
+        }
+        if self.packet_loss > 100 {
+            return Err("packet_loss > 100");
+        }
         Ok(())
     }
 
@@ -701,6 +716,19 @@ mod tests {
         let mut p = ConnectPayload::default();
         p.forward_ssrc = 0;
         assert!(p.validate().is_err());
+
+        let invalid_fields = [
+            ConnectPayload { complexity: 11, ..ConnectPayload::default() },
+            ConnectPayload { signal: 3, ..ConnectPayload::default() },
+            ConnectPayload { bandwidth: 5, ..ConnectPayload::default() },
+            ConnectPayload { opus_flags: 0x10, ..ConnectPayload::default() },
+            ConnectPayload { packet_loss: 101, ..ConnectPayload::default() },
+        ];
+        for invalid in invalid_fields {
+            assert!(invalid.validate().is_err(), "invalid payload accepted: {invalid:?}");
+        }
+        assert!(ConnectPayload { complexity: 0, ..ConnectPayload::default() }.validate().is_ok());
+        assert!(ConnectPayload { complexity: 10, signal: 2, bandwidth: 4, packet_loss: 100, ..ConnectPayload::default() }.validate().is_ok());
 
         // 负载长度必须恰好 15
         assert!(ConnectPayload::decode(&[0u8; 14]).is_none());

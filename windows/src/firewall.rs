@@ -1,6 +1,6 @@
 ﻿// Windows 防火墙自动放行（静默，无 cmd 窗口）
 //
-// 安全要点：规则限定 program + 具体端口，不再是 localport=any。
+// 安全要点：规则限定 program + 具体端口 + Private profile；不向公共网络开放。
 // 历史实现为整机开放所有入站 UDP，远超功能所需。
 //
 // 命名要点：netsh 使用自己的命令行解析器，含空格的 name 需要额外引号，
@@ -40,7 +40,7 @@ pub fn add_firewall_rule(audio_port: u16) -> Result<(), String> {
         "dir=in".into(), "action=allow".into(), "protocol=UDP".into(),
         ports,
         program,
-        "enable=yes".into(), "profile=any".into(),
+        "enable=yes".into(), "profile=private".into(),
     ])
     .map_err(|e| format!("防火墙命令执行失败: {e}"))?;
 

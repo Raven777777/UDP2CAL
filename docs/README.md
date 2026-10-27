@@ -33,6 +33,7 @@
 | [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟口径（`water_ms`/`pipe_ms`/`audible_ts`）、DMA 缓冲、实测校准、P0 高频诊断与**本环境实测基线** | 排障者、调优 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史与重大变更（按版本倒序） | 全部 |
 | [BUGFIX.md](BUGFIX.md) | **现行代码**的 bug 根因档案 | 全部 |
+| [archive/CONTROL_PLANE_REMEDIATION.md](archive/CONTROL_PLANE_REMEDIATION.md) | 私有控制面 / 网络架构审查快照、首批整改记录与未完成风险 | 追溯
 | [LEGAL.md](LEGAL.md) | 版权、GPL-3.0、第三方组件许可 | 分发者、合规审查 |
 | [archive/](archive/README.md) | 历史存档：v2 协议、迁移计划、ASRC 重构计划、旧修复记录、历次审查报告 | 追溯 |
 
@@ -50,7 +51,7 @@
 | 用户能感知的功能与调参项 | `FEATURES.md` | — |
 | 某版本改了什么 | `CHANGELOG.md` | 一句话概括 + 链接 |
 | 某个 bug 为什么发生 | `BUGFIX.md` | 一句话概括 + 链接 |
-| 改进路线、阶段划分、验收门 | `archive/PLAN_ASRC_REFACTOR.md`、`archive/PROPOSAL_LATENCY_V1.4.md`（均已完成归档） | 写"见 PLAN/PROPOSAL §x"，不复制阶段表 |
+| 已归档的改进路线与审查快照 | `archive/PLAN_ASRC_REFACTOR.md`、`archive/PROPOSAL_LATENCY_V1.4.md`、`archive/CONTROL_PLANE_REMEDIATION.md` | 仅供追溯；恢复未完成整改前须按当前代码重新审查 |
 | 构建命令与产物 | `BUILD.md` | — |
 
 > 判定标准：**读者会照着它写代码吗？** 会 → 协议规范；只想知道"为什么"或"在哪里" → 其他文档。
@@ -71,6 +72,7 @@ docs/
 ├─ BUGFIX.md                  # 现行代码的根因档案
 ├─ LEGAL.md                   # 许可证与合规
 ├─ archive/                   # 历史存档（不维护，不作为规范引用；见 archive/README.md）
+│  ├─ CONTROL_PLANE_REMEDIATION.md     # 控制面审查快照（首批整改；认证等未完成）
 │  ├─ PROTOCOL_V2.md                   # v2 协议（与 v3 不互通）
 │  ├─ PROPOSAL_LATENCY_V1.4.md        # 延迟优化提案：DSCP EF + 水位 150 + 阶跃吸收（v1.4.0 已落地）
 │  ├─ PLAN_V3_MIGRATION.md             # v2→v3 迁移计划与逐文件清单（已完成）
