@@ -1050,8 +1050,10 @@ class CaptureService : Service() {
         // 起播直接预缓冲到目标水位，避免"30ms 起播后用几分钟追到 150ms"。
         jitter.setStartPrebufferMs(drift.targetMs())
         var adjust = 0.0
-        // 空闲期冻结水位反馈：本地静音会让 water 长期低于目标，若继续积分，
-        // 恢复出声时会带着 −0.5% 的音高偏移，要几分钟才回正。
+        // 冻结水位反馈（断流 / 预缓冲未出声）：这两种状态下 water 长期低于目标，
+        // 若继续积分，积分会压到 -PI_INTEGRAL_MAX 的负饱和；恢复出声后只能按
+        // ≈12 ppm/s 慢慢退，稳态水位被顶在目标之上 10–30 ms 长达几分钟，
+        // 期间还带着几分音分的音高偏移。与 windows/src/main.rs 解码线程同源。
         var idleFeedback = false
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
@@ -1060,6 +1062,7 @@ class CaptureService : Service() {
             var code = Udp2CalProtocol.Pull.WAIT
             var pipeMs = 0
             var waterMs = 0
+            var jbPlaying = false
             var pulledLen = 0
             var needReset = false
             var reason = ""
@@ -1144,6 +1147,7 @@ class CaptureService : Service() {
                 arrivalNanos = jitter.arrivalNanosAt(audibleTs)
                 // 单一口径水位：抖动缓冲 + 解码/播放缓冲（声卡已接手的那段）
                 waterMs = jitter.waterMs() + pipeMs
+                jbPlaying = jitter.playing
                 pulledLen = jitter.pulledLength
             } finally {
                 linkLock.unlock()
@@ -1204,7 +1208,13 @@ class CaptureService : Service() {
             val nowMono = SystemClock.elapsedRealtime()
             val rtpIdle = lastReversePacketAt == 0L ||
                 nowMono - lastReversePacketAt > 500L
-            val du = if (rtpIdle) {
+            // 反馈只在**真的在出声**时才评估。只看 rtpIdle 不够：预缓冲阶段
+            // （jitter 还没攒够 startPrebuffer、playing=false）水位必然低于目标，
+            // 照常喂 PI 会把积分压到负饱和；开播后只能按 ki·|err| 慢慢退，
+            // 稳态水位因此停在目标之上 10–30 ms。现场日志指纹：开播瞬间
+            // `反馈 -1100ppm`，之后 -457 → -294 → +21 → +65 缓慢爬升。
+            val feedbackOn = !rtpIdle && jbPlaying
+            val du = if (!feedbackOn) {
                 if (!idleFeedback) {
                     idleFeedback = true
                     drift.reset()

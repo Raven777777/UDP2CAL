@@ -808,6 +808,8 @@ i_next     = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MA
   只能按 `ki·|err|`（err=-110 ms 时约 12 ppm/s）慢慢退，稳态水位因此被顶在目标
   之上 10–30 ms 长达数分钟。现场日志指纹：开播瞬间 `反馈 -1100ppm`，之后
   -457 → -294 → +21 → +65 缓慢爬升。门控后积分从 0 起算，开播即收敛。
+  两端实现一致：Windows `windows/src/main.rs` 解码线程、Android
+  `CaptureService.kt` 反向播放循环都用 `!rtpIdle && jitter.is_playing()`。
 - `dt < PI_MIN_UPDATE_MS`（5 ms）的调用只累计时间，不评估。
 - 反馈输出仍要经过最终钳位 `±RESAMPLE_MAX_ADJUST`（±0.5%），见下面的合成式。
 
