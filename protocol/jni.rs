@@ -416,6 +416,23 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseCo
     new_longs(env, &out)
 }
 
+/// `buildControl` 的入参合法性。返回 `false` 时导出函数必须返回 `null`。
+///
+/// 抽成独立函数是为了能在没有 `JNIEnv` 的情况下单测：这条防线的失效后果是
+/// **进程 abort**（debug）或**静默截断的坏包**（release），不能只靠“读一遍
+/// 代码看上去没问题”。
+///
+/// - `msg_type`：收窄成 `u8` 必须无损。Kotlin 会传 TYPE_DATA(0)/TYPE_CONNECT(1)/
+///   TYPE_DISCOVER_REQ(2)，测试里还会传 9，所以只拦 `0..=255` 之外的值，
+///   不做“已知类型”白名单。
+/// - `payload_len`：`build_control` 对超过 [`CONTROL_MAX_PAYLOAD`] 的负载有
+///   `debug_assert`，panic 从 `extern "system"` 逃出去 = abort；release 下则
+///   静默截断成 512 B 并把“看着合法”的坏包交给 Kotlin（Kotlin 以为成功）。
+fn build_control_args_ok(msg_type: jint, payload_len: jint) -> bool {
+    (0..=u8::MAX as jint).contains(&msg_type)
+        && (0..=CONTROL_MAX_PAYLOAD as jint).contains(&payload_len)
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_buildControl(
     env: Env,
@@ -433,7 +450,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_buildCo
         return null();
     }
     let payload_len = fns(env).GetArrayLength.unwrap()(env, payload);
-    if payload_len < 0 {
+    if !build_control_args_ok(msg_type, payload_len) {
         return null();
     }
     let mut body = Vec::new();
@@ -1555,4 +1572,40 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_waterTa
     _this: jobject,
 ) -> jint {
     water_target_ms() as jint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `buildControl` 的入参守卫：非法值必须在进 `build_control` 之前被拦下。
+    /// 漏拦的后果是 debug 构建 panic 逃出 `extern "system"` = 进程 abort。
+    #[test]
+    fn build_control_args_reject_out_of_range() {
+        // 合法：Kotlin 实际会传的三种类型（含 TYPE_DATA = 0）与测试里的 9
+        assert!(build_control_args_ok(TYPE_DATA as jint, 0));
+        assert!(build_control_args_ok(
+            TYPE_CONNECT as jint,
+            CONNECT_PAYLOAD_SIZE as jint
+        ));
+        assert!(build_control_args_ok(TYPE_DISCOVER_REQ as jint, 0));
+        assert!(build_control_args_ok(9, 0));
+        // 边界：u8::MAX 类型、恰好 512 字节负载都放行
+        assert!(build_control_args_ok(
+            u8::MAX as jint,
+            CONTROL_MAX_PAYLOAD as jint
+        ));
+
+        // msg_type 越过 u8（收窄会静默截断）
+        assert!(!build_control_args_ok(256, 0));
+        assert!(!build_control_args_ok(0x1_0000, 0));
+        assert!(!build_control_args_ok(-1, 0));
+        assert!(!build_control_args_ok(jint::MIN, 0));
+
+        // 负载超上限（debug_assert panic / release 静默截断）
+        assert!(!build_control_args_ok(TYPE_CONNECT as jint, 513));
+        assert!(!build_control_args_ok(TYPE_CONNECT as jint, jint::MAX));
+        // 负长度（GetArrayLength 正常不会给，但 JNI 边界不当假设）
+        assert!(!build_control_args_ok(TYPE_CONNECT as jint, -1));
+    }
 }
