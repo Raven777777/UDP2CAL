@@ -901,6 +901,10 @@ impl LoopbackCapture {
                 return ReadOutcome::Error(e.code().0);
             }
             if frames == 0 {
+                // WASAPI 契约：每次成功的 GetBuffer 都必须配对 ReleaseBuffer，
+                // 即使这次拿到 0 帧（AUDCLNT_S_NO_CURRENT_DATA 也走这里）。
+                // 这是本文件唯一曾漏调 ReleaseBuffer 的读取分支。
+                let _ = self.capture.ReleaseBuffer(frames);
                 return ReadOutcome::Empty;
             }
 
