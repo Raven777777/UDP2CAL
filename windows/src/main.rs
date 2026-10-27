@@ -1391,6 +1391,16 @@ impl AppState {
                         r.avg_us(r.send_us),
                         r.max_backlog / 2 * 10 / 480
                     );
+                    // 本地丢样与编码超限是“本机造成的丢帧”（CPU 被抢占导致
+                    // 装配缓冲写满、或码率超过 1275 字节/帧上限），不是网络丢包：
+                    // 只在实际发生时单独告警，否则埋在 30 s 汇总行末尾等于看不见。
+                    if r.dropped_samples > 0 || r.oversize > 0 {
+                        logf!(
+                            "[Reverse] 警告: 本地丢样={}ms 编码超限={}帧 —— 丢样看 CPU 抢占/装配缓冲，超限看码率是否超过 1275 字节/帧",
+                            r.dropped_samples / 2 * 10 / 480,
+                            r.oversize
+                        );
+                    }
                     // 节拍迟到量（借鉴 Sunshine 的 "Sleep overshoot"）：
                     // 只报 min/max/avg，不做 EWMA——偶发的百毫秒级卡顿才是最该看见的。
                     if r.late_n > 0 || r.reanchors > 0 {
