@@ -714,7 +714,8 @@ impl ReverseSender {
 ///
 /// * **未迟到**（`now` 不晚于 `slot + gap/2`）：正常前进一个 `gap`，
 ///   保持 10 ms 网格，把成簇到货的帧摊平；
-/// * **迟到超过半个 gap**：网格已经失真，重锚到 `now`。
+/// * **迟到超过半个 gap**：网格已经失真，把相位重锚到 `now + gap`
+///   ——下一帧从**这次实际发送时刻**起算一个 `gap`，而不是立刻连发。
 ///
 /// 为什么必须重锚：`[Pacer]` 实测发现只靠“落后 4 帧才重置”是不行的。
 /// 线程启动时初始槽位、一次卡顿、一次设备重开，都会把槽位永久推到一个
@@ -722,10 +723,14 @@ impl ReverseSender {
 /// 周期的，偏移一旦形成就**永久不变**，永远到不了 40 ms 的重置阈值。
 /// 后果不只是指标难看——槽位一直过期时，`while now >= slot` 会把积压
 /// 的帧连发出去，而这正是 10 ms 网格本要消灭的突发。
+///
+/// 重锚值必须带 `+ gap`：返回 `now` 会让槽位当场过期，同一个 `while`
+/// 里积压的第二帧立刻被发出（回退成连发），且迟到量恒等于一个 `gap`
+/// （实测 min/avg = 8945/10007 µs），指标从此失去意义。
 fn advance_slot(slot: Instant, gap: Duration, now: Instant) -> Instant {
     let half = gap / 2;
     if now > slot + half {
-        now
+        now + gap
     } else {
         slot + gap
     }
@@ -1175,12 +1180,25 @@ mod tests {
     #[test]
     fn advance_slot_reanchors_when_late() {
         let t0 = Instant::now();
-        // 迟到超过半个 gap：网格已失真，重锚到 now（绝不把偏移永久保留）
+        // 迟到超过半个 gap：网格已失真，相位重锚到“这次发送 + 一个 gap”
         let late = t0 + Duration::from_micros(15_788);
-        assert_eq!(advance_slot(t0, GAP, late), late);
+        assert_eq!(advance_slot(t0, GAP, late), late + GAP);
         // 大幅卡顿（设备重开/调度停滞）同样重锚，不积攒补发
         let stalled = t0 + Duration::from_millis(546);
-        assert_eq!(advance_slot(t0, GAP, stalled), stalled);
+        assert_eq!(advance_slot(t0, GAP, stalled), stalled + GAP);
+    }
+
+    #[test]
+    fn advance_slot_reanchor_does_not_send_queued_frames_back_to_back() {
+        // 回归：重锚返回 `now` 时槽位当场过期，积压的第二帧会被立刻发出。
+        // 重锚必须把下一槽位推到 now + gap，连发才不可能发生。
+        let t0 = Instant::now();
+        let late = t0 + Duration::from_millis(15);
+        let next = advance_slot(t0, GAP, late);
+        assert!(
+            next >= late + GAP,
+            "重锚后下一槽位 {next:?} 早于 {late:?} + {GAP:?}"
+        );
     }
 
     #[test]
@@ -1201,13 +1219,14 @@ mod tests {
 
     #[test]
     fn advance_slot_keeps_even_spacing_after_a_stall() {
-        // 重锚之后仍然是每 gap 一帧，不会出现连发
+        // 卡顿后重锚：槽位 = 本次发送 + 一个 gap，之后回到正常网格
         let t0 = Instant::now();
         let stall = t0 + Duration::from_millis(37);
         let s1 = advance_slot(t0, GAP, stall);
-        assert_eq!(s1, stall);
-        // 下一帧在 s1+10 ms，于 s1+1 ms 时刻还不到点
-        assert!(s1 + GAP > s1 + Duration::from_millis(1));
+        assert_eq!(s1, stall + GAP);
+        // 此刻（stall + 1 ms）下一帧还不到点，积压帧不会被连发
+        assert!(stall + Duration::from_millis(1) < s1);
+        // 到了 s1 就正常前进一个 gap
         assert_eq!(advance_slot(s1, GAP, s1), s1 + GAP);
     }
 

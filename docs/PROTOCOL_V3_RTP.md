@@ -1142,7 +1142,7 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 
 ```
 next_send_at = advance_slot(next_send_at, now)
-  now > next_send_at + 5 ms → now        // 迟到超过半帧：网格已失真，重锚
+  now > next_send_at + 5 ms → now + 10 ms   // 迟到超过半帧：网格失真，相位重锚
   否则                       → next_send_at + 10 ms
 wait = next_send_at − now
 wait ≥ 1 ms   → sleep/delay(wait)
@@ -1154,6 +1154,9 @@ wait ≥ 1 ms   → sleep/delay(wait)
 保留到永远——每帧都迟到同样的量，永远到不了更宽松的阈值。实测跑数：迟到
 稳定在 15.8 ms（≈ 一个 15.6 ms 系统 tick）却不触发 40 ms 重置，且槽位常年
 过期时 `while now ≥ slot` 会把积压的帧连发出去，正是网格要消灭的突发。
+重锚值必须是 `now + 10 ms` 而不是 `now`：返回 `now` 等于让槽位当场过期，
+同一轮 `while` 里积压的第二帧立刻被发出（回退成连发），且迟到量恒等于
+一个帧长（实测 min/avg = 8945/10007 µs），指标随之失去意义。
 
 落到代码：Windows 反向发送在 `windows/src/capture.rs` 的 `advance_slot()`
 里实现（含回归测试）；Android 正向发送由 `AudioRecord` 的 10 ms 阻塞读
