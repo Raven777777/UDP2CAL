@@ -1228,6 +1228,28 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP 是否真的尊重 DSCP 无法从
 本机确认；标记无效只是回到尽力而为，不会引入错误。
 
+### 8.7 传输层调优（借鉴 Sunshine 的实践）
+
+这一节记录**发送/接收路径上刻意做的调优**，以及刻意**不做**的部分。
+每一条都必须能从日志验证；没有验证手段的一律不加。
+
+| 机制 | 位置 | 做法 | 为什么 |
+|------|------|------|--------|
+| 高精度发送节拍 | `windows/src/hires.rs` + `windows/src/capture.rs` | 用 `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` 的定时器等 `next_send_at` | Windows 的 `Sleep`/`WaitForSingleObject` 超时受系统定时器分辨率限制（默认 15.6 ms），“睡 10 ms”常变成 15.6 ms，10 ms 网格被打成“两包挨着 + 一段空”。只用高精度**单个句柄**，不调 `timeBeginPeriod`（那是进程级全局状态且影响整机功耗）。创建失败自动退回毫秒级等待 |
+| 套接字缓冲 1 MiB | `windows/src/capture.rs`（反向发送）、`windows/src/main.rs`（主接收）、`android/.../UdpSender.kt`（两端） | `SO_SNDBUF`/`SO_RCVBUF` 请求 1 MiB，失败只告警 | Windows 默认发送缓冲仅 8 KiB 量级；一次 Wi-Fi 漫游/重传退避就会丢掉突发，丢一包就是一个可闻的 PLC。放大的是**内核队列**，两端每 10 ms 立刻 send/recv，不构成应用层积压。Android/Linux 会按 `net.core.rmem_max`（通常 ~208 KiB）截断，属预期 |
+| PCM 环满“最新优先” | `windows/src/audio.rs` `Ring::push_latest` | 环满时丢弃**未播旧数据**（生产者只投递 `request_flush`，`tail` 仍归消费者） | 历史实现只丢新样本 → 环永久满载 → 可听位置永远落后一个环容量，多出的延迟再也散不掉。丢旧数据只需一次 ≤10 ms 缺口，水位立即回正。计数见 `[Audio] 统计` 的 `满丢旧数据` |
+| 节拍迟到统计 | `windows/src/capture.rs` 的 `ReverseStats.late_*`，30 s 汇总 | 实际发送时刻 − 计划时刻的 min/avg/max，**不做 EWMA** | 只报 min/max/avg 才能看见偶发的百毫秒级卡顿；EWMA 会把卡顿抹平。这是判断“10 ms 网格是否真守住”的唯一直接证据，日志行 `[Pacer] 30s` |
+| 抖动缓冲满即覆盖最旧槽 | `protocol/rtp.rs` `JitterBuffer::store` | 槽位满时覆盖序号最小的槽 | 等价于 Sunshine 的 `drop_oldest`：宁可少一段历史，也不让播放头被旧包拖住 |
+
+**刻意不做**（视频专属，或与“100 包/秒、每 10 ms 一包”的节拍无关）：
+
+| Sunshine 的做法 | 本项目为什么不做 |
+|------|------|
+| 1 帧 VBV、B 帧恒 0、无限 GOP、参考帧失效/请求式 IDR | 只对视频编码器有意义；Opus 帧长固定 10 ms，没有重排序与参考帧概念 |
+| 按 1 ms 粒度摊平一帧的多个包 + GSO/USO 批发送 | 反向音频 100 包/秒、每 10 ms 一包，一帧就是一个包；Opus 负载 ≤1275 字节远低于 MTU，不需要摊平 |
+| 帧率只降不升、`minimum_fps_target` 空闲补帧 | 采集节拍由声卡决定（48 kHz 恒定），不需要自适应帧率 |
+| RS-FEC 20% | 本项目用 Opus in-band FEC（随 CONNECT 配置下发，见 8.4）；50 包/秒的音频里 FEC 开销比例远高于视频，LBRR 本身已按丢包率调节 |
+
 ---
 
 ## 九、常量汇总

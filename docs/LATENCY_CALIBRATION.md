@@ -156,6 +156,11 @@ t_s,ring_ms,pipe_ms,jb_ms,occupancy_ms,water_ms,target_ms,adjust_ppm,ff_ppm,sigm
 - `occupancy_ms` 与 `jb_ms` 的差 → 媒体空洞 vs 真实占槽；阶跃吸收只看前者；
 - `adjust_ppm` / `ff_ppm` → 看反馈是否收敛、设备前馈是否稳定（钟差应是小常数）；
 - `sigma_ppm` 与 `buckets` → 判断设备进度观测窗是否可用；
+- `[Pacer] 30s` 日志行（`min/avg/max`，单位 µs）→ 反向发送节拍的迟到量：
+  稳态 `max` 应在几百 µs 量级；若 `max` 周期性跳到 5–16 ms，说明高精度定时器
+  不可用（启动日志会有 `[Reverse] 高精度定时器不可用`），10 ms 网格正在被系统
+  tick 量化；`max` 偶发上百毫秒则是线程被抢占（磁盘/杀软/电源策略），需要对照
+  同时段的其他日志。
 - `plc` 增长 → 供水不足（目标太低或网络抖动超出缓冲）；
 - `trims` 增长 → 阶跃吸收在消费帧（逐帧解码后丢弃 PCM，不计入 `plc`）；
   稳态应接近不增长，持续增长说明目标偏低或判据过激（§7.10.2）。
