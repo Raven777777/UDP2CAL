@@ -97,11 +97,17 @@ class UdpSender(
             } catch (e: Exception) {
                 Log.w(TAG, "正向套接字 DSCP 标记失败：${e.message}")
             }
-            // 收发队列放大：失败（厂商限制/权限）只告警，继续用系统默认值
+            // 收发队列放大：失败（厂商限制/权限）只告警，继续用系统默认值。
+            // 这个套接字也要收 CONNECT_ACK（每秒 1 个），接收队列同样别用默认值。
             try {
                 sock.sendBufferSize = SOCKET_BUFFER_BYTES
             } catch (e: Exception) {
                 Log.w(TAG, "正向发送缓冲设置失败：${e.message}")
+            }
+            try {
+                sock.receiveBufferSize = SOCKET_BUFFER_BYTES
+            } catch (e: Exception) {
+                Log.w(TAG, "正向接收缓冲（ACK）设置失败：${e.message}")
             }
             val revSock = DatagramSocket()
             revSockLocal = revSock
