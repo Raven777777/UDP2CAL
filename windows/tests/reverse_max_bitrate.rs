@@ -29,7 +29,8 @@ fn run(bitrate_kbps: u16, label: &str) {
     let _ = enc.set_dred_duration(0);
     enc.set_complexity(10).unwrap();
     enc.set_bandwidth(Bandwidth::Fullband).unwrap();
-    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate_kbps as i32 * 1000)).unwrap();
+    enc.set_bitrate(Bitrate::BitsPerSecond(bitrate_kbps as i32 * 1000))
+        .unwrap();
 
     // 宽带音乐式内容（比纯正弦更能逼出 VBR 峰值）
     let frame: Vec<i16> = (0..FRAME_INTERLEAVED)

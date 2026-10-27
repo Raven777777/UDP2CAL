@@ -71,16 +71,15 @@ use jni_sys::{
 use crate::rtp::{
     extend_seq, extend_ts, water_target_ms, DeviceRateEstimator, DriftController, InsertResult,
     JitterBuffer, Pull, RateEstimator, RtpHeader, RtpPacket, StepAbsorber, ARRIVAL_TRACE,
-    OPUS_FRAME_SAMPLES,
-    OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, RTP_HEADER_SIZE,
+    OPUS_FRAME_SAMPLES, OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, RTP_HEADER_SIZE,
 };
 use crate::{
     build_control, clamp_bitrate_kbps, parse_control, snap_bitrate_kbps, ConnectAckPayload,
     ConnectPayload, ControlHeader, DiscoverReply, BITRATE_AUTO_KBPS, BITRATE_MAX_KBPS,
-    BITRATE_STEPS_KBPS, CONTROL_HEADER_SIZE, CONTROL_MAX_PAYLOAD, CONTROL_VERSION,
-    CONNECT_ACK_PAYLOAD_SIZE, CONNECT_PAYLOAD_SIZE, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE,
-    DEVICE_NAME_MAX, DISCOVER_PORT, OPUS_FRAME_MS, OPUS_PAYLOAD_TYPE, TYPE_CONNECT,
-    TYPE_CONNECT_ACK, TYPE_DATA, TYPE_DISCOVER_REPLY, TYPE_DISCOVER_REQ, TYPE_MAX_KNOWN,
+    BITRATE_STEPS_KBPS, CONNECT_ACK_PAYLOAD_SIZE, CONNECT_PAYLOAD_SIZE, CONTROL_HEADER_SIZE,
+    CONTROL_MAX_PAYLOAD, CONTROL_VERSION, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE, DEVICE_NAME_MAX,
+    DISCOVER_PORT, OPUS_FRAME_MS, OPUS_PAYLOAD_TYPE, TYPE_CONNECT, TYPE_CONNECT_ACK, TYPE_DATA,
+    TYPE_DISCOVER_REPLY, TYPE_DISCOVER_REQ, TYPE_MAX_KNOWN,
 };
 
 /// 原生方法收到的 `JNIEnv`：与 `jni-sys` 函数表字段同型，直接透传。
@@ -105,7 +104,13 @@ fn null<T>() -> *mut T {
 /// 把 `arr[offset .. offset+len)` 拷进 `out`；越界返回 false。
 ///
 /// 边界校验全部用 `i64` 相加，避开 `offset + len` 的 `jint` 溢出。
-unsafe fn read_bytes(env: Env, arr: jbyteArray, offset: jint, len: jint, out: &mut Vec<u8>) -> bool {
+unsafe fn read_bytes(
+    env: Env,
+    arr: jbyteArray,
+    offset: jint,
+    len: jint,
+    out: &mut Vec<u8>,
+) -> bool {
     if arr.is_null() || offset < 0 || len < 0 {
         return false;
     }
@@ -173,7 +178,13 @@ unsafe fn new_bytes(env: Env, data: &[u8]) -> jbyteArray {
         return null();
     }
     if !data.is_empty() {
-        f.SetByteArrayRegion.unwrap()(env, arr, 0, data.len() as jsize, data.as_ptr() as *const jbyte);
+        f.SetByteArrayRegion.unwrap()(
+            env,
+            arr,
+            0,
+            data.len() as jsize,
+            data.as_ptr() as *const jbyte,
+        );
     }
     arr
 }
@@ -808,7 +819,9 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbSetSt
     ms: jint,
 ) {
     if let Some(handle) = jb_ref(h) {
-        lock(&handle.inner).jb.set_start_prebuffer_ms(ms.max(0) as u32);
+        lock(&handle.inner)
+            .jb
+            .set_start_prebuffer_ms(ms.max(0) as u32);
     }
 }
 
@@ -873,7 +886,11 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
     g.pulled_len = 0;
     let mut scratch = std::mem::take(&mut g.scratch);
     ensure_payload_capacity(&mut scratch);
-    let result = g.jb.pull(ring_ms.max(0) as u32, pipe_ms.max(0) as u32, &mut scratch[..]);
+    let result = g.jb.pull(
+        ring_ms.max(0) as u32,
+        pipe_ms.max(0) as u32,
+        &mut scratch[..],
+    );
     let (code, ts, len) = match result {
         Pull::Packet { len, ts } => (1, ts, len),
         Pull::Plc { ts } => (2, ts, 0),
@@ -949,15 +966,21 @@ macro_rules! jb_scalar {
     };
 }
 
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbNextSeq, jlong, |g: &JbInner| g
-    .jb
-    .next_seq() as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbNextTs, jlong, |g: &JbInner| g
-    .jb
-    .next_ts() as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbHighestTs, jlong, |g: &JbInner| g
-    .jb
-    .highest_ts() as jlong);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbNextSeq,
+    jlong,
+    |g: &JbInner| g.jb.next_seq() as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbNextTs,
+    jlong,
+    |g: &JbInner| g.jb.next_ts() as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbHighestTs,
+    jlong,
+    |g: &JbInner| g.jb.highest_ts() as jlong
+);
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbStarted,
     jboolean,
@@ -968,19 +991,31 @@ jb_scalar!(
     jboolean,
     |g: &JbInner| if g.jb.is_playing() { 1 } else { 0 }
 );
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbPlcRun, jint, |g: &JbInner| g
-    .jb
-    .plc_run() as jint);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbEpoch, jlong, |g: &JbInner| g
-    .jb
-    .epoch as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbPulledLength, jint, |g: &JbInner| g
-    .pulled_len);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbPulledTs, jlong, |g: &JbInner| g
-    .pulled_ts as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbWaterMs, jint, |g: &JbInner| g
-    .jb
-    .water_ms() as jint);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbPlcRun,
+    jint,
+    |g: &JbInner| g.jb.plc_run() as jint
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbEpoch,
+    jlong,
+    |g: &JbInner| g.jb.epoch as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbPulledLength,
+    jint,
+    |g: &JbInner| g.pulled_len
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbPulledTs,
+    jlong,
+    |g: &JbInner| g.pulled_ts as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbWaterMs,
+    jint,
+    |g: &JbInner| g.jb.water_ms() as jint
+);
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbOccupancyFrames,
     jint,
@@ -1001,44 +1036,51 @@ jb_scalar!(
     jint,
     |g: &JbInner| g.jb.contiguous_frames() as jint
 );
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbReceived, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .received as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbLate, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .late as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbDuplicate, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .duplicate as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbResyncs, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .resyncs as jlong);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbReceived,
+    jlong,
+    |g: &JbInner| g.jb.stats.received as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbLate,
+    jlong,
+    |g: &JbInner| g.jb.stats.late as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbDuplicate,
+    jlong,
+    |g: &JbInner| g.jb.stats.duplicate as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbResyncs,
+    jlong,
+    |g: &JbInner| g.jb.stats.resyncs as jlong
+);
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbSeqRealign,
     jlong,
     |g: &JbInner| g.jb.stats.seq_realign as jlong
 );
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbOverflow, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .overflow as jlong);
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbPlcFrames, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .plc_frames as jlong);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbOverflow,
+    jlong,
+    |g: &JbInner| g.jb.stats.overflow as jlong
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbPlcFrames,
+    jlong,
+    |g: &JbInner| g.jb.stats.plc_frames as jlong
+);
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbMaxPlcRun,
     jint,
     |g: &JbInner| g.jb.stats.max_plc_run as jint
 );
-jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbStepTrims, jlong, |g: &JbInner| g
-    .jb
-    .stats
-    .step_trims as jlong);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbStepTrims,
+    jlong,
+    |g: &JbInner| g.jb.stats.step_trims as jlong
+);
 
 /// 到达时刻换算成 Java `System.nanoTime()` 口径；查不到返回 -1。
 #[no_mangle]
@@ -1082,7 +1124,9 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saCreat
     _env: Env,
     _this: jobject,
 ) -> Handle {
-    Box::into_raw(Box::new(StepHandle { inner: Mutex::new(StepAbsorber::new()) })) as Handle
+    Box::into_raw(Box::new(StepHandle {
+        inner: Mutex::new(StepAbsorber::new()),
+    })) as Handle
 }
 
 #[no_mangle]
@@ -1205,7 +1249,9 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reCreat
     _env: Env,
     _this: jobject,
 ) -> Handle {
-    Box::into_raw(Box::new(RateHandle { inner: Mutex::new(RateEstimator::new()) })) as Handle
+    Box::into_raw(Box::new(RateHandle {
+        inner: Mutex::new(RateEstimator::new()),
+    })) as Handle
 }
 
 #[no_mangle]
@@ -1337,8 +1383,10 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deObser
     played_nanos: jlong,
 ) {
     if let Some(handle) = device_rate_ref(h) {
-        lock(&handle.inner)
-            .observe(device_frames.max(0) as u64, instant_from_nanos(played_nanos));
+        lock(&handle.inner).observe(
+            device_frames.max(0) as u64,
+            instant_from_nanos(played_nanos),
+        );
     }
 }
 
@@ -1388,8 +1436,16 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcCreat
     device_rate: jint,
     target_ms: jint,
 ) -> Handle {
-    let rate = if device_rate > 0 { device_rate as u32 } else { OPUS_SAMPLE_RATE };
-    let target = if target_ms > 0 { target_ms as u32 } else { water_target_ms() };
+    let rate = if device_rate > 0 {
+        device_rate as u32
+    } else {
+        OPUS_SAMPLE_RATE
+    };
+    let target = if target_ms > 0 {
+        target_ms as u32
+    } else {
+        water_target_ms()
+    };
     Box::into_raw(Box::new(DriftHandle {
         inner: Mutex::new(DriftController::with_target(rate, target)),
     })) as Handle

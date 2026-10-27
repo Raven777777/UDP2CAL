@@ -1,4 +1,4 @@
-﻿// Windows 防火墙自动放行（静默，无 cmd 窗口）
+// Windows 防火墙自动放行（静默，无 cmd 窗口）
 //
 // 安全要点：规则限定 program + 具体端口 + Private profile；不向公共网络开放。
 // 历史实现为整机开放所有入站 UDP，远超功能所需。
@@ -30,17 +30,26 @@ pub fn add_firewall_rule(audio_port: u16) -> Result<(), String> {
 
     // 先删除旧规则（忽略失败，可能本来就不存在）
     let _ = netsh(&[
-        "advfirewall".into(), "firewall".into(), "delete".into(), "rule".into(),
+        "advfirewall".into(),
+        "firewall".into(),
+        "delete".into(),
+        "rule".into(),
         format!("name={RULE_NAME}"),
     ]);
 
     let result = netsh(&[
-        "advfirewall".into(), "firewall".into(), "add".into(), "rule".into(),
+        "advfirewall".into(),
+        "firewall".into(),
+        "add".into(),
+        "rule".into(),
         format!("name={RULE_NAME}"),
-        "dir=in".into(), "action=allow".into(), "protocol=UDP".into(),
+        "dir=in".into(),
+        "action=allow".into(),
+        "protocol=UDP".into(),
         ports,
         program,
-        "enable=yes".into(), "profile=private".into(),
+        "enable=yes".into(),
+        "profile=private".into(),
     ])
     .map_err(|e| format!("防火墙命令执行失败: {e}"))?;
 

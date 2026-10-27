@@ -112,7 +112,11 @@ pub struct ControlHeader {
 
 impl ControlHeader {
     pub const fn new(msg_type: u8, payload_len: u16, device_id: [u8; DEVICE_ID_SIZE]) -> Self {
-        Self { msg_type, payload_len, device_id }
+        Self {
+            msg_type,
+            payload_len,
+            device_id,
+        }
     }
 
     /// 写入 15 字节固定头；保留字节强制写 0。
@@ -142,7 +146,11 @@ impl ControlHeader {
         }
         let mut device_id = [0u8; DEVICE_ID_SIZE];
         device_id.copy_from_slice(&buf[7..15]);
-        Some(Self { msg_type: buf[2], payload_len, device_id })
+        Some(Self {
+            msg_type: buf[2],
+            payload_len,
+            device_id,
+        })
     }
 
     /// 是否为 v3 已定义的消息类型（1..=4）。`0` 与 `5..=255` 均返回 false。
@@ -242,7 +250,8 @@ pub fn demux(buf: &[u8]) -> Datagram<'_> {
             }
         }
         CONTROL_VERSION => {
-            if buf.len() < CONTROL_HEADER_SIZE || buf.len() > CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD
+            if buf.len() < CONTROL_HEADER_SIZE
+                || buf.len() > CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD
             {
                 Datagram::Drop
             } else {
@@ -503,7 +512,11 @@ impl DiscoverReply {
         let name = String::from_utf8_lossy(raw).into_owned();
         Some(Self {
             listen_port,
-            device_name: if name.is_empty() { "UDP2CAL PC".to_string() } else { name },
+            device_name: if name.is_empty() {
+                "UDP2CAL PC".to_string()
+            } else {
+                name
+            },
         })
     }
 }
@@ -579,7 +592,10 @@ mod tests {
         hdr.encode(&mut buf);
         assert_eq!(
             buf,
-            [0x03, 0x00, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+            [
+                0x03, 0x00, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD,
+                0xEF
+            ]
         );
         let back = ControlHeader::decode(&buf).unwrap();
         assert_eq!(back.msg_type, TYPE_CONNECT);
@@ -603,7 +619,10 @@ mod tests {
         };
         assert_eq!(
             p.encode(),
-            [0xC3, 0x50, 0x11, 0x22, 0x33, 0x44, 0x6F, 0x0A, 0x03, 0x01, 0x04, 0x03, 0x00, 0x00, 0x05]
+            [
+                0xC3, 0x50, 0x11, 0x22, 0x33, 0x44, 0x6F, 0x0A, 0x03, 0x01, 0x04, 0x03, 0x00, 0x00,
+                0x05
+            ]
         );
         assert_eq!(ConnectPayload::decode(&p.encode()), Some(p));
         assert!(p.validate().is_ok());
@@ -654,7 +673,10 @@ mod tests {
 
     #[test]
     fn discover_reply_matches_spec_vector() {
-        let r = DiscoverReply { listen_port: DEFAULT_LISTEN_PORT, device_name: "UDP2CAL".into() };
+        let r = DiscoverReply {
+            listen_port: DEFAULT_LISTEN_PORT,
+            device_name: "UDP2CAL".into(),
+        };
         let mut pkt = build_control(TYPE_DISCOVER_REPLY, &DEV, &r.encode());
         assert_eq!(
             pkt,
@@ -688,7 +710,11 @@ mod tests {
         assert_eq!(truncate_utf8("abc", 2), "ab");
         // 设备名上限截断后不得出现非法 UTF-8
         let long = "电".repeat(200);
-        let enc = DiscoverReply { listen_port: 1, device_name: long }.encode();
+        let enc = DiscoverReply {
+            listen_port: 1,
+            device_name: long,
+        }
+        .encode();
         assert!(enc.len() <= 2 + DEVICE_NAME_MAX);
         assert!(std::str::from_utf8(&enc[2..]).is_ok());
     }
@@ -743,24 +769,61 @@ mod tests {
         assert!(p.validate().is_err());
 
         // 与下方 invalid_fields 保持同一种写法（结构体更新语法）
-        let p = ConnectPayload { frame_ms: 20, ..ConnectPayload::default() };
+        let p = ConnectPayload {
+            frame_ms: 20,
+            ..ConnectPayload::default()
+        };
         assert!(p.validate().is_err());
 
-        let p = ConnectPayload { forward_ssrc: 0, ..ConnectPayload::default() };
+        let p = ConnectPayload {
+            forward_ssrc: 0,
+            ..ConnectPayload::default()
+        };
         assert!(p.validate().is_err());
 
         let invalid_fields = [
-            ConnectPayload { complexity: 11, ..ConnectPayload::default() },
-            ConnectPayload { signal: 3, ..ConnectPayload::default() },
-            ConnectPayload { bandwidth: 5, ..ConnectPayload::default() },
-            ConnectPayload { opus_flags: 0x10, ..ConnectPayload::default() },
-            ConnectPayload { packet_loss: 101, ..ConnectPayload::default() },
+            ConnectPayload {
+                complexity: 11,
+                ..ConnectPayload::default()
+            },
+            ConnectPayload {
+                signal: 3,
+                ..ConnectPayload::default()
+            },
+            ConnectPayload {
+                bandwidth: 5,
+                ..ConnectPayload::default()
+            },
+            ConnectPayload {
+                opus_flags: 0x10,
+                ..ConnectPayload::default()
+            },
+            ConnectPayload {
+                packet_loss: 101,
+                ..ConnectPayload::default()
+            },
         ];
         for invalid in invalid_fields {
-            assert!(invalid.validate().is_err(), "invalid payload accepted: {invalid:?}");
+            assert!(
+                invalid.validate().is_err(),
+                "invalid payload accepted: {invalid:?}"
+            );
         }
-        assert!(ConnectPayload { complexity: 0, ..ConnectPayload::default() }.validate().is_ok());
-        assert!(ConnectPayload { complexity: 10, signal: 2, bandwidth: 4, packet_loss: 100, ..ConnectPayload::default() }.validate().is_ok());
+        assert!(ConnectPayload {
+            complexity: 0,
+            ..ConnectPayload::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(ConnectPayload {
+            complexity: 10,
+            signal: 2,
+            bandwidth: 4,
+            packet_loss: 100,
+            ..ConnectPayload::default()
+        }
+        .validate()
+        .is_ok());
 
         // 负载长度必须恰好 15
         assert!(ConnectPayload::decode(&[0u8; 14]).is_none());
@@ -791,7 +854,10 @@ mod tests {
         assert_eq!(clamp_bitrate_kbps(1000), 512);
         assert_eq!(clamp_bitrate_kbps(1024), 512);
         assert_eq!(clamp_bitrate_kbps(65535), 512);
-        let p = ConnectPayload { bitrate_kbps: 1024, ..ConnectPayload::default() };
+        let p = ConnectPayload {
+            bitrate_kbps: 1024,
+            ..ConnectPayload::default()
+        };
         assert_eq!(p.effective_bitrate_kbps(), 512);
     }
 

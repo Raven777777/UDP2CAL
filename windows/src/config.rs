@@ -1,7 +1,7 @@
 // 配置管理 - 注册表读写
+use std::sync::OnceLock;
 use winreg::enums::*;
 use winreg::RegKey;
-use std::sync::OnceLock;
 
 const REG_PATH: &str = "Software\\UDP2CAL";
 const RUN_VALUE: &str = "UDP2CAL";
@@ -57,7 +57,11 @@ impl Config {
     }
 
     pub fn get_device_id(&self) -> u64 {
-        if self.device_id != 0 { self.device_id } else { resolve_device_id(0) }
+        if self.device_id != 0 {
+            self.device_id
+        } else {
+            resolve_device_id(0)
+        }
     }
 
     pub fn get_device_id_bytes(&self) -> [u8; 8] {
@@ -70,7 +74,10 @@ impl Config {
             Ok(k) => k,
             Err(_) => {
                 // 无注册表项时仍需返回一个稳定的设备 ID
-                return Self { device_id: resolve_device_id(0), ..Self::default() };
+                return Self {
+                    device_id: resolve_device_id(0),
+                    ..Self::default()
+                };
             }
         };
         let stored_id = get_qword(&path, "device_id", 0);

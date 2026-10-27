@@ -1,63 +1,62 @@
-﻿// UDP2CAL Windows 接收端 - 局域网音频串流
+// UDP2CAL Windows 接收端 - 局域网音频串流
 // 双状态机架构 + P2P 独占通信系统
-#![windows_subsystem = "windows"] 
+#![windows_subsystem = "windows"]
 
-mod audio; 
-mod capture; 
-mod config; 
-mod decoder; 
-mod diag; 
-mod firewall; 
-mod logger; 
-mod protocol; 
+mod audio;
+mod capture;
+mod config;
+mod decoder;
+mod diag;
+mod firewall;
+mod logger;
+mod protocol;
 
-use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space}; 
-use iced::{Alignment, Element, Length, Subscription, Task, Theme, Color}; 
-use iced::futures::SinkExt; 
-use std::net::SocketAddr; 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering}; 
-use std::sync::{Arc, Mutex, OnceLock}; 
-use std::time::{Duration, Instant}; 
-use windows::Win32::System::Threading::CreateMutexW; 
-use windows::Win32::Foundation::{BOOL, GetLastError, HWND, LPARAM, ERROR_ALREADY_EXISTS};
-use windows::Win32::UI::WindowsAndMessaging::{ 
-    EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
-    MessageBoxW, SetForegroundWindow, ShowWindow, MB_OK,
-    MB_ICONINFORMATION, SW_RESTORE,
-}; 
+use iced::futures::SinkExt;
+use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space};
+use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+    MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONINFORMATION, MB_OK, SW_RESTORE,
+};
 
-// ========================================== 
-// 图标加载 (编译期嵌入 icon.png) 
-// ========================================== 
-fn load_icon_rgba() -> (Vec<u8>, u32, u32) { 
-    static ICON_PNG: &[u8] = include_bytes!("../../icon.png"); 
-    if let Ok(img) = image::load_from_memory(ICON_PNG) { 
-        let rgba = img.into_rgba8(); 
-        let (w, h) = rgba.dimensions(); 
-        (rgba.into_raw(), w, h) 
-    } else { 
-        // 回退：生成 32x32 绿色圆点 
-        let width = 32u32; 
-        let height = 32u32; 
-        let mut rgba = Vec::with_capacity((width * height * 4) as usize); 
-        for y in 0..height { 
-            for x in 0..width { 
-                let dx = x as f32 - 15.5; 
-                let dy = y as f32 - 15.5; 
-                let dist = (dx * dx + dy * dy).sqrt(); 
-                if dist < 14.0 { 
-                    rgba.extend_from_slice(&[0, 204, 115, 255]); 
-                } else if dist < 15.0 { 
-                    rgba.extend_from_slice(&[0, 204, 115, 128]); 
-                } else { 
-                    rgba.extend_from_slice(&[0, 0, 0, 0]); 
-                } 
-            } 
-        } 
-        (rgba, width, height) 
-    } 
-} 
+// ==========================================
+// 图标加载 (编译期嵌入 icon.png)
+// ==========================================
+fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
+    static ICON_PNG: &[u8] = include_bytes!("../../icon.png");
+    if let Ok(img) = image::load_from_memory(ICON_PNG) {
+        let rgba = img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        (rgba.into_raw(), w, h)
+    } else {
+        // 回退：生成 32x32 绿色圆点
+        let width = 32u32;
+        let height = 32u32;
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - 15.5;
+                let dy = y as f32 - 15.5;
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < 14.0 {
+                    rgba.extend_from_slice(&[0, 204, 115, 255]);
+                } else if dist < 15.0 {
+                    rgba.extend_from_slice(&[0, 204, 115, 128]);
+                } else {
+                    rgba.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        (rgba, width, height)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum TrayCommand {
@@ -114,7 +113,11 @@ impl P2pState {
 
 /// A v3 device ID is public, so an established binding is the exact peer endpoint,
 /// not merely the ID. Endpoint migration is reserved for an authenticated protocol.
-fn is_bound_peer_source(peer: &P2pState, device_id: [u8; protocol::DEVICE_ID_SIZE], src: SocketAddr) -> bool {
+fn is_bound_peer_source(
+    peer: &P2pState,
+    device_id: [u8; protocol::DEVICE_ID_SIZE],
+    src: SocketAddr,
+) -> bool {
     peer.is_busy() && peer.device_id == device_id && peer.addr == Some(src)
 }
 
@@ -132,9 +135,21 @@ mod control_binding_tests {
         peer.addr = Some(original);
 
         assert!(is_bound_peer_source(&peer, id, original));
-        assert!(!is_bound_peer_source(&peer, id, "192.0.2.11:50000".parse().unwrap()));
-        assert!(!is_bound_peer_source(&peer, id, "192.0.2.10:50001".parse().unwrap()));
-        assert!(!is_bound_peer_source(&peer, [8u8; protocol::DEVICE_ID_SIZE], original));
+        assert!(!is_bound_peer_source(
+            &peer,
+            id,
+            "192.0.2.11:50000".parse().unwrap()
+        ));
+        assert!(!is_bound_peer_source(
+            &peer,
+            id,
+            "192.0.2.10:50001".parse().unwrap()
+        ));
+        assert!(!is_bound_peer_source(
+            &peer,
+            [8u8; protocol::DEVICE_ID_SIZE],
+            original
+        ));
     }
 }
 
@@ -149,7 +164,10 @@ fn should_log_control_reject() -> bool {
     // 因中毒而静默不记日志反而会丢掉现场证据。
     let mut last = gate.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+    if last
+        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+        .unwrap_or(true)
+    {
         *last = Some(now);
         return true;
     }
@@ -163,7 +181,10 @@ fn should_log_control_event() -> bool {
     let gate = LAST.get_or_init(|| Mutex::new(None));
     let mut last = gate.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+    if last
+        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+        .unwrap_or(true)
+    {
         *last = Some(now);
         return true;
     }
@@ -238,7 +259,11 @@ fn set_decode_thread(t: std::thread::Thread) {
 }
 
 fn wake_decoder() {
-    if let Some(t) = DECODE_THREAD.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+    if let Some(t) = DECODE_THREAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
         t.unpark();
     }
 }
@@ -713,7 +738,8 @@ fn start_broadcast_state_machine() {
                     &device_id,
                     &payload,
                 ) {
-                    let _ = socket.send_to(&buf[..total], ("255.255.255.255", protocol::DISCOVER_PORT));
+                    let _ =
+                        socket.send_to(&buf[..total], ("255.255.255.255", protocol::DISCOVER_PORT));
                 }
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -728,7 +754,11 @@ fn reset_to_ready() {
         let mut st = p2p_lock();
         *st = P2pState::new();
     }
-    if let Some(s) = reverse_sender().lock().unwrap_or_else(|e| e.into_inner()).take() {
+    if let Some(s) = reverse_sender()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
         s.stop();
     }
     jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
@@ -791,9 +821,13 @@ pub fn start_broadcast_listener() {
                 device_name: my_device_name().to_string(),
             };
             let body = reply.encode();
-            if let Some(total) =
-                protocol::build_control_to(&mut buf, 0, protocol::TYPE_DISCOVER_REPLY, &my_id, &body)
-            {
+            if let Some(total) = protocol::build_control_to(
+                &mut buf,
+                0,
+                protocol::TYPE_DISCOVER_REPLY,
+                &my_id,
+                &body,
+            ) {
                 let _ = socket.send_to(&buf[..total], src);
             }
         }
@@ -804,30 +838,30 @@ pub fn start_broadcast_listener() {
 // UI 及主控逻辑
 // ══════════════════════════════════════════════
 
-#[derive(Debug, Clone)] 
-enum Message { 
-    IpChanged(String), 
-    PortChanged(String), 
-    ToggleRunning, 
+#[derive(Debug, Clone)]
+enum Message {
+    IpChanged(String),
+    PortChanged(String),
+    ToggleRunning,
     ToggleReverse(bool),
-    ToggleAutoStart(bool), 
-    StatusUpdate(StatusInfo), 
-    Disconnected, 
+    ToggleAutoStart(bool),
+    StatusUpdate(StatusInfo),
+    Disconnected,
     /// 引擎级失败（监听失败 / 音频初始化失败）：必须回到停止态并把原因显示出来
     EngineError(String),
     /// P2P 绑定/重连状态变化：只触发一次重绘，不携带也不修改任何遥测数据。
     /// （历史实现用 bitrate=0 的 StatusUpdate 充当重绘信号，导致码率显示每秒闪一次 0）
     PeerStateChanged,
-    HideWindow, 
-    ShowWindow, 
-    Quit, 
-} 
+    HideWindow,
+    ShowWindow,
+    Quit,
+}
 
-#[derive(Debug, Clone)] 
-struct StatusInfo { 
-    bitrate_kbps: f32, 
-    level_db: f32, 
-} 
+#[derive(Debug, Clone)]
+struct StatusInfo {
+    bitrate_kbps: f32,
+    level_db: f32,
+}
 
 /// 提示行的语义级别。
 /// 历史实现靠中文子串（"失败/无效/不能/断开/不是合法"）猜测配色，
@@ -838,30 +872,30 @@ enum NoticeLevel {
     Error,
 }
 
-struct AppState { 
-    config: config::Config, 
-    ip_input: String, 
-    port_input: String, 
-    port_valid: bool, 
-    is_running: bool, 
-    connected: bool, 
-    last_bitrate: f32, 
-    last_level_db: f32, 
-    status_text: String, 
+struct AppState {
+    config: config::Config,
+    ip_input: String,
+    port_input: String,
+    port_valid: bool,
+    is_running: bool,
+    connected: bool,
+    last_bitrate: f32,
+    last_level_db: f32,
+    status_text: String,
     /// 需要直接展示给用户的提示（错误 / 警告 / 断开原因）
     notice: String,
     /// 提示级别，决定配色
     notice_level: NoticeLevel,
-    vb_cable_installed: bool, 
-    last_toggle_instant: Instant, 
+    vb_cable_installed: bool,
+    last_toggle_instant: Instant,
     /// 上次写音频诊断日志的时间（30s 一次，避免刷盘）
     last_stats_log: Instant,
-    session_id: u32, 
+    session_id: u32,
     reverse_audio: bool,
     reverse_enabled: bool,
-} 
+}
 
-fn main() -> Result<(), iced::Error> { 
+fn main() -> Result<(), iced::Error> {
     // 尽早初始化落盘日志：后续所有失败路径都要能留下证据
     logger::init();
     logf!("[App] 启动 v{}", env!("CARGO_PKG_VERSION"));
@@ -872,23 +906,25 @@ fn main() -> Result<(), iced::Error> {
     // SAFETY: 三处 `PCWSTR::from_raw` 的缓冲都是本作用域内的 `Vec<u16>`，
     // 以 `\0` 结尾且生命周期覆盖调用；`CreateMutexW` 句柄故意泄漏到进程结束
     // （单实例锁整个进程生命周期有效），不对其调用 `CloseHandle`。
-    unsafe { 
-        let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect(); 
-        let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr())); 
-        if GetLastError() == ERROR_ALREADY_EXISTS { 
+    unsafe {
+        let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect();
+        let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr()));
+        if GetLastError() == ERROR_ALREADY_EXISTS {
             // 先尝试把已运行实例的窗口拉到前台；再提示，避免"双击没反应"
             focus_existing_window("UDP2CAL");
             let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect();
-            let msg: Vec<u16> = "程序已在运行中（已尝试切换到已有窗口）\0".encode_utf16().collect();
-            MessageBoxW( 
-                None, 
-                PCWSTR::from_raw(msg.as_ptr()), 
-                PCWSTR::from_raw(title.as_ptr()), 
-                MB_OK | MB_ICONINFORMATION, 
-            ); 
-            return Ok(()); 
-        } 
-    } 
+            let msg: Vec<u16> = "程序已在运行中（已尝试切换到已有窗口）\0"
+                .encode_utf16()
+                .collect();
+            MessageBoxW(
+                None,
+                PCWSTR::from_raw(msg.as_ptr()),
+                PCWSTR::from_raw(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return Ok(());
+        }
+    }
 
     let startup_cfg = config::Config::load();
     LISTEN_PORT.store(startup_cfg.listen_port, Ordering::Release);
@@ -901,12 +937,12 @@ fn main() -> Result<(), iced::Error> {
     }
 
     // P2P 系统初始化
-    start_broadcast_listener(); 
+    start_broadcast_listener();
     start_broadcast_state_machine();
-    init_audio_worker(); 
+    init_audio_worker();
 
     // 初始化图标
-    let (icon_rgba, w, h) = load_icon_rgba(); 
+    let (icon_rgba, w, h) = load_icon_rgba();
 
     // 系统托盘（失败不致命：降级为"关窗即退出"）
     let tray_icon = install_tray(icon_rgba.clone(), w, h);
@@ -924,57 +960,64 @@ fn main() -> Result<(), iced::Error> {
     };
 
     // 主窗体
-    let result = iced::application(move || {
-        let cfg = config::Config::load();
-        REVERSE_ENABLED.store(if cfg.reverse_enabled != 0 { 1 } else { 0 }, Ordering::Release);
-        let now = Instant::now();
-        let state = AppState {
-            ip_input: cfg.listen_ip.clone(),
-            port_input: cfg.listen_port.to_string(),
-            port_valid: true,
-            is_running: false,
-            connected: false,
-            last_bitrate: 0.0,
-            last_level_db: -60.0,
-            status_text: String::new(),
-            notice: startup_notice.clone(),
-            notice_level: if firewall_warning.is_some() || !tray_ok {
-                NoticeLevel::Error
-            } else {
-                NoticeLevel::Info
-            },
-            vb_cable_installed: audio::detect_vb_cable().is_some(),
-            reverse_audio: false,
-            reverse_enabled: cfg.reverse_enabled != 0,
-            config: cfg,
-            last_toggle_instant: now,
-            last_stats_log: now,
-            session_id: 0,
-        };
-        (state, Task::none())
-    }, AppState::update, AppState::view)
-        .title("UDP2CAL")
-        .subscription(AppState::subscription)
-        .default_font(iced::Font::with_name("Microsoft YaHei"))
-        .theme(Theme::Dark)
-        .window(iced::window::Settings {
-            // ⚠ 此尺寸是精心设计的视觉尺寸，请勿修改。
-            // 320×290 客户区 + 1px 边框 + 标题栏，成品窗口恰好是 322×322 的完美正方形；
-            // 任何改动都会破坏这个正方形比例。
-            size: iced::Size::new(320.0, 290.0),
-            position: iced::window::Position::Centered,
-            resizable: false,
-            // 托盘不可用时必须让 X 真正退出：否则窗口隐藏后再也唤不回来，
-            // 进程会变成只能从任务管理器结束的幽灵进程。
-            exit_on_close_request: !tray_ok,
-            icon: iced::window::icon::from_rgba(icon_rgba, w, h).ok(),
-            ..Default::default()
-        })
-        .run();
+    let result = iced::application(
+        move || {
+            let cfg = config::Config::load();
+            REVERSE_ENABLED.store(
+                if cfg.reverse_enabled != 0 { 1 } else { 0 },
+                Ordering::Release,
+            );
+            let now = Instant::now();
+            let state = AppState {
+                ip_input: cfg.listen_ip.clone(),
+                port_input: cfg.listen_port.to_string(),
+                port_valid: true,
+                is_running: false,
+                connected: false,
+                last_bitrate: 0.0,
+                last_level_db: -60.0,
+                status_text: String::new(),
+                notice: startup_notice.clone(),
+                notice_level: if firewall_warning.is_some() || !tray_ok {
+                    NoticeLevel::Error
+                } else {
+                    NoticeLevel::Info
+                },
+                vb_cable_installed: audio::detect_vb_cable().is_some(),
+                reverse_audio: false,
+                reverse_enabled: cfg.reverse_enabled != 0,
+                config: cfg,
+                last_toggle_instant: now,
+                last_stats_log: now,
+                session_id: 0,
+            };
+            (state, Task::none())
+        },
+        AppState::update,
+        AppState::view,
+    )
+    .title("UDP2CAL")
+    .subscription(AppState::subscription)
+    .default_font(iced::Font::with_name("Microsoft YaHei"))
+    .theme(Theme::Dark)
+    .window(iced::window::Settings {
+        // ⚠ 此尺寸是精心设计的视觉尺寸，请勿修改。
+        // 320×290 客户区 + 1px 边框 + 标题栏，成品窗口恰好是 322×322 的完美正方形；
+        // 任何改动都会破坏这个正方形比例。
+        size: iced::Size::new(320.0, 290.0),
+        position: iced::window::Position::Centered,
+        resizable: false,
+        // 托盘不可用时必须让 X 真正退出：否则窗口隐藏后再也唤不回来，
+        // 进程会变成只能从任务管理器结束的幽灵进程。
+        exit_on_close_request: !tray_ok,
+        icon: iced::window::icon::from_rgba(icon_rgba, w, h).ok(),
+        ..Default::default()
+    })
+    .run();
 
     drop(tray_icon);
     result
-} 
+}
 
 /// 诊断数值缩写：12345 → "12.3k"，2_000_000 → "2.0M"
 fn short_num(n: u64) -> String {
@@ -987,113 +1030,122 @@ fn short_num(n: u64) -> String {
     }
 }
 
-impl AppState { 
-    fn update(&mut self, message: Message) -> Task<Message> { 
-        match message { 
-            Message::IpChanged(s) => { 
-                self.ip_input = s; 
-                Task::none() 
-            } 
-            Message::PortChanged(s) => { 
-                self.port_input = s; 
-                self.port_valid = self.port_input.parse::<u16>().is_ok() || self.port_input.is_empty(); 
-                Task::none() 
-            } 
-            Message::ToggleAutoStart(enabled) => { 
+impl AppState {
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::IpChanged(s) => {
+                self.ip_input = s;
+                Task::none()
+            }
+            Message::PortChanged(s) => {
+                self.port_input = s;
+                self.port_valid =
+                    self.port_input.parse::<u16>().is_ok() || self.port_input.is_empty();
+                Task::none()
+            }
+            Message::ToggleAutoStart(enabled) => {
                 // 写入失败必须回滚开关并告知用户，避免"开关假亮"
-                match self.config.set_auto_start(enabled) { 
-                    Ok(()) => { 
-                        let _ = self.config.save(); 
-                        self.notice.clear(); 
-                    } 
-                    Err(e) => { 
-                        self.notice = e; 
+                match self.config.set_auto_start(enabled) {
+                    Ok(()) => {
+                        let _ = self.config.save();
+                        self.notice.clear();
+                    }
+                    Err(e) => {
+                        self.notice = e;
                         self.notice_level = NoticeLevel::Error;
-                    } 
-                } 
-                Task::none() 
-            } 
+                    }
+                }
+                Task::none()
+            }
             Message::ToggleReverse(enabled) => {
                 // 运行中不可更改
-                if self.is_running { return Task::none(); }
+                if self.is_running {
+                    return Task::none();
+                }
                 self.reverse_enabled = enabled;
                 REVERSE_ENABLED.store(if enabled { 1 } else { 0 }, Ordering::Release);
                 self.config.set_reverse_enabled(enabled);
                 let _ = self.config.save();
                 Task::none()
             }
-            Message::ToggleRunning => { 
-                if self.last_toggle_instant.elapsed() < Duration::from_millis(200) { 
-                    return Task::none(); 
-                } 
-                self.last_toggle_instant = Instant::now(); 
-                self.session_id = self.session_id.wrapping_add(1); 
+            Message::ToggleRunning => {
+                if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
+                    return Task::none();
+                }
+                self.last_toggle_instant = Instant::now();
+                self.session_id = self.session_id.wrapping_add(1);
 
-                if self.is_running { 
+                if self.is_running {
                     APP_RUNNING.store(0, Ordering::Release);
                     REVERSE_ENABLED.store(0, Ordering::Release);
                     reset_to_ready();
-                    self.is_running = false; 
-                    self.connected = false; 
-                    self.reverse_audio = false; 
-                    self.last_bitrate = 0.0; 
-                    self.last_level_db = -60.0; 
-                    self.status_text.clear(); 
+                    self.is_running = false;
+                    self.connected = false;
+                    self.reverse_audio = false;
+                    self.last_bitrate = 0.0;
+                    self.last_level_db = -60.0;
+                    self.status_text.clear();
                     self.notice.clear();
-                } else { 
-                    let port: u16 = match self.port_input.parse() { 
-                        Ok(p) => p, 
-                        Err(_) => { 
-                            self.notice = "端口号无效，请输入 1-65535".into(); 
+                } else {
+                    let port: u16 = match self.port_input.parse() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.notice = "端口号无效，请输入 1-65535".into();
                             self.notice_level = NoticeLevel::Error;
-                            return Task::none(); 
-                        } 
-                    }; 
-                    if port == 0 { 
-                        self.notice = "端口号不能为 0".into(); 
+                            return Task::none();
+                        }
+                    };
+                    if port == 0 {
+                        self.notice = "端口号不能为 0".into();
                         self.notice_level = NoticeLevel::Error;
-                        return Task::none(); 
-                    } 
+                        return Task::none();
+                    }
                     // 监听地址必须是本机地址；空/非法值会让 bind 直接失败
                     let ip = self.ip_input.trim().to_string();
-                    if ip.is_empty() { 
-                        self.notice = "监听地址不能为空".into(); 
+                    if ip.is_empty() {
+                        self.notice = "监听地址不能为空".into();
                         self.notice_level = NoticeLevel::Error;
-                        return Task::none(); 
-                    } 
-                    if ip.parse::<std::net::IpAddr>().is_err() && ip != "localhost" { 
-                        self.notice = format!("监听地址「{ip}」不是合法的 IP"); 
+                        return Task::none();
+                    }
+                    if ip.parse::<std::net::IpAddr>().is_err() && ip != "localhost" {
+                        self.notice = format!("监听地址「{ip}」不是合法的 IP");
                         self.notice_level = NoticeLevel::Error;
-                        return Task::none(); 
-                    } 
+                        return Task::none();
+                    }
 
-                    self.config.listen_ip = ip; 
-                    self.config.listen_port = port as u32; 
-                    let _ = self.config.save(); 
+                    self.config.listen_ip = ip;
+                    self.config.listen_port = port as u32;
+                    let _ = self.config.save();
                     LISTEN_PORT.store(port as u32, Ordering::Release);
 
                     // 上次音频初始化失败过则重试一次（例如用户刚装好 VB-Cable）
-                    if matches!(AudioInitState::load(), AudioInitState::DecoderFailed | AudioInitState::DeviceFailed) { 
-                        init_audio_worker(); 
-                    } 
+                    if matches!(
+                        AudioInitState::load(),
+                        AudioInitState::DecoderFailed | AudioInitState::DeviceFailed
+                    ) {
+                        init_audio_worker();
+                    }
                     // 端口可能在本次会话中改过，补齐防火墙规则
-                    std::thread::spawn(move || { let _ = firewall::add_firewall_rule(port); });
+                    std::thread::spawn(move || {
+                        let _ = firewall::add_firewall_rule(port);
+                    });
 
                     APP_RUNNING.store(1, Ordering::Release);
                     reset_to_ready();
-                    self.is_running = true; 
-                    self.connected = false; 
-                    self.last_bitrate = 0.0; 
-                    self.last_level_db = -60.0; 
-                    self.status_text = "等待连接...".into(); 
+                    self.is_running = true;
+                    self.connected = false;
+                    self.last_bitrate = 0.0;
+                    self.last_level_db = -60.0;
+                    self.status_text = "等待连接...".into();
                     self.notice.clear();
-                    self.vb_cable_installed = audio::detect_vb_cable().is_some(); 
+                    self.vb_cable_installed = audio::detect_vb_cable().is_some();
                     // 应用反向串流设置到全局
-                    REVERSE_ENABLED.store(if self.reverse_enabled { 1 } else { 0 }, Ordering::Release);
-                } 
-                Task::none() 
-            } 
-            Message::StatusUpdate(info) => { 
+                    REVERSE_ENABLED
+                        .store(if self.reverse_enabled { 1 } else { 0 }, Ordering::Release);
+                }
+                Task::none()
+            }
+            Message::StatusUpdate(info) => {
                 // 「已连接」= 控制面绑定存在。规范 6.4 明确保活只看控制面，
                 // 不得用"是否收到 RTP"判断存活；历史实现只在 bitrate>0 时置真、
                 // 从不置假，导致 RTP 停止后码率归零而界面仍显示已连接。
@@ -1110,8 +1162,8 @@ impl AppState {
                         self.status_text = "已断开".into();
                     }
                 }
-                self.last_bitrate = info.bitrate_kbps; 
-                self.last_level_db = info.level_db; 
+                self.last_bitrate = info.bitrate_kbps;
+                self.last_level_db = info.level_db;
                 // 诊断：每 30s 落一次盘（音频计数器 + RTP/抖动缓冲计数器）
                 if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
                     self.last_stats_log = Instant::now();
@@ -1123,7 +1175,10 @@ impl AppState {
                     let peer = p2p_snapshot();
                     logf!(
                         "[Audio] 统计 块={} 重采样={} 丢样={} 欠载={}",
-                        s.writes, s.resampled, s.dropped, s.underrun
+                        s.writes,
+                        s.resampled,
+                        s.dropped,
+                        s.underrun
                     );
                     logf!(
                         "[Audio] 延迟≈{}ms（含声卡 {}ms）比率微调 {:+.3}%",
@@ -1155,17 +1210,17 @@ impl AppState {
                         s[12] / 2 * 10 / 480
                     );
                 }
-                Task::none() 
-            } 
-            Message::Disconnected => { 
-                if self.is_running && self.connected { 
-                    self.connected = false; 
-                    self.last_bitrate = 0.0; 
-                    self.last_level_db = -60.0; 
+                Task::none()
+            }
+            Message::Disconnected => {
+                if self.is_running && self.connected {
+                    self.connected = false;
+                    self.last_bitrate = 0.0;
+                    self.last_level_db = -60.0;
                     // 只更新顶部状态点（● 已断开），底部提示行不再重复同一信息
-                    self.status_text = "已断开".into(); 
-                } 
-                Task::none() 
+                    self.status_text = "已断开".into();
+                }
+                Task::none()
             }
             Message::EngineError(msg) => {
                 // 引擎级失败：必须回到停止态，否则界面会一直"假运行"
@@ -1185,19 +1240,15 @@ impl AppState {
             Message::HideWindow => {
                 latest_window_task(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
             }
-            Message::ShowWindow => {
-                latest_window_task(|id| {
-                    Task::batch([
-                        iced::window::set_mode(id, iced::window::Mode::Windowed),
-                        iced::window::gain_focus(id),
-                    ])
-                })
-            }
-            Message::Quit => { 
-                iced::exit()
-            } 
-        } 
-    } 
+            Message::ShowWindow => latest_window_task(|id| {
+                Task::batch([
+                    iced::window::set_mode(id, iced::window::Mode::Windowed),
+                    iced::window::gain_focus(id),
+                ])
+            }),
+            Message::Quit => iced::exit(),
+        }
+    }
 
     /// 状态点文字：靠 `status_text` 区分"已断开"与"等待连接"。
     /// 这里只影响显示，不再参与配色判定。
@@ -1205,22 +1256,28 @@ impl AppState {
         self.status_text.contains("断开")
     }
 
+    fn view(&self) -> Element<'_, Message> {
+        let bg = Color::from_rgb(0.08, 0.08, 0.10);
+        let card_bg = Color::from_rgb(0.13, 0.13, 0.16);
+        let border_color = Color::from_rgb(0.20, 0.20, 0.25);
+        let accent = Color::from_rgb(0.0, 0.80, 0.45);
+        let red = Color::from_rgb(0.95, 0.25, 0.30);
+        let grey = Color::from_rgb(0.40, 0.40, 0.45);
+        let dim = Color::from_rgb(0.55, 0.55, 0.60);
 
-    fn view(&self) -> Element<'_, Message> { 
-        let bg = Color::from_rgb(0.08, 0.08, 0.10); 
-        let card_bg = Color::from_rgb(0.13, 0.13, 0.16); 
-        let border_color = Color::from_rgb(0.20, 0.20, 0.25); 
-        let accent = Color::from_rgb(0.0, 0.80, 0.45); 
-        let red = Color::from_rgb(0.95, 0.25, 0.30); 
-        let grey = Color::from_rgb(0.40, 0.40, 0.45); 
-        let dim = Color::from_rgb(0.55, 0.55, 0.60); 
-
-        let (sc, st) = if !self.is_running { 
-            (grey, "● 已停止") 
-        } else if self.connected { 
-            (accent, "● 已连接") 
-        } else { 
-            (red, if self.status_is_disconnected() { "● 已断开" } else { "● 等待连接" }) 
+        let (sc, st) = if !self.is_running {
+            (grey, "● 已停止")
+        } else if self.connected {
+            (accent, "● 已连接")
+        } else {
+            (
+                red,
+                if self.status_is_disconnected() {
+                    "● 已断开"
+                } else {
+                    "● 等待连接"
+                },
+            )
         };
 
         // P2P 状态: TYPE_CONNECT 独占绑定 / 空闲
@@ -1234,8 +1291,16 @@ impl AppState {
             ("● 空闲".to_string(), accent)
         };
 
-        let vb_str = if self.vb_cable_installed { "● VB-Cable" } else { "● VB-Cable 未安装" };
-        let vb_color = if self.vb_cable_installed { Color::from_rgb(0.25, 0.80, 0.40) } else { Color::from_rgb(0.90, 0.55, 0.15) };
+        let vb_str = if self.vb_cable_installed {
+            "● VB-Cable"
+        } else {
+            "● VB-Cable 未安装"
+        };
+        let vb_color = if self.vb_cable_installed {
+            Color::from_rgb(0.25, 0.80, 0.40)
+        } else {
+            Color::from_rgb(0.90, 0.55, 0.15)
+        };
 
         // ── 底部状态行（永远只占一行，三种状态互斥）──
         //   未启动        → 广播地址
@@ -1258,7 +1323,10 @@ impl AppState {
             (String::new(), dim)
         } else if self.connected {
             if self.reverse_enabled {
-                ("● 反向串流已启用".to_string(), Color::from_rgb(0.25, 0.80, 0.40))
+                (
+                    "● 反向串流已启用".to_string(),
+                    Color::from_rgb(0.25, 0.80, 0.40),
+                )
             } else {
                 ("○ 反向串流未启用".to_string(), dim)
             }
@@ -1271,45 +1339,52 @@ impl AppState {
             }
         };
 
-        let mk = |label: &'static str, color: Color, msg: Message| { 
-            button(text(label).size(16)) 
-                .on_press(msg) 
-                .width(Length::Fill) 
-                .height(34) 
-                .style(move |_, status| { 
-                    let mut bg_color = color; 
-                    match status { 
-                        iced::widget::button::Status::Hovered => { 
-                            bg_color = Color::from_rgb( 
-                                (color.r + 0.06).min(1.0), 
-                                (color.g + 0.06).min(1.0), 
-                                (color.b + 0.06).min(1.0), 
-                            ); 
-                        } 
-                        iced::widget::button::Status::Pressed => { 
-                            bg_color = Color::from_rgb( 
-                                (color.r - 0.06).max(0.0), 
-                                (color.g - 0.06).max(0.0), 
-                                (color.b - 0.06).max(0.0), 
-                            ); 
-                        } 
-                        _ => {} 
-                    } 
-                    iced::widget::button::Style { 
-                        background: Some(iced::Background::Color(bg_color)), 
-                        text_color: Color::WHITE, 
-                        border: iced::Border { radius: 6.0.into(), ..Default::default() }, 
-                        shadow: Default::default(), 
-                        snap: true, 
-                    } 
-                }) 
-        }; 
+        let mk = |label: &'static str, color: Color, msg: Message| {
+            button(text(label).size(16))
+                .on_press(msg)
+                .width(Length::Fill)
+                .height(34)
+                .style(move |_, status| {
+                    let mut bg_color = color;
+                    match status {
+                        iced::widget::button::Status::Hovered => {
+                            bg_color = Color::from_rgb(
+                                (color.r + 0.06).min(1.0),
+                                (color.g + 0.06).min(1.0),
+                                (color.b + 0.06).min(1.0),
+                            );
+                        }
+                        iced::widget::button::Status::Pressed => {
+                            bg_color = Color::from_rgb(
+                                (color.r - 0.06).max(0.0),
+                                (color.g - 0.06).max(0.0),
+                                (color.b - 0.06).max(0.0),
+                            );
+                        }
+                        _ => {}
+                    }
+                    iced::widget::button::Style {
+                        background: Some(iced::Background::Color(bg_color)),
+                        text_color: Color::WHITE,
+                        border: iced::Border {
+                            radius: 6.0.into(),
+                            ..Default::default()
+                        },
+                        shadow: Default::default(),
+                        snap: true,
+                    }
+                })
+        };
 
-        let btn_c = if self.is_running { red } else { accent }; 
-        let auto_c = if self.config.is_auto_start() { accent } else { grey }; 
+        let btn_c = if self.is_running { red } else { accent };
+        let auto_c = if self.config.is_auto_start() {
+            accent
+        } else {
+            grey
+        };
 
-        let db = self.last_level_db.clamp(-60.0, 0.0); 
-        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0); 
+        let db = self.last_level_db.clamp(-60.0, 0.0);
+        let frac = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
 
         // 提示行：错误红色、普通信息蓝灰（级别由写入方显式声明）。
         // 无提示时整块只有 6px 间隔：320×290 的方形窗口容不下常驻空行。
@@ -1318,123 +1393,167 @@ impl AppState {
         } else {
             column![
                 Space::new().height(6),
-                text(self.notice.clone())
-                    .size(11)
-                    .color(if self.notice_level == NoticeLevel::Error { red } else { Color::from_rgb(0.62, 0.70, 0.78) }),
+                text(self.notice.clone()).size(11).color(
+                    if self.notice_level == NoticeLevel::Error {
+                        red
+                    } else {
+                        Color::from_rgb(0.62, 0.70, 0.78)
+                    }
+                ),
                 Space::new().height(6),
             ]
             .into()
         };
 
-        container( 
-            column![ 
-                row![ 
-                    text("ENJOY ME").size(20), 
-                    Space::new().width(Length::Fill), 
+        container(
+            column![
+                row![
+                    text("ENJOY ME").size(20),
+                    Space::new().width(Length::Fill),
                     text(st).color(sc).size(11),
                     Space::new().width(8),
                     text(vb_str).size(11).color(vb_color),
                     Space::new().width(8),
                     text(p2p_state).size(11).color(p2p_color),
-                ] 
-                .align_y(Alignment::Center), 
-                Space::new().height(8.0), 
-                container(
-                    column![
-                        text(if self.is_running { "监听端口" } else { "目标地址" }).size(14).color(dim),
-                        Space::new().height(4),
-                        if self.is_running {
-                            let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
-                            row![text(addr).size(14).color(Color::WHITE)]
-                                .height(32).align_y(Alignment::Center)
-                        } else {
-                            // 与运行态分支的 .height(32) 对齐：
-                            // text_input 的固有高度 = 字号16 × 行高1.3 + padding(5+5) = 30.8px，
-                            // 不锁高的话启停切换时这张卡片会有 1.2px 的高度跳变，把下面整列推开。
-                            row![
-                                text_input("0.0.0.0", &self.ip_input)
-                                    .on_input(Message::IpChanged)
-                                    .width(148)
-                                    .padding([5, 8])
-                                    .style(move |_, status| {
-                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status);
-                                        iced::widget::text_input::Style {
-                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
-                                            border: iced::Border { radius: 5.0.into(), color: Color::from_rgb(0.25, 0.25, 0.30), width: 1.0 },
-                                            ..base
-                                        }
-                                    }),
-                                text(" : ").size(16).color(dim),
-                                text_input("44044", &self.port_input)
-                                    .on_input(Message::PortChanged)
-                                    .width(68)
-                                    .padding([5, 8])
-                                    .style(move |_, status| {
-                                        let base = iced::widget::text_input::default(&iced::theme::Theme::Dark, status);
-                                        iced::widget::text_input::Style {
-                                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
-                                            border: iced::Border {
-                                                radius: 5.0.into(),
-                                                color: if self.port_valid { Color::from_rgb(0.25, 0.25, 0.30) } else { red },
-                                                width: 1.0
+                ]
+                .align_y(Alignment::Center),
+                Space::new().height(8.0),
+                container(column![
+                    text(if self.is_running {
+                        "监听端口"
+                    } else {
+                        "目标地址"
+                    })
+                    .size(14)
+                    .color(dim),
+                    Space::new().height(4),
+                    if self.is_running {
+                        let addr = format!("{}:{}", self.config.listen_ip, self.config.listen_port);
+                        row![text(addr).size(14).color(Color::WHITE)]
+                            .height(32)
+                            .align_y(Alignment::Center)
+                    } else {
+                        // 与运行态分支的 .height(32) 对齐：
+                        // text_input 的固有高度 = 字号16 × 行高1.3 + padding(5+5) = 30.8px，
+                        // 不锁高的话启停切换时这张卡片会有 1.2px 的高度跳变，把下面整列推开。
+                        row![
+                            text_input("0.0.0.0", &self.ip_input)
+                                .on_input(Message::IpChanged)
+                                .width(148)
+                                .padding([5, 8])
+                                .style(move |_, status| {
+                                    let base = iced::widget::text_input::default(
+                                        &iced::theme::Theme::Dark,
+                                        status,
+                                    );
+                                    iced::widget::text_input::Style {
+                                        background: iced::Background::Color(Color::from_rgb(
+                                            0.18, 0.18, 0.22,
+                                        )),
+                                        border: iced::Border {
+                                            radius: 5.0.into(),
+                                            color: Color::from_rgb(0.25, 0.25, 0.30),
+                                            width: 1.0,
+                                        },
+                                        ..base
+                                    }
+                                }),
+                            text(" : ").size(16).color(dim),
+                            text_input("44044", &self.port_input)
+                                .on_input(Message::PortChanged)
+                                .width(68)
+                                .padding([5, 8])
+                                .style(move |_, status| {
+                                    let base = iced::widget::text_input::default(
+                                        &iced::theme::Theme::Dark,
+                                        status,
+                                    );
+                                    iced::widget::text_input::Style {
+                                        background: iced::Background::Color(Color::from_rgb(
+                                            0.18, 0.18, 0.22,
+                                        )),
+                                        border: iced::Border {
+                                            radius: 5.0.into(),
+                                            color: if self.port_valid {
+                                                Color::from_rgb(0.25, 0.25, 0.30)
+                                            } else {
+                                                red
                                             },
-                                            ..base
-                                        }
-                                    }),
-                            ].height(32).align_y(Alignment::Center)
-                        },
-                    ]
-                )
+                                            width: 1.0,
+                                        },
+                                        ..base
+                                    }
+                                }),
+                        ]
+                        .height(32)
+                        .align_y(Alignment::Center)
+                    },
+                ])
                 .padding(10)
                 .width(Length::Fill)
                 .style(move |_| container::Style {
                     background: Some(iced::Background::Color(card_bg)),
-                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 },
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        color: border_color,
+                        width: 1.0
+                    },
                     ..Default::default()
                 }),
                 Space::new().height(8.0),
-                container(
-                    column![
-                        row![
-                            column![
-                                text("码率").size(12).color(dim),
-                                Space::new().height(2),
-                                row![
-                                    text(format!("{:.0}", self.last_bitrate as u32)).size(22),
-                                    Space::new().width(3),
-                                    text("kbps").size(11).color(dim)
-                                ].align_y(Alignment::End)
-                            ].width(Length::FillPortion(1)),
-                            column![
-                                text("电平").size(12).color(dim),
-                                Space::new().height(2),
-                                row![
-                                    text(format!("{:.0}", self.last_level_db as i32)).size(22),
-                                    Space::new().width(3),
-                                    text("dB").size(11).color(dim)
-                                ].align_y(Alignment::End)
-                            ].width(Length::FillPortion(1)),
-                        ],
-                        Space::new().height(6),
-                        progress_bar(0.0..=1.0, frac)
-                            .girth(3)
-                            .style(move |_| {
-                                let bar_color = if db > -10.0 { red }
-                                else if db > -25.0 { Color::from_rgb(0.90, 0.55, 0.15) }
-                                else { accent };
-                                iced::widget::progress_bar::Style {
-                                    background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
-                                    bar: iced::Background::Color(bar_color),
-                                    border: iced::Border { radius: 2.0.into(), ..Default::default() },
-                                }
-                            }),
-                    ]
-                )
+                container(column![
+                    row![
+                        column![
+                            text("码率").size(12).color(dim),
+                            Space::new().height(2),
+                            row![
+                                text(format!("{:.0}", self.last_bitrate as u32)).size(22),
+                                Space::new().width(3),
+                                text("kbps").size(11).color(dim)
+                            ]
+                            .align_y(Alignment::End)
+                        ]
+                        .width(Length::FillPortion(1)),
+                        column![
+                            text("电平").size(12).color(dim),
+                            Space::new().height(2),
+                            row![
+                                text(format!("{:.0}", self.last_level_db as i32)).size(22),
+                                Space::new().width(3),
+                                text("dB").size(11).color(dim)
+                            ]
+                            .align_y(Alignment::End)
+                        ]
+                        .width(Length::FillPortion(1)),
+                    ],
+                    Space::new().height(6),
+                    progress_bar(0.0..=1.0, frac).girth(3).style(move |_| {
+                        let bar_color = if db > -10.0 {
+                            red
+                        } else if db > -25.0 {
+                            Color::from_rgb(0.90, 0.55, 0.15)
+                        } else {
+                            accent
+                        };
+                        iced::widget::progress_bar::Style {
+                            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
+                            bar: iced::Background::Color(bar_color),
+                            border: iced::Border {
+                                radius: 2.0.into(),
+                                ..Default::default()
+                            },
+                        }
+                    }),
+                ])
                 .padding(10)
                 .width(Length::Fill)
                 .style(move |_| container::Style {
                     background: Some(iced::Background::Color(card_bg)),
-                    border: iced::Border { radius: 8.0.into(), color: border_color, width: 1.0 },
+                    border: iced::Border {
+                        radius: 8.0.into(),
+                        color: border_color,
+                        width: 1.0
+                    },
                     ..Default::default()
                 }),
                 Space::new().height(15),
@@ -1443,13 +1562,15 @@ impl AppState {
                         if self.is_running { "停止" } else { "启动" },
                         btn_c,
                         Message::ToggleRunning,
-                    ).width(Length::FillPortion(1)),
+                    )
+                    .width(Length::FillPortion(1)),
                     Space::new().width(8),
                     mk(
                         "开机自启",
                         auto_c,
                         Message::ToggleAutoStart(!self.config.is_auto_start()),
-                    ).width(Length::FillPortion(1)),
+                    )
+                    .width(Length::FillPortion(1)),
                     Space::new().width(8),
                     if self.is_running {
                         let rev_on = self.reverse_enabled;
@@ -1463,14 +1584,19 @@ impl AppState {
                                     Color::from_rgb(0.15, 0.15, 0.18)
                                 })),
                                 text_color: if rev_on { accent } else { dim },
-                                border: iced::Border { radius: 6.0.into(), ..Default::default() },
+                                border: iced::Border {
+                                    radius: 6.0.into(),
+                                    ..Default::default()
+                                },
                                 shadow: Default::default(),
                                 snap: true,
                             })
                     } else {
-                        mk("反向串流",
-                           if self.reverse_enabled { accent } else { grey },
-                           Message::ToggleReverse(!self.reverse_enabled))
+                        mk(
+                            "反向串流",
+                            if self.reverse_enabled { accent } else { grey },
+                            Message::ToggleReverse(!self.reverse_enabled),
+                        )
                     },
                 ],
                 // ── 提示行：只承载错误与警告（连接状态由顶部状态点负责）──
@@ -1492,37 +1618,37 @@ impl AppState {
             ..Default::default()
         })
         .into()
-    } 
+    }
 
-    fn subscription(&self) -> Subscription<Message> { 
-        let close_events = iced::event::listen_with(|event, _status, _id| { 
-            if let iced::Event::Window(window_event) = event { 
-                if matches!(window_event, iced::window::Event::CloseRequested) { 
-                    Some(Message::HideWindow) 
-                } else { 
-                    None 
-                } 
-            } else { 
-                None 
-            } 
-        }); 
+    fn subscription(&self) -> Subscription<Message> {
+        let close_events = iced::event::listen_with(|event, _status, _id| {
+            if let iced::Event::Window(window_event) = event {
+                if matches!(window_event, iced::window::Event::CloseRequested) {
+                    Some(Message::HideWindow)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
 
         let mut subs = vec![
             close_events,
             Subscription::run_with((), |_| tray_event_stream()),
         ];
 
-        if self.is_running { 
-            let ip = self.config.listen_ip.clone(); 
-            let port = self.config.listen_port; 
-            subs.push(
-                Subscription::run_with((ip, port), |data| udp_receiver_stream(data.0.clone(), data.1))
-            );
+        if self.is_running {
+            let ip = self.config.listen_ip.clone();
+            let port = self.config.listen_port;
+            subs.push(Subscription::run_with((ip, port), |data| {
+                udp_receiver_stream(data.0.clone(), data.1)
+            }));
         }
 
         Subscription::batch(subs)
     }
-} 
+}
 
 fn latest_window_task<F>(mut operation: F) -> Task<Message>
 where
@@ -1664,7 +1790,7 @@ fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
                     break;
                 }
             }
-        }
+        },
     )
 }
 
@@ -1876,144 +2002,155 @@ fn check_peer_timeout() -> bool {
     }
 }
 
-fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(64, move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-        let bind_addr = format!("{}:{}", listen_ip, listen_port);
-        let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = output
-                    .send(Message::EngineError(format!(
-                        "监听 {bind_addr} 失败：{}（端口可能被占用）",
-                        e.kind()
-                    )))
-                    .await;
-                return;
-            }
-        };
-
-        // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
-        let mut retries = 60;
-        while AudioInitState::load() == AudioInitState::Pending && retries > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            retries -= 1;
-        }
-
-        match AudioInitState::load() {
-            AudioInitState::DecoderFailed => {
-                let _ = output
-                    .send(Message::EngineError("Opus 解码器初始化失败".into()))
-                    .await;
-                return;
-            }
-            AudioInitState::DeviceFailed => {
-                let _ = output
-                    .send(Message::EngineError(
-                        "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into(),
-                    ))
-                    .await;
-                return;
-            }
-            _ => {}
-        }
-
-        reset_to_ready();
-        wake_decoder();
-
-        let mut buf = vec![0u8; 2048];
-        let mut last_stats = Instant::now();
-        let mut last_liveness = Instant::now();
-        let mut byte_count: u64 = 0;
-        let mut packet_count: u64 = 0;
-
-        loop {
-            // 控制面保活检查必须**与流量无关**地周期性执行（规范 6.4：保活只看
-            // 控制面，不得用"是否收到 RTP"判断连接存活）。历史实现把它放在
-            // recv 超时分支里：只要 RTP 持续到达，检查就永不执行，绑定永不释放。
-            if last_liveness.elapsed() >= Duration::from_millis(100) {
-                last_liveness = Instant::now();
-                if check_peer_timeout() {
-                    let _ = output.send(Message::Disconnected).await;
+fn udp_receiver_stream(
+    listen_ip: String,
+    listen_port: u32,
+) -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        64,
+        move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let bind_addr = format!("{}:{}", listen_ip, listen_port);
+            let socket = match tokio::net::UdpSocket::bind(&bind_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = output
+                        .send(Message::EngineError(format!(
+                            "监听 {bind_addr} 失败：{}（端口可能被占用）",
+                            e.kind()
+                        )))
+                        .await;
+                    return;
                 }
-            }
-
-            let recv = tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
-
-            let (len, src) = match recv {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    // Windows 上 UDP socket 会把上一次 send_to 收到的 ICMP 端口不可达
-                    // 回灌成一次 WSAECONNRESET。这类错误不是致命的，但绝对不能
-                    // 立刻重试——那会变成 100% CPU 的忙等。睡 10 ms 退避。
-                    if should_log_control_reject() {
-                        logf!("[UDP] recv_from 失败：{e}");
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                // 超时：下一轮继续做保活检查
-                Err(_) => continue,
             };
 
-            match protocol::demux(&buf[..len]) {
-                protocol::Datagram::Control(data) => {
-                    if let Some((hdr, payload)) = protocol::parse_control(data) {
-                        handle_control(&hdr, payload, &src, &socket, &mut output).await;
-                    }
-                }
-                protocol::Datagram::Rtp(data) => {
-                    let peer = p2p_snapshot();
-                    // 未绑定 / 源地址不符：一律丢弃（含绑定前后的迟到包）
-                    if !peer.is_busy() || peer.addr != Some(src) {
-                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let Ok(pkt) = protocol::rtp::parse(data) else {
-                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    };
-                    if pkt.ssrc != peer.forward_ssrc {
-                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    // 网络线程只插入，不解码、不阻塞等待播放
-                    let accepted = {
-                        let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
-                        jb.insert(&pkt) != protocol::rtp::InsertResult::Dropped
-                    };
-                    if accepted {
-                        packet_count += 1;
-                        byte_count += len as u64;
-                        RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                        RTP_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                    }
-                    wake_decoder();
-                }
-                protocol::Datagram::Drop => {
-                    RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
-                }
+            // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
+            let mut retries = 60;
+            while AudioInitState::load() == AudioInitState::Pending && retries > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                retries -= 1;
             }
 
-            if last_stats.elapsed() > Duration::from_millis(500) {
-                let elapsed = last_stats.elapsed().as_secs_f32();
-                let kbps = if elapsed > 0.0 {
-                    (byte_count * 8) as f32 / elapsed / 1000.0
-                } else {
-                    0.0
-                };
-                let level_db = f32::from_bits(AUDIO_LEVEL_DB.load(Ordering::Relaxed));
-                if packet_count > 0 {
-                    byte_count = 0;
-                    packet_count = 0;
-                } else {
-                    // 半秒内没有任何 RTP：码率归零（DTX 静音也走这里）
-                    byte_count = 0;
+            match AudioInitState::load() {
+                AudioInitState::DecoderFailed => {
+                    let _ = output
+                        .send(Message::EngineError("Opus 解码器初始化失败".into()))
+                        .await;
+                    return;
                 }
-                last_stats = Instant::now();
-                let _ = output
-                    .send(Message::StatusUpdate(StatusInfo { bitrate_kbps: kbps, level_db }))
-                    .await;
+                AudioInitState::DeviceFailed => {
+                    let _ = output
+                        .send(Message::EngineError(
+                            "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into(),
+                        ))
+                        .await;
+                    return;
+                }
+                _ => {}
             }
-        }
-    })
+
+            reset_to_ready();
+            wake_decoder();
+
+            let mut buf = vec![0u8; 2048];
+            let mut last_stats = Instant::now();
+            let mut last_liveness = Instant::now();
+            let mut byte_count: u64 = 0;
+            let mut packet_count: u64 = 0;
+
+            loop {
+                // 控制面保活检查必须**与流量无关**地周期性执行（规范 6.4：保活只看
+                // 控制面，不得用"是否收到 RTP"判断连接存活）。历史实现把它放在
+                // recv 超时分支里：只要 RTP 持续到达，检查就永不执行，绑定永不释放。
+                if last_liveness.elapsed() >= Duration::from_millis(100) {
+                    last_liveness = Instant::now();
+                    if check_peer_timeout() {
+                        let _ = output.send(Message::Disconnected).await;
+                    }
+                }
+
+                let recv =
+                    tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf))
+                        .await;
+
+                let (len, src) = match recv {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        // Windows 上 UDP socket 会把上一次 send_to 收到的 ICMP 端口不可达
+                        // 回灌成一次 WSAECONNRESET。这类错误不是致命的，但绝对不能
+                        // 立刻重试——那会变成 100% CPU 的忙等。睡 10 ms 退避。
+                        if should_log_control_reject() {
+                            logf!("[UDP] recv_from 失败：{e}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    // 超时：下一轮继续做保活检查
+                    Err(_) => continue,
+                };
+
+                match protocol::demux(&buf[..len]) {
+                    protocol::Datagram::Control(data) => {
+                        if let Some((hdr, payload)) = protocol::parse_control(data) {
+                            handle_control(&hdr, payload, &src, &socket, &mut output).await;
+                        }
+                    }
+                    protocol::Datagram::Rtp(data) => {
+                        let peer = p2p_snapshot();
+                        // 未绑定 / 源地址不符：一律丢弃（含绑定前后的迟到包）
+                        if !peer.is_busy() || peer.addr != Some(src) {
+                            RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let Ok(pkt) = protocol::rtp::parse(data) else {
+                            RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        if pkt.ssrc != peer.forward_ssrc {
+                            RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        // 网络线程只插入，不解码、不阻塞等待播放
+                        let accepted = {
+                            let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                            jb.insert(&pkt) != protocol::rtp::InsertResult::Dropped
+                        };
+                        if accepted {
+                            packet_count += 1;
+                            byte_count += len as u64;
+                            RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
+                            RTP_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                        }
+                        wake_decoder();
+                    }
+                    protocol::Datagram::Drop => {
+                        RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                if last_stats.elapsed() > Duration::from_millis(500) {
+                    let elapsed = last_stats.elapsed().as_secs_f32();
+                    let kbps = if elapsed > 0.0 {
+                        (byte_count * 8) as f32 / elapsed / 1000.0
+                    } else {
+                        0.0
+                    };
+                    let level_db = f32::from_bits(AUDIO_LEVEL_DB.load(Ordering::Relaxed));
+                    if packet_count > 0 {
+                        byte_count = 0;
+                        packet_count = 0;
+                    } else {
+                        // 半秒内没有任何 RTP：码率归零（DTX 静音也走这里）
+                        byte_count = 0;
+                    }
+                    last_stats = Instant::now();
+                    let _ = output
+                        .send(Message::StatusUpdate(StatusInfo {
+                            bitrate_kbps: kbps,
+                            level_db,
+                        }))
+                        .await;
+                }
+            }
+        },
+    )
 }

@@ -51,7 +51,11 @@ impl LogFile {
         if std::fs::rename(&self.path, self.dir.join(ROTATED_NAME)).is_err() {
             return false;
         }
-        match OpenOptions::new().create(true).append(true).open(&self.path) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             Ok(f) => {
                 self.file = f;
                 self.bytes = 0;
@@ -92,7 +96,12 @@ pub fn init() {
         let _ = file.write_all(banner.as_bytes());
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if LOG
-            .set(Mutex::new(LogFile { file, dir: base, path: path.clone(), bytes }))
+            .set(Mutex::new(LogFile {
+                file,
+                dir: base,
+                path: path.clone(),
+                bytes,
+            }))
             .is_ok()
         {
             let _ = LOG_PATH.set(path);

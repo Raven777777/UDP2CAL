@@ -233,7 +233,13 @@ pub struct RtpHeader {
 
 impl RtpHeader {
     pub const fn new(marker: bool, seq: u16, timestamp: u32, ssrc: u32) -> Self {
-        Self { marker, payload_type: OPUS_PAYLOAD_TYPE, seq, timestamp, ssrc }
+        Self {
+            marker,
+            payload_type: OPUS_PAYLOAD_TYPE,
+            seq,
+            timestamp,
+            ssrc,
+        }
     }
 
     /// 写入 12 字节固定头
@@ -313,7 +319,8 @@ pub fn write_packet(
     if dest.len() < total {
         return None;
     }
-    RtpHeader::new(marker, seq, timestamp, ssrc).encode((&mut dest[..RTP_HEADER_SIZE]).try_into().ok()?);
+    RtpHeader::new(marker, seq, timestamp, ssrc)
+        .encode((&mut dest[..RTP_HEADER_SIZE]).try_into().ok()?);
     dest[RTP_HEADER_SIZE..total].copy_from_slice(payload);
     Some(total)
 }
@@ -391,7 +398,12 @@ struct PacketSlot {
     len: u16,
 }
 
-const EMPTY_SLOT: PacketSlot = PacketSlot { valid: false, seq: 0, ts: 0, len: 0 };
+const EMPTY_SLOT: PacketSlot = PacketSlot {
+    valid: false,
+    seq: 0,
+    ts: 0,
+    len: 0,
+};
 
 /// 到达时刻追踪深度：128 × 10 ms ≈ 1.28 s，远大于任何可能的总水位。
 pub const ARRIVAL_TRACE: usize = 128;
@@ -809,28 +821,32 @@ impl JitterBuffer {
     fn store(&mut self, pkt: &RtpPacket<'_>, seq: u64, ts: u64) {
         let len = pkt.payload.len().min(OPUS_MAX_PAYLOAD);
         // 优先找空槽；槽满时覆盖序号最小者（调用方已保证只有一个溢出）
-        let idx = self
-            .slots
-            .iter()
-            .position(|s| !s.valid)
-            .unwrap_or_else(|| {
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.seq)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            });
+        let idx = self.slots.iter().position(|s| !s.valid).unwrap_or_else(|| {
+            self.slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.seq)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
         let base = idx * OPUS_MAX_PAYLOAD;
         self.data[base..base + len].copy_from_slice(&pkt.payload[..len]);
-        self.slots[idx] = PacketSlot { valid: true, seq, ts, len: len as u16 };
+        self.slots[idx] = PacketSlot {
+            valid: true,
+            seq,
+            ts,
+            len: len as u16,
+        };
         // 所有"接纳成功"的路径都汇聚到这里：到达时刻一并落账
         self.note_arrival(ts);
     }
 
     /// 记录一个包的到达时刻（仅诊断用：总延迟估算）
     fn note_arrival(&mut self, ts: u64) {
-        self.arrivals[self.arrival_pos] = Arrival { ts, at: Some(Instant::now()) };
+        self.arrivals[self.arrival_pos] = Arrival {
+            ts,
+            at: Some(Instant::now()),
+        };
         self.arrival_pos = (self.arrival_pos + 1) % ARRIVAL_TRACE;
     }
 
@@ -1075,7 +1091,11 @@ struct RateBucket {
     min_u: f64,
 }
 
-const EMPTY_BUCKET: RateBucket = RateBucket { epoch: u64::MAX, t: 0.0, min_u: f64::INFINITY };
+const EMPTY_BUCKET: RateBucket = RateBucket {
+    epoch: u64::MAX,
+    t: 0.0,
+    min_u: f64::INFINITY,
+};
 
 /// 速率前馈估计器：回归出"发送端的 1 秒有多长"。
 ///
@@ -1158,7 +1178,11 @@ impl RateEstimator {
         let idx = (epoch % RATE_BUCKETS as u64) as usize;
         let b = &mut self.buckets[idx];
         if b.epoch != epoch {
-            *b = RateBucket { epoch, t: (epoch as f64 + 0.5) * bucket_s, min_u: u };
+            *b = RateBucket {
+                epoch,
+                t: (epoch as f64 + 0.5) * bucket_s,
+                min_u: u,
+            };
         } else if u < b.min_u {
             b.min_u = u;
         }
@@ -1558,8 +1582,8 @@ impl DriftController {
         // ── 积分项（权限 ±PI_INTEGRAL_MAX，且抗饱和：输出顶满且误差还在
         //    往同方向顶时冻结）──
         let ki = PI_KP_PER_MS / PI_TI_S;
-        let i_next = (self.integral + ki * diff * (dt_ms / 1000.0))
-            .clamp(-PI_INTEGRAL_MAX, PI_INTEGRAL_MAX);
+        let i_next =
+            (self.integral + ki * diff * (dt_ms / 1000.0)).clamp(-PI_INTEGRAL_MAX, PI_INTEGRAL_MAX);
         let want = p + i_next;
         let saturated = want.abs() >= RESAMPLE_MAX_ADJUST;
         if !saturated || diff * i_next < 0.0 {
@@ -1606,7 +1630,10 @@ mod tests {
         let buf = pkt(0x1234, 0x4B0, true, &[0xF8, 0xFF, 0xFE]);
         assert_eq!(
             buf,
-            [0x80, 0xEF, 0x12, 0x34, 0x00, 0x00, 0x04, 0xB0, 0xDE, 0xAD, 0xBE, 0xEF, 0xF8, 0xFF, 0xFE]
+            [
+                0x80, 0xEF, 0x12, 0x34, 0x00, 0x00, 0x04, 0xB0, 0xDE, 0xAD, 0xBE, 0xEF, 0xF8, 0xFF,
+                0xFE
+            ]
         );
         let p = parse_owned(&buf);
         assert!(p.marker);
@@ -1665,7 +1692,10 @@ mod tests {
         // 1275 字节负载 → 1287 字节包
         let payload = vec![0xA5u8; OPUS_MAX_PAYLOAD];
         let mut buf = vec![0u8; RTP_MAX_PACKET];
-        assert_eq!(write_packet(&mut buf, false, 1, 0, 7, &payload), Some(RTP_MAX_PACKET));
+        assert_eq!(
+            write_packet(&mut buf, false, 1, 0, 7, &payload),
+            Some(RTP_MAX_PACKET)
+        );
         assert_eq!(UDP_IP_MAX_PACKET, 1315);
         assert!(write_packet(&mut buf, false, 1, 0, 7, &vec![0u8; 1276]).is_none());
         assert!(write_packet(&mut buf, false, 1, 0, 7, &[]).is_none());
@@ -1760,7 +1790,7 @@ mod tests {
         insert(&mut jb, 2, 960, false, 22);
         insert(&mut jb, 3, 1440, false, 23);
         assert_eq!(pull_tags(&mut jb, 0, 2), vec![20, 21]); // next_ts = 960
-        // 重复（已在槽里）与迟到（已经播过）
+                                                            // 重复（已在槽里）与迟到（已经播过）
         assert_eq!(insert(&mut jb, 2, 960, false, 99), InsertResult::Dropped);
         assert_eq!(insert(&mut jb, 1, 480, false, 98), InsertResult::Dropped);
         assert_eq!(pull_tags(&mut jb, 0, 2), vec![22, 23]);
@@ -1777,12 +1807,21 @@ mod tests {
         insert(&mut jb, 5, 2400, false, 6);
         insert(&mut jb, 6, 2880, false, 7);
         assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]); // next_ts = 1920
-        // 播放头还停在 0：缺口远未到期 → 等待，不生成 PLC
-        assert_eq!(jb.pull(PLC_LEAD_MS + 10, PLC_LEAD_MS + 10, &mut [0u8; 1275]), Pull::Wait);
+                                                                // 播放头还停在 0：缺口远未到期 → 等待，不生成 PLC
+        assert_eq!(
+            jb.pull(PLC_LEAD_MS + 10, PLC_LEAD_MS + 10, &mut [0u8; 1275]),
+            Pull::Wait
+        );
         // 解码缓冲只剩 20 ms（1920 - 20 ms）→ 缺口到期，PLC
-        assert_eq!(jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]), Pull::Plc { ts: 1920 });
+        assert_eq!(
+            jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]),
+            Pull::Plc { ts: 1920 }
+        );
         // 下一帧是真实包
-        assert_eq!(jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]), Pull::Packet { len: 1, ts: 2400 });
+        assert_eq!(
+            jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]),
+            Pull::Packet { len: 1, ts: 2400 }
+        );
     }
 
     #[test]
@@ -1894,7 +1933,10 @@ mod tests {
         let epoch = jb.epoch;
 
         // 远未来 seq 130 已在窗口之外：丢这一包，**不得**重同步
-        assert_eq!(insert(&mut jb, 130, 480 * 130, false, 130), InsertResult::Dropped);
+        assert_eq!(
+            insert(&mut jb, 130, 480 * 130, false, 130),
+            InsertResult::Dropped
+        );
         assert_eq!(jb.stats.overflow, 1);
         assert_eq!(jb.epoch, epoch, "缓冲不得被整块清空");
         assert_eq!(jb.stats.resyncs, 0);
@@ -1995,7 +2037,10 @@ mod tests {
         for _ in 0..60 {
             dev += 480;
             let u = d.update(300, dev);
-            assert!((u - prev).abs() <= RATIO_SLEW_STEP + 1e-12, "步进过大: {prev} → {u}");
+            assert!(
+                (u - prev).abs() <= RATIO_SLEW_STEP + 1e-12,
+                "步进过大: {prev} → {u}"
+            );
             prev = u;
         }
         assert!(prev > 0.0);
@@ -2031,7 +2076,11 @@ mod tests {
             (mean - WATER_TARGET_MS as f64).abs() < 8.0,
             "稳态水位必须收敛到目标: {mean}"
         );
-        assert!(d.adjust().abs() < 3e-4, "稳态比率必须收敛到零: {}", d.adjust());
+        assert!(
+            d.adjust().abs() < 3e-4,
+            "稳态比率必须收敛到零: {}",
+            d.adjust()
+        );
     }
 
     #[test]
@@ -2194,7 +2243,10 @@ mod tests {
             est.observe(44100 * sec, base + Duration::from_secs(sec));
         }
         let ff = est.feedforward().expect("enough buckets");
-        assert!(ff.abs() < 20e-6, "44.1k nominal must not look like drift: {ff}");
+        assert!(
+            ff.abs() < 20e-6,
+            "44.1k nominal must not look like drift: {ff}"
+        );
     }
 
     #[test]
@@ -2206,7 +2258,10 @@ mod tests {
         }
         assert!(est.feedforward().is_some());
         // 2 s 以上的跳变说明时间线重建：旧窗必须作废
-        est.observe(48000 * 8 + RATE_JUMP_MAX_SAMPLES + 1, base + Duration::from_secs(9));
+        est.observe(
+            48000 * 8 + RATE_JUMP_MAX_SAMPLES + 1,
+            base + Duration::from_secs(9),
+        );
         assert_eq!(est.buckets(), 0);
         assert!(est.feedforward().is_none());
 
@@ -2231,7 +2286,11 @@ mod tests {
             dev += 441;
             d.update(high, dev);
         }
-        assert!(d.adjust() > 0.001, "44.1 kHz 上高水位也必须顶起比率: {}", d.adjust());
+        assert!(
+            d.adjust() > 0.001,
+            "44.1 kHz 上高水位也必须顶起比率: {}",
+            d.adjust()
+        );
         assert!(d.ratio_updates > 1000);
     }
 
@@ -2302,7 +2361,10 @@ mod tests {
         let mut est = RateEstimator::new();
         feed_estimator(&mut est, 40.0, 0.10, 0.0); // 10% 的荒谬钟差
         let ppm = est.feedforward_ppm().expect("必须出估计");
-        assert!(ppm <= RATE_FEEDFORWARD_MAX * 1e6 + 1.0, "前馈未钳位: {ppm} ppm");
+        assert!(
+            ppm <= RATE_FEEDFORWARD_MAX * 1e6 + 1.0,
+            "前馈未钳位: {ppm} ppm"
+        );
     }
 
     #[test]
@@ -2427,7 +2489,11 @@ mod tests {
         let r = insert(&mut jb, (gap as u16).wrapping_add(1), resume_ts, true, 2);
         assert_eq!(r, InsertResult::Resync);
         assert_eq!(jb.next_ts(), resume_ts as u64);
-        assert!(jb.stats.late <= 1, "不得把恢复包判成迟到: {}", jb.stats.late);
+        assert!(
+            jb.stats.late <= 1,
+            "不得把恢复包判成迟到: {}",
+            jb.stats.late
+        );
     }
 
     // ── 调度：单一水位口径 ──
@@ -2439,8 +2505,14 @@ mod tests {
             insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
         }
         // 解码缓冲已达上限：帧就在手上也不生产（这就是"预解码节流"）
-        assert_eq!(jb.pull(DECODE_LIMIT_MS, DECODE_LIMIT_MS, &mut [0u8; 1275]), Pull::Wait);
-        assert_eq!(jb.pull(DECODE_LIMIT_MS + 40, DECODE_LIMIT_MS + 40, &mut [0u8; 1275]), Pull::Wait);
+        assert_eq!(
+            jb.pull(DECODE_LIMIT_MS, DECODE_LIMIT_MS, &mut [0u8; 1275]),
+            Pull::Wait
+        );
+        assert_eq!(
+            jb.pull(DECODE_LIMIT_MS + 40, DECODE_LIMIT_MS + 40, &mut [0u8; 1275]),
+            Pull::Wait
+        );
         // 掉到上限以下才生产
         assert_eq!(
             jb.pull(DECODE_LIMIT_MS - 10, DECODE_LIMIT_MS - 10, &mut [0u8; 1275]),
@@ -2563,8 +2635,15 @@ mod tests {
         assert_eq!(jb.next_seq(), 106);
         assert_eq!(jb.next_ts(), 6720);
         // M=1 且时间戳跳 500 ms：只有真正的断流才重同步，原因必须可读
-        assert_eq!(insert(&mut jb, 102, 6720 + 24_000, true, 9), InsertResult::Resync);
-        assert!(jb.last_rebase_reason.contains("M=1"), "{}", jb.last_rebase_reason);
+        assert_eq!(
+            insert(&mut jb, 102, 6720 + 24_000, true, 9),
+            InsertResult::Resync
+        );
+        assert!(
+            jb.last_rebase_reason.contains("M=1"),
+            "{}",
+            jb.last_rebase_reason
+        );
         // 序号 102 落后于已收的 105，但时间戳是未来：计一次“按时间戳对齐”，
         // 并且它已经进入重同步分支——两者不矛盾。
         assert_eq!(jb.stats.seq_realign, 1);

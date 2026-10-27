@@ -1,4 +1,4 @@
-﻿// 无锁 PCM 环 + cpal 输出回调
+// 无锁 PCM 环 + cpal 输出回调
 //
 // v3 的时钟模型只有一条规则：**声卡是唯一音频时钟**。因此本模块只做四件事：
 //   1. 提供一个无锁 SPSC 环，解码线程写、音频回调读；
@@ -60,7 +60,10 @@ impl Ring {
     /// frames 会自动向上取整到 2 的幂
     fn with_frames(frames: usize) -> Self {
         let cap = frames.max(1024).next_power_of_two();
-        let data = (0..cap).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        let data = (0..cap)
+            .map(|_| AtomicU32::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             data,
             mask: cap - 1,
@@ -491,7 +494,13 @@ fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConf
     }
     configs
         .into_iter()
-        .min_by_key(|c| (rank(c.sample_format()), if c.channels() == 1 { 0 } else { 1 }, c.channels()))
+        .min_by_key(|c| {
+            (
+                rank(c.sample_format()),
+                if c.channels() == 1 { 0 } else { 1 },
+                c.channels(),
+            )
+        })
         .ok_or_else(|| "无有效输出配置".to_string())
 }
 
@@ -585,7 +594,8 @@ where
                 // 永久落后欠载量，抖动缓冲的有效水位被被动抬高，PLC 触发点随之
                 // 推迟，形成"欠载 → 延迟增大 → 更易欠载"的正反馈。
                 if let Some(p) = played.upgrade() {
-                    let total = p.fetch_add(need_frames as u64, Ordering::Release) + need_frames as u64;
+                    let total =
+                        p.fetch_add(need_frames as u64, Ordering::Release) + need_frames as u64;
                     // 与上面的 clock_ns 同属一次回调；前馈只在 1 s 桶里取点，
                     // 两个原子量之间的亚毫秒撕裂不影响斜率。
                     clock_frames.store(total, Ordering::Release);
@@ -623,10 +633,13 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let sample_format = supported_config.sample_format();
     let supported_buffer = *supported_config.buffer_size();
 
-    let mut stream_config: StreamConfig = if supported_config.min_sample_rate() <= cpal::SampleRate(48000)
+    let mut stream_config: StreamConfig = if supported_config.min_sample_rate()
+        <= cpal::SampleRate(48000)
         && supported_config.max_sample_rate() >= cpal::SampleRate(48000)
     {
-        supported_config.with_sample_rate(cpal::SampleRate(48000)).into()
+        supported_config
+            .with_sample_rate(cpal::SampleRate(48000))
+            .into()
     } else {
         supported_config.with_max_sample_rate().into()
     };
@@ -1051,7 +1064,11 @@ mod tests {
         assert_eq!(aw.device_latency_frames(), 480);
         assert_eq!(aw.device_latency_ms(), 10);
         aw.device_latency_us.store(u64::MAX, Ordering::Release);
-        assert_eq!(aw.device_latency_frames(), 48000, "异常时间戳必须被钳到 1 s");
+        assert_eq!(
+            aw.device_latency_frames(),
+            48000,
+            "异常时间戳必须被钳到 1 s"
+        );
     }
 
     #[test]

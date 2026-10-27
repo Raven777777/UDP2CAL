@@ -20,12 +20,13 @@ use crate::protocol::rtp;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
-    MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -88,7 +89,11 @@ impl From<&protocol::ConnectPayload> for OpusReverseConfig {
         Self {
             bitrate_kbps: p.effective_bitrate_kbps(),
             bandwidth: p.bandwidth.min(4),
-            complexity: if p.complexity == 0 { 10 } else { p.complexity.min(protocol::OPUS_COMPLEXITY_MAX) },
+            complexity: if p.complexity == 0 {
+                10
+            } else {
+                p.complexity.min(protocol::OPUS_COMPLEXITY_MAX)
+            },
             signal: p.signal.min(2),
             vbr: p.vbr(),
             dtx: p.dtx(),
@@ -176,8 +181,14 @@ pub fn update_reverse_config(cfg: OpusReverseConfig) {
     if *c != cfg {
         logf!(
             "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
-            cfg.bitrate_kbps, cfg.bandwidth, cfg.complexity, cfg.signal,
-            cfg.vbr, cfg.dtx, cfg.fec, cfg.packet_loss
+            cfg.bitrate_kbps,
+            cfg.bandwidth,
+            cfg.complexity,
+            cfg.signal,
+            cfg.vbr,
+            cfg.dtx,
+            cfg.fec,
+            cfg.packet_loss
         );
         *c = cfg;
     }
@@ -248,7 +259,11 @@ impl ReverseSender {
             logf!("[Reverse] 反向音频线程创建失败");
         }
 
-        ReverseSender { running, alive, thread_handle: handle }
+        ReverseSender {
+            running,
+            alive,
+            thread_handle: handle,
+        }
     }
 
     pub fn is_alive(&self) -> bool {
@@ -383,7 +398,9 @@ impl ReverseSender {
             let wait_ms = if pcm_buf.len() >= FRAME_INTERLEAVED {
                 let now = Instant::now();
                 if next_send_at > now {
-                    (next_send_at - now).as_millis().clamp(1, WAIT_TIMEOUT_MS as u128) as u32
+                    (next_send_at - now)
+                        .as_millis()
+                        .clamp(1, WAIT_TIMEOUT_MS as u128) as u32
                 } else {
                     0
                 }
@@ -451,7 +468,9 @@ impl ReverseSender {
                 }
                 if resampled.len() > MAX_FRAME_BACKLOG {
                     let excess = resampled.len() - MAX_FRAME_BACKLOG;
-                    REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
+                    REVERSE_STATS
+                        .dropped_samples
+                        .fetch_add(excess as u64, Ordering::Relaxed);
                     resampled.drain(..excess);
                     // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当连续
                     timestamp = timestamp.wrapping_add((excess / 2) as u32);
@@ -473,7 +492,9 @@ impl ReverseSender {
             if pcm_buf.len() > MAX_FRAME_BACKLOG {
                 let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
                 pcm_buf.drain(..excess);
-                REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
+                REVERSE_STATS
+                    .dropped_samples
+                    .fetch_add(excess as u64, Ordering::Relaxed);
                 // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC
                 timestamp = timestamp.wrapping_add((excess / 2) as u32);
             }
@@ -521,10 +542,15 @@ impl ReverseSender {
                 // 时间戳每帧推进 480（含 DTX / 丢帧）
                 timestamp = timestamp.wrapping_add(rtp::FRAME_SAMPLES);
                 if len > 0 {
-                    let gap_ms = last_sent.map(|t| t.elapsed().as_millis()).unwrap_or(u128::MAX);
+                    let gap_ms = last_sent
+                        .map(|t| t.elapsed().as_millis())
+                        .unwrap_or(u128::MAX);
                     let ts_start = timestamp.wrapping_sub(rtp::FRAME_SAMPLES);
                     let ts_gap_ms = last_sent_ts
-                        .map(|p| ts_start.wrapping_sub(p) as u64 / (rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64))
+                        .map(|p| {
+                            ts_start.wrapping_sub(p) as u64
+                                / (rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64)
+                        })
                         .unwrap_or(u64::MAX);
                     let marker = first_packet
                         || gap_ms > rtp::RESYNC_GAP_MS as u128
@@ -544,7 +570,9 @@ impl ReverseSender {
                         match sent {
                             Ok(_) => {
                                 REVERSE_STATS.packets.fetch_add(1, Ordering::Relaxed);
-                                REVERSE_STATS.bytes.fetch_add(total as u64, Ordering::Relaxed);
+                                REVERSE_STATS
+                                    .bytes
+                                    .fetch_add(total as u64, Ordering::Relaxed);
                                 last_sent = Some(Instant::now());
                                 last_sent_ts = Some(ts_start);
                                 first_packet = false;
@@ -561,7 +589,6 @@ impl ReverseSender {
                     }
                 }
             }
-
         }
 
         logf!("[Reverse] 反向音频线程退出");
@@ -621,8 +648,16 @@ struct StereoResampler {
 
 impl StereoResampler {
     fn new(src_hz: u32, dst_hz: u32) -> Self {
-        let ratio = if dst_hz == 0 { 1.0 } else { src_hz as f64 / dst_hz as f64 };
-        Self { ratio, phase: 0.0, in_buf: Vec::with_capacity(4_096) }
+        let ratio = if dst_hz == 0 {
+            1.0
+        } else {
+            src_hz as f64 / dst_hz as f64
+        };
+        Self {
+            ratio,
+            phase: 0.0,
+            in_buf: Vec::with_capacity(4_096),
+        }
     }
 
     #[inline]
@@ -779,9 +814,18 @@ impl LoopbackCapture {
                 format.channels,
                 format.kind,
                 format.sample_rate,
-                if event.is_some() { "事件驱动" } else { "轮询" }
+                if event.is_some() {
+                    "事件驱动"
+                } else {
+                    "轮询"
+                }
             );
-            Some(Self { client, capture, format, event })
+            Some(Self {
+                client,
+                capture,
+                format,
+                event,
+            })
         }
     }
 
@@ -848,21 +892,24 @@ impl LoopbackCapture {
 
             match self.format.kind {
                 SampleKind::F32 => {
-                    let src = std::slice::from_raw_parts(data_ptr as *const f32, frame_count * channels);
+                    let src =
+                        std::slice::from_raw_parts(data_ptr as *const f32, frame_count * channels);
                     for f in 0..frame_count {
                         out.push(src[f * channels + c0]);
                         out.push(src[f * channels + c1]);
                     }
                 }
                 SampleKind::I16 => {
-                    let src = std::slice::from_raw_parts(data_ptr as *const i16, frame_count * channels);
+                    let src =
+                        std::slice::from_raw_parts(data_ptr as *const i16, frame_count * channels);
                     for f in 0..frame_count {
                         out.push(src[f * channels + c0] as f32 / 32768.0);
                         out.push(src[f * channels + c1] as f32 / 32768.0);
                     }
                 }
                 SampleKind::I32 => {
-                    let src = std::slice::from_raw_parts(data_ptr as *const i32, frame_count * channels);
+                    let src =
+                        std::slice::from_raw_parts(data_ptr as *const i32, frame_count * channels);
                     for f in 0..frame_count {
                         out.push(src[f * channels + c0] as f32 / 2_147_483_648.0);
                         out.push(src[f * channels + c1] as f32 / 2_147_483_648.0);
@@ -915,7 +962,11 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
         _ => return None,
     };
 
-    Some(CaptureFormat { channels, kind, sample_rate })
+    Some(CaptureFormat {
+        channels,
+        kind,
+        sample_rate,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -970,7 +1021,8 @@ mod tests {
             cbSize: 0,
         };
         // SAFETY: `wf` 是栈上的 WAVEFORMATEX，指针有效且生命周期覆盖调用。
-        let fmt = unsafe { parse_mix_format(&mut wf as *mut WAVEFORMATEX) }.expect("应支持 f32/2ch");
+        let fmt =
+            unsafe { parse_mix_format(&mut wf as *mut WAVEFORMATEX) }.expect("应支持 f32/2ch");
         assert_eq!(fmt.sample_rate, 44_100);
         assert_eq!(fmt.channels, 2);
         assert_eq!(fmt.kind, SampleKind::F32);
@@ -993,9 +1045,23 @@ mod tests {
         assert_eq!(cfg.signal, 2); // 非法值钳制
         assert!(cfg.vbr && cfg.fec && !cfg.dtx);
 
-        let p = protocol::ConnectPayload { bitrate_kbps: 1024, ..protocol::ConnectPayload::default() };
-        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 512, "高于上限必须钳制");
-        let p = protocol::ConnectPayload { bitrate_kbps: 64, ..protocol::ConnectPayload::default() };
-        assert_eq!(OpusReverseConfig::from(&p).bitrate_kbps, 64, "低档位原样透传");
+        let p = protocol::ConnectPayload {
+            bitrate_kbps: 1024,
+            ..protocol::ConnectPayload::default()
+        };
+        assert_eq!(
+            OpusReverseConfig::from(&p).bitrate_kbps,
+            512,
+            "高于上限必须钳制"
+        );
+        let p = protocol::ConnectPayload {
+            bitrate_kbps: 64,
+            ..protocol::ConnectPayload::default()
+        };
+        assert_eq!(
+            OpusReverseConfig::from(&p).bitrate_kbps,
+            64,
+            "低档位原样透传"
+        );
     }
 }
