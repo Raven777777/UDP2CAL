@@ -39,6 +39,8 @@ const DSCP_EF_TOS: u32 = 0xB8;
 
 /// 每声道 480 采样 = 10 ms @ 48 kHz
 const FRAME_MONO: usize = 480;
+/// 48 kHz 采样率下 1 ms 的样本数，仅用于把 lookahead 样本数换成毫秒打印
+const OPUS_SAMPLE_RATE_PER_MS: u32 = 48;
 /// 立体声交错样本数（一帧）
 const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
 /// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
@@ -399,6 +401,18 @@ impl ReverseSender {
         // 启动时下发一次；之后仅在配置变化时下发
         let mut applied = *reverse_config().lock().unwrap_or_else(|e| e.into_inner());
         apply_config(&mut encoder, &applied);
+
+        // Opus 固有前瞻：它无法关掉，也不算在网络/抖动缓冲里，但会真实
+        // 体现在端到端延迟上（目标水位只算抖动缓冲 + 播放缓冲）。启动打一次
+        // 就够，值是编码器参数的函数，不随码率变。
+        match encoder.lookahead() {
+            Ok(samples) => logf!(
+                "[Reverse] Opus lookahead={} 样本（≈{}ms）：这部分延迟不受水位控制",
+                samples,
+                samples / OPUS_SAMPLE_RATE_PER_MS
+            ),
+            Err(e) => logf!("[Reverse] 读取 Opus lookahead 失败: {e:?}"),
+        }
 
         let send_sock = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
