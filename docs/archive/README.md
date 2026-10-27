@@ -15,3 +15,4 @@
 | [CODE_REVIEW_2026-10-23.md](CODE_REVIEW_2026-10-23.md) | 第一轮全量审查（43 项） | 一次性材料 |
 | [CODE_REVIEW_ROUND2_2026-10-23.md](CODE_REVIEW_ROUND2_2026-10-23.md) | 第二轮全量审查（24 项） | 一次性材料 |
 | [CODE_REVIEW_2026-10-25.md](CODE_REVIEW_2026-10-25.md) | 第三轮全量审查（22 项） | 一次性材料；结论已并入 BUGFIX |
+| [CODE_REVIEW_2026-10-28.md](CODE_REVIEW_2026-10-28.md) | 全流程审查（23 项，8 项已修） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |

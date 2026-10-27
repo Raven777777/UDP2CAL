@@ -33,7 +33,8 @@
 | [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟口径（`water_ms`/`pipe_ms`/`audible_ts`）、DMA 缓冲、实测校准、P0 高频诊断与**本环境实测基线** | 排障者、调优 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史与重大变更（按版本倒序） | 全部 |
 | [BUGFIX.md](BUGFIX.md) | **现行代码**的 bug 根因档案 | 全部 |
-| [archive/CONTROL_PLANE_REMEDIATION.md](archive/CONTROL_PLANE_REMEDIATION.md) | 私有控制面 / 网络架构审查快照、首批整改记录与未完成风险 | 追溯
+| [archive/CONTROL_PLANE_REMEDIATION.md](archive/CONTROL_PLANE_REMEDIATION.md) | 私有控制面 / 网络架构审查快照、首批整改记录与未完成风险 | 追溯 |
+| [archive/CODE_REVIEW_2026-10-28.md](archive/CODE_REVIEW_2026-10-28.md) | 2026-10-28 全流程审查：8 项修复、验证证据与保留风险 | 维护者、发布审查 |
 | [LEGAL.md](LEGAL.md) | 版权、GPL-3.0、第三方组件许可 | 分发者、合规审查 |
 | [archive/](archive/README.md) | 历史存档：v2 协议、迁移计划、ASRC 重构计划、旧修复记录、历次审查报告 | 追溯 |
 
@@ -80,7 +81,8 @@ docs/
 │  ├─ BUGFIX_V2_ERA.md                 # v3 重写之前的 bug 记录
 │  ├─ CODE_REVIEW_2026-10-23.md        # 第一轮审查（43 项）
 │  ├─ CODE_REVIEW_ROUND2_2026-10-23.md # 第二轮审查（24 项）
-│  └─ CODE_REVIEW_2026-10-25.md        # 第三轮审查（22 项）
+│  ├─ CODE_REVIEW_2026-10-25.md        # 第三轮审查（22 项）
+│  └─ CODE_REVIEW_2026-10-28.md        # 全流程审查（23 项，8 项已修）
 └─ assets/                    # 界面截图（webp）
 ```
 

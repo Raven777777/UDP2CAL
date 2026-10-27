@@ -53,6 +53,42 @@
 
 ---
 
+## 未发布 — 2026-10-28 · 全流程审查加固（8 项）
+
+> 完整证据、未修风险与工具限制见
+> [CODE_REVIEW_2026-10-28.md](archive/CODE_REVIEW_2026-10-28.md)，根因摘要见
+> [BUGFIX.md](BUGFIX.md#2026-10-28--全流程审查加固8-项)。
+
+**控制面与发现**
+- Windows 在进入绑定状态机前拒绝全零 `device_id`；CONNECT 与 DISCOVER_REQ 使用同一有效性判定。
+- 发现服务按源 IP 的限流状态增加 1024 项硬上限。伪造大量源地址时不再能让状态表在
+  30 秒清理周期内无界增长；已在表中的源继续按 5 次/秒规则处理。
+
+**Android**
+- `ConnectPayload.isValid()` 与 Rust `ConnectPayload::validate()` 对齐：复杂度、signal、
+  bandwidth、保留 flags 和 packet loss 不再被误报为合法。
+- `Prefs.opusComplexity` 读写统一钳制到 1–10，历史或损坏配置不会再让 CONNECT 永久被拒。
+- `AudioRecord` 创建前显式检查 `RECORD_AUDIO`；运行期撤权进入稳定错误路径，Android Lint
+  的 3 个 `MissingPermission` 错误清零。
+
+**依赖与 unsafe**
+- `anyhow` 1.0.104、`memmap2` 0.9.12、`tokio` 1.54.1，修复对应 RustSec unsound advisory；
+  无 major 升级。审计警告 9→6，漏洞数保持 0。
+- 删除 `HiResTimer` 不必要的 `unsafe impl Send/Sync`，并用 `undocumented_unsafe_blocks`
+  固化安全注释门禁。
+- 删除 `StepAbsorber` 只写不读的私有字段。
+
+**验证**
+- protocol：80 项测试通过；Windows：44 单测 + 2 集成通过；Android：64 项通过。
+- Windows release 构建、Android Debug APK（含 CMake/C/JNI）构建通过。
+- Android Lint：0 errors / 16 warnings。Miri 因稳定版 Windows MSVC 无组件而未执行。
+
+**保留风险**
+- 设备身份仍不提供认证；JNI 句柄生命周期、Android AudioTrack 收尾竞态和 C 解码固定
+  10 ms 帧长检查仍需后续处理。详见审查报告的 P1/P2 清单。
+
+---
+
 ## 未发布 — 2026-10-27 · 接收时钟/播放控制重构（按 Plan.md 评审整改）
 
 > 目标不是“再调一次 PI”，而是把**设备钟差**、**网络抖动**、**播放缺口**三件事拆开：

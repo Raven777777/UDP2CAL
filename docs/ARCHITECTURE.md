@@ -248,6 +248,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 - **v3 控制包**：手机端 `TYPE_DISCOVER_REQ`（空负载）→ PC 回复 `TYPE_DISCOVER_REPLY`（`listen_port` + 设备名 ≤254 字节，UTF-8 不截断字符）
 - **广播状态机**（`start_broadcast_state_machine`）：READY 时每秒向 `255.255.255.255:44043` 广播 `TYPE_DISCOVER_REPLY`；BUSY 时自动静音
 - `listen_port` 取自当前监听端口（`LISTEN_PORT` 原子缓存，用户修改后立即生效）
+- 发现请求按来源 IP 限速 5 次/秒；限流状态最多跟踪 1024 个源，防止伪造源地址在周期清理前无界占用内存
 
 ### 图标
 
@@ -265,6 +266,8 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`P2P_STATE: Mutex<P2pState>` 记录的绑定关系（设备 ID / 源地址 / 双向 SSRC）**完全不变** |
 | **第三方 Android 端** | 收不到新 `CONNECT_ACK` → `isAckFresh()` 恒为 false → **不编码不发送任何正向 RTP**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
 | **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id + forward_ssrc 匹配保活分支），RTP 正常解码播放，**完全不受影响** |
+
+全零 `device_id` 在进入状态机前即被丢弃，不能建立绑定，也不能触发发现回复。
 
 > 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
 >

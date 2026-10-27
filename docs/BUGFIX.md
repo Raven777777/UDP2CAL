@@ -9,6 +9,32 @@
 
 ---
 
+## 2026-10-28 — 全流程审查加固（8 项）
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | Windows 控制面 | 规范定义全零 `device_id` 无效，但空 ID 仍可进入绑定状态机 | 控制头只校验消息类型，没有复用 `is_valid_device_id()` | CONNECT/DISCOVER_REQ 统一通过 `is_valid_control_header()`；新增全零 ID 回归 |
+| 2 | Windows 发现 | 按源 IP 的限流表只做 30 s 清理，没有容量上限 | UDP 源地址可伪造，持续的新源会在清理前累积 | 增加 1024 源硬上限；已有源仍按 5 次/秒处理，新增容量/复位测试 |
+| 3 | Windows 依赖 | `anyhow`、`memmap2`、`tokio` 命中 RustSec unsound advisory | 锁文件版本低于修复版本 | 更新至 1.0.104 / 0.9.12 / 1.54.1，无 major 升级 |
+| 4 | Windows 定时器 | `HiResTimer` 只在线程内使用，却声明 `unsafe impl Send/Sync` | 备用高精度等待实现遗留了过宽的线程安全承诺 | 删除两个 unsafe impl，未来跨线程误用由编译器拒绝 |
+| 5 | 协议实现 | `StepAbsorber::last_water_ms` 只写不读 | 旧单 tick 增长判据遗留字段 | 删除私有死字段并同步注释 |
+| 6 | Android 协议 | `ConnectPayload.isValid()` 只校验 PT、帧长和 SSRC | Kotlin 门面校验落后于 Rust 真源 | 补齐复杂度、signal、bandwidth、保留 flags、packet loss 校验 |
+| 7 | Android 配置 | complexity 写入钳制为 1–10，读取原样返回 | 历史/损坏配置可形成持续非法的 CONNECT | 读写统一使用 `sanitizeOpusComplexity()` 并增加极值测试 |
+| 8 | Android 采集 | `AudioRecord` 创建缺少显式权限检查；Lint 报 3 个 `MissingPermission` | 只依赖 Activity 启动前检查与外层通用异常 | 采集入口检查 `RECORD_AUDIO`，撤权时返回稳定错误 |
+
+### 验证
+
+- protocol 80、Windows 44 单测 + 2 集成、Android 64 项 JVM/JNI 测试全部通过。
+- Android `assembleDebug`（含 CMake/C/JNI）与 Lint 通过；Lint 为 0 errors / 16 warnings。
+- Windows `cargo build --release --locked` 通过。
+- RustSec：0 vulnerabilities / 6 warnings（基线为 9 warnings）。
+- Miri 未执行：稳定版 Windows MSVC 工具链没有该组件。
+
+> 完整审查与保留风险见
+> [archive/CODE_REVIEW_2026-10-28.md](archive/CODE_REVIEW_2026-10-28.md)。
+
+---
+
 ## 2026-10-28 — 传输层调优 / 反馈门控 / FEC 重建（10 项）
 
 | # | 模块 | 问题 | 根因 | 修复 |
