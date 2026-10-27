@@ -868,7 +868,8 @@ mod tests {
         assert!(build_control_to(&mut buf, usize::MAX, TYPE_CONNECT, &DEV, &payload).is_none());
         // 刚好溢出的边界：usize::MAX - total + 1
         let total = CONTROL_HEADER_SIZE + payload.len();
-        assert!(build_control_to(&mut buf, usize::MAX - total + 1, TYPE_CONNECT, &DEV, &payload).is_none());
+        let edge = usize::MAX - total + 1;
+        assert!(build_control_to(&mut buf, edge, TYPE_CONNECT, &DEV, &payload).is_none());
         // 不溢出的超大 offset 仍然按"缓冲区不足"拒绝
         assert!(build_control_to(&mut buf, 64, TYPE_CONNECT, &DEV, &payload).is_none());
     }
