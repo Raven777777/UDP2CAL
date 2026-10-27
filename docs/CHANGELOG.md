@@ -30,6 +30,19 @@
 - Android ACK 超时后重新生成正向 SSRC，让 Windows 走显式新会话；同 SSRC 保活不重建音频链路。
 - Android ACK 校验 `ConnectAckPayload.isValid()`。
 
+**控制面加固（2026-10-27）**
+- ACK 负载 6→10 字节，新增 `forward_ssrc` 回显；Android 只接受当前会话的 ACK，
+  旧会话/重复 ACK 不能刷新 `lastAckTime` 或覆盖 `reverse_ssrc`。两端必须同步升级。
+- Windows 绑定超时 3 s→4.5 s，比 Android 的 3 s ACK 窗口多一次重传余量，避免单包丢失先拆链。
+- 反向发送线程增加存活标志：线程因环回/编码器失败退出后，保活会自动重启它（沿用原 SSRC）。
+- WASAPI 环回 `GetBuffer` 连续失败 3 次即丢弃并重建采集客户端；设备失效/音频服务重启后
+  不再永久发送合成静音。初始化失败按 500 ms 退避重试。
+- `ReverseSender::stop` 改为同步 join，重启时旧采集线程不会与新线程重叠。
+- Android 播放协程增加监督：协程异常退出但 SSRC 未变时自动重启；SSRC 切换/ACK 超时
+  先 `cancelAndJoin` 旧循环再启动新循环，避免两个消费者共用一个 native 解码器。
+- Android ACK 新鲜度改用 `elapsedRealtime()`；ACK 提交与 SSRC 换代同锁，消除换号竞态。
+- 控制面合法/非法事件日志均限 1 条/秒，避免共享接收任务上的同步文件 I/O 拖慢 RTP。
+
 **DRED**
 - 接收端从未实现 DRED 解析/恢复；本版显式关闭发送端 DRED（`OPUS_SET_DRED_DURATION(0)`，构建
   `OPUS_DRED=OFF`），文档不再宣称深度冗余恢复。Deep PLC 保留。

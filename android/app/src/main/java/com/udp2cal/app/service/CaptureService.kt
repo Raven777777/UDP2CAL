@@ -15,6 +15,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.udp2cal.app.AudioPlayer
@@ -28,11 +29,16 @@ import com.udp2cal.app.native.OpusEncoder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -71,6 +77,7 @@ class CaptureService : Service() {
     private var controlJob: Job? = null
     private var reverseRxJob: Job? = null
     private var reversePlayJob: Job? = null
+    private var lastReverseStartAt = 0L
     private var notificationJob: Job? = null
 
     /** 主线程置位、IO 协程读取，必须 volatile */
@@ -361,7 +368,7 @@ class CaptureService : Service() {
             } finally {
                 controlJob?.cancel()
                 controlJob = null
-                stopReverseAudio()
+                stopReverseAudioAndJoin()
                 try { audioRecord?.stop() } catch (_: Exception) {}
                 try { audioRecord?.release() } catch (_: Exception) {}
                 audioRecord = null
@@ -454,7 +461,7 @@ class CaptureService : Service() {
                     _status.value = _status.value.copy(
                         connected = false, reverseAudio = false, errorMsg = "已断开（等待重连）"
                     )
-                    stopReverseAudio()
+                    stopReverseAudioAndJoin()
                     activeReverseSsrc = 0
                     // ACK 超时说明旧会话已不可用：换一个正向 SSRC，让对端在
                     // 下一次 CONNECT 时走显式新会话路径（清抖动缓冲/重建反向流）。
@@ -468,10 +475,19 @@ class CaptureService : Service() {
                     activeReverseSsrc = ssrc
                     if (ssrc == 0) {
                         // ACK 明确表示反向未启用：必须停止播放并清空缓冲
-                        stopReverseAudio()
+                        stopReverseAudioAndJoin()
                     } else {
                         startReverseAudio()
                     }
+                } else if (
+                    ssrc != 0 &&
+                    reversePlayJob?.isActive != true &&
+                    SystemClock.elapsedRealtime() - lastReverseStartAt > 2000
+                ) {
+                    // 播放协程可能因 AudioTrack/解码器异常退出，而 SSRC 没变；
+                    // 不能只靠 activeReverseSsrc 变化触发重启，否则会永久静音。
+                    Log.w(TAG, "反向播放协程已退出，自动重启")
+                    startReverseAudio()
                 }
             }
 
@@ -716,7 +732,7 @@ class CaptureService : Service() {
         var seq = rnd.nextInt() and 0xFFFF
         var timestamp = rnd.nextInt()
         var first = true
-        var lastSentAt = 0L
+        var lastSentMono = 0L
         var byteCount = 0L
         var lastReport = System.currentTimeMillis()
         /** 已累积但还不足一帧的样本数 */
@@ -758,13 +774,15 @@ class CaptureService : Service() {
                 lastCfgCheck = now
                 applyRuntimeConfig(enc)
             }
-            if (sender.isAckFresh(now)) {
+            val nowMono = SystemClock.elapsedRealtime()
+            if (sender.isAckFresh(nowMono)) {
                 val encStart = System.nanoTime()
                 val n = enc.encodeTo(pcm, packet, Udp2CalProtocol.RTP_HEADER_SIZE)
                 encodeNs += System.nanoTime() - encStart
                 statFrames++
                 if (n > 0) {
-                    val marker = first || (now - lastSentAt > Udp2CalProtocol.RESYNC_GAP_MS.toLong())
+                    val marker =
+                        first || (nowMono - lastSentMono > Udp2CalProtocol.RESYNC_GAP_MS.toLong())
                     Udp2CalProtocol.writeRtpHeader(
                         packet, 0, marker, seq, timestamp, sender.forwardSsrc
                     )
@@ -773,7 +791,7 @@ class CaptureService : Service() {
                     sendNs += System.nanoTime() - sendStart
                     if (sent) {
                         byteCount += n
-                        lastSentAt = System.currentTimeMillis()
+                        lastSentMono = nowMono
                         first = false
                         // 序号只属于真正发出的包；DTX/断连不占号（RFC 3550）
                         seq = (seq + 1) and 0xFFFF
@@ -824,8 +842,17 @@ class CaptureService : Service() {
     // 反向链路：接收（只插入） + 播放（按播放头拉取）
     // ══════════════════════════════════════════════════════════
 
-    private fun startReverseAudio() {
-        reversePlayJob?.cancel()
+    private suspend fun startReverseAudio() {
+        // 先等旧循环真正退出：旧循环仍可能持有同一个 native 解码器和
+        // AudioPlayer，直接并发启动会出现两个消费者抢写/解码。
+        // 但控制循环不能被 AudioTrack/HAL 卡死，超时后记录并继续。
+        val old = reversePlayJob
+        reversePlayJob = null
+        val joined = withTimeoutOrNull(1000) {
+            old?.cancelAndJoin()
+            true
+        } ?: false
+        if (!joined) Log.w(TAG, "旧反向播放协程 1 s 内未退出，继续启动新会话")
         linkLock.lock()
         try {
             jitter.reset()
@@ -834,6 +861,8 @@ class CaptureService : Service() {
             linkLock.unlock()
         }
         // 接收协程与会话同生命周期（见 launchReverseReceiver）
+        audioPlayer?.flush()
+        lastReverseStartAt = SystemClock.elapsedRealtime()
         reversePlayJob = serviceScope.launch(Dispatchers.IO) { reversePlayLoop() }
         _status.value = _status.value.copy(
             reverseAudio = true,
@@ -852,9 +881,26 @@ class CaptureService : Service() {
     }
 
     private fun stopReverseAudio() {
-        // 只停播放协程；接收协程继续保持阻塞 receive，等会话结束关闭 socket
+        // 只停播放协程；接收协程继续保持阻塞 receive，等会话结束关闭 socket。
+        // 非 suspend 版本用于服务停止路径，协程退出由服务作用域取消兜底。
         reversePlayJob?.cancel()
         reversePlayJob = null
+        linkLock.lock()
+        try {
+            jitter.reset()
+            linkSignal.signalAll()
+        } finally {
+            linkLock.unlock()
+        }
+        audioPlayer?.flush()
+        _status.value = _status.value.copy(reverseAudio = false, reverseBitrateKbps = 0f)
+    }
+
+    /** 需要保证旧循环已退出时使用（会话切换/ACK 超时/播放循环退出）。 */
+    private suspend fun stopReverseAudioAndJoin() = withContext(NonCancellable) {
+        val old = reversePlayJob
+        reversePlayJob = null
+        old?.cancelAndJoin()
         linkLock.lock()
         try {
             jitter.reset()
@@ -885,6 +931,8 @@ class CaptureService : Service() {
                 sock.receive(pkt)
             } catch (e: Exception) {
                 if (!coroutineContext.isActive || sock.isClosed) break
+                // 不忙等：socket 持续报错时也要让出线程，避免占满 IO 调度器
+                delay(10)
                 continue
             }
             val len = pkt.length
@@ -929,6 +977,10 @@ class CaptureService : Service() {
             failures++
             if (failures == 1 || failures % 50 == 0) {
                 Log.w(TAG, "反向 AudioTrack 写入失败（连续 $failures 次），重建后重试")
+            }
+            if (failures >= 100) {
+                Log.e(TAG, "反向 AudioTrack 连续重建失败，交由播放协程监督者重启")
+                return false
             }
             if (!player.recover()) delay(100) else delay(20)
         }
@@ -976,6 +1028,7 @@ class CaptureService : Service() {
         var adjust = 0.0
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
+        try {
         while (coroutineContext.isActive) {
             var code = Udp2CalProtocol.Pull.WAIT
             var pipeMs = 0
@@ -1196,8 +1249,10 @@ class CaptureService : Service() {
                 }
             }
         }
-        // 播放循环退出，把原生句柄还回去（本循环每连接新建一个）
-        step.close()
+        } finally {
+            // 播放循环退出，把原生句柄还回去（本循环每连接新建一个）
+            step.close()
+        }
     }
 
     // ══════════════════════════════════════════════════════════
@@ -1246,8 +1301,18 @@ class CaptureService : Service() {
     }
 
     override fun onDestroy() {
+        val oldCapture = captureJob
+        val oldPlay = reversePlayJob
         stopCapture()
         serviceScope.cancel()
+        // 先等采集/播放协程真正退出，再归还 Rust 堆上的 jlong 句柄；
+        // 否则旧协程可能还在 decode/insert，造成 use-after-free。
+        runBlocking {
+            withTimeoutOrNull(1000) {
+                oldPlay?.join()
+                oldCapture?.join()
+            }
+        }
         // 原生句柄用完之后必须归还：JitterBuffer/DriftController/RateEstimator 的
         // 状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
         runCatching { jitter.close() }

@@ -60,10 +60,15 @@ internal object ProtocolNative {
         packetLoss: Int,
     ): ByteArray?
 
-    /** `[reverseSsrc, payloadType, frameMs]` */
+    /** `[reverseSsrc, payloadType, frameMs, forwardSsrc]` */
     external fun ackDecode(buf: ByteArray, offset: Int, len: Int): IntArray?
 
-    external fun ackEncode(reverseSsrc: Int, payloadType: Int, frameMs: Int): ByteArray?
+    external fun ackEncode(
+        reverseSsrc: Int,
+        payloadType: Int,
+        frameMs: Int,
+        forwardSsrc: Int,
+    ): ByteArray?
 
     /** DISCOVER_REPLY 的监听端口；非法为 0 */
     external fun discoverPort(buf: ByteArray, offset: Int, len: Int): Int

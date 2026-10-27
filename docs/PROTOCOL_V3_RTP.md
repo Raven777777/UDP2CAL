@@ -366,17 +366,21 @@ CONNECT 负载固定 15 字节：
 
 ### 5.5 CONNECT_ACK（类型 4）
 
-ACK 负载固定 6 字节：
+ACK 负载固定 10 字节：
 
 | 偏移 | 长度 | 字段 | 说明 |
 |------|------|------|------|
 | 0 | 4 | `reverse_ssrc` (u32 BE) | Windows 反向 RTP 的 SSRC；`0` 表示反向未启用 |
 | 4 | 1 | `payload_type` | 必须为 `111` |
 | 5 | 1 | `frame_ms` | 必须为 `10` |
+| 6 | 4 | `forward_ssrc` (u32 BE) | 回显本次 CONNECT 的 `forward_ssrc`，用于会话绑定 |
 
 规则：
 
 - Windows 收到每个合法 CONNECT 后立即回复 ACK。
+- ACK 必须回显 CONNECT 的 `forward_ssrc`；Android 只接受与当前会话一致的 ACK。
+  旧会话/重复 ACK 不得刷新 `lastAckTime`，也不得覆盖 `reverse_ssrc`。
+  这是一次不兼容的负载扩展：Android 与 Windows 必须同步升级到本版。
 - ACK 的 `device_id` 是 Windows 的设备 ID。Android 必须验证源端口等于所配置的 Windows 监听端口；若接收端由发现列表选取，还必须验证 ACK device_id。手工填写地址时若没有可信的发现身份，只能验证地址/端口，不能据此声称对端已认证。
 - ACK 的目标地址是 CONNECT 的源 IP/端口（Android 主 socket）。
 - `reverse_ssrc=0` 时，Android 不得启动反向接收解码；已有反向播放应停止并清空缓冲。
@@ -431,11 +435,11 @@ ACK 负载固定 6 字节：
 C3 50 11 22 33 44 6F 0A 03 01 04 03 00 00 05
 ```
 
-**CONNECT_ACK**（device_id=`FE DC BA 98 76 54 32 10`，reverse_ssrc=`0xAABBCCDD`）：
+**CONNECT_ACK**（device_id=`FE DC BA 98 76 54 32 10`，reverse_ssrc=`0xAABBCCDD`，forward_ssrc=`0x11223344`）：
 
 ```
-03 00 04 00 06 00 00 FE DC BA 98 76 54 32 10
-AA BB CC DD 6F 0A
+03 00 04 00 0A 00 00 FE DC BA 98 76 54 32 10
+AA BB CC DD 6F 0A 11 22 33 44
 ```
 
 **DISCOVER_REPLY**（listen_port=`44044`=`0xAC0C`，名称 `UDP2CAL`）：
@@ -499,13 +503,13 @@ Android                                   Windows
 | Android CONNECT 间隔 | 1 s |
 | Windows ACK 延迟 | 立即回复 |
 | Android ACK 超时 | 3 s |
-| Windows CONNECT 超时 | 3 s |
+| Windows CONNECT 超时 | 4.5 s（给 Android 3 s ACK 窗口留一次重传余量） |
 
 规则：
 
 - 保活只看控制面，**不得**用“是否收到 RTP”判断连接存活；DTX 静音期间可能长时间没有 RTP。
 - Android 3 s 未收到新 ACK：标记断连，停止正向 RTP，保留 CONNECT 重试。
-- Windows 3 s 未收到绑定设备的 CONNECT：释放绑定，停止反向发送，回到 Ready。
+- Windows 4.5 s 未收到绑定设备的 CONNECT：释放绑定，停止反向发送，回到 Ready。
 - ACK 丢失但 CONNECT 正常时，以最近一次 ACK 时间为准；下一次 CONNECT 会重新触发 ACK。
 - 重连必须使用新 SSRC；旧 SSRC 包丢弃，抖动缓冲清空。
 
@@ -523,7 +527,7 @@ Android                                   Windows
 
 ```
 Ready ──(合法 CONNECT)──> Busy
-Busy  ──(3s 无 CONNECT)──> Ready
+Busy  ──(4.5s 无 CONNECT)──> Ready
 Busy  ──(异设备 CONNECT)──> Busy（静默忽略，不回 ACK）
 ```
 
@@ -1266,7 +1270,7 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | `BITRATE_STEPS_KBPS` | `[64,128,256,384,512]` | 手动档位（UI 滑块） |
 | `KEEPALIVE_INTERVAL_MS` | `1000` | CONNECT 间隔 |
 | `ACK_TIMEOUT_MS` | `3000` | Android 断连 |
-| `PEER_TIMEOUT_MS` | `3000` | Windows 释放绑定 |
+| `PEER_TIMEOUT_MS` | `4500` | Windows 释放绑定（比 ACK 窗口多 1.5 s，留一次重传余量） |
 
 ---
 
@@ -1289,7 +1293,7 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | CONNECT 负载不是 15 字节 | 丢弃，不绑定 |
 | CONNECT PT/帧长不合法 | 丢弃，不绑定 |
 | 无 ACK 超过 3 s | Android 断连，停止媒体，继续 CONNECT |
-| 无 CONNECT 超过 3 s | Windows 释放绑定，停止反向，回到 Ready |
+| 无 CONNECT 超过 4.5 s | Windows 释放绑定，停止反向，回到 Ready |
 | 抖动缓冲满 | 丢弃扩展序号最小的非 `next` 包，计数 |
 | 迟到/重复包 | 丢弃，计数 |
 | 时间戳合法但序号落后（断流/DTX 恢复） | 按时间戳重新对齐并计数，**不得丢弃** |
@@ -1312,7 +1316,7 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 - ts `0xFFFFFF00 + 480 -> 0x000000E0`；
 - 扩展时间戳 `0xFFFFFFFF + 480 -> 0x1000001DF`；
 - 控制头 15 字节、`payload_len` 边界 0/512/513；
-- CONNECT 15 字节、ACK 6 字节；
+- CONNECT 15 字节、ACK 10 字节；
 - 控制包与 RTP 解复用；
 - 超长/截断/全零 SSRC/错误 PT 全部拒绝。
 
@@ -1530,11 +1534,12 @@ packet_loss=5
 ### B.6 CONNECT_ACK 负载
 
 ```
-AA BB CC DD 6F 0A
+AA BB CC DD 6F 0A 11 22 33 44
 
 reverse_ssrc=0xAABBCCDD
 payload_type=0x6F (111)
 frame_ms=0x0A (10)
+forward_ssrc=0x11223344
 ```
 
 ### B.7 包长边界

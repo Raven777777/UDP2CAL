@@ -43,7 +43,11 @@ pub const KEEPALIVE_INTERVAL_MS: u64 = 1000;
 /// Android 侧 ACK 超时
 pub const ACK_TIMEOUT_MS: u64 = 3000;
 /// Windows 侧绑定释放超时
-pub const PEER_TIMEOUT_MS: u64 = 3000;
+///
+/// 必须比 Android 的 ACK 窗口更长，留出至少一次 CONNECT 重传的余量；
+/// 两侧同为 3 s 时，单次控制包丢失就会让 Windows 先拆链、Android 后知后觉，
+/// 造成本可避免的断音。
+pub const PEER_TIMEOUT_MS: u64 = 4500;
 
 // ── 消息类型 ──
 /// v3 废弃：媒体走 RTP，控制包中出现该类型一律丢弃
@@ -57,7 +61,7 @@ pub const TYPE_MAX_KNOWN: u8 = TYPE_CONNECT_ACK;
 
 // ── 负载长度 ──
 pub const CONNECT_PAYLOAD_SIZE: usize = 15;
-pub const CONNECT_ACK_PAYLOAD_SIZE: usize = 6;
+pub const CONNECT_ACK_PAYLOAD_SIZE: usize = 10;
 /// DISCOVER_REPLY 中设备名上限（不含 2 字节 listen_port）
 pub const DEVICE_NAME_MAX: usize = 254;
 
@@ -400,18 +404,29 @@ pub fn snap_bitrate_kbps(kbps: u16) -> u16 {
 
 // ═══════════════════════ CONNECT_ACK（类型 4） ═══════════════════════
 
-/// ACK 负载，固定 6 字节。
+/// ACK 负载，固定 10 字节。
+///
+/// `forward_ssrc` 是会话绑定：ACK 必须回显本次 CONNECT 的 forward_ssrc，
+/// Android 只接受与当前会话一致的 ACK。这样旧会话迟到/重复的 ACK 不能
+/// 刷新 lastAckTime，也不能把 reverse_ssrc 改回旧值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectAckPayload {
     /// Windows 反向 RTP 的 SSRC；`0` 表示反向未启用
     pub reverse_ssrc: u32,
     pub payload_type: u8,
     pub frame_ms: u8,
+    /// 本次会话的正向 SSRC（回显 CONNECT）
+    pub forward_ssrc: u32,
 }
 
 impl Default for ConnectAckPayload {
     fn default() -> Self {
-        Self { reverse_ssrc: 0, payload_type: OPUS_PAYLOAD_TYPE, frame_ms: OPUS_FRAME_MS }
+        Self {
+            reverse_ssrc: 0,
+            payload_type: OPUS_PAYLOAD_TYPE,
+            frame_ms: OPUS_FRAME_MS,
+            forward_ssrc: 0,
+        }
     }
 }
 
@@ -421,10 +436,11 @@ impl ConnectAckPayload {
         b[0..4].copy_from_slice(&self.reverse_ssrc.to_be_bytes());
         b[4] = self.payload_type;
         b[5] = self.frame_ms;
+        b[6..10].copy_from_slice(&self.forward_ssrc.to_be_bytes());
         b
     }
 
-    /// 解析负载；长度必须恰好 6 字节，PT/帧长必须合法。
+    /// 解析负载；长度必须恰好 10 字节，PT/帧长必须合法。
     pub fn decode(p: &[u8]) -> Option<Self> {
         if p.len() != CONNECT_ACK_PAYLOAD_SIZE {
             return None;
@@ -436,6 +452,7 @@ impl ConnectAckPayload {
             reverse_ssrc: u32::from_be_bytes([p[0], p[1], p[2], p[3]]),
             payload_type: p[4],
             frame_ms: p[5],
+            forward_ssrc: u32::from_be_bytes([p[6], p[7], p[8], p[9]]),
         })
     }
 }
@@ -587,8 +604,16 @@ mod tests {
 
     #[test]
     fn connect_ack_matches_spec_vector_b6() {
-        let a = ConnectAckPayload { reverse_ssrc: 0xAABB_CCDD, payload_type: 111, frame_ms: 10 };
-        assert_eq!(a.encode(), [0xAA, 0xBB, 0xCC, 0xDD, 0x6F, 0x0A]);
+        let a = ConnectAckPayload {
+            reverse_ssrc: 0xAABB_CCDD,
+            payload_type: 111,
+            frame_ms: 10,
+            forward_ssrc: 0x1122_3344,
+        };
+        assert_eq!(
+            a.encode(),
+            [0xAA, 0xBB, 0xCC, 0xDD, 0x6F, 0x0A, 0x11, 0x22, 0x33, 0x44]
+        );
         assert_eq!(ConnectAckPayload::decode(&a.encode()), Some(a));
     }
 
@@ -739,6 +764,8 @@ mod tests {
     fn ack_rejects_bad_params() {
         assert!(ConnectAckPayload::decode(&[0u8; 5]).is_none());
         assert!(ConnectAckPayload::decode(&[0u8; 7]).is_none());
+        assert!(ConnectAckPayload::decode(&[0u8; 9]).is_none());
+        assert!(ConnectAckPayload::decode(&[0u8; 11]).is_none());
         let mut raw = ConnectAckPayload::default().encode();
         raw[4] = 0; // PT 错误
         assert!(ConnectAckPayload::decode(&raw).is_none());

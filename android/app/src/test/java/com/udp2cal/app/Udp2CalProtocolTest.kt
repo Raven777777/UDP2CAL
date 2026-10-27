@@ -79,11 +79,12 @@ class Udp2CalProtocolTest {
 
     @Test
     fun connectAck_matchesSpecVectorB6() {
-        val raw = bytes(0xAA, 0xBB, 0xCC, 0xDD, 0x6F, 0x0A)
+        val raw = bytes(0xAA, 0xBB, 0xCC, 0xDD, 0x6F, 0x0A, 0x11, 0x22, 0x33, 0x44)
         val ack = Udp2CalProtocol.ConnectAckPayload.decode(raw, 0, raw.size)!!
         assertEquals(0xAABBCCDD.toInt(), ack.reverseSsrc)
         assertEquals(111, ack.payloadType)
         assertEquals(10, ack.frameMs)
+        assertEquals(0x11223344, ack.forwardSsrc)
         assertTrue(ack.isValid())
     }
 
@@ -98,9 +99,19 @@ class Udp2CalProtocolTest {
 
     @Test
     fun ackPayload_rejectsBadParams() {
-        assertNull(Udp2CalProtocol.ConnectAckPayload.decode(bytes(0, 0, 0, 1, 0x60, 0x0A), 0, 6))
-        assertNull(Udp2CalProtocol.ConnectAckPayload.decode(bytes(0, 0, 0, 1, 0x6F, 0x14), 0, 6))
+        assertNull(
+            Udp2CalProtocol.ConnectAckPayload.decode(
+                bytes(0, 0, 0, 1, 0x60, 0x0A, 0, 0, 0, 2), 0, 10
+            )
+        )
+        assertNull(
+            Udp2CalProtocol.ConnectAckPayload.decode(
+                bytes(0, 0, 0, 1, 0x6F, 0x14, 0, 0, 0, 2), 0, 10
+            )
+        )
         assertNull(Udp2CalProtocol.ConnectAckPayload.decode(ByteArray(5), 0, 5))
+        assertNull(Udp2CalProtocol.ConnectAckPayload.decode(ByteArray(9), 0, 9))
+        assertNull(Udp2CalProtocol.ConnectAckPayload.decode(ByteArray(11), 0, 11))
     }
 
     @Test

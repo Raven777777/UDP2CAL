@@ -155,6 +155,21 @@ fn should_log_control_reject() -> bool {
     false
 }
 
+/// 合法控制事件的日志闸门：同样与实时接收共线程，重连/SSRC 抖动时
+/// 不能让同步文件 I/O 每秒刷屏。
+fn should_log_control_event() -> bool {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let gate = LAST.get_or_init(|| Mutex::new(None));
+    if let Ok(mut last) = gate.lock() {
+        let now = Instant::now();
+        if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+            *last = Some(now);
+            return true;
+        }
+    }
+    false
+}
+
 fn p2p_lock() -> std::sync::MutexGuard<'static, P2pState> {
     P2P_STATE
         .get_or_init(|| Mutex::new(P2pState::new()))
@@ -176,6 +191,16 @@ static REVERSE_ENABLED: AtomicU8 = AtomicU8::new(0);
 static REVERSE_SENDER: OnceLock<Mutex<Option<crate::capture::ReverseSender>>> = OnceLock::new();
 fn reverse_sender() -> &'static Mutex<Option<crate::capture::ReverseSender>> {
     REVERSE_SENDER.get_or_init(|| Mutex::new(None))
+}
+
+/// 反向发送线程是否仍存活。槽位为 `Some` 不代表线程还在跑：
+/// 环回初始化失败、编码器创建失败、线程 panic 都会让线程退出而槽位不动。
+fn reverse_sender_alive() -> bool {
+    reverse_sender()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|s| s.is_alive()))
+        .unwrap_or(false)
 }
 
 /// 获取本机设备 ID 字节数组（进程内只解析一次，避免每包读注册表）
@@ -1609,11 +1634,17 @@ fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
     )
 }
 
-/// 发送 CONNECT_ACK（6 字节负载：reverse_ssrc + PT + frame_ms）。
+/// 发送 CONNECT_ACK（10 字节负载：reverse_ssrc + PT + frame_ms + forward_ssrc）。
 /// 复用监听 socket 发送：ACK 源端口恒为服务端口，便于对端归属判断。
-async fn send_connect_ack(socket: &tokio::net::UdpSocket, src_addr: &SocketAddr, reverse_ssrc: u32) {
+async fn send_connect_ack(
+    socket: &tokio::net::UdpSocket,
+    src_addr: &SocketAddr,
+    reverse_ssrc: u32,
+    forward_ssrc: u32,
+) {
     let payload = protocol::ConnectAckPayload {
         reverse_ssrc,
+        forward_ssrc,
         ..protocol::ConnectAckPayload::default()
     }
     .encode();
@@ -1717,15 +1748,17 @@ async fn handle_control(
             SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
             reverse_ssrc,
         );
-        logf!(
-            "[P2P] 手机端 {} 已绑定（forward_ssrc={:#010x} reverse_ssrc={:#010x} reverse_port={}）",
-            src_addr.ip(),
-            cfg.forward_ssrc,
-            reverse_ssrc,
-            cfg.reverse_port
-        );
+        if should_log_control_event() {
+            logf!(
+                "[P2P] 手机端 {} 已绑定（forward_ssrc={:#010x} reverse_ssrc={:#010x} reverse_port={}）",
+                src_addr.ip(),
+                cfg.forward_ssrc,
+                reverse_ssrc,
+                cfg.reverse_port
+            );
+        }
         let _ = output.try_send(Message::PeerStateChanged);
-        send_connect_ack(socket, src_addr, reverse_ssrc).await;
+        send_connect_ack(socket, src_addr, reverse_ssrc, cfg.forward_ssrc).await;
         return;
     }
 
@@ -1736,6 +1769,10 @@ async fn handle_control(
     let reverse_stale = new_session
         || peer.reverse_port != cfg.reverse_port
         || (peer.reverse_ssrc != 0) != want_reverse;
+    // 槽位里还有 ReverseSender 但线程已经结束：必须重启，否则保活一直显示健康。
+    // 这种情况不换 SSRC（换号会让 Android 无谓地重建解码器/播放缓冲）。
+    let sender_dead = want_reverse && peer.reverse_ssrc != 0 && !reverse_sender_alive();
+    let need_restart = reverse_stale || sender_dead;
 
     let reverse_ssrc = if reverse_stale {
         desired_reverse_ssrc(cfg.reverse_port, peer.reverse_ssrc, true)
@@ -1755,24 +1792,36 @@ async fn handle_control(
     if new_session {
         jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
         wake_decoder();
-        logf!("[P2P] forward_ssrc 变化 → 新会话，已重置抖动缓冲");
+        if should_log_control_event() {
+            logf!("[P2P] forward_ssrc 变化 → 新会话，已重置抖动缓冲");
+        }
     }
-    if reverse_stale {
+    if need_restart {
         restart_reverse_sender(
             SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
             reverse_ssrc,
         );
-        logf!(
-            "[P2P] 反向发送更新：ssrc={:#010x} port={}",
-            reverse_ssrc,
-            cfg.reverse_port
-        );
+        if should_log_control_event() {
+            if reverse_stale {
+                logf!(
+                    "[P2P] 反向发送更新：ssrc={:#010x} port={}",
+                    reverse_ssrc,
+                    cfg.reverse_port
+                );
+            } else {
+                logf!(
+                    "[P2P] 反向发送线程已退出，已重启：ssrc={:#010x} port={}",
+                    reverse_ssrc,
+                    cfg.reverse_port
+                );
+            }
+        }
     }
 
-    send_connect_ack(socket, src_addr, reverse_ssrc).await;
+    send_connect_ack(socket, src_addr, reverse_ssrc, cfg.forward_ssrc).await;
 }
 
-/// 控制面超时：绑定设备 3 s 没有 CONNECT → 释放绑定、停止反向、回到 Ready。
+/// 控制面超时：绑定设备 4.5 s 没有 CONNECT → 释放绑定、停止反向、回到 Ready。
 /// 只依据控制面保活判断（DTX 静音期间可能长时间没有 RTP）。
 fn check_peer_timeout() -> bool {
     let st = p2p_lock();

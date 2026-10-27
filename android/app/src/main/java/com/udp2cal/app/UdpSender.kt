@@ -1,5 +1,6 @@
 package com.udp2cal.app
 
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -63,14 +64,14 @@ class UdpSender(
     @Volatile var reverseSock: DatagramSocket? = null; private set
     @Volatile var reversePort: Int = 0; private set
 
+    /** 会话锁：保证 forward_ssrc 换代与 ACK 提交原子化 */
+    private val sessionLock = Any()
+
     /** 本次会话的正向 SSRC：每次 connect 重新生成，重连必须换新值 */
     @Volatile var forwardSsrc: Int = 0; private set
 
     /** ACK 下发的反向 SSRC；0 表示反向未启用 */
     @Volatile var reverseSsrc: Int = 0; private set
-
-    /** ACK 代际：每收到一个合法 ACK 自增，供上层检测"SSRC 变化" */
-    @Volatile var ackGeneration: Long = 0L; private set
 
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         var sockLocal: DatagramSocket? = null
@@ -92,7 +93,11 @@ class UdpSender(
             revSockLocal = revSock
             reverseSock = revSock
             reversePort = revSock.localPort
-            forwardSsrc = newSsrc()
+            synchronized(sessionLock) {
+                forwardSsrc = newSsrc()
+                lastAckTime = 0L
+                reverseSsrc = 0
+            }
             socket = sock
             remoteAddr = addr
             remoteIp = addr.address?.hostAddress
@@ -132,10 +137,11 @@ class UdpSender(
     }
 
     /**
-     * ACK 是否"新鲜"。只表示"最近 3 秒内收到过 ACK"，
+     * ACK 是否"新鲜"。只表示"最近 3 秒内收到过 ACK"（Windows 侧绑定超时为
+     * 4.5 秒，刻意比本窗口长，避免单次控制包丢失时先拆后知），
      * 不能退化成"历史上收到过 ACK"——否则超时判定会与它互相打脸。
      */
-    fun isAckFresh(nowMs: Long = System.currentTimeMillis(), windowMs: Long = ACK_WINDOW_MS): Boolean {
+    fun isAckFresh(nowMs: Long = SystemClock.elapsedRealtime(), windowMs: Long = ACK_WINDOW_MS): Boolean {
         val t = lastAckTime
         return t > 0L && nowMs - t <= windowMs
     }
@@ -153,9 +159,13 @@ class UdpSender(
      * 断连后主动更换正向 SSRC：下一次 CONNECT 会让接收端把它识别为
      * "新会话"，清空旧抖动缓冲并重建反向音频链路。普通保活不会调用。
      */
-    fun regenerateForwardSsrc(): Int {
+    fun regenerateForwardSsrc(): Int = synchronized(sessionLock) {
         forwardSsrc = newSsrc()
-        return forwardSsrc
+        // 旧会话的 ACK 不再属于当前 forward_ssrc；同时立即失效，避免旧 ACK
+        // 在下一轮控制 tick 之前把连接状态"救活"。
+        lastAckTime = 0L
+        reverseSsrc = 0
+        forwardSsrc
     }
 
     private fun newSsrc(): Int {
@@ -199,9 +209,14 @@ class UdpSender(
                 // 不能只看到 CONNECT_ACK 类型就认：payload 必须描述我们支持的
                 // 媒体格式（PT/10ms），否则是错版本/错会话的对端。
                 if (!ack.isValid()) continue
-                reverseSsrc = ack.reverseSsrc
-                lastAckTime = System.currentTimeMillis()
-                ackGeneration++
+                // ACK 必须回显当前 forward_ssrc；旧会话/重复 ACK 直接丢弃。
+                // 提交与 regenerateForwardSsrc 同锁，避免"校验通过后恰好换号"
+                // 让旧 ACK 把 lastAckTime/reverseSsrc 写回来。
+                synchronized(sessionLock) {
+                    if (ack.forwardSsrc != forwardSsrc) return@synchronized
+                    reverseSsrc = ack.reverseSsrc
+                    lastAckTime = SystemClock.elapsedRealtime()
+                }
             }
         }, "udp2cal-ack").apply {
             isDaemon = true

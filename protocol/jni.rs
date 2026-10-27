@@ -471,7 +471,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connect
     new_bytes(env, &p.encode())
 }
 
-/// `[reverseSsrc, payloadType, frameMs]`
+/// `[reverseSsrc, payloadType, frameMs, forwardSsrc]`
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackDecode(
     env: Env,
@@ -488,7 +488,12 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackDeco
         Some(p) => p,
         None => return null(),
     };
-    let out: [jint; 3] = [p.reverse_ssrc as jint, p.payload_type as jint, p.frame_ms as jint];
+    let out: [jint; 4] = [
+        p.reverse_ssrc as jint,
+        p.payload_type as jint,
+        p.frame_ms as jint,
+        p.forward_ssrc as jint,
+    ];
     new_ints(env, &out)
 }
 
@@ -499,11 +504,13 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackEnco
     reverse_ssrc: jint,
     payload_type: jint,
     frame_ms: jint,
+    forward_ssrc: jint,
 ) -> jbyteArray {
     let p = ConnectAckPayload {
         reverse_ssrc: reverse_ssrc as u32,
         payload_type: payload_type as u8,
         frame_ms: frame_ms as u8,
+        forward_ssrc: forward_ssrc as u32,
     };
     new_bytes(env, &p.encode())
 }

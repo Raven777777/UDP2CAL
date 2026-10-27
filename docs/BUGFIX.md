@@ -9,6 +9,22 @@
 
 ---
 
+## 2026-10-27 — 控制面会话绑定与反向链路自愈
+
+| # | 模块 | 问题 | 根因 | 修复 |
+|---|------|------|------|------|
+| 1 | 三端 | 旧会话 ACK 可刷新连接、覆盖反向 SSRC | ACK 只带 reverse_ssrc/PT/frame，不绑定 forward_ssrc | ACK 扩为 10 字节并回显 forward_ssrc；Android 只接受当前会话 |
+| 2 | Windows | 单次控制包丢失时 Windows 先超时拆链 | ACK 窗口与绑定超时同为 3 s，无重传余量 | `PEER_TIMEOUT_MS=4500`，比 ACK 窗口长 1.5 s |
+| 3 | Windows | 停止播放后恢复，手机永久无声 | WASAPI 端点失效/服务重启后旧采集客户端只返回错误，线程把错误当空闲，永久发合成静音；发送线程死亡后槽位仍为 `Some` | `GetBuffer` 错误区分并连续 3 次重建客户端；`ReverseSender` 存活标志 + 保活自动重启；`stop` 同步 join |
+| 4 | Android | 播放协程退出后无人重启 | 只有 `activeReverseSsrc` 变化才启动播放；协程异常/写入连续失败会永久退出 | 控制面监督 `reversePlayJob`，2 s 退避后重启；切换会话时 `cancelAndJoin` 旧循环 |
+| 5 | Android | ACK 新鲜度受系统墙钟跳变影响；换 SSRC 与 ACK 提交有竞态 | `System.currentTimeMillis` + 无会话锁 | 改用 `elapsedRealtime`，ACK 提交与 `regenerateForwardSsrc` 同锁 |
+
+> 未修复（设计限制）：首次 CONNECT 仍只凭公开 `device_id` 绑定，未认证的局域网主机
+> 可以在 Ready 状态抢先绑定并指定 `reverse_port`，从而接收 Windows 环回声。要彻底修复
+> 需要配对码/确认对话框等认证机制，超出本次小修范围。
+
+---
+
 ## 2026-10-27 — 反向串流生命周期与版本号
 
 | # | 模块 | 问题 | 根因 | 修复 |

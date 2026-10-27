@@ -217,39 +217,60 @@ fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig)
 
 pub struct ReverseSender {
     running: Arc<AtomicBool>,
+    /// 线程真正退出后置 false；仅看 `Some(ReverseSender)` 不能判断它还在跑。
+    alive: Arc<AtomicBool>,
     thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct AliveGuard<'a>(&'a AtomicBool);
+
+impl Drop for AliveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl ReverseSender {
     /// `ssrc` 由控制面生成并写入 CONNECT_ACK；本函数不自行生成。
     pub fn start(target: SocketAddr, ssrc: u32) -> Self {
         let running = Arc::new(AtomicBool::new(true));
+        let alive = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+        let alive_clone = alive.clone();
 
         let handle = std::thread::Builder::new()
             .name("reverse-capture".into())
             .spawn(move || {
-                Self::run_loop(target, ssrc, &running_clone);
+                Self::run_loop(target, ssrc, &running_clone, &alive_clone);
             })
             .ok();
+        if handle.is_none() {
+            alive.store(false, Ordering::Release);
+            logf!("[Reverse] 反向音频线程创建失败");
+        }
 
-        ReverseSender { running, thread_handle: handle }
+        ReverseSender { running, alive, thread_handle: handle }
     }
 
-    /// 请求停止，`join` 交给后台线程：调用方可能是 UI/执行器线程，
-    /// 反向线程可能正卡在事件等待上，同步 join 会传导成界面卡顿。
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// 请求停止并等待线程退出。
+    ///
+    /// 旧的异步 join 会让 `restart_reverse_sender` 在新线程启动时仍持有
+    /// 环回端点，正是“重启后无声”的竞态来源。反向线程的等待上限是
+    /// `WAIT_TIMEOUT_MS`（10 ms），同步 join 的阻塞可接受。
     pub fn stop(mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
-            let _ = std::thread::Builder::new()
-                .name("reverse-join".into())
-                .spawn(move || {
-                    let _ = handle.join();
-                });
+            let _ = handle.join();
         }
+        self.alive.store(false, Ordering::Release);
     }
 
-    fn run_loop(target: SocketAddr, ssrc: u32, running: &AtomicBool) {
+    fn run_loop(target: SocketAddr, ssrc: u32, running: &AtomicBool, alive: &AtomicBool) {
+        let _alive_guard = AliveGuard(alive);
         logf!("[Reverse] 启动反向音频 → {} (ssrc={:#010x})", target, ssrc);
 
         let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
@@ -292,16 +313,15 @@ impl ReverseSender {
             ),
         }
 
-        let capture = match LoopbackCapture::new() {
-            Some(c) => c,
-            None => {
-                logf!("[Reverse] 环回捕获初始化失败");
-                return;
-            }
-        };
-
+        // 环回采集客户端可重建：设备失效（AUDCLNT_E_DEVICE_INVALIDATED）、
+        // 音频服务重启、端点切换后，旧客户端可能永远返回错误。不能把它当成
+        // “端点空闲”而一直发合成静音，否则重连前手机永远听不到声音。
+        let mut capture: Option<LoopbackCapture> = None;
         // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）
-        let mut resampler = StereoResampler::new(capture.sample_rate(), 48_000);
+        let mut resampler: Option<StereoResampler> = None;
+        let mut last_capture_attempt: Option<Instant> = None;
+        let mut last_capture_fail_log = Instant::now() - Duration::from_secs(10);
+        let mut read_errors: u32 = 0;
         let mut loopback: Vec<f32> = Vec::with_capacity(2_048);
         let mut resampled: Vec<f32> = Vec::with_capacity(2_048);
         let mut pcm_buf: Vec<i16> = Vec::with_capacity(MAX_FRAME_BACKLOG);
@@ -329,6 +349,31 @@ impl ReverseSender {
 
         let mut cfg_check_at = Instant::now();
         while running.load(Ordering::Relaxed) {
+            // 没有可用采集客户端时，按 500 ms 退避重建；初始化失败不能直接退出线程。
+            if capture.is_none()
+                && last_capture_attempt
+                    .map(|t| t.elapsed() >= Duration::from_millis(500))
+                    .unwrap_or(true)
+            {
+                last_capture_attempt = Some(Instant::now());
+                match LoopbackCapture::new() {
+                    Some(c) => {
+                        let rate = c.sample_rate();
+                        resampler = Some(StereoResampler::new(rate, 48_000));
+                        capture = Some(c);
+                        last_data_at = Instant::now();
+                        read_errors = 0;
+                        logf!("[Reverse] 环回捕获已就绪（{} Hz）", rate);
+                    }
+                    None => {
+                        if last_capture_fail_log.elapsed() >= Duration::from_secs(5) {
+                            last_capture_fail_log = Instant::now();
+                            logf!("[Reverse] 环回捕获初始化失败，500 ms 后重试");
+                        }
+                    }
+                }
+            }
+
             // ── 配置变化检测：500 ms 一次，避免每帧抢锁（发送线程不该有锁流量）──
             if cfg_check_at.elapsed() > Duration::from_millis(500) {
                 cfg_check_at = Instant::now();
@@ -354,20 +399,60 @@ impl ReverseSender {
             };
             let t_wait = Instant::now();
             // 事件是否触发只影响延迟；静音补齐仍按 last_data_at/墙钟节拍判断。
-            let _ = capture.wait(wait_ms);
+            let _ = if let Some(c) = capture.as_ref() {
+                c.wait(wait_ms)
+            } else {
+                std::thread::sleep(Duration::from_millis(wait_ms.max(5) as u64));
+                false
+            };
             REVERSE_STATS
                 .wait_us
                 .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
             let t_read = Instant::now();
-            let got_data = capture.read_stereo(&mut loopback).is_some();
+            let outcome = if let Some(c) = capture.as_ref() {
+                c.read_stereo(&mut loopback)
+            } else {
+                ReadOutcome::Empty
+            };
             REVERSE_STATS
                 .read_us
                 .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let got_data = match outcome {
+                ReadOutcome::Data => {
+                    read_errors = 0;
+                    true
+                }
+                ReadOutcome::Empty => {
+                    read_errors = 0;
+                    false
+                }
+                ReadOutcome::Error(code) => {
+                    read_errors = read_errors.saturating_add(1);
+                    if read_errors == 1 || read_errors % 50 == 0 {
+                        logf!(
+                            "[Reverse] 环回 GetBuffer 失败（hr=0x{code:08X}，连续 {read_errors} 次）"
+                        );
+                    }
+                    if read_errors >= 3 {
+                        logf!("[Reverse] 环回端点连续失败，重建采集客户端");
+                        capture = None;
+                        resampler = None;
+                        read_errors = 0;
+                        last_data_at = Instant::now();
+                        last_capture_attempt = Some(Instant::now());
+                    }
+                    false
+                }
+            };
 
             if got_data {
                 last_data_at = Instant::now();
                 last_frame_at = Instant::now();
-                resampler.process(&loopback, &mut resampled);
+                if let Some(rs) = resampler.as_mut() {
+                    rs.process(&loopback, &mut resampled);
+                } else {
+                    resampled.clear();
+                }
                 if resampled.len() > MAX_FRAME_BACKLOG {
                     let excess = resampled.len() - MAX_FRAME_BACKLOG;
                     REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
@@ -625,6 +710,16 @@ impl Drop for LoopbackCapture {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ReadOutcome {
+    /// 拿到真实（或 WASAPI 标记为 SILENT 的）样本
+    Data,
+    /// 本次没有新数据
+    Empty,
+    /// GetBuffer 失败；0x8007xxxx / AUDCLNT_E_* 都在这里
+    Error(i32),
+}
+
 impl LoopbackCapture {
     fn new() -> Option<Self> {
         unsafe {
@@ -708,21 +803,23 @@ impl LoopbackCapture {
     }
 
     /// 读取一帧 PCM，输出**固定立体声交错** f32（L,R,L,R,...）
-    fn read_stereo(&self, out: &mut Vec<f32>) -> Option<()> {
+    fn read_stereo(&self, out: &mut Vec<f32>) -> ReadOutcome {
         unsafe {
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
             let mut flags: u32 = 0;
 
-            let hr = self.capture.GetBuffer(
+            if let Err(e) = self.capture.GetBuffer(
                 &mut data_ptr as *mut *mut u8,
                 &mut frames,
                 &mut flags,
                 None,
                 None,
-            );
-            if hr.is_err() || frames == 0 {
-                return None;
+            ) {
+                return ReadOutcome::Error(e.code().0);
+            }
+            if frames == 0 {
+                return ReadOutcome::Empty;
             }
 
             let frame_count = frames as usize;
@@ -733,7 +830,7 @@ impl LoopbackCapture {
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data_ptr.is_null() {
                 out.resize(frame_count * 2, 0.0);
                 let _ = self.capture.ReleaseBuffer(frames);
-                return Some(());
+                return ReadOutcome::Data;
             }
 
             let channels = self.format.channels;
@@ -765,7 +862,7 @@ impl LoopbackCapture {
             }
 
             let _ = self.capture.ReleaseBuffer(frames);
-            Some(())
+            ReadOutcome::Data
         }
     }
 }

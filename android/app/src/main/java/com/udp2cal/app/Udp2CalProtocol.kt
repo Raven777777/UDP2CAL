@@ -40,7 +40,7 @@ object Udp2CalProtocol {
     const val TYPE_MAX_KNOWN: Byte = 4
 
     const val CONNECT_PAYLOAD_SIZE = 15
-    const val CONNECT_ACK_PAYLOAD_SIZE = 6
+    const val CONNECT_ACK_PAYLOAD_SIZE = 10
     const val DEVICE_NAME_MAX = 254
 
     const val OPUS_FLAG_VBR = 0x01
@@ -190,17 +190,23 @@ object Udp2CalProtocol {
 
     // ═══════════════════════ CONNECT_ACK（类型 4） ═══════════════════════
 
-    class ConnectAckPayload(val reverseSsrc: Int, val payloadType: Int, val frameMs: Int) {
+    class ConnectAckPayload(
+        val reverseSsrc: Int,
+        val payloadType: Int,
+        val frameMs: Int,
+        val forwardSsrc: Int,
+    ) {
         fun isValid(): Boolean = payloadType == OPUS_PAYLOAD_TYPE && frameMs == OPUS_FRAME_MS
 
         fun encode(): ByteArray =
-            ProtocolNative.ackEncode(reverseSsrc, payloadType, frameMs)
+            ProtocolNative.ackEncode(reverseSsrc, payloadType, frameMs, forwardSsrc)
                 ?: ByteArray(CONNECT_ACK_PAYLOAD_SIZE)
 
         companion object {
             fun decode(buf: ByteArray, offset: Int, len: Int): ConnectAckPayload? {
                 val a = ProtocolNative.ackDecode(buf, offset, len) ?: return null
-                return ConnectAckPayload(a[0], a[1], a[2])
+                if (a.size != 4) return null
+                return ConnectAckPayload(a[0], a[1], a[2], a[3])
             }
         }
     }

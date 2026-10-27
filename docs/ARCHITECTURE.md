@@ -180,7 +180,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 传输 | 服务端口 UDP，控制包 + 正向 RTP 同 socket | 首字节解复用 |
 | 接收端 | 单方向一个 `JitterBuffer` + 一个解码实例 | 不需要"5 个采样率解码器" |
 | 发现 | Windows 监听 44043，DISCOVER_REPLY 带 `listen_port` | Android 用该端口连接，不再假定 44044；IPv4 广播仅覆盖本地广播域 |
-| 保活 | Android 每 1 s CONNECT；PC 3 s 无 CONNECT 释放绑定；Android 3 s 无 ACK 断连 | **只看控制面**，不看 RTP |
+| 保活 | Android 每 1 s CONNECT；PC 4.5 s 无 CONNECT 释放绑定（比 Android 3 s ACK 窗口多一次重传余量）；Android 3 s 无 ACK 断连 | **只看控制面**，不看 RTP |
 | 模式切换 | 语音↔音乐重建 AudioRecord/AudioTrack，网络层与 SSRC 一并重建 | 允许短暂中断，不做"保网络层"的特殊分支 |
 
 > 反向编码器"仅在变化时应用"是为了避免不必要的瞬时重配开销；并不是因为每个
@@ -270,7 +270,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 ### 释放独占的途径
 
 1. **Windows 端点击「停止」** → `reset_to_ready()`：清空绑定、停止反向发送、复位抖动缓冲
-2. **绑定设备 3 s 没有 CONNECT**（`PEER_TIMEOUT_MS`）→ 接收流的超时分支自动释放，回到 Ready
+2. **绑定设备 4.5 s 没有 CONNECT**（`PEER_TIMEOUT_MS`，比 Android 的 3 s ACK 窗口多一次重传余量）→ 接收流的超时分支自动释放，回到 Ready
 3. **`forward_ssrc` 变化** → 视为新会话：重置抖动缓冲/解码器/播放头，保留绑定但换反向 SSRC
 4. **重启 Windows 程序** → 全局状态初始化回到 Ready
 
