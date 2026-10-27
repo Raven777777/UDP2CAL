@@ -20,11 +20,26 @@ pub struct Config {
 /// 都会生成新的随机值，导致每次 save() 都在改写设备身份。
 static DEVICE_ID: OnceLock<u64> = OnceLock::new();
 
+/// 默认监听端口（与 protocol::DEFAULT_LISTEN_PORT 一致）
+const DEFAULT_LISTEN_PORT: u32 = 44044;
+
+/// 端口合法区间。注册表里的 DWORD 是外部输入（可手改、可被旧版本写入）：
+/// 超出 1..=65535 的值必须在加载时归一，因为下游有多处 `as u16` 截断
+/// （DISCOVER_REPLY 广播、防火墙规则），截断后的回绕端口与实际 bind 用值
+/// 不一致：广播出去的是错端口、防火墙放行的是错端口，而 bind 反而失败。
+fn sanitize_port(v: u32) -> u32 {
+    if (1..=65535).contains(&v) {
+        v
+    } else {
+        DEFAULT_LISTEN_PORT
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen_ip: "0.0.0.0".into(),
-            listen_port: 44044,
+            listen_port: DEFAULT_LISTEN_PORT,
             auto_start: 0,
             device_id: 0,
             reverse_enabled: 0,
@@ -83,7 +98,7 @@ impl Config {
         let stored_id = get_qword(&path, "device_id", 0);
         Self {
             listen_ip: get_string(&path, "listen_ip", "0.0.0.0"),
-            listen_port: get_dword(&path, "listen_port", 44044),
+            listen_port: sanitize_port(get_dword(&path, "listen_port", DEFAULT_LISTEN_PORT)),
             auto_start: get_dword(&path, "auto_start", 0),
             device_id: resolve_device_id(stored_id),
             reverse_enabled: get_dword(&path, "reverse_enabled", 0),
@@ -143,4 +158,26 @@ fn get_dword(key: &RegKey, name: &str, default: u32) -> u32 {
 
 fn get_qword(key: &RegKey, name: &str, default: u64) -> u64 {
     key.get_value(name).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_port_keeps_valid_and_normalizes_invalid() {
+        for p in [1u32, 80, 44044, 65535] {
+            assert_eq!(sanitize_port(p), p, "合法端口必须原样保留");
+        }
+        // 0 / 越界 / 旧版本可能写入的怪值 → 回默认值
+        for p in [0u32, 65536, 70000, u32::MAX] {
+            assert_eq!(
+                sanitize_port(p),
+                DEFAULT_LISTEN_PORT,
+                "非法端口 {p} 必须归一为默认值"
+            );
+        }
+        // 归一后的值必须能安全地截断成 u16
+        assert_eq!(sanitize_port(u32::MAX) as u16, DEFAULT_LISTEN_PORT as u16);
+    }
 }
