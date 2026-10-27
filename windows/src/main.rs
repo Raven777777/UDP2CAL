@@ -133,6 +133,14 @@ fn is_valid_control_header(header: &protocol::ControlHeader) -> bool {
 const DISCOVERY_RATE_PER_SOURCE: u32 = 5;
 const DISCOVERY_MAX_TRACKED_SOURCES: usize = 1024;
 
+/// RTP 连续空闲超过该值：下一个通过校验的包到达时先 reset 抖动缓冲。
+///
+/// 与 Android 端 `REVERSE_IDLE_RESET_MS`、`docs/PROTOCOL_V3_RTP.md` §7.12 一致。
+/// 不做这一步时，本地 PLC/静音分支会按 10 ms/帧把 `next_ts` 一路推过新包的
+/// 时间戳，发送端时间线一旦回退（编码器/采集重启），恢复包永远被判「迟到」，
+/// 结果是整条反向音频永久静音、只留下单调增长的 `stats.late`。
+const RTP_IDLE_RESET_MS: u64 = 1_000;
+
 /// 发现请求的按源限流，并为流量状态表设置硬上限。
 ///
 /// UDP 源地址可被伪造；只按 30 s 周期清理而不限制表大小，会让持续到达的
@@ -2253,6 +2261,8 @@ fn udp_receiver_stream(
             let mut last_stats = Instant::now();
             let mut last_liveness = Instant::now();
             let mut byte_count: u64 = 0;
+            // 最近一次通过校验的 RTP 包到达时刻（空闲恢复判据，见 RTP_IDLE_RESET_MS）
+            let mut last_rtp_at: Option<Instant> = None;
 
             loop {
                 // 控制面保活检查必须**与流量无关**地周期性执行（规范 6.4：保活只看
@@ -2307,10 +2317,25 @@ fn udp_receiver_stream(
                             continue;
                         }
                         // 网络线程只插入，不解码、不阻塞等待播放
+                        // 空闲恢复：长时间无包后，本地已把播放头推到远超前于发送端，
+                        // 必须先 reset 再按首包重新起播（否则恢复包全被当 late 丢弃）。
+                        let idle_too_long = last_rtp_at
+                            .map(|at| at.elapsed().as_millis() > RTP_IDLE_RESET_MS as u128)
+                            .unwrap_or(false);
                         let accepted = {
                             let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                            if idle_too_long {
+                                jb.reset();
+                            }
                             jb.insert(&pkt) != protocol::rtp::InsertResult::Dropped
                         };
+                        if idle_too_long {
+                            logf!(
+                                "[RTP] 空闲超过 {}ms，已重置抖动缓冲并按首包重新起播",
+                                RTP_IDLE_RESET_MS
+                            );
+                        }
+                        last_rtp_at = Some(Instant::now());
                         if accepted {
                             byte_count += len as u64;
                             RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
