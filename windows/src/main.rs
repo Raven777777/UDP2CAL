@@ -906,6 +906,8 @@ struct AppState {
 fn main() -> Result<(), iced::Error> {
     // 尽早初始化落盘日志：后续所有失败路径都要能留下证据
     logger::init();
+    // 任何线程 panic 都要落盘：GUI 子系统下 stderr 会被丢弃
+    logger::install_panic_hook();
     logf!("[App] 启动 v{}", env!("CARGO_PKG_VERSION"));
     if let Some(p) = logger::path() {
         logf!("[App] 日志文件: {}", p.display());

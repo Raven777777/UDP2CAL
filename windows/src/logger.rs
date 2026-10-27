@@ -129,6 +129,49 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
     log.append(&line);
 }
 
+/// 安装 panic hook：把 panic 的线程名/位置/信息（及可用时的 backtrace）落盘。
+///
+/// 未安装时的后果：发布版是 GUI 子系统，`eprintln!` 被系统丢弃；解码线程或
+/// UDP 接收任务 panic 后进程仍活着、`APP_RUNNING` 仍为 1、DISCOVER_REQ 照旧
+/// 回 ACK，手机看到“幽灵设备”，而日志里一个字都没有。
+///
+/// 用 `try_lock` 而不是 `lock`：panic 可能就发生在持日志锁的路径上，
+/// `std::sync::Mutex` 不可重入，重入会死锁（或 panic-in-panic 直接 abort）。
+/// 抢不到锁就只靠 stderr，绝不能让 hook 本身再出问题。
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        // `capture()` 只在 RUST_BACKTRACE 开启时真正抓栈，其余情况 Display 为空。
+        let bt = std::backtrace::Backtrace::capture();
+        let line = format!(
+            "[{}] [Panic] thread '{}' at {}: {}\n{}",
+            timestamp(),
+            name,
+            loc,
+            msg,
+            bt
+        );
+        eprint!("{line}");
+        let Some(lock) = LOG.get() else { return };
+        if let Ok(mut log) = lock.try_lock() {
+            log.append(&line);
+        }
+    }));
+}
+
 /// 本地时间戳，格式 `2026-10-23 20:55:24.123`
 fn timestamp() -> String {
     // SAFETY: `GetLocalTime` 无参数、返回值语义（无指针输出），调用总是成功。
