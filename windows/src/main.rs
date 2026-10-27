@@ -8,6 +8,7 @@ mod config;
 mod decoder;
 mod diag;
 mod firewall;
+mod hires;
 mod logger;
 mod protocol;
 
@@ -1229,17 +1230,28 @@ impl AppState {
                     );
                     // 反向链路统计由 UI 线程汇总：发送线程内**不得**做文件 I/O，
                     // 否则一次慢写盘就会打断 RTP（实测每 30 s 一次破音）
-                    let s = capture::take_reverse_stats();
-                    let frames = s[11].max(1);
+                    let r = capture::take_reverse_stats();
                     logf!(
                         "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={} 帧={} 均值us(wait/read/encode/send)={:.0}/{:.0}/{:.0}/{:.0} 积压峰值={}ms",
-                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[11],
-                        s[7] as f64 / frames as f64,
-                        s[8] as f64 / frames as f64,
-                        s[9] as f64 / frames as f64,
-                        s[10] as f64 / frames as f64,
-                        s[12] / 2 * 10 / 480
+                        r.packets, r.bytes, r.encode_errors, r.oversize, r.dropped_samples,
+                        r.send_errors, r.gaps, r.frames,
+                        r.avg_us(r.wait_us),
+                        r.avg_us(r.read_us),
+                        r.avg_us(r.encode_us),
+                        r.avg_us(r.send_us),
+                        r.max_backlog / 2 * 10 / 480
                     );
+                    // 节拍迟到量（借鉴 Sunshine 的 "Sleep overshoot"）：
+                    // 只报 min/max/avg，不做 EWMA——偶发的百毫秒级卡顿才是最该看见的。
+                    if r.late_n > 0 {
+                        logf!(
+                            "[Pacer] 30s: 节拍迟到 min/avg/max={}/{}/{}us 帧={}",
+                            r.late_min_us,
+                            r.late_avg_us(),
+                            r.late_max_us,
+                            r.late_n
+                        );
+                    }
                 }
                 Task::none()
             }

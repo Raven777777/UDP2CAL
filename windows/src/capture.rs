@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use audiopus::{Application, Bitrate, Channels, SampleRate};
 
+use crate::hires::HiResTimer;
 use crate::logf;
 use crate::protocol;
 use crate::protocol::rtp;
@@ -131,6 +132,16 @@ pub struct ReverseStats {
     pub frames: AtomicU64,
     /// 组帧缓冲峰值（交错样本数；2 样本 = 1 个 48 kHz 帧）
     pub max_backlog: AtomicU64,
+    /// 节拍迟到量（微秒）：实际发送时刻 − 计划发送时刻。
+    ///
+    /// 这是判断"发送网格是否准"的唯一直接指标：均值为 0 说明 10 ms 网格
+    /// 被完整保持；出现周期性几毫秒的迟到就是定时器精度不足（见 `hires.rs`）。
+    /// 统计口径照抄 Sunshine 的 `Sleep overshoot`：min/max/avg，**不用 EWMA**
+    /// ——EWMA 会把偶发的百毫秒级卡顿抹平，而卡顿恰恰是最该看见的东西。
+    pub late_us: AtomicU64,
+    pub late_min_us: AtomicU64,
+    pub late_max_us: AtomicU64,
+    pub late_n: AtomicU64,
 }
 
 static REVERSE_STATS: ReverseStats = ReverseStats {
@@ -147,25 +158,74 @@ static REVERSE_STATS: ReverseStats = ReverseStats {
     send_us: AtomicU64::new(0),
     frames: AtomicU64::new(0),
     max_backlog: AtomicU64::new(0),
+    late_us: AtomicU64::new(0),
+    late_min_us: AtomicU64::new(u64::MAX),
+    late_max_us: AtomicU64::new(0),
+    late_n: AtomicU64::new(0),
 };
 
+/// 一个统计窗口的快照（读取即清零，调用方为 UI 线程）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReverseSnapshot {
+    pub packets: u64,
+    pub bytes: u64,
+    pub encode_errors: u64,
+    pub oversize: u64,
+    pub dropped_samples: u64,
+    pub send_errors: u64,
+    pub gaps: u64,
+    pub wait_us: u64,
+    pub read_us: u64,
+    pub encode_us: u64,
+    pub send_us: u64,
+    pub frames: u64,
+    pub max_backlog: u64,
+    pub late_us: u64,
+    /// 窗口内最小迟到量（无样本时为 0）
+    pub late_min_us: u64,
+    pub late_max_us: u64,
+    pub late_n: u64,
+}
+
+impl ReverseSnapshot {
+    /// 每帧平均耗时（微秒）：`packets == 0` 时按 1 帧算，避免除零
+    pub fn avg_us(&self, sum: u64) -> f64 {
+        sum as f64 / self.frames.max(1) as f64
+    }
+
+    /// 节拍迟到均值（微秒）
+    pub fn late_avg_us(&self) -> u64 {
+        if self.late_n == 0 {
+            return 0;
+        }
+        self.late_us / self.late_n
+    }
+}
+
 /// 读取并清零（30 s 汇总用，调用方为 UI 线程）
-pub fn take_reverse_stats() -> [u64; 13] {
-    [
-        REVERSE_STATS.packets.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.bytes.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.encode_errors.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.oversize.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.dropped_samples.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.send_errors.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.gaps.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.wait_us.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.read_us.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.encode_us.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.send_us.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.frames.swap(0, Ordering::Relaxed),
-        REVERSE_STATS.max_backlog.swap(0, Ordering::Relaxed),
-    ]
+pub fn take_reverse_stats() -> ReverseSnapshot {
+    let s = ReverseSnapshot {
+        packets: REVERSE_STATS.packets.swap(0, Ordering::Relaxed),
+        bytes: REVERSE_STATS.bytes.swap(0, Ordering::Relaxed),
+        encode_errors: REVERSE_STATS.encode_errors.swap(0, Ordering::Relaxed),
+        oversize: REVERSE_STATS.oversize.swap(0, Ordering::Relaxed),
+        dropped_samples: REVERSE_STATS.dropped_samples.swap(0, Ordering::Relaxed),
+        send_errors: REVERSE_STATS.send_errors.swap(0, Ordering::Relaxed),
+        gaps: REVERSE_STATS.gaps.swap(0, Ordering::Relaxed),
+        wait_us: REVERSE_STATS.wait_us.swap(0, Ordering::Relaxed),
+        read_us: REVERSE_STATS.read_us.swap(0, Ordering::Relaxed),
+        encode_us: REVERSE_STATS.encode_us.swap(0, Ordering::Relaxed),
+        send_us: REVERSE_STATS.send_us.swap(0, Ordering::Relaxed),
+        frames: REVERSE_STATS.frames.swap(0, Ordering::Relaxed),
+        max_backlog: REVERSE_STATS.max_backlog.swap(0, Ordering::Relaxed),
+        late_us: REVERSE_STATS.late_us.swap(0, Ordering::Relaxed),
+        late_min_us: REVERSE_STATS.late_min_us.swap(u64::MAX, Ordering::Relaxed),
+        late_max_us: REVERSE_STATS.late_max_us.swap(0, Ordering::Relaxed),
+        late_n: REVERSE_STATS.late_n.swap(0, Ordering::Relaxed),
+    };
+    // 窗口内没有任何发送时 min 仍是哨兵值，对外一律报 0
+    let late_min_us = if s.late_n == 0 { 0 } else { s.late_min_us };
+    ReverseSnapshot { late_min_us, ..s }
 }
 
 static REVERSE_CFG: OnceLock<Mutex<OpusReverseConfig>> = OnceLock::new();
@@ -368,6 +428,16 @@ impl ReverseSender {
         let frame_gap = Duration::from_millis(FRAME_MS as u64);
         let mut next_send_at = Instant::now();
 
+        // 高精度等待（详见 `hires.rs`）：毫秒级 `WaitForSingleObject` / `Sleep`
+        // 会被 Windows 默认 15.6 ms 的定时器 tick 量化，“睡 10 ms”往往变成
+        // 15.6 ms，10 ms 发送网格因此被打成“两包挨着 + 一段空”，接收端水位
+        // 呈锯齿、阶跃吸收被动触发。拿不到高精度定时器就退回原行为（功能不变）。
+        let hi_timer = HiResTimer::new();
+        match hi_timer.as_ref() {
+            Some(_) => logf!("[Reverse] 发送节拍使用高精度定时器"),
+            None => logf!("[Reverse] 高精度定时器不可用，发送节拍退回毫秒级等待"),
+        }
+
         let mut cfg_check_at = Instant::now();
         while running.load(Ordering::Relaxed) {
             // 没有可用采集客户端时，按 500 ms 退避重建；初始化失败不能直接退出线程。
@@ -404,9 +474,11 @@ impl ReverseSender {
                 }
             }
 
-            // 有帧在等发送窗口时，等待时长按"离下一个发送时刻还有多久"算，
-            // 这样既不阻塞采集读取，又能准点发出
-            let wait_ms = if pcm_buf.len() >= FRAME_INTERLEAVED {
+            // 有帧在等发送窗口时用**高精度定时器**睡到下一个发送时刻；
+            // 没有待发帧（端点空闲）时才等 WASAPI 事件——空闲路径上的等待
+            // 精度无关紧要，没必要唤醒系统定时器。
+            let has_frame = pcm_buf.len() >= FRAME_INTERLEAVED;
+            let wait_ms = if has_frame {
                 let now = Instant::now();
                 if next_send_at > now {
                     (next_send_at - now)
@@ -419,13 +491,21 @@ impl ReverseSender {
                 WAIT_TIMEOUT_MS
             };
             let t_wait = Instant::now();
-            // 事件是否触发只影响延迟；发送仍按 10 ms 网格整形。
-            let _ = if let Some(c) = capture.as_ref() {
-                c.wait(wait_ms)
-            } else {
-                std::thread::sleep(Duration::from_millis(wait_ms.max(5) as u64));
-                false
-            };
+            match (has_frame, hi_timer.as_ref()) {
+                (true, Some(timer)) if next_send_at > t_wait => {
+                    timer.wait_until(next_send_at);
+                }
+                _ => {
+                    // 已到点（无需等待）或没有高精度定时器：退回事件等待。
+                    // 事件是否触发只影响延迟；发送仍按 10 ms 网格整形。
+                    let _ = if let Some(c) = capture.as_ref() {
+                        c.wait(wait_ms)
+                    } else {
+                        std::thread::sleep(Duration::from_millis(wait_ms.max(5) as u64));
+                        false
+                    };
+                }
+            }
             REVERSE_STATS
                 .wait_us
                 .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -517,6 +597,16 @@ impl ReverseSender {
             // 只发到点的帧：节拍整形。落后超过 4 帧（调度抖动/设备暂停）时
             // 重置网格，绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
             while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
+                // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
+                let late_us = Instant::now().duration_since(next_send_at).as_micros() as u64;
+                REVERSE_STATS.late_us.fetch_add(late_us, Ordering::Relaxed);
+                REVERSE_STATS
+                    .late_min_us
+                    .fetch_min(late_us, Ordering::Relaxed);
+                REVERSE_STATS
+                    .late_max_us
+                    .fetch_max(late_us, Ordering::Relaxed);
+                REVERSE_STATS.late_n.fetch_add(1, Ordering::Relaxed);
                 next_send_at += frame_gap;
                 if next_send_at + 4 * frame_gap < Instant::now() {
                     next_send_at = Instant::now();
