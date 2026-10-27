@@ -816,8 +816,29 @@ impl LoopbackCapture {
                 }
             }
 
-            let capture: IAudioCaptureClient = client.GetService().ok()?;
-            client.Start().ok()?;
+            // 从这里往后不能再提前返回：`event` 是内核句柄，`Self` 没建好就没有
+            // Drop 去关它。run_loop 每 500 ms 重试一次，用 `?` 提前返回就是 2 个
+            // 句柄/秒的无界泄漏（最终 CreateEventW 失败、环回彻底起不来）。
+            let capture: IAudioCaptureClient = match client.GetService() {
+                Ok(c) => c,
+                Err(e) => {
+                    logf!(
+                        "[Reverse] GetService(IAudioCaptureClient) 失败: {}",
+                        e.code().0
+                    );
+                    if let Some(h) = event {
+                        let _ = CloseHandle(h);
+                    }
+                    return None;
+                }
+            };
+            if let Err(e) = client.Start() {
+                logf!("[Reverse] IAudioClient::Start 失败: {}", e.code().0);
+                if let Some(h) = event {
+                    let _ = CloseHandle(h);
+                }
+                return None;
+            }
             logf!(
                 "[Reverse] WASAPI 环回已启动（{} 声道 / {:?} / {} Hz / {})",
                 format.channels,
