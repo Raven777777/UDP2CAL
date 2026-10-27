@@ -1,11 +1,13 @@
 package com.udp2cal.app.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
@@ -43,6 +45,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.yield
+import androidx.core.content.ContextCompat
 import java.security.SecureRandom
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.coroutineContext
@@ -543,6 +546,12 @@ class CaptureService : Service() {
     // ══════════════════════════════════════════════════════════
 
     private suspend fun runMicCaptureLoop(enc: OpusEncoder, sender: UdpSender, voiceMode: Boolean) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            fail("麦克风初始化失败（未授权）")
+            return
+        }
         // 采集/编码/发送跑在同一条线程上：提到音频优先级，避免被后台任务抢占
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         val minBufSize = AudioRecord.getMinBufferSize(
