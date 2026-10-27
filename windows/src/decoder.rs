@@ -64,6 +64,35 @@ impl OpusDecoder {
         }
     }
 
+    /// 用**下一个包**里的 LBRR 冗余重建刚刚丢失的那一帧（Opus 带内 FEC）。
+    ///
+    /// libopus 语义（RFC 6716 §4.4）：`opus_decode(..., decode_fec = 1)` 不解析
+    /// `pkt` 自己的音频，而是用它携带的 LBRR 冗余还原**上一帧**。因此调用方
+    /// 必须保证同一个包随后还会用 `fec = false` 正常解码一次，解码器状态才连续。
+    ///
+    /// 包内没有 LBRR（发送端没开 in-band FEC）时 libopus 自动退化成 PLC，
+    /// 所以这个调用不会比 [`conceal`](Self::conceal) 更差——但只有发送端开了
+    /// FEC 才有真实收益。返回 `None` 表示连退化 PLC 都失败，调用方走静音。
+    pub fn decode_fec(&mut self, data: &[u8]) -> Option<usize> {
+        if data.is_empty() {
+            return None;
+        }
+        let packet = Packet::try_from(data).ok()?;
+        // 只交出**恰好一帧**的输出缓冲：`opus_decode(fec = 1)` 会把调用方给的
+        // `frame_size` 填满（第一帧是 LBRR 重建，后面都是补的 PLC），
+        // 实测传 5760 就返回 5760。我们的时间线固定 10 ms，多出来的帧会被
+        // 当成"这一帧"写进播放环 → 延迟棘轮，所以这里必须自己掐住长度。
+        let want = OPUS_FRAME_SAMPLES as usize;
+        let signals = MutSignals::try_from(&mut self.pcm_buf[..want]).ok()?;
+        match self.decoder.decode_float(Some(packet), signals, true) {
+            Ok(n) if n == want => {
+                self.last_n = n;
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
     /// 丢包隐藏：恒定产出一帧 10 ms（480 采样）。
     ///
     /// libopus 的 PLC 按解码器内部的 `frame_size` 合成，而该值来自**上一次被解析**
@@ -100,7 +129,7 @@ impl OpusDecoder {
 mod tests {
     use super::*;
     use audiopus::coder::Encoder;
-    use audiopus::Application;
+    use audiopus::{Application, Bitrate};
 
     fn encode_ms(dec: &mut OpusDecoder, ms: usize) -> usize {
         let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)
@@ -128,6 +157,98 @@ mod tests {
                 "{ms} ms 包之后 PLC 必须仍然只产出一帧 10 ms"
             );
         }
+    }
+
+    // ── 带内 FEC（LBRR）重建 ──
+
+    const FRAME: usize = OPUS_FRAME_SAMPLES as usize;
+
+    /// 相位连续的 440 Hz 正弦，幅度 0.5（写进 Opus 时比噪声更容易看清
+    /// "重建出来的是不是原来那一帧"）
+    fn tone_frame(first: usize) -> Vec<f32> {
+        (0..FRAME)
+            .map(|i| {
+                let t = (first + i) as f32 / 48_000.0;
+                (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5
+            })
+            .collect()
+    }
+
+    /// 低码率 SILK + `packet_loss_perc > 0` + in-band FEC 才会真的塞 LBRR；
+    /// 32 kbps 单声道 10 ms 是这条路径最容易命中的配置。
+    fn encode_three_frames(inband_fec: bool) -> [Vec<u8>; 3] {
+        let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
+            .expect("create encoder");
+        enc.set_bitrate(Bitrate::BitsPerSecond(32_000))
+            .expect("bitrate");
+        enc.set_packet_loss_perc(20).expect("loss perc");
+        enc.set_inband_fec(inband_fec).expect("inband fec");
+        std::array::from_fn(|i| {
+            let mut buf = vec![0u8; 1275];
+            let n = enc
+                .encode_float(&tone_frame(i * FRAME), &mut buf)
+                .expect("encode");
+            buf.truncate(n);
+            buf
+        })
+    }
+
+    fn mean_abs_err(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32
+    }
+
+    /// 核心断言：丢帧后用下一个包的 LBRR 重建，比 PLC 外推更接近真实那一帧。
+    #[test]
+    fn fec_rebuilds_the_lost_frame_closer_than_plc() {
+        let [f1, f2, f3] = encode_three_frames(true);
+
+        let mut reference = OpusDecoder::new().expect("decoder");
+        assert!(reference.decode(&f1).is_some());
+        let n = reference.decode(&f2).expect("参考帧应能解码");
+        let truth = reference.pcm_mut(n).to_vec();
+
+        let mut fec = OpusDecoder::new().expect("decoder");
+        assert!(fec.decode(&f1).is_some());
+        let n = fec.decode_fec(&f3).expect("带内 FEC 应能重建上一帧");
+        assert_eq!(n, FRAME, "FEC 重建也必须是固定 10 ms");
+        let fec_pcm = fec.pcm_mut(n).to_vec();
+
+        let mut plc = OpusDecoder::new().expect("decoder");
+        assert!(plc.decode(&f1).is_some());
+        let n = plc.conceal().expect("PLC 应产出一帧");
+        let plc_pcm = plc.pcm_mut(n).to_vec();
+
+        let fec_err = mean_abs_err(&fec_pcm, &truth);
+        let plc_err = mean_abs_err(&plc_pcm, &truth);
+        assert!(
+            fec_err < plc_err,
+            "FEC 应比 PLC 更接近原始帧：fec={fec_err:.4} plc={plc_err:.4}"
+        );
+    }
+
+    /// FEC 只是"重建",不能吃掉那个包：之后它还要被正常解码一次，否则
+    /// 解码器状态与发送端错位（后续每一帧都会失真）。
+    #[test]
+    fn decode_fec_keeps_the_decoder_in_step_with_the_next_packet() {
+        let [f1, f2, f3] = encode_three_frames(true);
+        let mut dec = OpusDecoder::new().expect("decoder");
+        assert!(dec.decode(&f1).is_some());
+        assert_eq!(dec.decode_fec(&f3), Some(FRAME));
+        assert_eq!(dec.decode(&f3), Some(FRAME), "同一个包之后必须还能正常解码");
+        // 再往后解一帧也正常（真包 / 无 LBRR 都不会让状态坏掉）
+        assert_eq!(dec.decode_fec(&f2), Some(FRAME));
+    }
+
+    /// 发送端没开 in-band FEC 时包里没有 LBRR，libopus 自动退化成 PLC：
+    /// 这条路径不会比 `conceal()` 更差，所以调用方不需要先知道对端有没有开。
+    #[test]
+    fn decode_fec_without_lbrr_falls_back_to_plc() {
+        let [f1, f2, _f3] = encode_three_frames(false);
+        let mut dec = OpusDecoder::new().expect("decoder");
+        assert!(dec.decode(&f1).is_some());
+        assert_eq!(dec.decode_fec(&f2), Some(FRAME));
+        // 空包是"连兜底都没有"的情形：调用方据此走静音
+        assert_eq!(dec.decode_fec(&[]), None);
     }
 
     #[test]

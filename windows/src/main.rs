@@ -325,6 +325,9 @@ static DEVICE_LATENCY_MS: AtomicU32 = AtomicU32::new(0);
 /// 当前重采样比率微调量（f32 位模式，±0.005）
 static DRIFT_ADJUST_BITS: AtomicU32 = AtomicU32::new(0);
 
+/// 用 Opus 带内 FEC 重建成功的帧数（每个统计窗口清零，诊断用）
+static FEC_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// RTP 接收计数（诊断用）
 static RTP_RX_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RTP_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -649,17 +652,36 @@ fn init_audio_worker() {
                         }
                         // 解码失败按丢包处理：不写数据，水位到期后自然 PLC
                     }
-                    protocol::rtp::Pull::Plc { .. } => match dec.conceal() {
-                        Some(n) => {
-                            let pcm = dec.pcm_mut(n);
-                            rms_sum += pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                            rms_count += n as u64;
-                            aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                    protocol::rtp::Pull::Plc { .. } => {
+                        // 先用 Opus 带内 FEC 重建这一帧：丢帧的 LBRR 冗余在**下一个
+                        // 包里**，所以前瞻一个包（不消费，下一轮 `pull` 仍会正常取它）
+                        // 来还原；只有下一个包也还没到时才退回 PLC。发送端没开
+                        // in-band FEC 时 libopus 会自动退化成 PLC，故不会更差。
+                        // 现实中这正好覆盖"包迟到/被 AP 攒批挤掉"的短洞：
+                        // 过去每洞必 PLC（30 ms 听起来就是一下音量塌陷）。
+                        let fec_n = {
+                            let jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                            match jb.peek_current(&mut payload) {
+                                Some(len) => dec.decode_fec(&payload[..len]),
+                                None => None,
+                            }
+                        };
+                        if fec_n.is_some() {
+                            FEC_FRAMES.fetch_add(1, Ordering::Relaxed);
                         }
-                        None => {
-                            aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                        match fec_n.or_else(|| dec.conceal()) {
+                            Some(n) => {
+                                let pcm = dec.pcm_mut(n);
+                                rms_sum +=
+                                    pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+                                rms_count += n as u64;
+                                aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                            }
+                            None => {
+                                aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                            }
                         }
-                    },
+                    }
                     protocol::rtp::Pull::Silence { .. } => {
                         // 连续 PLC 已达上限：输出静音但**继续推进媒体时间**
                         // （`pull` 内部已 advance），否则恢复时真包会被判迟到
@@ -1228,9 +1250,10 @@ impl AppState {
                         f32::from_bits(DRIFT_ADJUST_BITS.load(Ordering::Relaxed)) * 100.0
                     );
                     logf!(
-                        "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) 水位={}ms SSRC={:#010x}",
+                        "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) FEC={} 水位={}ms SSRC={:#010x}",
                         j.received, j.bytes, j.late, j.duplicate, j.overflow, j.resyncs,
-                        j.plc_frames, j.max_plc_run, water, peer.forward_ssrc
+                        j.plc_frames, j.max_plc_run,
+                        FEC_FRAMES.swap(0, Ordering::Relaxed), water, peer.forward_ssrc
                     );
                     logf!(
                         "[RTP] 丢包/非法包={} 累计接收={}",

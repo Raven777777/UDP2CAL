@@ -1261,6 +1261,7 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | PCM 环满“最新优先” | `windows/src/audio.rs` `Ring::push_latest` | 环满时丢弃**未播旧数据**（生产者只投递 `request_flush`，`tail` 仍归消费者） | 历史实现只丢新样本 → 环永久满载 → 可听位置永远落后一个环容量，多出的延迟再也散不掉。丢旧数据只需一次 ≤10 ms 缺口，水位立即回正。计数见 `[Audio] 统计` 的 `满丢旧数据` |
 | 节拍迟到统计 | `windows/src/capture.rs` 的 `ReverseStats.late_*`，30 s 汇总 | 实际发送时刻 − 计划时刻的 min/avg/max，**不做 EWMA** | 只报 min/max/avg 才能看见偶发的百毫秒级卡顿；EWMA 会把卡顿抹平。这是判断“10 ms 网格是否真守住”的唯一直接证据，日志行 `[Pacer] 30s` |
 | 抖动缓冲满即覆盖最旧槽 | `protocol/rtp.rs` `JitterBuffer::store` | 槽位满时覆盖序号最小的槽 | 等价于 Sunshine 的 `drop_oldest`：宁可少一段历史，也不让播放头被旧包拖住 |
+| Opus 带内 FEC 重建 | `windows/src/main.rs`（`Pull::Plc` 分支）、`protocol/rtp.rs` `JitterBuffer::peek_current`、`windows/src/decoder.rs` `OpusDecoder::decode_fec` | 丢帧时先用**下一个包**里的 LBRR 冗余重建该帧（`opus_decode(..., fec = 1)`），下一个包也还没到才退回 PLC；`peek_current` 只读不消费，同一个包随后照常解码 | 实测一次 >100 ms 的到达停顿会连丢 3 帧 = 30 ms PLC，听感就是“音量塌一下”。同一测试音源实测：FEC 重建与原始帧的平均绝对误差 0.0064，PLC 外推是 0.297（约 1/46）。前提是发送端开了 in-band FEC；没开时 libopus 自动退化成 PLC，所以接收端不需要先知道对端配置。`opus_decode(fec = 1)` 会把调用方给的输出缓冲填满（传 5760 就返回 5760），因此必须只交 480 采样，否则多出的帧会被当成“这一帧”写进播放环。计数见 `[RTP]` 行的 `FEC=` |
 
 **刻意不做**（视频专属，或与“100 包/秒、每 10 ms 一包”的节拍无关）：
 
@@ -1269,7 +1270,7 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | 1 帧 VBV、B 帧恒 0、无限 GOP、参考帧失效/请求式 IDR | 只对视频编码器有意义；Opus 帧长固定 10 ms，没有重排序与参考帧概念 |
 | 按 1 ms 粒度摊平一帧的多个包 + GSO/USO 批发送 | 反向音频 100 包/秒、每 10 ms 一包，一帧就是一个包；Opus 负载 ≤1275 字节远低于 MTU，不需要摊平 |
 | 帧率只降不升、`minimum_fps_target` 空闲补帧 | 采集节拍由声卡决定（48 kHz 恒定），不需要自适应帧率 |
-| RS-FEC 20% | 本项目用 Opus in-band FEC（随 CONNECT 配置下发，见 8.4）；50 包/秒的音频里 FEC 开销比例远高于视频，LBRR 本身已按丢包率调节 |
+| RS-FEC 20% | 本项目用 Opus in-band FEC（随 CONNECT 配置下发，见 8.4；接收端已实现 LBRR 重建，见上表）；100 包/秒的音频里包级 FEC 的额外带宽比例远高于视频，LBRR 本身已按丢包率调节 |
 
 ---
 
