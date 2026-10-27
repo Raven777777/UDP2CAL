@@ -43,6 +43,16 @@
 - Android ACK 新鲜度改用 `elapsedRealtime()`；ACK 提交与 SSRC 换代同锁，消除换号竞态。
 - 控制面合法/非法事件日志均限 1 条/秒，避免共享接收任务上的同步文件 I/O 拖慢 RTP。
 
+**空闲链路（方案 A，2026-10-27）**
+- Windows 反向发送端不再在端点空闲时合成静音；RTP 只在有真实媒体时发送，
+  端点失效不再被静音掩盖。
+- Android 播放线程在没有可播放包且播放缓冲低于 `PLC_LEAD_MS` 时本机写静音，
+  保持 AudioTrack 不断流；本地静音不推进媒体时间线。
+- RTP 空闲超过 1 s 后，下个通过校验的包先重置抖动缓冲；发送端恢复时按墙钟
+  缺口补偿 RTP 时间戳并置 marker，避免恢复包被判 late。
+- 16-bit PCM 无法表达 -120 dBFS（1 LSB ≈ -90.3 dBFS），因此不使用 -120 dB 底噪；
+  空闲期输出数字静音。
+
 **DRED**
 - 接收端从未实现 DRED 解析/恢复；本版显式关闭发送端 DRED（`OPUS_SET_DRED_DURATION(0)`，构建
   `OPUS_DRED=OFF`），文档不再宣称深度冗余恢复。Deep PLC 保留。

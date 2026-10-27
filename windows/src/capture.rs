@@ -39,12 +39,11 @@ const FRAME_MONO: usize = 480;
 const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
 /// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
 const MAX_FRAME_BACKLOG: usize = FRAME_INTERLEAVED * 4;
-// 静音补齐不设上限：端点空闲时仍按 10 ms 节拍发静音，保持接收端播放链
-// 与 AudioTrack 持续供数。若停止发包，接收端会欠载/重同步，恢复出声时
-// 表现为"反向串流断开、必须重连"。静音包体积极小，常年发送成本可忽略。
-/// 帧长（毫秒）：静音补齐的墙钟节拍基准
+// 端点空闲时**不再**由发送端合成静音：接收端在本机用静音维持
+// AudioTrack，RTP 只在有真实媒体时发送。这样端点失效不会被静音掩盖。
+/// 帧长（毫秒）：发送节拍与空闲时间戳补偿的基准
 const FRAME_MS: u32 = rtp::FRAME_MS;
-/// WASAPI 事件等待上限：超时仅用于"静音补齐"判断，不用于播放节拍
+/// WASAPI 事件等待上限：超时仅用于轮询/重建判断，不用于播放节拍
 const WAIT_TIMEOUT_MS: u32 = 10;
 
 /// AUDCLNT_BUFFERFLAGS_SILENT：置位时缓冲内容未定义，必须按静音处理
@@ -334,10 +333,7 @@ impl ReverseSender {
         let mut first_packet = true;
         let mut last_sent: Option<Instant> = None;
         let mut last_sent_ts: Option<u32> = None;
-        // 端点最近一次真正给出数据的时间：只有它够久没更新时才补静音。
-        // 缺少这个判据时，事件等待超时与"事件带回 20 ms 数据"会同时成立，
-        // 结果每秒多发 3~4 帧，接收端缓冲十几秒就被灌满 → 周期性重同步（破音）。
-        let mut last_data_at = Instant::now();
+        // 端点最近一次真正给出数据的时间：只用于恢复时补偿媒体时间戳。
         let mut last_frame_at = Instant::now();
 
         // ── 1 帧节拍整形 ──
@@ -361,7 +357,6 @@ impl ReverseSender {
                         let rate = c.sample_rate();
                         resampler = Some(StereoResampler::new(rate, 48_000));
                         capture = Some(c);
-                        last_data_at = Instant::now();
                         read_errors = 0;
                         logf!("[Reverse] 环回捕获已就绪（{} Hz）", rate);
                     }
@@ -398,7 +393,7 @@ impl ReverseSender {
                 WAIT_TIMEOUT_MS
             };
             let t_wait = Instant::now();
-            // 事件是否触发只影响延迟；静音补齐仍按 last_data_at/墙钟节拍判断。
+            // 事件是否触发只影响延迟；发送仍按 10 ms 网格整形。
             let _ = if let Some(c) = capture.as_ref() {
                 c.wait(wait_ms)
             } else {
@@ -438,7 +433,7 @@ impl ReverseSender {
                         capture = None;
                         resampler = None;
                         read_errors = 0;
-                        last_data_at = Instant::now();
+                        last_frame_at = Instant::now();
                         last_capture_attempt = Some(Instant::now());
                     }
                     false
@@ -446,7 +441,10 @@ impl ReverseSender {
             };
 
             if got_data {
-                last_data_at = Instant::now();
+                // 这段“无真实媒体”的墙钟时间要补进 RTP 时间戳，否则接收端
+                // 本地静音已经把播放头推进，恢复包会被判成 late。读取到的
+                // 样本本身覆盖一段时间，必须从缺口里扣掉，避免重复计时。
+                let idle_ms = last_frame_at.elapsed().as_millis() as u64;
                 last_frame_at = Instant::now();
                 if let Some(rs) = resampler.as_mut() {
                     rs.process(&loopback, &mut resampled);
@@ -460,19 +458,17 @@ impl ReverseSender {
                     // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当连续
                     timestamp = timestamp.wrapping_add((excess / 2) as u32);
                 }
+                let new_ms = (resampled.len() as u64 / 2) * 1000 / 48_000;
+                let gap_ms = idle_ms.saturating_sub(new_ms);
+                if gap_ms > (rtp::FRAME_MS as u64 * 2) {
+                    timestamp = timestamp.wrapping_add(
+                        (gap_ms * rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64) as u32,
+                    );
+                }
                 for &s in &resampled {
                     let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(v);
                 }
-            } else if last_data_at.elapsed() > Duration::from_millis(200)
-                && last_frame_at.elapsed() >= Duration::from_millis(FRAME_MS as u64)
-            {
-                // 端点空闲超过 200 ms 才补静音，且严格按 10 ms 墙钟节拍——
-                // 这是"静音补齐"，不是播放定时器，也绝不允许超过实时速率。
-                // 不设上限：停止发包会让接收端欠载/重同步，恢复出声时看起来
-                // 像"反向串流断开"。持续静音包同时保持接收端 AudioTrack 供数。
-                last_frame_at = Instant::now();
-                pcm_buf.extend(std::iter::repeat(0i16).take(FRAME_INTERLEAVED));
             }
 
             // 积压保护：超过 40 ms 只保留最新部分（发送端不得积压）
@@ -675,7 +671,7 @@ impl StereoResampler {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// WASAPI 环回捕获（事件驱动，带静音补齐）
+// WASAPI 环回捕获（事件驱动；失效时由外层重建）
 // ═══════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -712,7 +708,7 @@ impl Drop for LoopbackCapture {
 
 #[derive(Debug, Clone, Copy)]
 enum ReadOutcome {
-    /// 拿到真实（或 WASAPI 标记为 SILENT 的）样本
+    /// 拿到真实（非 SILENT）样本
     Data,
     /// 本次没有新数据
     Empty,
@@ -826,11 +822,12 @@ impl LoopbackCapture {
             out.clear();
             out.reserve(frame_count * 2);
 
-            // 静音标志：缓冲内容未定义，必须当作零样本
+            // 静音标志：缓冲内容未定义。按“没有真实媒体”处理，不向网络发送
+            // 合成静音；接收端会在本地维持 AudioTrack。
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 || data_ptr.is_null() {
-                out.resize(frame_count * 2, 0.0);
+                out.clear();
                 let _ = self.capture.ReleaseBuffer(frames);
-                return ReadOutcome::Data;
+                return ReadOutcome::Empty;
             }
 
             let channels = self.format.channels;

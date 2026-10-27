@@ -68,6 +68,9 @@ class CaptureService : Service() {
 
         /** ACK 轮询周期：只用于检测连接状态与发送保活 */
         private const val TICK_MS = 200L
+
+        /** RTP 连续空闲超过该值：下个包到达时重置抖动缓冲，避免本地静音把播放头推过后被判 late */
+        private const val REVERSE_IDLE_RESET_MS = 1_000L
     }
 
     private val binder = LocalBinder()
@@ -78,6 +81,8 @@ class CaptureService : Service() {
     private var reverseRxJob: Job? = null
     private var reversePlayJob: Job? = null
     private var lastReverseStartAt = 0L
+    /** 最近一次通过校验的反向 RTP 到达时刻（monotonic ms）；接收/播放协程共享 */
+    @Volatile private var lastReversePacketAt = 0L
     private var notificationJob: Job? = null
 
     /** 主线程置位、IO 协程读取，必须 volatile */
@@ -863,6 +868,12 @@ class CaptureService : Service() {
         // 接收协程与会话同生命周期（见 launchReverseReceiver）
         audioPlayer?.flush()
         lastReverseStartAt = SystemClock.elapsedRealtime()
+        linkLock.lock()
+        try {
+            lastReversePacketAt = 0L
+        } finally {
+            linkLock.unlock()
+        }
         reversePlayJob = serviceScope.launch(Dispatchers.IO) { reversePlayLoop() }
         _status.value = _status.value.copy(
             reverseAudio = true,
@@ -888,6 +899,7 @@ class CaptureService : Service() {
         linkLock.lock()
         try {
             jitter.reset()
+            lastReversePacketAt = 0L
             linkSignal.signalAll()
         } finally {
             linkLock.unlock()
@@ -904,6 +916,7 @@ class CaptureService : Service() {
         linkLock.lock()
         try {
             jitter.reset()
+            lastReversePacketAt = 0L
             linkSignal.signalAll()
         } finally {
             linkLock.unlock()
@@ -941,8 +954,19 @@ class CaptureService : Service() {
             val ssrc = activeReverseSsrc
             if (ssrc == 0 || rtp.ssrc != ssrc) continue
 
+            val nowMono = SystemClock.elapsedRealtime()
             linkLock.lock()
             try {
+                // 长时间没有 RTP（Windows 暂停播放/端点重建）后，本地静音已经
+                // 把 nextTs 推到接近墙钟。恢复的第一个包必须先重置时间线，
+                // 否则会被当作 late 丢掉，听起来就是“恢复后一直没声音”。
+                if (lastReversePacketAt != 0L &&
+                    nowMono - lastReversePacketAt > REVERSE_IDLE_RESET_MS
+                ) {
+                    Log.i(TAG, "反向 RTP 空闲 ${nowMono - lastReversePacketAt}ms，重置抖动缓冲")
+                    jitter.reset()
+                }
+                lastReversePacketAt = nowMono
                 jitter.insert(
                     rtp.seq, rtp.timestamp, rtp.marker,
                     buf, rtp.payloadOffset, rtp.payloadLength
@@ -1026,6 +1050,9 @@ class CaptureService : Service() {
         // 起播直接预缓冲到目标水位，避免"30ms 起播后用几分钟追到 150ms"。
         jitter.setStartPrebufferMs(drift.targetMs())
         var adjust = 0.0
+        // 空闲期冻结水位反馈：本地静音会让 water 长期低于目标，若继续积分，
+        // 恢复出声时会带着 −0.5% 的音高偏移，要几分钟才回正。
+        var idleFeedback = false
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
         try {
@@ -1174,7 +1201,22 @@ class CaptureService : Service() {
                 deviceRate.observe(head, System.nanoTime())
             }
             val ff = deviceRate.feedforward() ?: 0.0
-            val du = drift.update(waterMs, head)
+            val nowMono = SystemClock.elapsedRealtime()
+            val rtpIdle = lastReversePacketAt == 0L ||
+                nowMono - lastReversePacketAt > 500L
+            val du = if (rtpIdle) {
+                if (!idleFeedback) {
+                    idleFeedback = true
+                    drift.reset()
+                }
+                0.0
+            } else {
+                if (idleFeedback) {
+                    idleFeedback = false
+                    drift.reset()
+                }
+                drift.update(waterMs, head)
+            }
             adjust = ff + du
             // 两支路相合后仍须守比率钳位：前馈和反馈各自钳过了，乘积可能越界。
             adjust = adjust.coerceIn(
@@ -1238,13 +1280,21 @@ class CaptureService : Service() {
                 }
 
                 else -> {
-                    // 没数据：等接收协程的 signal（超时只防漏唤醒，不承担节拍）
-                    linkLock.lock()
-                    try {
-                        linkSignal.await(5, java.util.concurrent.TimeUnit.MILLISECONDS)
-                    } catch (_: InterruptedException) {
-                    } finally {
-                        linkLock.unlock()
+                    // 没有可播放的包（空闲/起播预缓冲）：本机补静音保持
+                    // AudioTrack 不断流。发送端不再为“保活”合成静音，
+                    // 因此这里的本地输出是唯一的空闲期供数来源。
+                    if (pipeMs <= Udp2CalProtocol.PLC_LEAD_MS) {
+                        val produced = resampler.process(silence, 0, silence.size / 2)
+                        if (produced > 0 && !writeOrRecover(player, resampler.buffer(), produced)) return
+                    } else {
+                        // 播放缓冲还够：等接收协程的 signal（超时只防漏唤醒）
+                        linkLock.lock()
+                        try {
+                            linkSignal.await(5, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        } catch (_: InterruptedException) {
+                        } finally {
+                            linkLock.unlock()
+                        }
                     }
                 }
             }

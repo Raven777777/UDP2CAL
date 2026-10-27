@@ -392,6 +392,9 @@ fn init_audio_worker() {
             let mut rms_count = 0u64;
             let mut last_stats = Instant::now();
             let mut last_latency_log = Instant::now();
+            let mut last_packet_at = Instant::now();
+            let mut last_newest_ts = 0u64;
+            let mut idle_feedback = false;
 
             // 最近一次下发的总比率微调（反馈 Δu 与前馈 r̂ 的合成）
             let mut adjust: f64;
@@ -410,6 +413,8 @@ fn init_audio_worker() {
                         step.reset();
                         dec.reset();
                         aw.flush();
+                        last_packet_at = Instant::now();
+                        idle_feedback = false;
                         AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
                     }
                     std::thread::park_timeout(Duration::from_millis(50));
@@ -501,6 +506,10 @@ fn init_audio_worker() {
                     )
                 };
                 let water = jb_water.saturating_add(pipe_ms);
+                if newest_ts != last_newest_ts {
+                    last_newest_ts = newest_ts;
+                    last_packet_at = Instant::now();
+                }
 
                 // 阶跃吸收的日志（锁外：logf 会写盘）。水位一律用**总水位**
                 // （jb + pipe）口径，与判据一致；否则“跳了 120 ms 只掉 76 ms”
@@ -545,7 +554,22 @@ fn init_audio_worker() {
 
                 // ── 反馈：只收长期残差 ──
                 // 计时同样用声卡已消费帧数（断流时媒体样本不前进，用它计时会冻结积分）。
-                let du = drift.update(water, played);
+                // 长时间没有新 RTP 时冻结反馈并复位积分：否则 `pull` 推进播放头后
+                // water≈0，PI 会一路积到 −0.5%，恢复出声时带明显音高偏移。
+                let rtp_idle = last_packet_at.elapsed() > Duration::from_millis(500);
+                let du = if rtp_idle {
+                    if !idle_feedback {
+                        idle_feedback = true;
+                        drift.reset();
+                    }
+                    0.0
+                } else {
+                    if idle_feedback {
+                        idle_feedback = false;
+                        drift.reset();
+                    }
+                    drift.update(water, played)
+                };
                 adjust = ff + du;
                 // 两支路相合后仍须守比率钳位：前馈和反馈各自钳过了，乘积可能越界。
                 // 在这里钳一次，诊断 CSV 里看到的才是真正下发给重采样器的数。
