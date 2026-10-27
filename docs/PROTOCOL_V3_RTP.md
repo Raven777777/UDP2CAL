@@ -1141,12 +1141,23 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 实现要点（两端一致）：
 
 ```
-next_send_at += 10 ms
+next_send_at = advance_slot(next_send_at, now)
+  now > next_send_at + 5 ms → now        // 迟到超过半帧：网格已失真，重锚
+  否则                       → next_send_at + 10 ms
 wait = next_send_at − now
 wait ≥ 1 ms   → sleep/delay(wait)
 0 < wait < 1 ms → yield
-wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 ```
+
+重锚阈值是**半帧**而不是"落后 4 帧"：发送循环本身是 10 ms 周期，一次卡顿
+（线程启动、设备重开、调度停滞）造成的偏移量如果不立刻重锚，就会被忠实
+保留到永远——每帧都迟到同样的量，永远到不了更宽松的阈值。实测跑数：迟到
+稳定在 15.8 ms（≈ 一个 15.6 ms 系统 tick）却不触发 40 ms 重置，且槽位常年
+过期时 `while now ≥ slot` 会把积压的帧连发出去，正是网格要消灭的突发。
+
+落到代码：Windows 反向发送在 `windows/src/capture.rs` 的 `advance_slot()`
+里实现（含回归测试）；Android 正向发送由 `AudioRecord` 的 10 ms 阻塞读
+天然对齐，不需要这层网格。
 
 禁止用"补发"实现追赶：连发两包会让接收端瞬时水位抬高 10 ms，
 这正是要消灭的东西。心跳/本地静音同理，不得超过实时速率。

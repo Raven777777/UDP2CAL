@@ -604,11 +604,12 @@ impl ReverseSender {
                 .max_backlog
                 .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
 
-            // 只发到点的帧：节拍整形。落后超过 4 帧（调度抖动/设备暂停）时
-            // 重置网格，绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
+            // 只发到点的帧：节拍整形。槽位落后超过半个帧就重锚（见 `advance_slot`），
+            // 绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
             while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
+                let now = Instant::now();
                 // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
-                let late_us = Instant::now().duration_since(next_send_at).as_micros() as u64;
+                let late_us = now.duration_since(next_send_at).as_micros() as u64;
                 REVERSE_STATS.late_us.fetch_add(late_us, Ordering::Relaxed);
                 REVERSE_STATS
                     .late_min_us
@@ -617,10 +618,7 @@ impl ReverseSender {
                     .late_max_us
                     .fetch_max(late_us, Ordering::Relaxed);
                 REVERSE_STATS.late_n.fetch_add(1, Ordering::Relaxed);
-                next_send_at += frame_gap;
-                if next_send_at + 4 * frame_gap < Instant::now() {
-                    next_send_at = Instant::now();
-                }
+                next_send_at = advance_slot(next_send_at, frame_gap, now);
                 frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
                 pcm_buf.drain(..FRAME_INTERLEAVED);
 
@@ -703,6 +701,33 @@ impl ReverseSender {
         }
 
         logf!("[Reverse] 反向音频线程退出");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 发送节拍槽位推进
+// ═══════════════════════════════════════════════════════════════════
+
+/// 一次发送之后，下一个发送槽位应该取什么时刻。
+///
+/// 语义借鉴 Sunshine 的“组起点 + n×帧间隔，错过就作废整组”：
+///
+/// * **未迟到**（`now` 不晚于 `slot + gap/2`）：正常前进一个 `gap`，
+///   保持 10 ms 网格，把成簇到货的帧摊平；
+/// * **迟到超过半个 gap**：网格已经失真，重锚到 `now`。
+///
+/// 为什么必须重锚：`[Pacer]` 实测发现只靠“落后 4 帧才重置”是不行的。
+/// 线程启动时初始槽位、一次卡顿、一次设备重开，都会把槽位永久推到一个
+/// 固定偏移上（实测稳定 15.8 ms ≈ 一个系统 tick）：发送循环本身是 10 ms
+/// 周期的，偏移一旦形成就**永久不变**，永远到不了 40 ms 的重置阈值。
+/// 后果不只是指标难看——槽位一直过期时，`while now >= slot` 会把积压
+/// 的帧连发出去，而这正是 10 ms 网格本要消灭的突发。
+fn advance_slot(slot: Instant, gap: Duration, now: Instant) -> Instant {
+    let half = gap / 2;
+    if now > slot + half {
+        now
+    } else {
+        slot + gap
     }
 }
 
@@ -1132,6 +1157,59 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GAP: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn advance_slot_keeps_grid_when_on_time() {
+        let t0 = Instant::now();
+        // 准时发出：下一个槽位正好差一个 gap
+        assert_eq!(advance_slot(t0, GAP, t0), t0 + GAP);
+        // 晚了一点点（≤ 半个 gap）仍留在网格上
+        assert_eq!(
+            advance_slot(t0, GAP, t0 + Duration::from_millis(4)),
+            t0 + GAP
+        );
+    }
+
+    #[test]
+    fn advance_slot_reanchors_when_late() {
+        let t0 = Instant::now();
+        // 迟到超过半个 gap：网格已失真，重锚到 now（绝不把偏移永久保留）
+        let late = t0 + Duration::from_micros(15_788);
+        assert_eq!(advance_slot(t0, GAP, late), late);
+        // 大幅卡顿（设备重开/调度停滞）同样重锚，不积攒补发
+        let stalled = t0 + Duration::from_millis(546);
+        assert_eq!(advance_slot(t0, GAP, stalled), stalled);
+    }
+
+    #[test]
+    fn advance_slot_never_returns_a_past_slot() {
+        // 回归：槽位一旦过期，`while now >= slot` 就会把积压的帧连发出去，
+        // 而那正是网格要消灭的突发。新槽位必须不早于 now−半帧。
+        let t0 = Instant::now();
+        for us in (0..=45_000).step_by(500) {
+            let now = t0 + Duration::from_micros(us);
+            let next = advance_slot(t0, GAP, now);
+            assert!(
+                next + GAP / 2 >= now,
+                "us={us} 得到过期槽位：{next:?} 早于 {now:?}"
+            );
+            assert!(next >= now, "us={us} 新槽位 {next:?} 不应早于 now {now:?}");
+        }
+    }
+
+    #[test]
+    fn advance_slot_keeps_even_spacing_after_a_stall() {
+        // 重锚之后仍然是每 gap 一帧，不会出现连发
+        let t0 = Instant::now();
+        let stall = t0 + Duration::from_millis(37);
+        let s1 = advance_slot(t0, GAP, stall);
+        assert_eq!(s1, stall);
+        // 下一帧在 s1+10 ms，于 s1+1 ms 时刻还不到点
+        assert!(s1 + GAP > s1 + Duration::from_millis(1));
+        assert_eq!(advance_slot(s1, GAP, s1), s1 + GAP);
+    }
 
     #[test]
     fn resampler_passthrough_is_bit_exact() {
