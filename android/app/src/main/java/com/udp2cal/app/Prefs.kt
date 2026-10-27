@@ -6,6 +6,8 @@ import android.content.SharedPreferences
 object Prefs {
     private const val NAME = "udp2cal_prefs"
 
+    internal fun sanitizeOpusComplexity(value: Int): Int = value.coerceIn(1, 10)
+
     /** 码率默认档位（自动档已移除，新装与旧版"自动"都落到这里） */
     const val DEFAULT_BITRATE_KBPS = 256
 
@@ -35,8 +37,12 @@ object Prefs {
 
     // ── Opus 编码器设置 ──
     var opusComplexity: Int
-        get() = prefs.getInt("opus_complexity", 10) // 默认最高复杂度，极致音质
-        set(v) = prefs.edit().putInt("opus_complexity", v.coerceIn(1, 10)).apply()
+        get() = sanitizeOpusComplexity(
+            prefs.getInt("opus_complexity", 10) // 默认最高复杂度，极致音质
+        )
+        set(v) = prefs.edit()
+            .putInt("opus_complexity", sanitizeOpusComplexity(v))
+            .apply()
 
     var opusSignal: Int
         get() = prefs.getInt("opus_signal", 3001) // OPUS_SIGNAL_VOICE (默认语音)

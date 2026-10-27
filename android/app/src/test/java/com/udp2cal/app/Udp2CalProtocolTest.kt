@@ -25,6 +25,16 @@ class Udp2CalProtocolTest {
 
     private fun bytes(vararg v: Int): ByteArray = ByteArray(v.size) { v[it].toByte() }
 
+    @Test
+    fun opusComplexity_isSanitizedOnReadAndWrite() {
+        assertEquals(1, Prefs.sanitizeOpusComplexity(Int.MIN_VALUE))
+        assertEquals(1, Prefs.sanitizeOpusComplexity(0))
+        assertEquals(5, Prefs.sanitizeOpusComplexity(5))
+        assertEquals(10, Prefs.sanitizeOpusComplexity(10))
+        assertEquals(10, Prefs.sanitizeOpusComplexity(11))
+        assertEquals(10, Prefs.sanitizeOpusComplexity(Int.MAX_VALUE))
+    }
+
     // ═══════ 控制面 ═══════
 
     @Test
