@@ -32,15 +32,53 @@ struct LogFile {
 
 impl LogFile {
     /// 追加一行；超限时先轮转。
-    /// 轮转失败只影响日志本身，绝不 panic、绝不影响主流程；
-    /// 同时把计数清零，避免每次写入都重试一次 rename。
+    /// 轮转失败只影响日志本身，绝不 panic、绝不影响主流程；失败时改为
+    /// 原地截断（见 [`Self::truncate_in_place`]），以保证 2 MiB 上限仍然成立。
     fn append(&mut self, line: &str) {
         let len = line.len() as u64;
         if self.bytes + len > MAX_BYTES && !self.rotate() {
-            self.bytes = 0;
+            // 轮转失败（备份文件被杀软/其他进程占住）时不能假装成功：
+            // 把 `bytes` 清零会让计数与文件真实大小脱钩，之后的写入再也不
+            // 触发轮转，文件便无上限地长下去——与模块承诺的 2 MiB 上限相惖。
+            // 退一步：原地截断（内容本来也转不出去，保留一半旧日志没有意义）。
+            // 连截断都失败才保留计数，让下一次写入再试一次。
+            eprintln!("[{}] [Logger] 轮转失败，原地截断日志", timestamp());
+            self.truncate_in_place();
         }
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.bytes += len;
+        }
+    }
+
+    /// 轮转失败时的兜底：清空主文件并重新打开追加句柄。
+    ///
+    /// 不能直接 `self.file.set_len(0)`：Windows 下以 `FILE_APPEND_DATA` 打开的
+    /// 句柄不允许 `SetEndOfFile`（会 ERROR_ACCESS_DENIED），必须借一个新句柄
+    /// 把文件截成 0。旧内容本来就轮转不出去，保留一半旧日志没有意义——目标
+    /// 是让 2 MiB 上限继续成立。
+    fn truncate_in_place(&mut self) -> bool {
+        let _ = self.file.flush();
+        // 这个句柄只为截断；drop 之后才能把追加句柄换回去
+        let truncated = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .is_ok();
+        if !truncated {
+            return false;
+        }
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(f) => {
+                self.file = f;
+                self.bytes = 0;
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -188,4 +226,80 @@ macro_rules! logf {
     ($($arg:tt)*) => {
         $crate::logger::write_line(format_args!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// 每个用例独占一个临时目录（并发跑不会互相踩）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "udp2cal-logtest-{}-{}-{:?}",
+            std::process::id(),
+            tag,
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        dir
+    }
+
+    /// `bytes` 预置成超限，使下一次 `append` 立即触发轮转分支
+    fn over_limit_log(dir: &Path, content: &[u8]) -> LogFile {
+        let path = dir.join("udp2cal.log");
+        std::fs::write(&path, content).expect("写入初始日志");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("打开日志");
+        LogFile {
+            file,
+            dir: dir.to_path_buf(),
+            path,
+            bytes: MAX_BYTES,
+        }
+    }
+
+    #[test]
+    fn rotate_success_moves_old_file_and_resets_counter() {
+        let dir = temp_dir("ok");
+        let mut log = over_limit_log(&dir, b"old-content\n");
+        log.append("new\n");
+
+        // 旧内容整体搬到备份文件，主文件只剩本次写入
+        let rotated = std::fs::read(dir.join(ROTATED_NAME)).expect("备份文件应存在");
+        assert_eq!(rotated, b"old-content\n");
+        assert_eq!(log.bytes, 4, "计数应只包含新写入的字节数");
+        assert_eq!(
+            std::fs::metadata(&log.path).map(|m| m.len()).unwrap_or(0),
+            4,
+            "主文件应只包含新写入的内容"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 轮转失败（备份目标被目录占住 → rename 必然失败）时必须原地截断，
+    /// 否则计数与文件大小脱钩，日志文件会突破 2 MiB 上限无限增长。
+    #[test]
+    fn rotate_failure_truncates_in_place_instead_of_losing_the_cap() {
+        let dir = temp_dir("fail");
+        // 用目录占住备份名，使 rename 确定性失败
+        std::fs::create_dir(dir.join(ROTATED_NAME)).expect("创建占位目录");
+
+        let mut log = over_limit_log(&dir, b"0123456789");
+        log.append("new\n");
+
+        let size = std::fs::metadata(&log.path)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX);
+        assert_eq!(
+            size, 4,
+            "轮转失败后应原地截断再写入，而不是继续在超限文件尾部追加"
+        );
+        assert_eq!(log.bytes, 4, "计数必须与文件真实大小一致");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
