@@ -1942,8 +1942,18 @@ fn udp_receiver_stream(listen_ip: String, listen_port: u32) -> impl iced::future
 
             let (len, src) = match recv {
                 Ok(Ok(v)) => v,
-                // 超时 / socket 错误：下一轮继续做保活检查
-                _ => continue,
+                Ok(Err(e)) => {
+                    // Windows 上 UDP socket 会把上一次 send_to 收到的 ICMP 端口不可达
+                    // 回灌成一次 WSAECONNRESET。这类错误不是致命的，但绝对不能
+                    // 立刻重试——那会变成 100% CPU 的忙等。睡 10 ms 退避。
+                    if should_log_control_reject() {
+                        logf!("[UDP] recv_from 失败：{e}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                // 超时：下一轮继续做保活检查
+                Err(_) => continue,
             };
 
             match protocol::demux(&buf[..len]) {
