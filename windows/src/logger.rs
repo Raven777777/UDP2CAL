@@ -10,12 +10,27 @@
 //! - 全局单例 + 互斥锁；调用频率为秒级到分钟级，不在音频回调路径上
 //!
 //! 用法：`crate::logf!("[Audio] 初始化失败: {e}");`
+//!
+//! ## 只在 debug 构建落盘
+//!
+//! Release 构建**完全不写盘**（不建目录、不 `metadata`、不 open/rename），
+//! 由 [`ENABLED`] 决定：`cfg!(debug_assertions)` 为假时 [`init`] / [`write_line`] /
+//! [`install_panic_hook`] 一律首行早退，且 `logf!` 宏本身编译期短路（`cfg!` 是
+//! 字面 `false`，LLVM 直接删掉整个分支，格式化开销也一起消失）。
+//! 目的：发布版不给用户机器制造任何日志写入/Disk I/O，也不用担心日志文件被
+//! 杀软或同步盘扫描。需要现场排障证据时用 `cargo build`（debug）出的二进制。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use windows::Win32::System::SystemInformation::GetLocalTime;
+
+/// 落盘日志总开关：**仅 debug 构建**开启。
+///
+/// Release 下为 `false`，`init()` 不碰磁盘（连目录都不创建），`logf!` 宏在编译期
+/// 就被优化成空语句——保证发布版的日志相关 Disk I/O 恒为 0。
+pub const ENABLED: bool = cfg!(debug_assertions);
 
 /// 单文件上限，超过后轮转一次
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -108,7 +123,13 @@ static LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// 初始化日志文件。失败时静默降级为"仅 stderr"，不影响主流程。
+///
+/// Release 构建（[`ENABLED`] == false）直接返回：不创建目录、不读 `metadata`、
+/// 不轮转、不打开文件，`LOG`/`LOG_PATH` 保持空，[`path`] 因此返回 `None`。
 pub fn init() {
+    if !ENABLED {
+        return;
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -153,7 +174,13 @@ pub fn path() -> Option<&'static PathBuf> {
 }
 
 /// 写入一行日志。任意线程可调用。
+///
+/// Release 构建下为空操作（连时间戳与字符串格式化都跳过）；正常情况下
+/// `logf!` 宏已在编译期把调用点整段删掉，这里的早退只是兜底。
 pub fn write_line(args: std::fmt::Arguments<'_>) {
+    if !ENABLED {
+        return;
+    }
     let line = format!("[{}] {}\n", timestamp(), args);
     // 开发期（从命令行启动）仍输出到 stderr；release 下句柄无效，write 会被忽略
     eprint!("{line}");
@@ -177,6 +204,10 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
 /// `std::sync::Mutex` 不可重入，重入会死锁（或 panic-in-panic 直接 abort）。
 /// 抢不到锁就只靠 stderr，绝不能让 hook 本身再出问题。
 pub fn install_panic_hook() {
+    // Release 下没有日志文件、stderr 也被 GUI 子系统丢弃，装 hook 无收益
+    if !ENABLED {
+        return;
+    }
     std::panic::set_hook(Box::new(|info| {
         let payload = info.payload();
         let msg = if let Some(s) = payload.downcast_ref::<&str>() {
@@ -224,7 +255,12 @@ fn timestamp() -> String {
 #[macro_export]
 macro_rules! logf {
     ($($arg:tt)*) => {
-        $crate::logger::write_line(format_args!($($arg)*))
+        // `cfg!` 是编译期常量：release 下整个分支被删除，连 `format_args!` 的
+        // 格式化成本都不存在。实参在语法上仍被"使用"，因此各调用点不会因为
+        // 日志被编译掉而报 unused variable / unused_mut。
+        if $crate::logger::ENABLED {
+            $crate::logger::write_line(format_args!($($arg)*))
+        }
     };
 }
 

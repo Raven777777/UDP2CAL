@@ -8,6 +8,10 @@
 //! 输出：`%LOCALAPPDATA%\UDP2CAL\asrc_diag.csv`，首行列名，每次启动覆盖重写，
 //! 最多记录 [`MAX_SECONDS`] 秒。
 //!
+//! 仅 debug 构建可用：release 下 [`AsrcDiag::from_env`] 恒返回空壳（即使有人
+//! 设了环境变量也不落盘），与 `logger` 模块的 [`crate::logger::ENABLED`] 同源，
+//! 保证发布版日志类 Disk I/O 恒为 0。
+//!
 //! 关闭时开销只有一个 `Option` 判空：写入路径既不在音频回调里，也不在锁内。
 
 use std::io::Write;
@@ -45,7 +49,7 @@ impl AsrcDiag {
             next_at: start,
             start,
         };
-        if ms == 0 {
+        if ms == 0 || !crate::logger::ENABLED {
             return diag;
         }
 

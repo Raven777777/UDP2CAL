@@ -35,6 +35,15 @@
   ACK 线程 `receive` 异常后 `Thread.sleep(10)` 退避，不再忙等。
 - Windows 发送端启动时打印一次 `Opus lookahead=`（这部分延迟不受水位控制，是延迟预算里的已知量）。
 
+**Windows 落盘日志改为仅 debug 构建**
+- `logger::ENABLED = cfg!(debug_assertions)`：release 下 `init()` / `write_line()` /
+  `install_panic_hook()` 首行早退，不建目录、不 `metadata`、不轮转、不 open；
+  `logf!` 宏用 `cfg!` 编译期短路，62 处调用点在 release 里连格式化都不存在
+  （校验：release 二进制内已无 `udp2cal.log` 字符串）。发布版日志类 Disk I/O = 0。
+- `diag.rs` 的 `asrc_diag.csv` 用同一开关：release 下即使设置 `UDP2CAL_ASRC_DIAG` 也不落盘。
+- 实机验证：release 跑 45 s 未创建 `%LOCALAPPDATA%\UDP2CAL\`；debug 跑 12 s 正常写入。
+  历史日志不删不移（release 不碰旧文件），需手动清理。
+
 ---
 
 ## 未发布 — 2026-10-28 · 传输层调优（借鉴 Sunshine）+ 反馈门控 + 双端 FEC 重建
