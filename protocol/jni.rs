@@ -53,7 +53,10 @@
 
 // 这里全是 JNI 入口点，安全边界由 JVM 侧保证（参数由 `external fun` 声明约束，
 // 句柄由 `Box::into_raw`/`Box::from_raw` 成对管理），不需要 Rust API 文档里的
-// `# Safety` 段；行文见模块头部的「形态」与「时钟桥」。
+// `# Safety` 段；行文见模块头部的「形态」与「时钟桥」与「unsafe 契约」。
+//
+// crate 根是 `#![deny(unsafe_code)]`，本模块是全 crate 唯一的例外。
+#![allow(unsafe_code)]
 #![allow(non_snake_case)]
 #![allow(clippy::missing_safety_doc)]
 

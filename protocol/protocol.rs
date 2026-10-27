@@ -21,6 +21,10 @@
 //! 协议只有单一版本：`byte[0]` 必须等于 [`CONTROL_VERSION`]，不做协商、
 //! 不降级、不探测 v2。
 
+// 纯逻辑部分（本文件 + `rtp.rs`）确认没有 unsafe；用 lint 钉住，防止后续
+// 为了绕过借用检查而引入。唯一的 unsafe 集中在 `jni` 模块的 C ABI 边界。
+#![deny(unsafe_code)]
+
 pub mod rtp;
 
 /// JNI 绑定（Android 端复用本 crate 的唯一实现，见 `docs/PROTOCOL_V3_RTP.md` §12）。
