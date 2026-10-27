@@ -4,6 +4,39 @@
 
 ---
 
+## 未发布 — 2026-10-28 · 可观测性、线程优先级与 FEC 默认值（对齐检查第一批）
+
+> 依据 [archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md](archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md)
+> 的 S1–S11，**不改协议语义**：只动默认值、日志、状态卡与调度优先级。
+
+**Opus 带内 FEC 默认打开**
+- `Prefs.kt`：`opus_fec` 默认 0 → **2**（与设置页勾选状态一致），`opus_packet_loss` 默认 0 → **10**。
+  两者必须同时改：`packet_loss=0` 时 libopus 认为无需冗余，等于把 FEC 白开。
+  10 ms 帧的带内 FEC 不增加包数与延迟（上一帧的 LBRR 搭在本包里），接收端重建路径早已就绪。
+  该默认值在 V2 时代被刻意改成 0（见 archive/BUGFIX_V2_ERA.md），本轮按“接收端已完备”的现状回退。
+
+**丢包可观测**
+- `protocol/rtp.rs` 新增 `expected_packets()` / `lost_estimate()`：序号跨度 − 成功入槽数，
+  每次重同步重置基准（新增回归测试 `jb_lost_estimate_counts_sequence_holes`）。
+- Windows `[RTP]` 行新增 `丢包≈lost/expected（x%）`；分子含“没到达”与“到达但未入槽”（迟到/溢出/重复，各自计数在旁边），
+  这样才谈得上按丢包率调水位/开 FEC。
+- `[Reverse]` 行旁新增一条条件告警：本地丢样/编码超限非 0 才打印（此前埋在 30 s 汇总行末尾等于看不见）。
+- Android 反向卡片新增「抖动缓冲」一行：`迟到 · 溢出 · PLC(峰值) · 重同步`，每秒刷新，反向停止时清空。
+
+**线程优先级**
+- Windows `reverse-capture` 线程 `SetThreadPriority(THREAD_PRIORITY_HIGHEST)`：10 ms 网格被抢占一次就是一个 PLC 帧；
+  失败只告警（不进 MMCSS，不新增 crate feature）。
+- Android 反向接收协程临时提到 `URGENT_AUDIO` 并在退出时还原（`Dispatchers.IO` 线程复用，不能把优先级留在池线程上）；
+  ACK 线程提到 `THREAD_PRIORITY_AUDIO`（专用线程、随会话存活；控制面不压过采集/播放）。
+  1 Hz 控制协程**刻意不提**：它在共享 IO 池上且每秒睡眠，提了只会把优先级留在无关任务上。
+
+**其他一行改动**
+- Android 正向 socket 补 `receiveBufferSize`（CONNECT_ACK 由同一个 socket 接收）；
+  ACK 线程 `receive` 异常后 `Thread.sleep(10)` 退避，不再忙等。
+- Windows 发送端启动时打印一次 `Opus lookahead=`（这部分延迟不受水位控制，是延迟预算里的已知量）。
+
+---
+
 ## 未发布 — 2026-10-28 · 传输层调优（借鉴 Sunshine）+ 反馈门控 + 双端 FEC 重建
 
 > 三件事互不重叠：**发送节拍真正落在 10 ms 网格上**、**反馈只在水温有意义的时刻评估**、
