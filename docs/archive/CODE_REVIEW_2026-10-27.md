@@ -186,3 +186,18 @@ RUSTSEC-2026-0204（`fmt::Pointer` 对 Atomic/Shared 的非法解引用），路
 | T-06 | `should_log_control_reject` 被 UDP 收包错误复用 | 命名语义漂移，仅风格 | 重命名为 `should_log_throttled` |
 | T-07 | 抖动缓冲 / 阶跃吸收无 loom、proptest | 需新增 dev-dependency | `proptest` 先覆盖纯函数，`loom` 覆盖 `Ring` |
 | T-08 | windows 其余模块未加 `deny(unsafe_code)` | capture/main/logger 含 unsafe，需模块级 allow | 对 config/decoder/diag/firewall/audio 加 `#![deny(unsafe_code)]` |
+
+---
+
+## 附录（同日追加）：F-10 已执行
+
+审查完成后维护者授权执行全量格式化，故 F-10 状态由「未修，需授权」改为**已修**。
+
+- 提交：`style: cargo fmt 全量格式化（纯格式，无逻辑变更）`，11 个文件 / 1197 插入 / 746 删除，**独立成提交，不掺任何语义改动**。
+- 变更类别只有三种：换行/缩进/行宽重排、`use` 顺序按字母表重排（`reorder_imports` 默认行为）、闭包体补 `{}` 与单表达式 `match` 臂去 `{}`。
+- 等价性验证：剔除 `use` 语句并去掉空白与逗号后逐文件比对 token 流——7 个文件完全一致，4 个文件仅差上述 `{}` 各 2 字节，无 token 语义变化。
+- 门禁：两 crate `cargo fmt -- --check` 均干净；protocol clippy 0 告警 / 75 passed；windows clippy 0 告警 / 21+2 passed。
+- 因此「第 7 节」表中的 `cargo fmt --check` 一行应读作：基线红 → 终态**绿**。
+- 未添加 `.git-blame-ignore-revs`（维护者要求只做 fmt）；需要时：
+  `echo 56e0c96 >> .git-blame-ignore-revs && git config blame.ignoreRevsFile .git-blame-ignore-revs`
+- T-05「无 CI」按维护者决定**不处理**：不加 CI 配置，「后续建议 1」作废。
