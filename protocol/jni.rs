@@ -938,6 +938,41 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
     code
 }
 
+/// 前瞻播放位上的包而**不消费**它（供 Opus 带内 FEC 重建丢帧使用）。
+///
+/// 返回负载长度；`0` 表示播放位的包还没到（或句柄无效），调用方退回 PLC。
+/// 与 `jbPull` 的 `WAIT`(0) 同值但语义不同：本函数**不推进**任何游标，
+/// 也不会改变 `pulledLen`/`pulledTs`（那两个描述的是上一次 `jbPull` 的结果）。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPeek(
+    env: Env,
+    _this: jobject,
+    h: Handle,
+    out: jbyteArray,
+) -> jint {
+    let handle = match jb_ref(h) {
+        Some(x) => x,
+        None => return 0,
+    };
+    let mut g = lock(&handle.inner);
+    let mut scratch = std::mem::take(&mut g.scratch);
+    ensure_payload_capacity(&mut scratch);
+    let len = match g.jb.peek_current(&mut scratch[..]) {
+        Some(n) => n,
+        None => {
+            g.scratch = scratch;
+            return 0;
+        }
+    };
+    let ok = write_bytes(env, out, 0, &scratch[..len]);
+    g.scratch = scratch;
+    if ok {
+        len as jint
+    } else {
+        0
+    }
+}
+
 /// 阶跃裁剪：按播放顺序取一帧，调用方必须**解码后丢弃 PCM**，
 /// 让有状态 Opus 解码器跟住发送端。返回判别值同 `jbPull`。
 #[no_mangle]

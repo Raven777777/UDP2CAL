@@ -369,6 +369,13 @@ object Udp2CalProtocol {
          */
         fun pullTrim(out: ByteArray): Int = ProtocolNative.jbPullTrim(handle, out)
 
+        /**
+         * 前瞻播放位上的包而**不消费**它：Opus 的带内 FEC（LBRR）把丢帧的冗余
+         * 放在下一个包里，所以补洞前必须先看到下一个包。返回负载长度，
+         * 0 表示播放位的包还没到。之后 [pull] 仍会正常取出同一个包。
+         */
+        fun peek(out: ByteArray): Int = ProtocolNative.jbPeek(handle, out)
+
         fun destroyed(): Boolean = handle == 0L
 
         override fun close() {

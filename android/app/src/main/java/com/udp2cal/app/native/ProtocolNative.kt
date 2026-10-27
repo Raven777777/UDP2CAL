@@ -122,6 +122,12 @@ internal object ProtocolNative {
     /** 取一帧用于阶跃裁剪；调用方必须解码后丢弃 PCM。 */
     external fun jbPullTrim(h: Long, out: ByteArray): Int
 
+    /**
+     * 前瞻播放位上的包但**不消费**它（Opus 带内 FEC 重建用）。
+     * 返回负载长度；0 表示播放位的包还没到（调用方退回 PLC）。
+     */
+    external fun jbPeek(h: Long, out: ByteArray): Int
+
     /** 起播所需的连续媒体水位（毫秒）。 */
     external fun jbSetStartPrebufferMs(h: Long, ms: Int)
 
