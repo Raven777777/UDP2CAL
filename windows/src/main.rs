@@ -145,12 +145,13 @@ static P2P_STATE: OnceLock<Mutex<P2pState>> = OnceLock::new();
 fn should_log_control_reject() -> bool {
     static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     let gate = LAST.get_or_init(|| Mutex::new(None));
-    if let Ok(mut last) = gate.lock() {
-        let now = Instant::now();
-        if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
-            *last = Some(now);
-            return true;
-        }
+    // 中毒恢复与 p2p_lock 一致：闸门里只有 Instant，没有需要保持的不变量；
+    // 因中毒而静默不记日志反而会丢掉现场证据。
+    let mut last = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+        *last = Some(now);
+        return true;
     }
     false
 }
@@ -160,12 +161,11 @@ fn should_log_control_reject() -> bool {
 fn should_log_control_event() -> bool {
     static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
     let gate = LAST.get_or_init(|| Mutex::new(None));
-    if let Ok(mut last) = gate.lock() {
-        let now = Instant::now();
-        if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
-            *last = Some(now);
-            return true;
-        }
+    let mut last = gate.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+        *last = Some(now);
+        return true;
     }
     false
 }
@@ -728,10 +728,8 @@ fn reset_to_ready() {
         let mut st = p2p_lock();
         *st = P2pState::new();
     }
-    if let Ok(mut sender) = reverse_sender().lock() {
-        if let Some(s) = sender.take() {
-            s.stop();
-        }
+    if let Some(s) = reverse_sender().lock().unwrap_or_else(|e| e.into_inner()).take() {
+        s.stop();
     }
     jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
     wake_decoder();
@@ -1702,13 +1700,14 @@ fn desired_reverse_ssrc(reverse_port: u16, previous: u32, regenerate: bool) -> u
 
 /// 启动/重启反向发送器：先停旧的，保证同一时刻只有一个线程持有环回端点
 fn restart_reverse_sender(addr: SocketAddr, ssrc: u32) {
-    if let Ok(mut slot) = reverse_sender().lock() {
-        if let Some(old) = slot.take() {
-            old.stop();
-        }
-        if ssrc != 0 {
-            *slot = Some(capture::ReverseSender::start(addr, ssrc));
-        }
+    // 中毒恢复：槽里只有 Option<ReverseSender>，取回内部值继续操作；
+    // 若因中毒直接跳过，旧发送线程会继续跑而日志一无所知。
+    let mut slot = reverse_sender().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = slot.take() {
+        old.stop();
+    }
+    if ssrc != 0 {
+        *slot = Some(capture::ReverseSender::start(addr, ssrc));
     }
 }
 

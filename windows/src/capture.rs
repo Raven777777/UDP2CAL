@@ -171,15 +171,15 @@ fn reverse_config() -> &'static Mutex<OpusReverseConfig> {
 
 /// 由 main.rs 的控制面调用；只有内容真正变化才落盘日志
 pub fn update_reverse_config(cfg: OpusReverseConfig) {
-    if let Ok(mut c) = reverse_config().lock() {
-        if *c != cfg {
-            logf!(
-                "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
-                cfg.bitrate_kbps, cfg.bandwidth, cfg.complexity, cfg.signal,
-                cfg.vbr, cfg.dtx, cfg.fec, cfg.packet_loss
-            );
-            *c = cfg;
-        }
+    // 中毒恢复与其他 Mutex 一致：这里只是一份配置快照，没有跨字段不变量。
+    let mut c = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
+    if *c != cfg {
+        logf!(
+            "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
+            cfg.bitrate_kbps, cfg.bandwidth, cfg.complexity, cfg.signal,
+            cfg.vbr, cfg.dtx, cfg.fec, cfg.packet_loss
+        );
+        *c = cfg;
     }
 }
 
@@ -290,10 +290,7 @@ impl ReverseSender {
         };
 
         // 启动时下发一次；之后仅在配置变化时下发
-        let mut applied = OpusReverseConfig::default();
-        if let Ok(cfg) = reverse_config().lock() {
-            applied = *cfg;
-        }
+        let mut applied = *reverse_config().lock().unwrap_or_else(|e| e.into_inner());
         apply_config(&mut encoder, &applied);
 
         let send_sock = match UdpSocket::bind("0.0.0.0:0") {
@@ -374,11 +371,10 @@ impl ReverseSender {
             // ── 配置变化检测：500 ms 一次，避免每帧抢锁（发送线程不该有锁流量）──
             if cfg_check_at.elapsed() > Duration::from_millis(500) {
                 cfg_check_at = Instant::now();
-                if let Ok(cfg) = reverse_config().lock() {
-                    if *cfg != applied {
-                        apply_config(&mut encoder, &cfg);
-                        applied = *cfg;
-                    }
+                let cfg = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
+                if *cfg != applied {
+                    apply_config(&mut encoder, &cfg);
+                    applied = *cfg;
                 }
             }
 
