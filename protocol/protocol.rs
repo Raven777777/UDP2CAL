@@ -194,7 +194,11 @@ pub fn build_control_to(
         return None;
     }
     let total = CONTROL_HEADER_SIZE + payload.len();
-    if offset + total > dest.len() {
+    // 用 checked_add 而不是 `offset + total`：后者在 release 下溢出回绕，
+    // 能绕过这里的长度校验，随后 `dest[offset]` 直接索引 panic——与本函数
+    // 文档承诺的"缓冲区不足返回 None"矛盾。
+    let end = offset.checked_add(total)?;
+    if end > dest.len() {
         return None;
     }
     dest[offset] = CONTROL_VERSION;
@@ -205,7 +209,7 @@ pub fn build_control_to(
     dest[offset + 5] = 0;
     dest[offset + 6] = 0;
     dest[offset + 7..offset + 15].copy_from_slice(device_id);
-    dest[offset + CONTROL_HEADER_SIZE..offset + total].copy_from_slice(payload);
+    dest[offset + CONTROL_HEADER_SIZE..end].copy_from_slice(payload);
     Some(total)
 }
 
@@ -850,6 +854,19 @@ mod tests {
         assert!(build_control_to(&mut buf, 60, TYPE_CONNECT, &DEV, &payload).is_none());
         // 负载超限
         assert!(build_control_to(&mut buf, 0, TYPE_CONNECT, &DEV, &vec![0u8; 513]).is_none());
+    }
+
+    /// `offset + total` 溢出必须返回 None，而不是绕过长度校验后索引 panic。
+    #[test]
+    fn build_control_to_rejects_overflowing_offset() {
+        let mut buf = [0u8; 64];
+        let payload = [0u8; 4];
+        assert!(build_control_to(&mut buf, usize::MAX, TYPE_CONNECT, &DEV, &payload).is_none());
+        // 刚好溢出的边界：usize::MAX - total + 1
+        let total = CONTROL_HEADER_SIZE + payload.len();
+        assert!(build_control_to(&mut buf, usize::MAX - total + 1, TYPE_CONNECT, &DEV, &payload).is_none());
+        // 不溢出的超大 offset 仍然按"缓冲区不足"拒绝
+        assert!(build_control_to(&mut buf, 64, TYPE_CONNECT, &DEV, &payload).is_none());
     }
 
     #[test]
