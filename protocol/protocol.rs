@@ -734,12 +734,11 @@ mod tests {
         p.payload_type = 110;
         assert!(p.validate().is_err());
 
-        let mut p = ConnectPayload::default();
-        p.frame_ms = 20;
+        // 与下方 invalid_fields 保持同一种写法（结构体更新语法）
+        let p = ConnectPayload { frame_ms: 20, ..ConnectPayload::default() };
         assert!(p.validate().is_err());
 
-        let mut p = ConnectPayload::default();
-        p.forward_ssrc = 0;
+        let p = ConnectPayload { forward_ssrc: 0, ..ConnectPayload::default() };
         assert!(p.validate().is_err());
 
         let invalid_fields = [

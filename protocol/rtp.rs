@@ -1671,7 +1671,7 @@ mod tests {
         assert!(write_packet(&mut buf, false, 1, 0, 7, &[]).is_none());
         // 缓冲区不足
         let mut small = vec![0u8; 20];
-        assert!(write_packet(&mut small, false, 1, 0, 7, &vec![0u8; 9]).is_none());
+        assert!(write_packet(&mut small, false, 1, 0, 7, &[0u8; 9]).is_none());
     }
 
     // ── 扩展计数 ──
@@ -2452,9 +2452,10 @@ mod tests {
     fn scheduler_thresholds_are_ordered() {
         // 目标水位必需覆盖整个流水线，节流点必需在 PLC 提前量之上，
         // 否则"该生产"与"该补 PLC"会互相打架。
-        assert!(PLC_LEAD_MS < DECODE_LIMIT_MS);
-        assert!(DECODE_LIMIT_MS < WATER_TARGET_MS);
-        assert!(JITTER_START_MS < WATER_TARGET_MS);
+        // 常量比较在编译期求值：改错常量直接编译失败，不必等跑测试。
+        const { assert!(PLC_LEAD_MS < DECODE_LIMIT_MS) };
+        const { assert!(DECODE_LIMIT_MS < WATER_TARGET_MS) };
+        const { assert!(JITTER_START_MS < WATER_TARGET_MS) };
     }
 
     // ── 阶跃吸收（方案 C）──
@@ -2462,8 +2463,9 @@ mod tests {
     #[test]
     fn water_target_default_is_150_and_override_is_clamped() {
         assert_eq!(WATER_TARGET_MS, 150);
-        assert!(WATER_TARGET_MIN_MS < WATER_TARGET_MS);
-        assert!(WATER_TARGET_MS < WATER_TARGET_MAX_MS);
+        // 同上：编译期求值
+        const { assert!(WATER_TARGET_MIN_MS < WATER_TARGET_MS) };
+        const { assert!(WATER_TARGET_MS < WATER_TARGET_MAX_MS) };
         // 环境变量缓存后的值必须落在允许区间内（未设置时等于常数）
         assert!((WATER_TARGET_MIN_MS..=WATER_TARGET_MAX_MS).contains(&water_target_ms()));
     }
