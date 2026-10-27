@@ -122,6 +122,7 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
 
 /// 本地时间戳，格式 `2026-10-23 20:55:24.123`
 fn timestamp() -> String {
+    // SAFETY: `GetLocalTime` 无参数、返回值语义（无指针输出），调用总是成功。
     let t = unsafe { GetLocalTime() };
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",

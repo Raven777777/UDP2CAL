@@ -871,6 +871,9 @@ fn main() -> Result<(), iced::Error> {
         logf!("[App] 日志文件: {}", p.display());
     }
 
+    // SAFETY: 三处 `PCWSTR::from_raw` 的缓冲都是本作用域内的 `Vec<u16>`，
+    // 以 `\0` 结尾且生命周期覆盖调用；`CreateMutexW` 句柄故意泄漏到进程结束
+    // （单实例锁整个进程生命周期有效），不对其调用 `CloseHandle`。
     unsafe { 
         let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect(); 
         let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr())); 
@@ -1587,6 +1590,8 @@ fn install_tray(icon_rgba: Vec<u8>, width: u32, height: u32) -> Option<tray_icon
 /// 单实例：按窗口标题激活已运行的实例
 fn focus_existing_window(title: &str) {
     let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` 以 0 结尾，指针在调用期间有效；FindWindowW 失败时返回
+    // Err，不产生悬垂引用。
     unsafe {
         if let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR::from_raw(wide.as_ptr())) {
             let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -1600,6 +1605,8 @@ fn restore_native_window() {
         process_id: std::process::id(),
         window: HWND(std::ptr::null_mut()),
     };
+    // SAFETY: `LPARAM` 携带 `&mut search` 的地址，`EnumWindows` 是同步调用，
+    // 回调期间 `search` 保留独占可变借用且一直存活，不存在别名或悬垂。
     unsafe {
         let _ = EnumWindows(
             Some(find_window_for_process),
@@ -1620,7 +1627,12 @@ struct WindowSearch {
 /// 只接受"可见 + 有标题"的顶层窗口。
 /// 历史上命中枚举到的第一个同进程窗口即可，可能选到不可见的辅助窗口，
 /// 导致托盘双击"没反应"。
+///
+/// # Safety
+/// `data` 必须是由 [`restore_native_window`] 传入的 `&mut WindowSearch` 地址；
+/// 回调是同步的，指针在该调用期间有效且不与其它借用冲突。
 unsafe extern "system" fn find_window_for_process(hwnd: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: 见上，`data` 来自 restore_native_window 的 `&mut search`。
     let search = &mut *(data.0 as *mut WindowSearch);
     let mut process_id = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut process_id));

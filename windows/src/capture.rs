@@ -272,6 +272,8 @@ impl ReverseSender {
         let _alive_guard = AliveGuard(alive);
         logf!("[Reverse] 启动反向音频 → {} (ssrc={:#010x})", target, ssrc);
 
+        // SAFETY: 无指针参数；HRESULT 成功（含 S_FALSE）时本线程的 COM 初始化
+        // 计数 +1，与下面 ComGuard 里唯一一次 CoUninitialize 严格配对。
         let com_ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
         let _com_guard = ComGuard { active: com_ok };
 
@@ -598,6 +600,8 @@ struct ComGuard {
 impl Drop for ComGuard {
     fn drop(&mut self) {
         if self.active {
+            // SAFETY: 仅当本线程上一次 CoInitializeEx 返回成功时 active 为 true，
+            // 因此这里恰好抵消那一次初始化；Drop 只执行一次。
             unsafe { CoUninitialize() };
         }
     }
@@ -697,6 +701,9 @@ struct LoopbackCapture {
 
 impl Drop for LoopbackCapture {
     fn drop(&mut self) {
+        // SAFETY: `client` 是本结构独占拥有的 COM 接口指针（Drop 只跑一次，
+        // 无其它别名）；`event` 用 take() 取走，保证 CloseHandle 只执行一次。
+        // 两个调用都只接受有效句柄，失败返回值被忽略即等于不做事。
         unsafe {
             let _ = self.client.Stop();
             if let Some(h) = self.event.take() {
@@ -718,6 +725,9 @@ enum ReadOutcome {
 
 impl LoopbackCapture {
     fn new() -> Option<Self> {
+        // SAFETY: 整块只做 COM 调用，不解引用裸指针；`GetMixFormat` 返回的
+        // 指针传给 parse_mix_format 后立刻 CoTaskMemFree，且只释放一次；
+        // 失败分支逐个关闭已取得的句柄；事件句柄的最终关闭在 Drop 里。
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
@@ -787,6 +797,8 @@ impl LoopbackCapture {
     fn wait(&self, timeout_ms: u32) -> bool {
         match self.event {
             Some(h) => {
+                // SAFETY: `h` 来自 CreateEventW，在本结构存活期内始终有效
+                // （只在 Drop 里关闭），且 WaitForSingleObject 不转移所有权。
                 let r = unsafe { WaitForSingleObject(h, timeout_ms) };
                 r == WAIT_OBJECT_0
             }
@@ -800,6 +812,10 @@ impl LoopbackCapture {
 
     /// 读取一帧 PCM，输出**固定立体声交错** f32（L,R,L,R,...）
     fn read_stereo(&self, out: &mut Vec<f32>) -> ReadOutcome {
+        // SAFETY: `GetBuffer` 成功时保证 `data_ptr` 指向连续 `frames * channels`
+        // 个样本的内存，布局与混音格式一致（`self.format`），并且在 `ReleaseBuffer`
+        // 之前不被释放；SILENT 标志或空指针时不读。切片长度严格取
+        // `frames * channels`，`c0/c1` 的下标都小于 `channels`。
         unsafe {
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
@@ -865,6 +881,11 @@ impl LoopbackCapture {
 }
 
 /// 解析 WAVEFORMATEX / WAVEFORMATEXTENSIBLE
+///
+/// # Safety
+/// `fmt` 必须指向至少 `size_of::<WAVEFORMATEX>()` 字节的有效内存（典型来源是
+/// `IAudioClient::GetMixFormat`）。只有 `cbSize >= 22`（WAVEFORMATEXTENSIBLE
+/// 比 WAVEFORMATEX 多出的字节数）时才会按扩展结构读取尾部字段。
 unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     if fmt.is_null() {
         return None;
@@ -952,6 +973,7 @@ mod tests {
             nAvgBytesPerSec: 44_100 * 8,
             cbSize: 0,
         };
+        // SAFETY: `wf` 是栈上的 WAVEFORMATEX，指针有效且生命周期覆盖调用。
         let fmt = unsafe { parse_mix_format(&mut wf as *mut WAVEFORMATEX) }.expect("应支持 f32/2ch");
         assert_eq!(fmt.sample_rate, 44_100);
         assert_eq!(fmt.channels, 2);
