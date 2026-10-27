@@ -130,9 +130,71 @@ fn is_valid_control_header(header: &protocol::ControlHeader) -> bool {
     header.is_known_type() && protocol::is_valid_device_id(&header.device_id)
 }
 
+const DISCOVERY_RATE_PER_SOURCE: u32 = 5;
+const DISCOVERY_MAX_TRACKED_SOURCES: usize = 1024;
+
+/// 发现请求的按源限流，并为流量状态表设置硬上限。
+///
+/// UDP 源地址可被伪造；只按 30 s 周期清理而不限制表大小，会让持续到达的
+/// 不同源地址在清理前无界占用内存。达到上限后拒绝新源，已有的合法源仍按
+/// 原令牌桶规则工作，直到下一轮清理回收过期项。
+fn allow_discovery_request(
+    bucket: &mut std::collections::HashMap<std::net::IpAddr, (u32, Instant)>,
+    source: std::net::IpAddr,
+    now: Instant,
+) -> bool {
+    if let Some((count, window_start)) = bucket.get_mut(&source) {
+        if now.duration_since(*window_start) >= Duration::from_secs(1) {
+            *count = 0;
+            *window_start = now;
+        }
+        if *count >= DISCOVERY_RATE_PER_SOURCE {
+            return false;
+        }
+        *count += 1;
+        return true;
+    }
+    if bucket.len() >= DISCOVERY_MAX_TRACKED_SOURCES {
+        return false;
+    }
+    bucket.insert(source, (1, now));
+    true
+}
+
 #[cfg(test)]
 mod control_binding_tests {
     use super::*;
+
+    #[test]
+    fn discovery_limiter_is_bounded_and_resets_per_second() {
+        let mut bucket = std::collections::HashMap::new();
+        let source = "192.0.2.1".parse().unwrap();
+        let t0 = Instant::now();
+        for _ in 0..DISCOVERY_RATE_PER_SOURCE {
+            assert!(allow_discovery_request(&mut bucket, source, t0));
+        }
+        assert!(!allow_discovery_request(&mut bucket, source, t0));
+        assert!(allow_discovery_request(
+            &mut bucket,
+            source,
+            t0 + Duration::from_secs(1)
+        ));
+
+        let mut full = std::collections::HashMap::new();
+        for i in 0..DISCOVERY_MAX_TRACKED_SOURCES {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(i as u32 + 1));
+            assert!(allow_discovery_request(&mut full, ip, t0));
+        }
+        let new_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1));
+        assert!(!allow_discovery_request(&mut full, new_ip, t0));
+        assert_eq!(full.len(), DISCOVERY_MAX_TRACKED_SOURCES);
+        // 已在表中的源不受新源上限影响，避免一次伪造洪泛把正常设备也锁死。
+        assert!(allow_discovery_request(
+            &mut full,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(1)),
+            t0 + Duration::from_secs(1)
+        ));
+    }
 
     #[test]
     fn control_header_rejects_all_zero_device_id() {
@@ -853,7 +915,6 @@ pub fn start_broadcast_listener() {
         let my_id = my_device_id();
         // 简单令牌桶：同一源 IP 每秒最多应答 MAX_PER_SEC 次。
         // 发现请求 15B、应答 ~15B+主机名，无限制时可被用于 UDP 反射放大。
-        const MAX_PER_SEC: u32 = 5;
         let mut bucket: std::collections::HashMap<std::net::IpAddr, (u32, Instant)> =
             std::collections::HashMap::new();
         let mut last_cleanup = Instant::now();
@@ -867,15 +928,8 @@ pub fn start_broadcast_listener() {
                 bucket.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(5));
                 last_cleanup = Instant::now();
             }
-            {
-                let entry = bucket.entry(src.ip()).or_insert((0, Instant::now()));
-                if entry.1.elapsed() >= Duration::from_secs(1) {
-                    *entry = (0, Instant::now());
-                }
-                if entry.0 >= MAX_PER_SEC {
-                    continue;
-                }
-                entry.0 += 1;
+            if !allow_discovery_request(&mut bucket, src.ip(), Instant::now()) {
+                continue;
             }
 
             let Some((hdr, payload)) = protocol::parse_control(&buf[..amt]) else {
