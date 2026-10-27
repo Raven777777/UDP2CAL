@@ -1175,11 +1175,18 @@ impl AppState {
     /// 注册表写入可能被杀毒软件/组策略拦截。用 `let _ =` 吞掉错误会让用户
     /// 以为设置已持久化：重启后配置静默回退，而日志里没有任何线索。为此把
     /// 错误写进日志并提示用户（回滚语义由各调用点自己决定，这里不改配置值）。
-    fn persist_config(&mut self) {
-        if let Err(e) = self.config.save() {
-            logf!("[Config] 保存配置失败: {e}");
-            self.notice = format!("配置保存失败：{e}");
-            self.notice_level = NoticeLevel::Error;
+    ///
+    /// 返回是否保存成功。调用方**只在成功时**才能清空 `notice`：否则刚写的
+    /// “配置保存失败”提示会被紧接着的 `notice.clear()` 抹掉，用户什么也看不到。
+    fn persist_config(&mut self) -> bool {
+        match self.config.save() {
+            Ok(()) => true,
+            Err(e) => {
+                logf!("[Config] 保存配置失败: {e}");
+                self.notice = format!("配置保存失败：{e}");
+                self.notice_level = NoticeLevel::Error;
+                false
+            }
         }
     }
 
@@ -1199,8 +1206,9 @@ impl AppState {
                 // 写入失败必须回滚开关并告知用户，避免"开关假亮"
                 match self.config.set_auto_start(enabled) {
                     Ok(()) => {
-                        self.persist_config();
-                        self.notice.clear();
+                        if self.persist_config() {
+                            self.notice.clear();
+                        }
                     }
                     Err(e) => {
                         self.notice = e;
@@ -1267,7 +1275,7 @@ impl AppState {
 
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;
-                    self.persist_config();
+                    let saved = self.persist_config();
                     LISTEN_PORT.store(port as u32, Ordering::Release);
 
                     // 上次音频初始化失败过则重试一次（例如用户刚装好 VB-Cable）
@@ -1289,7 +1297,9 @@ impl AppState {
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
                     self.status_text = "等待连接...".into();
-                    self.notice.clear();
+                    if saved {
+                        self.notice.clear();
+                    }
                     self.vb_cable_installed = audio::detect_vb_cable().is_some();
                     // 应用反向串流设置到全局
                     REVERSE_ENABLED
