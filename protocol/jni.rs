@@ -49,8 +49,9 @@ use jni_sys::{
 };
 
 use crate::rtp::{
-    extend_seq, extend_ts, water_target_ms, DriftController, InsertResult, JitterBuffer, Pull,
-    RateEstimator, RtpHeader, RtpPacket, StepAbsorber, ARRIVAL_TRACE, OPUS_FRAME_SAMPLES,
+    extend_seq, extend_ts, water_target_ms, DeviceRateEstimator, DriftController, InsertResult,
+    JitterBuffer, Pull, RateEstimator, RtpHeader, RtpPacket, StepAbsorber, ARRIVAL_TRACE,
+    OPUS_FRAME_SAMPLES,
     OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, RTP_HEADER_SIZE,
 };
 use crate::{
@@ -258,7 +259,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
     env: Env,
     _this: jobject,
 ) -> jlongArray {
-    let v: [jlong; 43] = [
+    let v: [jlong; 44] = [
         CONTROL_VERSION as jlong,
         CONTROL_HEADER_SIZE as jlong,
         CONTROL_MAX_PAYLOAD as jlong,
@@ -301,6 +302,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
         crate::rtp::RESYNC_GAP_MS as jlong,
         crate::rtp::STEP_TRIM_GROWTH_MS as jlong,
         crate::rtp::STEP_TRIM_EXCESS_MS as jlong,
+        crate::rtp::STEP_TRIM_HOLD_MS as jlong,
         crate::rtp::STEP_TRIM_MAX_PER_MIN as jlong,
     ];
     new_longs(env, &v)
@@ -319,7 +321,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
         crate::rtp::PI_TI_S,
         crate::rtp::PI_INTEGRAL_MAX,
         crate::rtp::PI_MIN_UPDATE_MS,
-        crate::rtp::WATER_SMOOTH_ALPHA,
+        crate::rtp::WATER_SMOOTH_TAU_MS,
         crate::rtp::RATE_WINDOW_S,
         crate::rtp::RATE_FEEDFORWARD_MAX,
     ];
@@ -667,6 +669,10 @@ struct DriftHandle {
     inner: Mutex<DriftController>,
 }
 
+struct DeviceRateHandle {
+    inner: Mutex<DeviceRateEstimator>,
+}
+
 #[inline]
 unsafe fn lock<'a, T>(cell: &'a Mutex<T>) -> MutexGuard<'a, T> {
     // 中毒恢复：JNI 侧不允许把 panic 传染成永久不可用
@@ -699,6 +705,13 @@ unsafe fn drift_ref(h: Handle) -> Option<&'static DriftHandle> {
         return None;
     }
     (h as *const DriftHandle).as_ref()
+}
+
+unsafe fn device_rate_ref(h: Handle) -> Option<&'static DeviceRateHandle> {
+    if h == 0 {
+        return None;
+    }
+    (h as *const DeviceRateHandle).as_ref()
 }
 
 // ═══════════════════════ JitterBuffer ═══════════════════════
@@ -741,6 +754,19 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbReset
         g.jb.reset();
         g.pulled_len = 0;
         g.pulled_ts = 0;
+    }
+}
+
+/// 显式启动预缓冲：攒到本方向目标水位才起播（不再 30 ms 起播后慢慢爬）。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbSetStartPrebufferMs(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+    ms: jint,
+) {
+    if let Some(handle) = jb_ref(h) {
+        lock(&handle.inner).jb.set_start_prebuffer_ms(ms.max(0) as u32);
     }
 }
 
@@ -828,20 +854,41 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
     code
 }
 
+/// 阶跃裁剪：按播放顺序取一帧，调用方必须**解码后丢弃 PCM**，
+/// 让有状态 Opus 解码器跟住发送端。返回判别值同 `jbPull`。
 #[no_mangle]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbSkipFrames(
-    _env: Env,
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPullTrim(
+    env: Env,
     _this: jobject,
     h: Handle,
-    n: jint,
+    out: jbyteArray,
 ) -> jint {
-    match jb_ref(h) {
-        Some(handle) => {
-            let mut g = lock(&handle.inner);
-            g.jb.skip_frames(n.max(0) as u32) as jint
+    let handle = match jb_ref(h) {
+        Some(x) => x,
+        None => return 0,
+    };
+    let mut g = lock(&handle.inner);
+    g.pulled_len = 0;
+    let mut scratch = std::mem::take(&mut g.scratch);
+    ensure_payload_capacity(&mut scratch);
+    let result = g.jb.pull_trim(&mut scratch[..]);
+    let (code, ts, len) = match result {
+        Pull::Packet { len, ts } => (1, ts, len),
+        Pull::Plc { ts } => (2, ts, 0),
+        Pull::Silence { ts } => (3, ts, 0),
+        Pull::Wait => (0, 0, 0),
+    };
+    if code != 0 {
+        g.pulled_ts = ts;
+        g.pulled_len = len as jint;
+        if len > 0 && !write_bytes(env, out, 0, &scratch[..len]) {
+            g.pulled_len = 0;
+            g.scratch = scratch;
+            return 2;
         }
-        None => 0,
     }
+    g.scratch = scratch;
+    code
 }
 
 macro_rules! jb_scalar {
@@ -892,6 +939,21 @@ jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbPulledTs, jlong, |g: &Jb
 jb_scalar!(Java_com_udp2cal_app_native_ProtocolNative_jbWaterMs, jint, |g: &JbInner| g
     .jb
     .water_ms() as jint);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbOccupancyFrames,
+    jint,
+    |g: &JbInner| g.jb.occupancy_frames() as jint
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbOccupancyMs,
+    jint,
+    |g: &JbInner| g.jb.occupancy_ms() as jint
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbContiguousMs,
+    jint,
+    |g: &JbInner| g.jb.contiguous_ms() as jint
+);
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbContiguousFrames,
     jint,
@@ -1030,6 +1092,34 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecid
     ((d.frames as jlong) << 32) | (d.limited as jlong)
 }
 
+/// 与 [`..._saDecide`] 相同，但显式传入 `System.nanoTime()` 基准时刻，
+/// 供单测推进虚拟时间（生产路径仍用实时时钟）。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecideAt(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+    jb_water_ms: jint,
+    pipe_ms: jint,
+    can_trim: jboolean,
+    target_ms: jint,
+    now_nanos: jlong,
+) -> jlong {
+    let handle = match step_ref(h) {
+        Some(x) => x,
+        None => return 0,
+    };
+    let mut g = lock(&handle.inner);
+    let d = g.decide_at(
+        jb_water_ms.max(0) as u32,
+        pipe_ms.max(0) as u32,
+        can_trim != 0,
+        target_ms.max(0) as u32,
+        instant_from_nanos(now_nanos),
+    );
+    ((d.frames as jlong) << 32) | (d.limited as jlong)
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saHits(
     _env: Env,
@@ -1157,6 +1247,92 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reObser
 ) -> jlong {
     match rate_ref(h) {
         Some(handle) => lock(&handle.inner).observations() as jlong,
+        None => 0,
+    }
+}
+
+// ═══════════════════ DeviceRateEstimator（设备时钟前馈） ═══════════════════
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deCreate(
+    _env: Env,
+    _this: jobject,
+) -> Handle {
+    Box::into_raw(Box::new(DeviceRateHandle {
+        inner: Mutex::new(DeviceRateEstimator::new()),
+    })) as Handle
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deDestroy(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+) {
+    if h != 0 {
+        drop(Box::from_raw(h as *mut DeviceRateHandle));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deReset(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+) {
+    if let Some(handle) = device_rate_ref(h) {
+        lock(&handle.inner).reset();
+    }
+}
+
+/// `played_nanos` 用 Java `System.nanoTime()`，与 `Instant` 同源。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deObserve(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+    device_frames: jlong,
+    played_nanos: jlong,
+) {
+    if let Some(handle) = device_rate_ref(h) {
+        lock(&handle.inner)
+            .observe(device_frames.max(0) as u64, instant_from_nanos(played_nanos));
+    }
+}
+
+/// 无估计时返回 NaN。正值表示设备时钟偏慢。
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deFeedforward(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+) -> jdouble {
+    match device_rate_ref(h) {
+        Some(handle) => lock(&handle.inner).feedforward().unwrap_or(f64::NAN),
+        None => f64::NAN,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deSigmaPpm(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+) -> jdouble {
+    match device_rate_ref(h) {
+        Some(handle) => lock(&handle.inner).sigma_ppm(),
+        None => 0.0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deBuckets(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+) -> jint {
+    match device_rate_ref(h) {
+        Some(handle) => lock(&handle.inner).buckets() as jint,
         None => 0,
     }
 }

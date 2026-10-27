@@ -181,7 +181,7 @@ v3 使用标准 RTP 固定头，12 字节，无 CSRC、无扩展、无填充。
 - 声道数由 Opus 包 TOC 决定。接收端解码器必须按当前方向配置的声道数初始化；不得从 RTP 头或控制包推断声道数。
 - 负载就是 Opus 包本身，不添加长度、序号、设备 ID、码率或采样率字段。
 - DTX 静音包允许为 1–2 字节；不允许发送零长度 RTP 负载。
-- FEC/DRED 只作为 Opus 带内冗余，不拆成独立 RTP 包。
+- FEC 只作为 Opus 带内冗余，不拆成独立 RTP 包；DRED 本版不启用。
 
 ### 4.3 时间戳
 
@@ -199,26 +199,27 @@ v3 使用标准 RTP 固定头，12 字节，无 CSRC、无扩展、无填充。
 ### 4.4 序列号
 
 - 初始序列号为随机 16 位值。
-- **序列号与时间戳同频推进：发送端每产生一个 10 ms 采集帧，序列号必须递增 1，
-  与该帧是否真的发出无关。** 包括：正常发送的帧、编码失败/发送失败而丢弃的帧、
-  DTX 静音未发包的帧、以及 ACK 超时暂停发送期间的帧。
+- **序列号只属于真正发出的 RTP 包**（RFC 3550）：正常发送成功才递增 1。编码失败、发送失败、
+  DTX **未发包**的帧（编码器返回 0 或策略决定不发送）、ACK 超时暂停期间都不占号。
+  DTX 若实际发出 1–2 字节静音包，它仍是真实 RTP 包，必须占号。
+- 时间戳仍按媒体时间每 10 ms 推进（包括未发包的帧），因此恢复发送后序号连续但时间戳会留下真实缺口；接收端用 `M=1` + 时间戳缺口识别断点。
 - DTX 静音结束后恢复发送时，用 `marker=1` 表示静默结束。
 - 序列号回绕周期约为 `2^16 × 10 ms ≈ 10.9 分钟`。
 - 接收端必须用扩展计数器处理 16 位回绕；乱序窗口远小于 32768，因此可用有符号差值扩展。
 
-> **为什么必须同频（2026-10-25 修订）**：接收端在断流/静音期间会用 PLC/静音推进
-> `next_seq`。若发送端在此期间冻结序列号，恢复包的 `ext_seq` 会永久落后于
-> `next_seq`，且滞后量随静音时长**单调增大**，永不闭合；恢复包会被"序号迟到"
-> 判定拦下，`marker=1` 的重同步分支永远不可达 → 单向音频永久静音。
-> 旧表述"DTX 不递增序列号"与接收端算法不自洽，已废止。
+> **为什么未发送的 DTX 帧不占号（2026-10 修订）**：序号是“已发送包”的计数，不是媒体帧计数。
+> 若未发送的帧也占号，链路一旦丢包，接收端看到的序号缺口就无法区分“发送端没发”与“网络丢了”，
+> 重排窗口/丢包统计全部失真。接收端在 PLC/静音期间**只推进 `next_ts`，不推进 `next_seq`**；
+> 恢复包若序号落后但时间戳合法，按时间戳接纳并计入 `seq_realign`，不得整段丢弃。
+> 旧表述“序列号与时间戳同频推进”与 RFC 3550 及当前实现都不自洽，已废止。
 
 ### 4.5 SSRC
 
 - 每个方向、每个连接会话使用独立的随机非零 32 位 SSRC。
 - 正向 SSRC 由 Android 生成，放在 CONNECT 的 `forward_ssrc` 中。
 - 反向 SSRC 由 Windows 生成，放在 CONNECT_ACK 的 `reverse_ssrc` 中。
-- 重连时必须生成新的 SSRC；旧 SSRC 的包必须被丢弃。
-- 同一设备、同一 SSRC 的周期 CONNECT 是保活，不得重置抖动缓冲。
+- 重连时必须生成新的 SSRC；旧 SSRC 的包必须被丢弃。Android 在 ACK 超时（3 s）后会主动更换正向 SSRC，下一次 CONNECT 让 Windows 走显式新会话路径。
+- 同一设备、同一 SSRC 的周期 CONNECT 是保活，不得重置抖动缓冲，也不得重建音频链路。
 - SSRC 不是认证凭据；只能配合源地址校验使用。
 
 ### 4.6 标记位 M
@@ -265,9 +266,9 @@ v3 使用标准 RTP 固定头，12 字节，无 CSRC、无扩展、无填充。
 - 高于 512 kbps 的配置必须被拒绝或钳制到 512。
 - Opus 负载最大 1275 字节；编码结果超过 1275 字节时：
   - 必须丢弃该帧，不得截断；
-  - 计数并降低码率/关闭或降低 FEC/DRED 冗余；
+  - 计数并降低码率/关闭 FEC 冗余；
   - 不得让 RTP 包超过 1287 字节。
-- FEC/DRED 会增加单帧体积；高码率 + 高冗余时更容易超限，必须做上述保护。
+- FEC 会增加单帧体积；高码率 + 高冗余时更容易超限，必须做上述保护。
 
 ### 4.8 RTP 示例
 
@@ -552,11 +553,11 @@ Reconnecting ──(ACK)──> Connected
 
 ### 7.1 设计约束
 
-1. **声卡播放头是唯一音频时钟**。不得用 `Instant`、`System.currentTimeMillis()`、`sleep` 或定时器决定播放/PLC/重同步。
+1. **声卡播放头是唯一音频时钟**。但必须区分三个时间参考：RTP 媒体样本时间、接收端单调时钟（QPC/`Instant`）、声卡播放位置。三者通过平台层给出的设备进度建立可验证映射；不得用 `sleep` 或定时器决定播放/PLC/重同步。
 2. 网络线程只负责收包、校验、插入抖动缓冲；不得在音频路径上阻塞等待播放。
 3. Windows 使用独立解码线程 + 现有无锁 PCM 环；cpal 回调只搬运 PCM，不碰 Opus、不分配、不加锁。
 4. Android 在 AudioTrack 写线程中直接拉取/解码/PLC；AudioTrack 的阻塞写入天然提供节拍。
-5. 接收缓冲是“已收到但未播放”的音频水位；等待由水位表达。
+5. 接收缓冲是“已收到但未播放”的音频水位；等待由水位表达。`jb.water_ms()` 是媒体跨度（含空洞），另以 `occupancy_ms()` / `contiguous_ms()` 分别记录真实占槽与连续可解码量。
 
 ### 7.2 参数
 
@@ -564,28 +565,29 @@ Reconnecting ──(ACK)──> Connected
 |------|----|------|
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
-| `JITTER_START_MS` | 30 ms | 预缓冲启动阈值（3 帧连续） |
-| `WATER_TARGET_MS` | 150 ms | 目标**总**水位（单一口径：抖动缓冲 + PCM 环 + 声卡缓冲）。**两端必须同值**；取值由实测断供幅度决定，见 §7.10.1 |
+| `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧连续）；实际启动还要求水位达到本方向的启动目标 |
+| `WATER_TARGET_MS` | 150 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
-| `STEP_TRIM_GROWTH_MS` | 80 ms | 阶跃判据一：单次 tick 内抖动缓冲水位增长超过即判为阶跃，见 §7.10.2 |
-| `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据二：总水位 > `target + 100` ms 即判为超预算 |
+| `STEP_TRIM_GROWTH_MS` | 80 ms | 仅诊断：记录“单次 tick 增长超过该值”的次数，**不再作为裁剪判据** |
+| `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据：总水位 > `target + 100` ms 且持续 `STEP_TRIM_HOLD_MS` |
+| `STEP_TRIM_HOLD_MS` | 1500 ms | 必须持续超预算这么久才裁剪；90 ms 攒批/一次补齐不算积压 |
 | `STEP_TRIM_MAX_PER_MIN` | 3 | 60 s 窗口内最多裁剪次数，超限只记录不裁剪 |
 | `DECODE_LIMIT_MS` | 40 ms | 解码缓冲深度上限：到顶就暂停生产（生产节奏由声卡消费节奏约束） |
-| `PLC_LEAD_MS` | 20 ms | 可听点见底的判据：`pipe_ms <= 20` 才允许补 PLC |
+| `PLC_LEAD_MS` | 20 ms | 解码提交余量：PCM 环 `ring_ms <= 20` 才允许补 PLC；声卡缓冲不计入该判据 |
 | `PLC_MAX_MS` | 120 ms | 连续 PLC 上限（12 帧） |
 | `MAX_REORDER_PACKETS` | 64 | 编码包重排槽位 |
 | `RESYNC_GAP_MS` | 200 ms | 触发重同步的时间戳跳变阈值 |
 | `RESAMPLE_MAX_ADJUST` | ±0.005 | 重采样比率微调上限（±0.5%） |
 | `RATIO_SLEW_STEP` | 0.0001 | 单次比率步进（1%/s 斜坡，按真实 dt 缩放） |
-| `PI_KP_PER_MS` | 0.00002 | 反馈比例增益：每 1 ms 水位偏差给 20 ppm（1 音分=578 ppm） |
-| `PI_TI_S` | 90 s | 积分时间常数（双积分器 ζ=√(K·KP·Ti)/2；90 s → ζ≈0.67） |
-| `PI_INTEGRAL_MAX` | 0.0015 | 积分项权限（±1500 ppm），限住长饱和后的余振 |
+| `PI_KP_PER_MS` | 0.00002 | 反馈比例增益：每 1 ms 长期水位偏差给 20 ppm（1 音分=578 ppm） |
+| `PI_TI_S` | 180 s | 积分时间常数；配合 KP 得到 ζ≈0.67 的慢环，只修长期残差 |
+| `PI_INTEGRAL_MAX` | 0.001 | 积分项权限（±1000 ppm），限住长饱和后的余振 |
 | `PI_MIN_UPDATE_MS` | 5 ms | 单次评估的最小时间跨度；更密的调用只累计时间 |
-| `WATER_SMOOTH_ALPHA` | 0.065 | 水位一阶低通系数（τ≈150 ms，带宽≈1 Hz） |
-| `RATE_WINDOW_S` / `RATE_BUCKETS` | 30 s / 30 | 前馈观测窗与桶数（每桶 1 s，桶内只留最小单向时延） |
+| `WATER_SMOOTH_TAU_MS` | 4000 ms | 水位一阶低通时间常数：90 ms 攒批衰减约 20 倍，只留长期均值 |
+| `RATE_WINDOW_S` / `RATE_BUCKETS` | 30 s / 30 | 设备时钟估计窗与桶数（每桶 1 s，桶内取设备进度/QPC 的最小二乘点） |
 | `RATE_MIN_BUCKETS` | 6 | 起算所需最少桶数（没攒够宁可不出估计） |
-| `RATE_JUMP_MAX_SAMPLES` | 96000（2 s） | 单次观测允许的媒体跳变上限：超过即判时间线被重建，整窗作废 |
-| `RATE_FEEDFORWARD_MAX` | ±0.02 | 前馈钳位（±2%：超出说明不是钟差） |
+| `RATE_JUMP_MAX_SAMPLES` | 96000（2 s） | 设备帧单次跳变上限：超过即判时间线被重建，整窗作废 |
+| `RATE_FEEDFORWARD_MAX` | ±0.02 | 设备时钟前馈钳位（±2%：超出说明不是钟差） |
 
 > UDP2CAL v1.3.0 起删除了 `JITTER_TARGET_MS`（被 `WATER_TARGET_MS` 取代，口径并入声卡缓冲）、
 > `JITTER_HIGH_MS`/`JITTER_LOW_MS`（从未被读）、全部 `SLIP_*` 与
@@ -627,12 +629,13 @@ JitterBuffer {
 4. 若包迟到/重复：
      ext_ts < next_ts                    -> 丢弃并计数（时间戳是播放顺序的唯一权威）
      slots 中已存在同一 ext_ts            -> 丢弃并计数（重复）
-5. 断点判定（**必须先于"序号迟到"判定**）：
+5. 序号滞后（断流 / DTX 恢复）：
      若 ext_seq < next_seq：
-         说明发送端发生过"时间戳前进、序号冻结"的断点（ACK 中断 / DTX），
+         说明发送端发生过"时间戳前进、序号不占号"的断点（ACK 中断 / DTX），
          或断流跨过了 i16 差值边界（>32767 个包 ≈ 5.4 分钟）。
-         以该包为新基准重新对齐（清 slots、重置 next_seq/next_ts/highest_*），
-         然后照常入槽；计入 seq_realign。
+         此时**不重建缓冲**：时间戳合法且未重复就照常入槽，计入 seq_realign，
+         并保持 next_seq 不动；恢复包按时间戳播放。只有 M=1 且时间戳跳变
+         超过 RESYNC_GAP_MS 才走下一步的显式重建。
 6. 若 M=1 且 (ext_ts - next_ts) > RESYNC_GAP_MS：
      清空 slots；重置 next_seq/next_ts/highest_*；
      重置解码器/PLC 状态；进入 PREBUFFER；
@@ -657,13 +660,14 @@ JitterBuffer {
 播放线程（Android 的 AudioTrack 写线程，或 Windows 的解码线程）循环：
 
 ```text
-ring_ms = PCM 环中已解码但尚未被声卡取走的毫秒数   // Android 无独立 PCM 环，恒为 0
+ring_ms = PCM 环中已解码但尚未被声卡取走的毫秒数
+           // Android 无独立 PCM 环：用 written − playbackHead 作为同一口径
 pipe_ms = ring_ms + 声卡已接手但尚未播完的毫秒数    // = 可听点之前压着的全部媒体量
 
 if (!started) return 等待;
 
 if (!playing):
-    if 连续可解码帧数 >= JITTER_START_MS / 10:
+    if 连续可解码帧数 >= JITTER_START_MS / 10 且 jb.water_ms >= start_ms:
         playing = true
     else:
         return 等待;
@@ -673,19 +677,18 @@ if slot[next_ts] 存在:
         return 等待;                    # 开门的是声卡的消费节奏，不是定时器
     decode(slot.payload) -> PCM
     remove slot
-    next_seq += 1
+    next_seq = max(next_seq, slot.seq + 1)   # 只反映真实收到的包
     next_ts  += 480
     plc_run = 0
     return PCM
 
-if pipe_ms <= PLC_LEAD_MS:              # 可听点之前已经见底 → 缺口确定
+if ring_ms <= PLC_LEAD_MS:              # 解码提交余量见底 → 缺口确定
     if plc_run < PLC_MAX_MS / 10:
         pcm = opus_plc_10ms()
         plc_run += 1
     else:
         pcm = silence_10ms()
-    next_seq += 1
-    next_ts  += 480
+    next_ts  += 480                     # PLC 不占发送端序号
     return pcm
 
 return 等待            // 还有余量，继续等
@@ -697,11 +700,12 @@ return 等待            // 还有余量，继续等
 - **不存在播放头时间戳**。旧实现的 `playhead_ts`（设备帧→48 kHz 媒体帧的换算 + 偏移记账）
   已被整条删除：`playback − callback` 换算出的设备帧从不参与播放判定，只用于上报声卡延迟。
 - 两个判据都是水位：`ring_ms` 决定“现在该不该生产下一帧”（生产节奏跟声卡走），
-  `pipe_ms` 决定“这一帧还来不来得及”（要不要补 PLC）。二者相差的正是声卡缓冲那一段。
-- `ring_ms >= DECODE_LIMIT_MS` 与 `pipe_ms <= PLC_LEAD_MS` 是同一个量的两个阈值：
-  前者是上限（别把延迟堆起来），后者是下限（见底就补）。中间是自由区。
+  `ring_ms <= PLC_LEAD_MS` 决定“这一帧还来不来得及”（要不要补 PLC）。设备缓冲是提交余量，
+  不能计入 PLC 判据：声卡缓冲再深，也不能证明 PCM 环里还有可提交的数据。
 - 有真实包到达但 `next_ts` 已经越过它：按迟到丢弃；不得回退 `next_ts`。
-- `PLC_LEAD_MS` 就是"可听点只剩 20 ms 余量"这件事本身，不需要再按下标换算。
+- `PLC_LEAD_MS` 是“下一次向设备提交 PCM 的最后时刻”，不是“可听点还剩多少”。
+  Windows 的 `ring_ms` 只统计 PCM 环；Android 的 AudioTrack 阻塞写没有独立环，
+  用 `written − playbackHead` 作为同一口径（它反映尚未被混音器消费的提交量）。
 
 ### 7.6 状态机
 
@@ -709,12 +713,12 @@ return 等待            // 还有余量，继续等
 IDLE
   │ 收到第一个合法 RTP
   ▼
-PREBUFFER ──(连续 >= 3 帧)──> PLAYING
+PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
   ▲                              │
-  │                              ├─ 下一帧缺失，但 pipe_ms > PLC_LEAD_MS
+  │                              ├─ 下一帧缺失，但 ring_ms > PLC_LEAD_MS
   │                              │     └─> GAP（等待，不消耗媒体时间）
   │                              │
-  │                              ├─ next_ts 缺失且 pipe_ms <= PLC_LEAD_MS
+  │                              ├─ next_ts 缺失且 ring_ms <= PLC_LEAD_MS
   │                              │     └─> PLC（最多 12 帧）→ 之后静音
   │                              │
   │                              └─ M=1 且跳变 > 200ms
@@ -723,9 +727,9 @@ PREBUFFER ──(连续 >= 3 帧)──> PLAYING
   └────────────────────────────── RESYNC（清空、重置、重新预缓冲）
 ```
 
-- `GAP` 不是定时器状态：只要可听点之前还压着超过 `PLC_LEAD_MS` 的媒体量，就继续等；
-  等待本身不消耗媒体时间，也不产生定时器。
-- `PLC` 由**水位见底**触发（`pipe_ms <= PLC_LEAD_MS`），不是由时钟触发；
+- `GAP` 不是定时器状态：只要 PCM 环里还压着超过 `PLC_LEAD_MS` 的已解码数据，就继续等；
+  设备缓冲不参与这个判据。
+- `PLC` 由 **PCM 环见底**（`ring_ms <= PLC_LEAD_MS`）触发，不是由时钟触发；
   `plc_run` 达到 12 后输出静音，但仍保持 `PLAYING`，直到真实包恢复。
 - 真实包恢复且时间戳跳变大于 200 ms：进入 `RESYNC`；否则直接继续 `PLAYING`，`plc_run=0`。
 
@@ -734,11 +738,11 @@ PREBUFFER ──(连续 >= 3 帧)──> PLAYING
 **启动**
 
 - 首包建立基准；不要求首包序列号是某个固定值。
-- 连续 3 帧（30 ms）可解码后才开始播放。降到 30 ms 的前提是水位由受控重采样闭环维持（7.9），不再是"离散校正需要留安全垫"的旧模型。
+- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（150 ms），所以不存在“30 ms 先播、再用 24 秒慢慢爬到 150 ms”的过程；`JITTER_START_MS` 只是硬下限。
+- `start_ms` 每个方向独立，可取 [30, WATER_TARGET_MS]；当前实现取目标值，以一次可闻的启动等待换取稳态不欠载。
 - 若首包丢失，以第一个收到的包为基准；不得无限等待“第 0 帧”。
-- Windows cpal 回调在预缓冲完成前输出静音；播放进度只由回调的 `played_frames` 表达，
-  不存在需要"启动计时"的播放头，也没有设备帧→媒体帧的换算。
-- Android 的 AudioTrack 只需 2 帧（20 ms）缓冲并启用 low-latency 通路；这 2 帧是输出缓冲，不是应用层无限队列。
+- Windows cpal 回调在预缓冲完成前输出静音；播放进度由回调侧的 `played_frames` 表达，并通过 `OutputCallbackInfo::timestamp().playback`（WASAPI `IAudioClock::GetPosition` + QPC）建立设备进度映射。
+- Android 的 AudioTrack 只需 2 帧（20 ms）硬件缓冲并启用 low-latency 通路；这 2 帧是输出缓冲，不是应用层无限队列。
 
 **重同步**
 
@@ -767,119 +771,117 @@ PREBUFFER ──(连续 >= 3 帧)──> PLAYING
 - PLC 不得由网络线程、定时器或“超过 N 毫秒没收到包”的计时器触发。
 - PLC 输出必须进入与真实 PCM 相同的输出路径，参与水位统计。
 
-### 7.9 漂移校正：前馈管速率，反馈管相位
+### 7.9 漂移校正：设备钟差走慢环，网络抖动不进入音高
 
-发送端采集时钟与接收端声卡时钟不同源，水位会缓慢漂移。校正分两条**互不污染**的支路。
+必须区分三个时间参考，并为它们建立**可验证的映射**：
 
-**反馈支路（PI，管相位）**
+| 时间参考 | 来源 | 用途 |
+|---------|------|------|
+| RTP 媒体样本时间 | 包头 timestamp（48 kHz） | 槽位索引、可听点、媒体缺口 |
+| 接收端单调时钟 | Windows QPC / `Instant`；Android `System.nanoTime()` | 日志、超时、估计器的时间轴 |
+| 声卡设备进度 | Windows `IAudioClock::GetPosition`（cpal 已把位置与 QPC 放进 `OutputCallbackInfo::timestamp().playback`）；Android `AudioTrack.getPlaybackHeadPosition()`（不可用时用 `written − playbackHead`） | 反馈计时、设备钟差前馈 |
+
+**反馈支路（只修长期残差）**
 
 ```text
-water   = 抖动缓冲 + PCM 环 + 声卡已接手未播（ms）      # 单一口径，见 7.10
-err     = 低通(water) − WATER_TARGET_MS
-p       = clamp(err × PI_KP_PER_MS, ±RESAMPLE_MAX_ADJUST)
-i_next  = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MAX)
-          抗饱和：p+i 已到钳位且 err 与 i 同号时不累加（否则饱和后积分一直堆）
-Δu      = 限速后的 clamp(p + i, ±RESAMPLE_MAX_ADJUST)
-          单次限速 RATIO_SLEW_STEP × (dt/10ms)      # 约 1%/s
+water_slow = 低通(water_ms, τ = WATER_SMOOTH_TAU_MS = 4 s)
+err        = water_slow − WATER_TARGET_MS
+p          = clamp(err × PI_KP_PER_MS, ±RESAMPLE_MAX_ADJUST)
+i_next     = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MAX)
+             抗饱和：p+i 已到钳位且 err 与 i 同号时不累加
+Δu         = 限速后的 clamp(p + i, ±RESAMPLE_MAX_ADJUST)
+             单次限速 RATIO_SLEW_STEP × (dt/10ms)      # 约 1%/s
 ```
 
-- 比例增益 `PI_KP_PER_MS = 0.00002`：20 ms 偏差只给 400 ppm（≈0.7 音分，1 音分=578 ppm），
-  抖动不会被放大成变调。**这个增益同时决定水位回归速度**（`d水位/dt = −1000·adjust`），
-  所以 20 ms 偏差对应 0.4 ms/s：慢是可接受的，大偏差交给阶跃吸收和 PLC 兜底。
-- 积分时间 `PI_TI_S = 90 s`。水位本身是速率差的**纯积分**，在它上面再叠积分就是双积分器：
-  闭环 `s² + K_plant·KP·s + K_plant·KI`，阻尼比 `ζ = √(K_plant·KP·Ti)/2`。
-  v1.5.0 的 `KP=5e-5 / Ti=10 s` 得 ζ≈0.35——欠阻尼，网络每次抖动都会把它敲响，
-  振铃周期几十秒、幅度顶到 ±0.5%（8.6 音分），听感正是"几十秒一次循环的变调"；
-  改成 `KP=2e-5 / Ti=90 s` 后 ζ≈0.67，同一串抖动台阶下 30 s 窗口的峰峰值从
-  7808 ppm（13.5 音分）降到 1729 ppm（3.0 音分）。回归用例：
-  `rtp::tests::drift_jitter_steps_do_not_become_a_pitch_cycle`。
-- 积分权限 `PI_INTEGRAL_MAX = 0.0015`（±1500 ppm ≈2.6 音分）：积分只吃前馈残余的**长期**
-  速率差，不需要也不该覆盖满幅——给它 ±0.5% 的话，一次长时间饱和之后要把 8.6 音分的
-  变调花几十秒吐回来，又是一轮变调。
-- 计时用**声卡已消费帧数**而不是媒体样本数：断流时媒体时间不前进，用它会冻结积分。
-- 低通按真实 `dt` 缩放：`alpha = 1 − (1 − WATER_SMOOTH_ALPHA)^(dt/10ms)`，带宽≈1 Hz。
-- PI 无静差：稳态水位回到目标，不存在旧的"±300 ppm 残余比率"。
-- `dt < PI_MIN_UPDATE_MS`（5 ms）的调用只累计时间，不评估——正常 10 ms 帧率下每次都会评估。
+- 4 s 低通是这里的关键：90 ms 的攒批在低通后只剩约 1/20，PI 看到的是长期均值，
+  不会每次网络成批到达就调制音高。
+- `PI_KP_PER_MS = 0.00002`、`PI_TI_S = 180 s`、`PI_INTEGRAL_MAX = 0.001`：
+  增益刻意小、积分权限只 ±1000 ppm。主频差已由前馈拿走，反馈不需要也不允许
+  去追每一次网络抖动。
+- 反馈计时用**设备已消费帧数**而不是媒体样本数：断流时媒体时间不前进，用它计时会冻结积分。
+- `dt < PI_MIN_UPDATE_MS`（5 ms）的调用只累计时间，不评估。
+- 反馈输出仍要经过最终钳位 `±RESAMPLE_MAX_ADJUST`（±0.5%），见下面的合成式。
 
-**前馈支路（速率估计器，管频率）**
+**前馈支路（设备钟差估计器）**
 
-- 观测对：每个新包的 `(highest_ts, 到达时刻)`。用 `highest_ts` 而不是"已收样本数"：
-  丢包会让后者少计 480 样本，时间线则无偏。
-- 每 1 s 一个桶，桶内只保留**最小单向时延** `min(t_local − media)`。
-  排队只会增大单向时延，取最小几乎不受排队影响（NTP min-filter / WebRTC 同源）。
-- 30 个桶做最小二乘拟合：`r̂ = −slope`（媒体快于本地钟 → slope 负 → r̂ 正），
-  钳 `±RATE_FEEDFORWARD_MAX`（±2%）；同时给出斜率标准差折算的 `σ`（ppm）。
-- 桶数不足 `RATE_MIN_BUCKETS`（6）时**不发布**估计（宁可用 0，也不用噪声）。
-- 观测窗 30 s：精度下限 `σ_δ ≈ σ_J·√12·√τ_j / T^1.5`（τ_j≈50 ms），
-  σ_J=2 ms 时 30 s 约 ±9 ppm、10 s 仅 ±49 ppm、3 s 完全不可用。
-- `resync`/epoch 变化会重建 `highest_ts` 基准，速率估计器必须在**同一处** `reset()`，
-  否则旧观测会把"重同步跳变"当成钟差。
+- 观测对是 `(设备累计帧, 该帧对应的 QPC/单调时刻)`，**不是** RTP 到达时刻。
+  Windows 由音频回调在读取 `IAudioClock` 时间戳的同一刻写入；Android 用播放头与
+  `System.nanoTime()`。这样测到的是“声卡设备时钟相对本机单调钟”的频差。
+- 每 1 s 取一个点，最近 30 个点做最小二乘，得到设备帧/秒斜率。
+- `ratio_err = slope / 48000 − 1`；`ff = clamp(−ratio_err, ±RATE_FEEDFORWARD_MAX)`。
+  设备时钟偏快 → `ff` 为负 → 重采样比率变小 → 每输入帧产出更多设备帧。
+- 桶数不足 `RATE_MIN_BUCKETS`（6）时**不发布**估计（宁可用 0，也不用噪声）；
+  设备帧跳变超过 `RATE_JUMP_MAX_SAMPLES`（2 s）时整窗作废。
+- 该估计器只使用设备进度，不读取任何“包到达”信息，所以网络攒批/乱序不会进入前馈。
 
 **合成**
 
 ```text
-ratio = 源采样率/设备采样率 × (1 + ff) × (1 + Δu)      # ff = r̂ − 1
+adjust = clamp(ff + Δu, ±RESAMPLE_MAX_ADJUST)
+ratio  = 源采样率/设备采样率 × (1 + adjust)
 ```
 
-- 频率补偿（晶振差、温度漂移）全部由 `ff` 承担，反馈环只需修相位，工作点永远在 0 附近；
-- 两条支路都**不需要记住偏移**：没有 `timestamp_offset`、没有 `note_ratio_correction`、
-  没有 `note_pcm_correction`。任何需要"记住偏移"的机制都说明中间表示选错了。
-
-**为什么不再有第二级离散回落**
-
-逐样本丢/插 1 ms 的"有界回落"（`SLIP_*` 常量、升余弦交叉淡化、`slip_drop`/`slip_insert`）
-已整个删除：比率是连续量，改动它不会在 PCM 里留下任何接缝；回落方案则每个接缝都在
-PCM 上留痕，而且它的存在只为兜住"比率顶满"的极端情况。±0.5% 的吞吐等于每秒 5 ms 水位差，
-覆盖任何真实晶振（典型 10–100 ppm）；真正超出钳位的是**阶跃**（改设备采样率、WASAPI 引擎
-周期切换、发送端节拍重置），那不是 ASRC 能修的，交给 `RESYNC`/PLC。
+- 前馈管频率（晶振差、温度漂移），反馈只修前馈剩余的低频相位偏差；两条支路
+  各自钳位后仍要在合成处再钳一次，诊断里看到的 `adjust_ppm` 才是真正下发的值。
+- 没有任何需要“记住偏移”的机制：没有 `timestamp_offset`、没有
+  `note_ratio_correction`、没有 `note_pcm_correction`。
+- 逐样本丢/插（`SLIP_*`）仍然不存在：比率是连续量，±0.5% 的吞吐等于每秒 5 ms
+  水位差，足够覆盖真实晶振；真正的阶跃交给 §7.10.2。
 
 ### 7.10 水位口径与可听点换算
 
-**只有一个水位**：
+**控制用的总水位**：
 
 ```text
 water_ms    = jb.water_ms() + ring_ms + device_latency_ms
 jb.water_ms = ((jb.highest_ts() − jb.next_ts()) / 480 + 1) × 10   # 上限 64 帧
 ring_ms     = 环内已解码帧数 × 1000 / device_rate
-pipe_ms     = ring_ms + device_latency_ms          # 可听点之前压着的全部媒体量
+pipe_ms     = ring_ms + device_latency_ms          # 仅用于可听点/诊断
 ```
 
-三项分别是"已收未解码""已解码未被声卡取走""已交给声卡未播完"。所有判据都用这三个量：
+`jb.water_ms()` 是**媒体跨度**：它包含空洞与尚未到达的帧，不等于“真实可解码音频”。
+因此另有两个只读诊断量：
+
+```text
+jb.occupancy_ms    = 实际占用槽位数 × 10          # 真实已收到的帧
+jb.contiguous_ms   = 从 next_ts 起连续可解码的帧 × 10
+```
+
+- PI 的 `err` 用 `water_ms`：空洞最终会被 PLC/重同步消费掉，控制目标应覆盖整条媒体时间线。
+- 阶跃判据用 `occupancy_ms`（见 §7.10.2）：只有真实占槽的积压才值得裁剪，媒体空洞不应触发裁剪。
+- `contiguous_ms` 用于启动与诊断，回答“现在到底能连续解出多少音频”。
 
 | 判据 | 用途 |
 |------|------|
 | `water_ms` vs `WATER_TARGET_MS` | PI 的 `err`（唯一控制目标） |
-| `pipe_ms <= PLC_LEAD_MS` | 可听点见底 → 允许补 PLC |
+| `ring_ms <= PLC_LEAD_MS` | 解码提交余量见底 → 允许补 PLC（设备缓冲不计入） |
 | `ring_ms >= DECODE_LIMIT_MS` | 解码缓冲到上限 → 暂停生产 |
+| `occupancy_ms + pipe_ms` | 阶跃吸收的积压判据 |
 
-`jb.water_ms()` 用 `highest_ts − next_ts` 而不是"从 `next_ts` 起连续可解的帧数"：
-后者在**队首那一帧还没到**（乱序/迟到）时会瞬间塌到 0，而后面明明还压着十几帧。
-把它当控制信号，PI 会在每次乱序时误以为缓冲空了、反向把比率拉满，实机上是水位
-长期锯齿的主因（P0 打点里 3.4 万个样本中仅 39 个塌陷，但每次都会引发一次错误的
-反向调节）。
 `device_latency_ms` 来自 `OutputCallbackInfo::timestamp()` 的 `playback − callback`
-（Windows）；Android 缺省 0（播放头本身就是混音器消费位置）。
+（Windows）；Android 没有等价的独立 PCM 环，`ring_ms` 用 `written − playbackHead`，
+设备延迟按 0 处理，避免同一段缓冲被计算两次。
 
 **可听点对应的媒体时间戳**（只用于总延迟估算与日志）：
 
 ```text
 queued_media = (ring_frames + device_latency_frames) × current_ratio()
 audible_ts   = jb.next_ts() − queued_media
+total_latency = now − arrival_of(audible_ts)          # 不再额外加 device_latency
 ```
 
-即"下一个要播的媒体样本"往前推掉缓冲里压着的那些样本。乘 `current_ratio()`
-是因为环里装的是设备帧，而媒体时间线是 48 kHz。
+`audible_ts` 已经减掉了 PCM 环与声卡缓冲，`now − arrival(audible_ts)` 就是“这个样本从
+到达到现在被听到”的完整接收端延迟。再加一次 `device_latency` 会把声卡缓冲重复计算。
+发送端采集/编码/排队与网络传输不在这个数字里，必须另行打点。
 
 **为什么不再需要双向换算**
 
-旧实现要从设备帧反算播放头（`base_ts + floor(played×48000/device_rate) + offset`，
-外加余数累加器），于是每次比率调整都要 `note_ratio_correction` 把换算偏移补回去，
-每次离散回落还要 `note_pcm_correction` 再补一次——三条补丁互相依赖，任何一处漏掉
-都会让"播放头"与"水位"背道而驰。改为水位口径后，`played_frames` 不再出现在任何
-播放判定里，换算链与偏移记账整条消失。
+旧实现要从设备帧反算播放头（`base_ts + floor(played×48000/device_rate) + offset`），
+每次比率调整都要补偏移。现在播放判定只用水位，`played_frames`/设备位置只用于
+计时与前馈估计，换算链与偏移记账整条消失。
 
 绝对精度仍需**实测校准一次**（见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)），
-但校准值只作为日志/展示的修正量，不参与水位控制——水位控制只关心相对填充变化。
+校准值只作为日志/展示的修正量，不参与水位控制。
 
 ### 7.10.1 为什么 `WATER_TARGET_MS` 是 150 ms（以及它为什么会被环境改变）
 
@@ -936,8 +938,13 @@ A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600
 `UDP2CAL_WATER_TARGET_MS` 可覆盖，允许区间
 `WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位，进程内首次读取后缓存
 （`protocol::rtp::water_target_ms()`）。取值经 `DriftController::with_target()` 注入，PI 的
-`err` 仍只对比这一个量。Android 端保持常量 150，**两端必须同值**：一端改了另一端没改，
-等于给水位控制换了个参考点，水位会长期偏在目标之外并顶钳位。
+`err` 仍只对比这一个量。
+
+**两个方向的目标各自独立**：正向（Android 发 → Windows 收）与反向（Windows 发 → Android 收）
+各有自己的网络路径、设备时钟与到达统计，`WATER_TARGET_MS` 不是跨端协议常量。Windows 的
+环境变量只改正向接收；Android 的常量只改反向接收。只有存在共享瓶颈/耦合时才需要联动定值，
+当前实现没有这种耦合。相应地，`JITTER_START_MS` 只是每方向的启动下限，实际启动目标取本方向
+的 `WATER_TARGET_MS`。
 
 这个参数仍是**唯一**跟环境相关的常数：换路由器、换手机、对方装新 App 都可能重新引入扫描源
 或改变空档幅度，此时应重跑 P0 打点按实测最大空档 ×1.5–1.6 重新定值；现场调参优先用
@@ -945,59 +952,60 @@ A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600
 
 ### 7.10.2 阶跃吸收（step trim）
 
-**问题**：即使关掉扫描，AP 仍可能把十到二十帧一次性补齐，一个 tick 内把水位顶高 100–200 ms。
-比率排水只有 5 ms/s，排 100 ms 要 20 s，期间 `adjust_ppm` 一直贴 ±5000（≈±8.6 音分）——
-这就是听感上的"音调漂移"。这类**阶跃**不能交给 PI，只能用整帧硬重同步当场吃掉。
+**问题**：AP 可能把十几帧一次性补齐，短时间把水位顶高 100–200 ms。比率排水只有 5 ms/s，
+排 100 ms 要 20 s，期间 `adjust_ppm` 贴着钳位，听感就是音调漂移。这类**持续积压**不能交给 PI。
 
-**判据**（`StepAbsorber::decide` / `Udp2CalProtocol.StepAbsorber`，两端同一套阈值与限额）：
+**判据**（`StepAbsorber::decide_at` / `Udp2CalProtocol.StepAbsorber.decideAt`，两端同一套阈值）：
 
-- 单次 tick 内 `jb.water_ms()` 增长 > `STEP_TRIM_GROWTH_MS`（80 ms）→ 判为阶跃；或
-- 总水位 `jb + pipe` > `target + STEP_TRIM_EXCESS_MS`（`target + 100` ms）→ 判为超预算。
-
-命中任一即裁剪。第一条只看抖动缓冲的增长（`pipe` 的增长是解码器正常生产，不是阶跃），
-第二条看总水位。
+- 只看**持续性**：`occupancy_ms + pipe_ms > target + STEP_TRIM_EXCESS_MS`（`target + 100` ms）
+  必须连续保持 `STEP_TRIM_HOLD_MS`（1500 ms）才裁剪。
+- 单次 tick 增长 `> STEP_TRIM_GROWTH_MS`（80 ms）只记诊断计数，**不再单独触发裁剪**：
+  一次 90 ms 断供后 9 帧一起到，只要缓冲原本盖住了它，水位很快就会回落，裁剪反而制造跳音。
+- 裁剪后用 `occupancy_ms`（真实占槽）而不是媒体跨度判定；媒体空洞由 PLC 消费，不应算作积压。
+- `can_trim`（= `jb.is_playing()`）为 false 时不裁剪；首次调用只登记基准（`primed`）。
 
 **裁多少**：
 
 ```text
-n = ceil((jb_water_ms + pipe_ms − target) / FRAME_MS)   # 只跳到目标，向上取整到整帧
-n = min(n, PLC_MAX_MS / FRAME_MS)                       # 上限 12 帧（120 ms）
+n = ceil((occupancy_ms + pipe_ms − target) / FRAME_MS)   # 只跳到目标，向上取整到整帧
+n = min(n, PLC_MAX_MS / FRAME_MS)                        # 上限 12 帧（120 ms）
 ```
+
+**怎么裁（关键变化）**：
+
+- 不再调用 `skip_frames()` 直接丢编码包。Opus 是有状态编解码器，跳过编码包会让解码器
+  的增益/预测状态与媒体时间线脱节，后续接缝出现爆音或长时间异常。
+- 改为 `pull_trim(out)` 循环：**逐帧从抖动缓冲取出，逐帧走正常解码路径**（真实包解码、
+  缺失帧走 PLC），把 PCM 直接丢弃，直到累计 `n` 帧。解码器状态始终连续，接缝处
+  是正常的 PLC 过渡，不是“解码器少看了一段码流”。
+- `pull_trim()` 不越过已到达的最新媒体：`next_ts >= highest_ts` 立即返回 `Wait`，调用方停止循环。
+- 计入独立计数器 `stats.step_trims`，**不**计入 `plc_frames`。
+
+**为什么不用时域伸缩（NetEq 式 WSOLA）**：本系统单次积压上限 120 ms、且必须持续
+1.5 s 才触发，属于“已经明显多了”的粗粒度恢复；此时逐帧解码后丢 PCM 的接缝由
+PLC/解码器状态自然覆盖，听感成本低于在实时路径引入 WSOLA 的搜索、窗函数与
+双倍缓冲。WSOLA 更适合 20–60 ms 的细粒度连续拉伸；把 90 ms 网络攒批交给它，
+反而会把网络交付节奏重新调制进音高。若未来目标水位降到 <100 ms、或单次裁剪
+需要 <30 ms，再按 NetEq 模型评估 WSOLA，并以“相似度搜索耗时 / 额外内存 /
+接口复杂度”三项实测决定，而不是默认开启。
 
 **限额与边界**：
 
 - 每 60 s 最多裁剪 `STEP_TRIM_MAX_PER_MIN`（3）次；超限时 `StepDecision.frames` 仍有值但
-  `limited = true`，调用方**只记录不裁剪**——参数过激时听感是"跳音"，宁可让水位高一会儿。
-- 首次 `decide` 只登记水位基准（`primed`），不下结论：启动时 `last_water_ms = 0` 会把正常
-  水位当成一次巨大阶跃。
-- `can_trim`（= `jb.is_playing()`）为 false 时只更新基准、不裁剪：预缓冲期水位本来就在爬升。
-- `JitterBuffer::skip_frames(n)`（Kotlin `skipFrames(n)`）只推进播放头 + 清槽位，**不产生
-  任何 PLC 样本**，也不推进 `epoch`（解码器与重采样器无需重建）；跳完 `plc_run = 0`，新的
-  一段从下一帧重新起算。
-- 播放头**不得越过已到达的最新媒体**：`next_ts >= highest_ts` 立即停，返回真正跳过的帧数
-  （可能小于 `n`）。
-- 计入独立计数器 `stats.step_trims`（Kotlin `stepTrims`），**不**计入 `plc_frames`；限额
-  预算按“发出一次裁剪”计（`StepAbsorber::trims_in_window` / `trimsInWindow()`），实际跳过
-  了多少帧只看 `step_trims`——两个数分叉是正常的（播放头被 `highest_ts` 截短时）。
-- 被限额压制时水位并不会自己降下来，所以判据会**每个 tick 再次命中**；限额日志用
-  `take_limited_log()` / `takeLimitedLog()` 做闸门，**每个 60 s 窗口只打一条**，否则
-  Windows ≈250 条/s、Android ≈200 条/s 会把日志轮转刷爆。
-- `StepAbsorber` 是纯判定器：只看数字、不碰缓冲，所以决策与 `skip_frames` 可以在同一把锁里
-  完成，日志在外面打。
+  `limited = true`，调用方**只记录不裁剪**。
+- 被限额压制时判据会每个 tick 再次命中；限额日志用 `take_limited_log()` 做闸门，
+  每个 60 s 窗口只打一条。
+- `StepAbsorber` 是纯判定器：只看数字、不碰缓冲。决策与 `pull_trim` 在同一把锁内完成，
+  日志在锁外打。
 
 **接入点**（两端都在拉取之前判定，日志前缀 `[Step]`）：
 
-- Windows：`windows/src/main.rs` 解码循环，`jb.pull` 之前；`UDP2CAL_ASRC_DIAG` 的诊断 CSV
-  末列 `trims` 就是累计跳过的整帧数；
+- Windows：`windows/src/main.rs` 解码循环，`jb.pull` 之前；诊断 CSV 末列 `trims` 是累计消费帧数。
 - Android：`android/.../service/CaptureService.kt` 的 `reversePlayLoop`，`jitter.pull` 之前，
   在 `linkLock` 内。
 
-**为什么不回到样本级丢/插**：v1.3.0 已整条删除 `SLIP_*`（见 7.9），样本级回落会在 PCM 上
-留接缝；阶跃只能用整帧级硬重同步，一次跳 10–120 ms。每分钟 ≤3 次的限额就是它的听感预算。
-
-**已知代价**：每次裁剪是一次 10–120 ms 的时间跳，只在"环境变了/链路抖了一下"时发生。
-若 `trims` 持续增长，说明 `WATER_TARGET_MS` 相对该环境偏低（或判据对该环境过激），
-应先重定目标而不是放宽限额。
+**已知代价**：每次裁剪仍是一次 10–120 ms 的时间跳，但因为逐帧解码，接缝是 PLC 而不是
+解码器状态断裂。若 `trims` 持续增长，说明目标水位相对该环境偏低，应先重定目标。
 
 ### 7.11 Windows 接收管线
 
@@ -1024,8 +1032,8 @@ cpal 输出回调（只 pop PCM、填静音、更新 played_frames）
 - 解码线程等待用条件变量/事件；不得用 `recv_timeout`、`sleep(10ms)` 或“60 ms PLC 定时器”驱动播放。
 - PCM 环容量至少 200 ms；建议 16384 帧（约 341 ms）或按设备缓冲调整。
 - 解码线程只在环有空间且水位未超过目标时解码；不得无限预解码。
-- `played_frames` 与 `device_latency_us` 用原子变量发布；解码线程据此算 `ring_ms`/`pipe_ms`，
-  不反算任何播放头时间戳。
+- `played_frames`、设备时钟采样与 `device_latency_us` 用原子变量发布；解码线程据此算
+  `ring_ms`/`pipe_ms` 与可听点，但不用它们反算“播放头媒体时间戳”去驱动播放判定。
 - 网络线程、解码线程、音频回调之间的唯一共享是抖动缓冲（锁/无锁队列）和 PCM 环；不得共享可变 Opus 实例。
 - 删除 v2 的 `recv_timeout(30ms)`、60 ms PLC 计时、`Instant` 重排衰减、3 秒漂移 EMA。
 
@@ -1049,7 +1057,8 @@ AudioTrack / 声卡
 - 不使用 `soTimeout=40ms` 驱动接收；反向 socket 用阻塞 `receive()`。
 - 不使用 40/80 ms 反向 PLC 定时器；PLC 由播放头到期触发。
 - 播放头用 `AudioTrack.getPlaybackHeadPosition()`/`getTimestamp()` 获取；处理 32 位回绕。
-- 若设备不支持 48 kHz，使用受控重采样；Android 没有独立 PCM 环，`ring_ms` 恒为 0，
+- 若设备不支持 48 kHz，使用受控重采样；Android 没有独立 PCM 环，
+  `ring_ms` 取 `written − playbackHead`（即尚未被混音器消费的提交量），
   生产节拍由 `AudioTrack.write` 的阻塞本身提供（见 7.10）。
 - 预缓冲：写线程先在 AudioTrack 里累积 2 帧（20 ms）再 `play()`；之后按播放头拉取。
 
@@ -1061,7 +1070,7 @@ AudioTrack / 声卡
 - 丢包/迟到/重复/乱序数；
 - 抖动缓冲当前水位（ms）；
 - PLC 帧数、连续 PLC 最大值；
-- 阶跃吸收：累计跳过的整帧数（`step_trims`，**单独计数**，不进 `plc_frames`）、当前 60 s 窗口
+- 阶跃吸收：累计消费的整帧数（`step_trims`，逐帧解码后丢弃 PCM，**单独计数**，不进 `plc_frames`）、当前 60 s 窗口
   内已用次数（`StepAbsorber::trims_in_window` / `trimsInWindow()`，两端都在限额日志里打印）；
 - 漂移校正：当前比率微调量（%）、反馈量（ppm）、前馈量 `r̂`（ppm）、其标准差 σ（ppm）、
   观测桶数；
@@ -1075,14 +1084,16 @@ AudioTrack / 声卡
 接收端唯一能在本地测到的延迟口径：
 
 ```
-total_latency_ms = now − arrival_time(audible_ts 那一帧) + device_latency_ms
+total_latency_ms = now − arrival_time(audible_ts 那一帧)
 ```
 
 - `arrival_time` 由抖动缓冲在**接纳**每个包时记录（128 条环形记录，≈1.28 s 历史）；
   查询时取"最新一条 `entry_ts ≤ audible_ts` 的记录"（`audible_ts` 见 7.10）；
-- `device_latency_ms` 是声卡自报的"填缓冲→发声"延迟（见 7.10），Android 端缺省为 0；
+- `audible_ts` 已经减去了 PCM 环与声卡缓冲（见 7.10），因此这里**不再加** `device_latency_ms`；
+  再加一次就是重复计算；
 - 它**不包含**发送端采集→发包以及单程网络时延：这两个量在没有跨设备时钟的情况下
-  测不出来，因此这个数字应理解为"这段音频到了本机之后又等了多久"。
+  测不出来，因此这个数字应理解为"这段音频到了本机之后又等了多久"。发送端必须在
+  采集/读取/编码/发送各段分别打点，不能把这段隐藏延迟混进接收端数字。
 
 要求：
 
@@ -1104,7 +1115,8 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧) + device_latency_m
 4. 直接调用 UDP `send`；不得进入应用层音频队列。
 5. 发送失败/编码失败：丢帧、计数、继续下一帧；不得重试、不得补发、不得阻塞采集。
 6. 不得在音频线程等待 ACK 或控制回复。
-7. 每个 10 ms 帧推进时间戳 480、**序列号推进 1**（两者同频，不论该帧是否真的发出，见 4.4）。
+7. 每个 10 ms 采集帧推进时间戳 480；**序列号只在包真正发出后推进 1**。DTX、编码失败、
+   发送失败与 ACK 暂停期间都不占号（见 4.4）。
 8. 超过 1275 字节的 Opus 负载不得发送。
 9. `M=1` 按 4.6 设置。
 10. **1 帧节拍整形**：发送时刻钉在 10 ms 网格上，把采集设备成簇交出的帧摊平。
@@ -1154,6 +1166,8 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 
 - CONNECT 的 Opus 参数只描述**反向**（Windows → Android）编码器。
 - Windows 收到相同配置时不得重复调用 `OPUS_SET_*`；比较结构体，只有变化才应用。
+  “每个 `OPUS_SET_*` 都会重置编码器”是错误结论：只有 `OPUS_RESET_STATE` 与少数
+  隐式模式切换会重置状态；不做无谓重配是为了避免瞬时毛刺，不是因为每个 CTL 都重置。
 - 正向编码器配置由 Android 本地决定；Windows 不需要知道。
 - 帧长固定 10 ms；任何一方收到 `frame_ms != 10` 都拒绝连接，不做动态切换。
 - 码率 `0`（自动）= 上限 512 kbps；最大 512 kbps；手动五档 64/128/256/384/512。
@@ -1170,8 +1184,11 @@ wait < −40 ms → next_send_at = now      // 落后过多：重置，不追赶
 发送过程中：
 
 - 编码/发送失败不改变 SSRC，不重置时间戳；
-- DTX 不发包但时间戳继续按 10 ms 推进；
-- 恢复发送时 `M=1`；
+- DTX 未发包时时间戳仍按 10 ms 推进；恢复发送时 `M=1`，序号从最后一个真正发出的包继续。
+  （Android 编码器若输出 1–2 字节 DTX 包并实际发送，则这些包正常占号。）
+- 发送端必须记录 `wait/read/encode/send` 四段耗时、帧数与装配缓冲峰值（Windows
+  反向发送已写入 30 s 摘要）；若装配缓冲持续增长，说明采集/发送节拍不匹配，必须
+  在源头限界并让时间戳保留真实缺口，而不是把积压伪装成均匀到包；
 - 重连/换 SSRC 时重置 `seq/ts` 和抖动缓冲。
 
 ### 8.6 DSCP EF 标记（QoS）
@@ -1221,27 +1238,28 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
 | `JITTER_START_MS` | `30` | 预缓冲（3 帧） |
-| `WATER_TARGET_MS` | `150` | 目标总水位（抖动缓冲 + PCM 环 + 声卡）；两端必须同值 |
+| `WATER_TARGET_MS` | `150` | 目标总水位（抖动缓冲 + PCM 环 + 声卡）；每个方向独立定值 |
 | `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 端运行时覆盖目标水位的环境变量 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 覆盖值允许区间，越界钳位 |
-| `STEP_TRIM_GROWTH_MS` | `80` | 单 tick 抖动缓冲增长超过即判为阶跃 |
-| `STEP_TRIM_EXCESS_MS` | `100` | 总水位 > `target + 100` 即判为超预算 |
+| `STEP_TRIM_GROWTH_MS` | `80` | 仅诊断：不再单独触发裁剪 |
+| `STEP_TRIM_EXCESS_MS` | `100` | 总水位 > `target + 100` 且持续 `STEP_TRIM_HOLD_MS` 才裁剪 |
+| `STEP_TRIM_HOLD_MS` | `1500` | 持续超预算的确认时间 |
 | `STEP_TRIM_MAX_PER_MIN` | `3` | 阶跃裁剪的每分钟限额（超限只记录） |
 | `DECODE_LIMIT_MS` | `40` | 解码缓冲深度上限（生产节流） |
-| `PLC_LEAD_MS` | `20` | 可听点见底判据 |
+| `PLC_LEAD_MS` | `20` | PCM 环提交余量判据（设备缓冲不计入） |
 | `PLC_MAX_MS` | `120` | PLC 上限 |
 | `MAX_REORDER_PACKETS` | `64` | 重排槽位 |
 | `RESYNC_GAP_MS` | `200` | 重同步阈值 |
 | `RESAMPLE_MAX_ADJUST` | `0.005` | 比率微调上限（±0.5%） |
 | `RATIO_SLEW_STEP` | `0.0001` | 比率单次步进（1%/s） |
 | `PI_KP_PER_MS` | `0.00002` | 反馈比例增益 |
-| `PI_TI_S` | `90.0` | 积分时间常数 |
-| `PI_INTEGRAL_MAX` | `0.0015` | 积分项权限（1500 ppm） |
+| `PI_TI_S` | `180.0` | 积分时间常数 |
+| `PI_INTEGRAL_MAX` | `0.001` | 积分项权限（1000 ppm） |
 | `PI_MIN_UPDATE_MS` | `5.0` | 评估最小时间跨度 |
-| `WATER_SMOOTH_ALPHA` | `0.065` | 水位低通（τ≈150 ms） |
+| `WATER_SMOOTH_TAU_MS` | `4000.0` | 水位低通时间常数（4 s） |
 | `RATE_WINDOW_S` / `RATE_BUCKETS` | `30.0` / `30` | 前馈观测窗 / 桶数 |
 | `RATE_MIN_BUCKETS` | `6` | 前馈最少桶数 |
-| `RATE_JUMP_MAX_SAMPLES` | `96000` | 前馈单次观测的媒体跳变上限（2 s），超过即重建窗口 |
+| `RATE_JUMP_MAX_SAMPLES` | `96000` | 设备帧单次跳变上限（2 s），超过即重建窗口 |
 | `RATE_FEEDFORWARD_MAX` | `0.02` | 前馈钳位（±2%） |
 | `BITRATE_AUTO_KBPS` | `512` | `0` 的兼容映射（= 上限） |
 | `BITRATE_MAX_KBPS` | `512` | 码率上限 |
@@ -1306,12 +1324,13 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 - 迟到包；
 - 丢包 + PLC 10 ms × N；
 - 连续 PLC 上限；
-- `skip_frames(n)`：只推进时间线 + 清槽，不产生任何 PLC 样本、不计入 `plc_frames`、
-  不推进 `epoch`；不得越过 `highest_ts`（跳不满时返回实际帧数）；未进入 PLAYING 时不动作；
-  成功后 `plc_run` 归零且计入 `stats.step_trims`；
-- `StepAbsorber`：稳态噪声不触发；单次增长 > `STEP_TRIM_GROWTH_MS` 触发；总水位 >
-  `target + STEP_TRIM_EXCESS_MS` 触发；首次 `decide` 只登记基准；`can_trim = false` 时不下结论；
-  每 60 s 最多 `STEP_TRIM_MAX_PER_MIN` 次，超限时 `limited = true` 且不裁剪；
+- `pull_trim(out)`：调用方循环最多 `n` 次，逐帧取包并走正常解码/PLC 路径，PCM 由调用方丢弃；
+  不得越过 `highest_ts`（`next_ts >= highest_ts` 时返回 `Wait`）；未进入 PLAYING 时不动作；
+  每消费一帧计入 `stats.step_trims`，真实包成功后 `plc_run` 归零；
+- `StepAbsorber`：稳态噪声不触发；单次 90 ms 增长**不再**触发；`occupancy + pipe >
+  target + STEP_TRIM_EXCESS_MS` 持续 `STEP_TRIM_HOLD_MS` 才触发；首次 `decide` 只登记基准；
+  `can_trim = false` 时不下结论；每 60 s 最多 `STEP_TRIM_MAX_PER_MIN` 次，超限时
+  `limited = true` 且不裁剪；
 - `M=1` + 200 ms 跳变重同步；
 - 16/32 位回绕；
 - 序号冻结后恢复（ACK 中断 / DTX）必须自愈；
@@ -1320,15 +1339,15 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
   单次变化 ≤ `RATIO_SLEW_STEP`×(dt/10 ms)；闭环仿真收敛到目标且**无静差**；
   抗饱和生效；±4 ms 抖动带内比率几乎不动；`dt` 不足 `PI_MIN_UPDATE_MS` 时不出量；
   44.1 kHz 设备率下同样收敛；
-- 前馈估计器：未攒够 `RATE_MIN_BUCKETS` 不发布；200 ppm / −300 ppm 钟差在 30 s 窗内
-  误差 ≤15 ppm；0–20 ms 单向排队不影响结果；钳位 ±`RATE_FEEDFORWARD_MAX`；
-  `reset()` 后重新起算；同一 `highest_ts` 重复观测只记一次；
-  媒体跳变超过 `RATE_JUMP_MAX_SAMPLES` 时旧窗口作废、从新基准重算；
-- 调度节流：`ring_ms >= DECODE_LIMIT_MS` 时不生产；`pipe_ms <= PLC_LEAD_MS` 才补 PLC；
+- 设备钟差前馈：未攒够 `RATE_MIN_BUCKETS` 不发布；200 ppm / −300 ppm 钟差在 30 s 窗内
+  误差 ≤15 ppm；网络到达抖动不进入观测；钳位 ±`RATE_FEEDFORWARD_MAX`；
+  `reset()` 后重新起算；设备帧跳变超过 `RATE_JUMP_MAX_SAMPLES` 时旧窗口作废；
+- 调度节流：`ring_ms >= DECODE_LIMIT_MS` 时不生产；`ring_ms <= PLC_LEAD_MS` 才补 PLC；
   阈值序 `PLC_LEAD_MS < DECODE_LIMIT_MS < WATER_TARGET_MS`；
 - 重采样器：48k→48k 与 48k→44.1k 的输出帧数正确、跨块相位连续、DC 精确通过、
   块边界无台阶、12 kHz 幅度波动 <0.1 dB、比率钳位；
-- 水位边界：`pipe_ms` 在 `PLC_LEAD_MS` 上下切 PLC/正常；`ring_ms` 在 `DECODE_LIMIT_MS` 上下切生产/暂停。
+- 水位边界：`ring_ms` 在 `PLC_LEAD_MS` 上下切 PLC/正常、在 `DECODE_LIMIT_MS` 上下切生产/暂停；
+  设备缓冲为 10/20/30/50 ms 时 PLC 仍由 PCM 环触发。
 
 **Opus**
 
@@ -1342,10 +1361,10 @@ diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP �
 v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.md)「协议单一实现」）：Kotlin 通过 JNI
 调用同一份代码，不再存在"两份实现跑偏"。一致性由三道闸门看守：
 
-- `Udp2CalProtocolTest`（62 例）在桌面 JVM 上加载 `udp2cal_protocol.dll`，与 Android 真机跑的是
+- `Udp2CalProtocolTest`（63 例）在桌面 JVM 上加载 `udp2cal_protocol.dll`，与 Android 真机跑的是
   **同一份机器码**：字节向量、回绕、边界全部照旧；
 - `nativeConstantsMatchKotlinConstants` / `nativeRealConstantsMatchKotlinConstants`：Rust 导出的
-  43 个整数常量与 8 个浮点常量必须与 Kotlin 的 `const val` 逐项相等（Kotlin 常量仅为编译期需要）；
+  44 个整数常量与 9 个浮点常量必须与 Kotlin 的 `const val` 逐项相等（Kotlin 常量仅为编译期需要）；
 - 附录 B 的十六进制向量仍是跨版本（v3 各实现）的互通基准：换实现、换语言时以它为准。
 
 ### 11.3 集成测试
@@ -1360,7 +1379,7 @@ v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.m
 - 200 ms 时间戳跳变/发送端重启；
 - DTX 静音 1–10 s 后恢复；
 - 64 / 128 / 256 / 384 / 512 kbps（五档，滑块）；
-- FEC/DRED 开启与关闭；
+- FEC 开启与关闭（DRED 本版不启用，见第八章/BUILD）；
 - Windows 44.1 kHz 输出设备；
 - Android 44.1/48 kHz 输出；
 - 反向开关切换；
@@ -1373,24 +1392,33 @@ v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.m
 2. 发送端无应用层音频队列；发送线程单帧处理时间稳定。
 3. 接收端稳态总水位维持在 `WATER_TARGET_MS` 附近。v1.4.0 验收口径（关闭扫描后的环境）：
    `water_ms` 中位 150±20 ms、标准差 <25 ms；`adjust_ppm` 贴 ±5000（顶满）的时间占比 <5%；
-   PLC <2 次/分；端到端总延迟 ≤190 ms。无持续增长；30 min 内无单向漂移；稳态比率残差
-   <20 ppm。强抖动网络下水位数标准差做不到 <10 ms（实测 31–64 ms）——那是网络交付节奏
-   的函数，不是控制器的函数，所以验收取 25 ms；超出上述目标时应先按 §7.10.1 重定
-   `WATER_TARGET_MS`，而不是放宽验收。
-4. 丢包时只在可听点见底（`pipe_ms <= PLC_LEAD_MS`）后 PLC；真实包恢复后 PLC 停止。
-5. DTX 静音不导致断连；恢复时能正确重同步。
-6. 任意 RTP 包不超过 1287 字节；任意 UDP/IP 包不超过 1315 字节。
-7. 序列号/时间戳回绕不产生爆音或长时间静音。
-8. 重连使用新 SSRC；旧包不进入新会话。
-9. Windows cpal 回调无锁、无分配、无 Opus 调用。
-10. Android AudioTrack 写线程无应用层 PCM 队列、无 `soTimeout` 驱动。
-11. 1 小时连续运行无内存增长、无无界队列、无明显漂移。
-12. 两端控制包字节级一致。
+   PLC <2 次/分；接收端可听点延迟（`now − arrival(audible_ts)`）无持续增长；30 min 内无单向
+   漂移；稳态比率残差 <20 ppm。端到端延迟还包含采集/编码/发送/网络，不能用单一 ≤190 ms
+   一刀切，必须另做发送端打点与录音对齐。强抖动网络下水位数标准差做不到 <10 ms（实测
+   31–64 ms）——那是网络交付节奏的函数，不是控制器的函数，所以验收取 25 ms；超出上述目标
+   时应先按 §7.10.1 重定 `WATER_TARGET_MS`，而不是放宽验收。
+4. 设备钟差与网络抖动分离：
+   - 仅设备时钟误差（±200/±300 ppm、无网络抖动）时，前馈收敛、`adjust_ppm` 稳定、
+     音高稳定、`trims` 不增长；
+   - 仅网络攒批（90 ms 一次补齐）时，单次增长不触发裁剪，`adjust_ppm` 不被单次到达
+     推走，无周期性变调；
+   - 阶跃积压持续 >1.5 s 时，`trims` 增长而 `plc` 不增长，接缝无爆音；
+   - 单包丢失/200 ms–2 s 断流：PLC 上限、静音、恢复与 resync 行为符合 §7.5/§7.6。
+5. 丢包时只在 PCM 环见底（`ring_ms <= PLC_LEAD_MS`）后 PLC；设备缓冲为 10/20/30/50 ms
+   时都必须在欠载前补 PLC；真实包恢复后 PLC 停止。
+6. DTX 静音不导致断连；恢复时能正确重同步。
+7. 任意 RTP 包不超过 1287 字节；任意 UDP/IP 包不超过 1315 字节。
+8. 序列号/时间戳回绕不产生爆音或长时间静音。
+9. 重连使用新 SSRC；旧包不进入新会话。
+10. Windows cpal 回调无锁、无分配、无 Opus 调用。
+11. Android AudioTrack 写线程无应用层 PCM 队列、无 `soTimeout` 驱动。
+12. 1 小时连续运行无内存增长、无无界队列、无明显漂移。
+13. 两端控制包字节级一致。
 
 ### 11.5 已知限制
 
 **已通过实现解决**（不再列为风险，留作记录）：WASAPI 环回事件驱动、44.1 kHz 设备的播放头换算、
-FEC/DRED 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低于 1275 字节）。
+FEC 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低于 1275 字节）。
 实测与校准流程见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)。
 
 仍然存在、且**不打算在本版解决**的限制：

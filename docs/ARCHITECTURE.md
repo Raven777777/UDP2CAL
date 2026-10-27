@@ -55,7 +55,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | 位置 | 角色 |
 | --- | --- |
 | `protocol/protocol.rs`、`protocol/rtp.rs` | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
-| `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，71 个 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
+| `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，60 个 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
 | `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
 | `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
 
@@ -103,8 +103,8 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用；Windows 防火墙仅对 Private profile 放行 |
 | 采集（Android） | `AudioRecord` 48 kHz 单声道 | `READ_BLOCKING` 累积到整帧再编码；语音模式决定音源与 AEC（创建时定型） |
 | 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
-| 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | DRED + Deep PLC；负载上限 1275 字节，超限丢帧不截断 |
-| 时钟 | 声卡播放头 | 可听位置 = `played_frames − 设备延迟`；规则见协议 7.10 |
+| 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | Deep PLC；DRED 不启用（接收端无解析/恢复路径）；负载上限 1275 字节，超限丢帧不截断 |
+| 时钟 | 三个时间参考 | RTP 媒体时间、接收端 QPC/`Instant`、声卡设备进度（Windows `IAudioClock::GetPosition`，Android 播放头）；映射规则见协议 7.9/7.10 |
 | 输出（Windows） | cpal 0.15 / WASAPI | 无锁 SPSC 环（341 ms）+ 显式 10 ms 设备缓冲 + 事件驱动回调 |
 
 > 这里刻意不列"版本号矩阵"之外的运行时策略：那些属于会随实现漂移的细节，
@@ -183,8 +183,8 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 保活 | Android 每 1 s CONNECT；PC 3 s 无 CONNECT 释放绑定；Android 3 s 无 ACK 断连 | **只看控制面**，不看 RTP |
 | 模式切换 | 语音↔音乐重建 AudioRecord/AudioTrack，网络层与 SSRC 一并重建 | 允许短暂中断，不做"保网络层"的特殊分支 |
 
-> 反向编码器的"仅在变化时应用"很重要：`OPUS_SET_*` 每次调用都会重置编码器内部状态，
-> 每秒无条件重配会造成周期性音质劣化。
+> 反向编码器"仅在变化时应用"是为了避免不必要的瞬时重配开销；并不是因为每个
+> `OPUS_SET_*` 都会重置编码器——真正重置状态的是 `OPUS_RESET_STATE` 与少数隐式模式切换。
 
 ---
 
@@ -325,7 +325,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：cpal 0.15.3 把帧数换算成 `hnsBufferDuration` 时少乘 100 |
 | 预解码深度 ≤40 ms | `rtp::JitterBuffer::pull`：`ring_ms >= DECODE_LIMIT_MS` 就返回 `Wait` | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到可听点前面几百毫秒，恢复后真包全被判迟到 |
 | 回调唤醒解码线程 | `audio.rs`：`thread.unpark()` | 播放头前移本身就是"该拉下一帧"的信号，不需要定时器 |
-| 前馈管速率 + 反馈管相位 | `rtp::RateEstimator` / `rtp::DriftController` 每帧调用 | 钟差（晶振/温度）是慢变量，用 30 s 观测窗回归出 `r̂` 前馈掉；剩下的相位误差由 PI 修，因此比率工作点永远在 0 附近，不会把抖动放成变调 |
+| 前馈管设备钟差 + 反馈管长期残差 | `rtp::DeviceRateEstimator` / `rtp::DriftController` | 前馈观测 `(设备帧, QPC)`，测的是媒体时钟相对**声卡设备时钟**的频差；反馈对 4 s 低通后的水位做慢 PI，只修长期残差。网络攒批不进入前馈，因此不会变成变调 |
 | 没有播放头，也没有偏移记账 | 旧 `PlayheadClock`（base/余数/offset/`note_*`）已删除 | 一旦存在"设备帧↔媒体时间戳"换算，就必须记住偏移；改为纯水位口径后，`played_frames` 不参与任何播放判定，换算链与三处补丁一起消失 |
 | flush 只投递请求 | `audio.rs::Ring::request_flush` | `tail` 归消费者所有；生产者直接写会让 `len()` 回绕成 `usize::MAX`，解码线程永久停产（静默死锁） |
 | 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后 >4 帧重置而非补发 |

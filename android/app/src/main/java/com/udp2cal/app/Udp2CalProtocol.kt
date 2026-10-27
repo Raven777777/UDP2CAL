@@ -89,17 +89,21 @@ object Udp2CalProtocol {
     const val PLC_MAX_MS = 120
     const val RESYNC_GAP_MS = 200
 
+    /** 仅用于诊断：单 tick 涨幅不再直接触发裁剪。 */
     const val STEP_TRIM_GROWTH_MS = 80
     const val STEP_TRIM_EXCESS_MS = 100
+    /** 总水位必须**持续**超限这么久，才证明是真实积压而非一次网络补齐。 */
+    const val STEP_TRIM_HOLD_MS = 1500
     const val STEP_TRIM_MAX_PER_MIN = 3
 
     const val RESAMPLE_MAX_ADJUST = 0.005
     const val RATIO_SLEW_STEP = 0.0001
     const val PI_KP_PER_MS = 0.00002
-    const val PI_TI_S = 90.0
-    const val PI_INTEGRAL_MAX = 0.0015
+    const val PI_TI_S = 180.0
+    const val PI_INTEGRAL_MAX = 0.001
     const val PI_MIN_UPDATE_MS = 5.0
-    const val WATER_SMOOTH_ALPHA = 0.065
+    /** 水位低通时间常数：只让“长期残余”进入反馈，不追每次网络突发。 */
+    const val WATER_SMOOTH_TAU_MS = 4000.0
     const val RATE_WINDOW_S = 30.0
     const val RATE_BUCKETS = 30
     const val RATE_MIN_BUCKETS = 6
@@ -320,6 +324,11 @@ object Udp2CalProtocol {
             ProtocolNative.jbReset(handle)
         }
 
+        /** 起播所需的连续媒体水位；默认 30 ms，可提到目标水位避免起播后追。 */
+        fun setStartPrebufferMs(ms: Int) {
+            ProtocolNative.jbSetStartPrebufferMs(handle, ms)
+        }
+
         /** 该时间戳样本的到达时刻（`System.nanoTime()` 口径）；查不到返回 -1。 */
         fun arrivalNanosAt(ts: Long): Long = ProtocolNative.jbArrivalNanosAt(handle, ts)
 
@@ -328,6 +337,15 @@ object Udp2CalProtocol {
 
         /** 从 `nextTs` 起连续有多少帧（用于起播判定）。 */
         fun contiguousFrames(): Int = ProtocolNative.jbContiguousFrames(handle)
+
+        /** 从 `nextTs` 起连续可解码的毫秒数。 */
+        fun contiguousMs(): Int = ProtocolNative.jbContiguousMs(handle)
+
+        /** 实际占用的帧数（不含空洞）。 */
+        fun occupancyFrames(): Int = ProtocolNative.jbOccupancyFrames(handle)
+
+        /** 实际占用的毫秒数（不含空洞）——比 waterMs 更接近“能播多久”。 */
+        fun occupancyMs(): Int = ProtocolNative.jbOccupancyMs(handle)
 
         fun insert(seq: Int, ts: Long, marker: Boolean, buf: ByteArray, offset: Int, length: Int): Boolean =
             ProtocolNative.jbInsert(handle, seq, ts, marker, buf, offset, length)
@@ -339,8 +357,11 @@ object Udp2CalProtocol {
         fun pull(ringMs: Int, pipeMs: Int, out: ByteArray): Int =
             ProtocolNative.jbPull(handle, ringMs, pipeMs, out)
 
-        /** 丢弃 `n` 帧（阶跃吸收），返回实际跳过的帧数；不产生 PLC。 */
-        fun skipFrames(n: Int): Int = ProtocolNative.jbSkipFrames(handle, n)
+        /**
+         * 阶跃裁剪：按播放顺序取一帧。调用方必须把它交给解码器并丢弃 PCM，
+         * 以保持有状态 Opus 解码器与发送端同步（不能只推进缓冲游标）。
+         */
+        fun pullTrim(out: ByteArray): Int = ProtocolNative.jbPullTrim(handle, out)
 
         fun destroyed(): Boolean = handle == 0L
 
@@ -368,8 +389,8 @@ object Udp2CalProtocol {
     /**
      * 一次性积压（Wi-Fi 重传、调度抖动）的整帧吸收器。
      *
-     * 判据：单次 `pull` 周期内抖动缓冲水位骤增超过 [STEP_TRIM_GROWTH_MS]，
-     * 或总水位超过目标 + [STEP_TRIM_EXCESS_MS]；每分钟最多 [STEP_TRIM_MAX_PER_MIN] 次。
+     * 判据：总水位超过目标 + [STEP_TRIM_EXCESS_MS] 且**持续** [STEP_TRIM_HOLD_MS]，
+     * 单次涨幅 [STEP_TRIM_GROWTH_MS] 只做诊断；每分钟最多 [STEP_TRIM_MAX_PER_MIN] 次。
      */
     class StepAbsorber : AutoCloseable {
         private var handle: Long = ProtocolNative.saCreate()
@@ -388,6 +409,22 @@ object Udp2CalProtocol {
 
         fun decide(jbWaterMs: Int, pipeMs: Int, canTrim: Boolean, targetMs: Int): StepDecision {
             val packed = ProtocolNative.saDecide(handle, jbWaterMs, pipeMs, canTrim, targetMs)
+            val frames = (packed ushr 32).toInt()
+            val limited = (packed and 1L) != 0L
+            return if (frames == 0 && !limited) StepDecision.NONE else StepDecision(frames, limited)
+        }
+
+        /** 单测用：显式传入 `System.nanoTime()` 时刻。 */
+        internal fun decideAt(
+            jbWaterMs: Int,
+            pipeMs: Int,
+            canTrim: Boolean,
+            targetMs: Int,
+            nowNanos: Long,
+        ): StepDecision {
+            val packed = ProtocolNative.saDecideAt(
+                handle, jbWaterMs, pipeMs, canTrim, targetMs, nowNanos
+            )
             val frames = (packed ushr 32).toInt()
             val limited = (packed and 1L) != 0L
             return if (frames == 0 && !limited) StepDecision.NONE else StepDecision(frames, limited)
@@ -447,13 +484,52 @@ object Udp2CalProtocol {
         }
     }
 
+    // ═══════════════════════ 设备时钟前馈（Rust 实现） ═══════════════════════
+
+    /**
+     * 用（声卡播放帧数, `System.nanoTime()`）估计设备时钟相对单调时钟的速率。
+     * 这是唯一允许进入重采样比率的前馈：网络到达抖动不参与。
+     */
+    class DeviceRateEstimator : AutoCloseable {
+        private var handle: Long = ProtocolNative.deCreate()
+
+        fun reset() {
+            ProtocolNative.deReset(handle)
+        }
+
+        fun observe(deviceFrames: Long, playedNanos: Long) {
+            ProtocolNative.deObserve(handle, deviceFrames, playedNanos)
+        }
+
+        fun feedforward(): Double? =
+            ProtocolNative.deFeedforward(handle).let { if (it.isNaN()) null else it }
+
+        fun feedforwardPpm(): Double? = feedforward()?.times(1e6)
+
+        fun sigmaPpm(): Double = ProtocolNative.deSigmaPpm(handle)
+
+        fun buckets(): Int = ProtocolNative.deBuckets(handle)
+
+        override fun close() {
+            if (handle != 0L) {
+                ProtocolNative.deDestroy(handle)
+                handle = 0L
+            }
+        }
+
+        @Suppress("deprecation")
+        protected fun finalize() {
+            close()
+        }
+    }
+
     // ═══════════════════════ 漂移控制（Rust 实现） ═══════════════════════
 
     /**
      * 抗饱和 PI：把总水位钉在 [targetMs] 上，输出重采样比率修正。
      *
-     * `adjust` 直接喂给 [StreamResampler]；`±RESAMPLE_MAX_ADJUST` 是硬上限
-     * （0.5% ≈ 5 ms/s，多吃 100 ms 要 20 s——所以"积压"必须靠跳帧而不是加速）。
+     * 只处理长期残余（4 s 低通），不再追每次网络突发；`adjust` 直接喂给
+     * [StreamResampler]，`±RESAMPLE_MAX_ADJUST` 是硬上限。
      */
     class DriftController(
         private val deviceRate: Int = OPUS_SAMPLE_RATE,

@@ -140,6 +140,21 @@ mod control_binding_tests {
 
 static P2P_STATE: OnceLock<Mutex<P2pState>> = OnceLock::new();
 
+/// 非法控制包的日志闸门：控制面与 RTP 共用一个接收任务，攻击者/故障设备
+/// 刷非法 CONNECT 时不能让它用文件 I/O 拖慢实时音频接收。每秒最多一条。
+fn should_log_control_reject() -> bool {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let gate = LAST.get_or_init(|| Mutex::new(None));
+    if let Ok(mut last) = gate.lock() {
+        let now = Instant::now();
+        if last.map(|t| now.duration_since(t) >= Duration::from_secs(1)).unwrap_or(true) {
+            *last = Some(now);
+            return true;
+        }
+    }
+    false
+}
+
 fn p2p_lock() -> std::sync::MutexGuard<'static, P2pState> {
     P2P_STATE
         .get_or_init(|| Mutex::new(P2pState::new()))
@@ -329,12 +344,22 @@ fn init_audio_worker() {
             // 缓冲里还压着多少媒体，比率只改"一帧媒体换多少设备帧"。
             let device_rate = aw.device_rate;
             let mut drift = protocol::rtp::DriftController::new(device_rate);
-            let mut rate = protocol::rtp::RateEstimator::new();
+            // 前馈只看**声卡设备进度 vs QPC**：网络攒批/重排不进入比率。
+            // 发送端媒体时间线 vs Instant 的旧 RateEstimator 已从比率路径移除。
+            let mut device_rate_est =
+                protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
             // 阶跃吸收（方案 C）：判据与限额与 Android 端同构
             let mut step = protocol::rtp::StepAbsorber::new();
             // 实际生效的目标水位（环境变量可覆盖，两端各自读各自的）
             let water_target = protocol::rtp::water_target_ms();
+            // 启动预缓冲：先攒够本方向目标再开播，之后靠 ASRC 慢慢收敛；
+            // 不再出现“3 帧就开播、再用 24 s 爬坡”的隐性瞬态。
+            jitter()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_start_prebuffer_ms(water_target);
             let mut payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
+            let mut trim_payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
             let silence_frame = [0.0f32; protocol::rtp::FRAME_SAMPLES as usize];
             let mut last_epoch = 0u64;
             let mut idle = false;
@@ -342,8 +367,7 @@ fn init_audio_worker() {
             let mut rms_count = 0u64;
             let mut last_stats = Instant::now();
             let mut last_latency_log = Instant::now();
-            // 前馈：已喂给估计器的最高媒体时间戳（同一个包只喂一次）
-            let mut fed_ts = 0u64;
+
             // 最近一次下发的总比率微调（反馈 Δu 与前馈 r̂ 的合成）
             let mut adjust: f64;
             let mut diag = diag::AsrcDiag::from_env();
@@ -357,11 +381,10 @@ fn init_audio_worker() {
                         idle = true;
                         jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
                         drift.reset();
-                        rate.reset();
+                        device_rate_est.reset();
                         step.reset();
                         dec.reset();
                         aw.flush();
-                        fed_ts = 0;
                         AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
                     }
                     std::thread::park_timeout(Duration::from_millis(50));
@@ -376,10 +399,9 @@ fn init_audio_worker() {
                     last_epoch = epoch;
                     dec.reset();
                     drift.reset();
-                    rate.reset();
+                    device_rate_est.reset();
                     step.reset();
                     aw.flush();
-                    fed_ts = 0;
                 }
 
                 // ── 水位（唯一观测量）──
@@ -399,29 +421,43 @@ fn init_audio_worker() {
                     next_ts,
                     newest_ts,
                     arrival,
-                    newest,
                     plc_frames,
                     trims,
                     step_hit,
                 ) = {
                     let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
 
-                    // ── 阶跃吸收（方案 C）：先吃掉“一次补齐”的台阶，再按水位拉取 ──
-                    // 判据：本 tick 内 jb 水位涨过 STEP_TRIM_GROWTH_MS，或总水位
-                    // 越过 target + STEP_TRIM_EXCESS_MS。命中则整帧硬重同步：丢掉
-                    // n 帧、时间线前移，**不**产生 PLC（样本级丢插会留下接缝，
-                    // v1.3.0 已删，别加回来）。
-                    let before_water = jb.water_ms();
+                    // ── 阶跃吸收（方案 C）：持续超额才裁，且逐帧解码后再丢 PCM ──
+                    // 判据：总水位持续 STEP_TRIM_HOLD_MS 超过 target+STEP_TRIM_EXCESS_MS。
+                    // 单次 90 ms 攒批不再触发。裁剪必须按播放顺序把每一帧交给
+                    // Opus 解码器（PLC 缺口走 conceal），只丢弃解码后的 PCM；
+                    // 直接清槽位会让有状态解码器与发送端错位，接缝处爆音。
+                    let before_water = jb.occupancy_ms();
                     let before_total = before_water.saturating_add(pipe_ms);
                     let decision = step.decide(before_water, pipe_ms, jb.is_playing(), water_target);
                     let mut hit: Option<(u32, u32, u32, bool)> = None;
                     if decision.frames > 0 {
-                        let skipped = if decision.limited {
-                            0
-                        } else {
-                            jb.skip_frames(decision.frames)
-                        };
-                        hit = Some((before_total, decision.frames, skipped, decision.limited));
+                        let mut trimmed = 0u32;
+                        if !decision.limited {
+                            for _ in 0..decision.frames {
+                                match jb.pull_trim(&mut trim_payload) {
+                                    protocol::rtp::Pull::Packet { len, .. } => {
+                                        // 解码只为推进状态；PCM 不写环 = 裁掉
+                                        let _ = dec.decode(&trim_payload[..len]);
+                                        trimmed += 1;
+                                    }
+                                    protocol::rtp::Pull::Plc { .. } => {
+                                        let _ = dec.conceal();
+                                        trimmed += 1;
+                                    }
+                                    protocol::rtp::Pull::Silence { .. } => {
+                                        trimmed += 1;
+                                    }
+                                    protocol::rtp::Pull::Wait => break,
+                                }
+                            }
+                        }
+                        hit = Some((before_total, decision.frames, trimmed, decision.limited));
                     }
 
                     let r = jb.pull(ring_ms, pipe_ms, &mut payload);
@@ -434,7 +470,6 @@ fn init_audio_worker() {
                         next_ts,
                         highest,
                         jb.arrival_of(audible_ts),
-                        jb.arrival_of(highest),
                         jb.stats.plc_frames,
                         jb.stats.step_trims,
                         hit,
@@ -470,22 +505,23 @@ fn init_audio_worker() {
                     }
                 }
 
-                // ── 前馈：管速率 ──
-                // 观测量是"发送端媒体时间线 vs 本地 Instant"的最小延迟，与解码
-                // 节奏无关、与 base_ratio（源/设备率）无关；乘上去即可。
-                if let Some(at) = newest {
-                    if newest_ts > fed_ts {
-                        rate.observe(newest_ts, at);
-                        fed_ts = newest_ts;
-                    }
+                // ── 前馈：只管“声卡设备时钟 vs QPC” ──
+                // 设备进度与时刻都取自音频回调里的 IAudioClock 采样：设备帧数
+                // 与 `timestamp().playback` 对应的 QPC 时刻绑定，而不是解码线程
+                // 被唤醒时的 `Instant::now()`。网络到达节奏不进入这里，90 ms
+                // 攒批因此不会调制音高。
+                let (played, played_at) = aw
+                    .device_clock_sample()
+                    .unwrap_or_else(|| (aw.played_frames(), Instant::now()));
+                if played > 0 {
+                    device_rate_est.observe(played, played_at);
                 }
-                let ff = rate.feedforward().unwrap_or(0.0);
+                let ff = device_rate_est.feedforward().unwrap_or(0.0);
 
-                // ── 反馈：管相位 ──
-                // 计时用声卡已消费帧数（断流时媒体样本不前进，用它计时会冻结积分）
-                let played = aw.played_frames();
+                // ── 反馈：只收长期残差 ──
+                // 计时同样用声卡已消费帧数（断流时媒体样本不前进，用它计时会冻结积分）。
                 let du = drift.update(water, played);
-                adjust = (1.0 + ff) * (1.0 + du) - 1.0;
+                adjust = ff + du;
                 // 两支路相合后仍须守比率钳位：前馈和反馈各自钳过了，乘积可能越界。
                 // 在这里钳一次，诊断 CSV 里看到的才是真正下发给重采样器的数。
                 adjust = adjust.clamp(
@@ -496,12 +532,14 @@ fn init_audio_worker() {
                 DRIFT_ADJUST_BITS.store((adjust as f32).to_bits(), Ordering::Relaxed);
 
                 // ── 总延迟估算 ──
-                // 正在出声的那一帧是多久以前到达的 + 声卡缓冲 = 听感延迟。
+                // `audible_ts` 已经扣掉了“PCM 环 + 声卡排队”对应的媒体量，
+                // 因此 now − arrival(audible_ts) **本身**就是听感延迟，不能再加
+                // device_latency（旧公式把声卡等待算了两遍）。
                 if let Some(at) = arrival {
                     let dev_ms = aw.device_latency_ms();
                     DEVICE_LATENCY_MS.store(dev_ms, Ordering::Relaxed);
                     let age_ms = at.elapsed().as_millis().min(u32::MAX as u128) as u32;
-                    LATENCY_MS.store(age_ms.saturating_add(dev_ms), Ordering::Relaxed);
+                    LATENCY_MS.store(age_ms, Ordering::Relaxed);
                 }
 
                 match pull {
@@ -546,8 +584,8 @@ fn init_audio_worker() {
                         water_target,
                         adjust * 1e6,
                         ff * 1e6,
-                        rate.sigma_ppm(),
-                        rate.used_buckets(),
+                        device_rate_est.sigma_ppm(),
+                        device_rate_est.buckets(),
                         played as f64 / device_rate as f64,
                         newest_ts,
                         next_ts,
@@ -585,8 +623,8 @@ fn init_audio_worker() {
                         adjust * 100.0,
                         du * 1e6,
                         ff * 1e6,
-                        rate.sigma_ppm(),
-                        rate.used_buckets(),
+                        device_rate_est.sigma_ppm(),
+                        device_rate_est.buckets(),
                         trims,
                     );
                 }
@@ -1055,11 +1093,16 @@ impl AppState {
                     );
                     // 反向链路统计由 UI 线程汇总：发送线程内**不得**做文件 I/O，
                     // 否则一次慢写盘就会打断 RTP（实测每 30 s 一次破音）
-                    let (pk, bytes, enc_err, oversize, dropped, send_err, gaps) =
-                        capture::take_reverse_stats();
+                    let s = capture::take_reverse_stats();
+                    let frames = s[11].max(1);
                     logf!(
-                        "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={}",
-                        pk, bytes, enc_err, oversize, dropped, send_err, gaps
+                        "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={} 帧={} 均值us(wait/read/encode/send)={:.0}/{:.0}/{:.0}/{:.0} 积压峰值={}ms",
+                        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[11],
+                        s[7] as f64 / frames as f64,
+                        s[8] as f64 / frames as f64,
+                        s[9] as f64 / frames as f64,
+                        s[10] as f64 / frames as f64,
+                        s[12] / 2 * 10 / 480
                     );
                 }
                 Task::none() 
@@ -1619,11 +1662,15 @@ async fn handle_control(
     }
 
     let Some(cfg) = protocol::ConnectPayload::decode(payload) else {
-        logf!("[P2P] CONNECT 负载长度非法（{} 字节），丢弃", payload.len());
+        if should_log_control_reject() {
+            logf!("[P2P] CONNECT 负载长度非法（{} 字节），丢弃", payload.len());
+        }
         return;
     };
     if let Err(reason) = cfg.validate() {
-        logf!("[P2P] CONNECT 参数非法（{reason}），丢弃");
+        if should_log_control_reject() {
+            logf!("[P2P] CONNECT 参数非法（{reason}），丢弃");
+        }
         return;
     }
     let now = Instant::now();
@@ -1633,7 +1680,9 @@ async fn handle_control(
     // v3 device_id 是公开标识，不是认证凭据。绑定期间固定完整源端点；
     // 未认证的地址/端口变化不能迁移绑定或刷新保活。合法网络切换需等待超时后重连。
     if same_device && !is_bound_peer_source(&peer, header.device_id, *src_addr) {
-        logf!("[P2P] 已绑定设备从新端点发起 CONNECT，拒绝未认证的端点迁移");
+        if should_log_control_reject() {
+            logf!("[P2P] 已绑定设备从新端点发起 CONNECT，拒绝未认证的端点迁移");
+        }
         return;
     }
 

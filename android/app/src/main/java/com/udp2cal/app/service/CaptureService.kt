@@ -94,7 +94,7 @@ class CaptureService : Service() {
     private val linkSignal = linkLock.newCondition()
     private val jitter = Udp2CalProtocol.JitterBuffer()
     private val drift = Udp2CalProtocol.DriftController()
-    private val rate = Udp2CalProtocol.RateEstimator()
+    private val deviceRate = Udp2CalProtocol.DeviceRateEstimator()
     @Volatile private var activeReverseSsrc = 0
 
     private data class CaptureParams(
@@ -456,6 +456,9 @@ class CaptureService : Service() {
                     )
                     stopReverseAudio()
                     activeReverseSsrc = 0
+                    // ACK 超时说明旧会话已不可用：换一个正向 SSRC，让对端在
+                    // 下一次 CONNECT 时走显式新会话路径（清抖动缓冲/重建反向流）。
+                    sender.regenerateForwardSsrc()
                 }
             }
 
@@ -693,10 +696,9 @@ class CaptureService : Service() {
      * 统一的 10 ms 帧发送循环。
      *
      * 规则（规范 4.3/4.4/8.1）：
-     *   * 每帧时间戳 +480、序列号 +1，**两者同频，与是否真的发出无关**；
-     *   * 编码失败/发送失败/DTX 空帧：该帧不产出负载，但序列号仍 +1
-     *     （让接收端看到连续的时间线，避免恢复包被判迟到）；
-     *   * 未连接（无新鲜 ACK）时不编码不发送，时间戳与序列号照常推进。
+     *   * 每帧时间戳 +480，**无条件推进**（DTX/断连也保留媒体时间）；
+     *   * 序列号只属于真正发出的包：编码失败/发送失败/DTX/无新鲜 ACK 都不 +1；
+     *   * 未连接（无新鲜 ACK）时不编码不发送，时间戳照常推进。
      *
      * **1 帧节拍整形**：AudioRecord 的阻塞读天然成簇返回（常见 20 ms 一次），
      * 直接发就是"两包挨着、然后静默 20 ms"，接收端水位呈锯齿。这里把发送时刻
@@ -723,12 +725,22 @@ class CaptureService : Service() {
         val frameNs = FRAME * 1_000_000_000L / Udp2CalProtocol.OPUS_SAMPLE_RATE
         var nextSendAt = System.nanoTime()
         var lastCfgCheck = 0L
+        // Plan §6：发送端隐藏积压打点。read/encode/send 分段计时 + 装配缓冲峰值，
+        // 30 s 打一行，用来判断“接收端看着均匀，发送端却越排越多”。
+        var statsAt = System.nanoTime()
+        var readNs = 0L
+        var encodeNs = 0L
+        var sendNs = 0L
+        var statFrames = 0L
+        var maxFilled = 0
 
         while (coroutineContext.isActive) {
             // AudioRecord.read 允许返回不足请求量的样本（缓冲区尚未填满）。
             // 必须累积到整 480 采样再编码：补零发送等于丢音频，且会让帧率翻倍
             // （实测 190 包/秒 → 接收端缓冲被灌满，41% 的包被判超窗丢弃）。
+            val readStart = System.nanoTime()
             val n = readInto(pcm, filled, FRAME - filled)
+            readNs += System.nanoTime() - readStart
             if (n < 0) {
                 // 设备失效：不空转，交给外层 finally 收尾
                 _status.value = _status.value.copy(errorMsg = "麦克风读取失败，请重新开始采集")
@@ -736,6 +748,7 @@ class CaptureService : Service() {
                 return
             }
             filled += n
+            if (filled > maxFilled) maxFilled = filled  // 仅未满一帧的装配余量，不是应用层队列
             if (filled < FRAME) continue
             filled = 0
 
@@ -746,33 +759,52 @@ class CaptureService : Service() {
                 applyRuntimeConfig(enc)
             }
             if (sender.isAckFresh(now)) {
+                val encStart = System.nanoTime()
                 val n = enc.encodeTo(pcm, packet, Udp2CalProtocol.RTP_HEADER_SIZE)
+                encodeNs += System.nanoTime() - encStart
+                statFrames++
                 if (n > 0) {
                     val marker = first || (now - lastSentAt > Udp2CalProtocol.RESYNC_GAP_MS.toLong())
                     Udp2CalProtocol.writeRtpHeader(
                         packet, 0, marker, seq, timestamp, sender.forwardSsrc
                     )
-                    if (sender.send(packet, 0, Udp2CalProtocol.RTP_HEADER_SIZE + n)) {
+                    val sendStart = System.nanoTime()
+                    val sent = sender.send(packet, 0, Udp2CalProtocol.RTP_HEADER_SIZE + n)
+                    sendNs += System.nanoTime() - sendStart
+                    if (sent) {
                         byteCount += n
                         lastSentAt = System.currentTimeMillis()
                         first = false
+                        // 序号只属于真正发出的包；DTX/断连不占号（RFC 3550）
+                        seq = (seq + 1) and 0xFFFF
                     }
                 }
             }
+            // 时间戳无条件按媒体时间推进（DTX/断连期间也走），恢复后时间轴自然留缺口
             timestamp += FRAME
-            // 序列号与时间戳**同频**推进：每 10 ms 帧无条件 +1，与是否真的发出无关。
-            //
-            // 历史实现把它放在 `if (n >= 0)` 里（断连期间不递增），而时间戳仍然
-            // 无条件推进。接收端在断流期间会用 PLC/静音推进 nextSeq，滞后量永不
-            // 闭合；恢复包先被"序号迟到"判定拦下，M=1 重同步分支永远不可达 →
-            // 单向音频永久静音（ACK 中断 0.2~3 s 即可触发，且界面仍显示已连接）。
-            seq = (seq + 1) and 0xFFFF
 
             if (now - lastReport >= 1000) {
                 val elapsed = (now - lastReport).coerceAtLeast(1)
                 _status.value = _status.value.copy(bitrateKbps = byteCount * 8f / elapsed)
                 byteCount = 0
                 lastReport = now
+            }
+            val statsElapsed = System.nanoTime() - statsAt
+            if (statsElapsed >= 30_000_000_000L) {
+                val ms = statsElapsed / 1_000_000.0
+                Log.i(
+                    TAG,
+                    "tx30s frames=$statFrames read=${(readNs / 1e6 / ms * 1000).toInt()}us" +
+                        " encode=${(encodeNs / 1e6 / ms * 1000).toInt()}us" +
+                        " send=${(sendNs / 1e6 / ms * 1000).toInt()}us" +
+                        " assemble_peak=${maxFilled * 1000 / Udp2CalProtocol.OPUS_SAMPLE_RATE}ms"
+                )
+                statsAt = System.nanoTime()
+                readNs = 0
+                encodeNs = 0
+                sendNs = 0
+                statFrames = 0
+                maxFilled = 0
             }
 
             // ── 1 帧节拍整形 ──
@@ -920,8 +952,8 @@ class CaptureService : Service() {
         var latencyMs = 0
         // 阶跃吸收（方案 C）：与 Windows 端同一套判据与限额
         val step = Udp2CalProtocol.StepAbsorber()
-        // 前馈观测点：只喂"比上次更新的时间戳"
-        var fedTs = 0L
+        // 起播直接预缓冲到目标水位，避免"30ms 起播后用几分钟追到 150ms"。
+        jitter.setStartPrebufferMs(drift.targetMs())
         var adjust = 0.0
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
@@ -943,6 +975,7 @@ class CaptureService : Service() {
             var stepSkipped = 0
             var stepTotal = 0L
             var stepLimited = false
+            var trimFrames = 0
 
             linkLock.lock()
             try {
@@ -961,11 +994,11 @@ class CaptureService : Service() {
                 val pipeFrames = player.pendingFrames(head)
                 pipeMs = (pipeFrames * 1000L / Udp2CalProtocol.OPUS_SAMPLE_RATE).toInt()
 
-                // ── 阶跃吸收（方案 C）：先吃掉"一次补齐"的台阶，再按水位拉取 ──
-                // 判据：本 tick 内 jitter 水位涨过 STEP_TRIM_GROWTH_MS，或总水位越过
-                // target + STEP_TRIM_EXCESS_MS。命中则整帧硬重同步：丢掉 n 帧、时间线
-                // 前移，**不**产生 PLC（样本级丢插会留下接缝，v1.3.0 已删，别加回来）。
-                val beforeWater = jitter.waterMs()
+                // ── 阶跃吸收（方案 C）：持续超额才裁，先按水位拉取 ──
+                // 判据：occupancy + pipe 连续 STEP_TRIM_HOLD_MS 超过
+                // target + STEP_TRIM_EXCESS_MS。单次 90 ms 攒批不触发。
+                // 命中后逐帧解码再丢 PCM（见下），不是清槽位硬跳。
+                val beforeWater = jitter.occupancyMs()
                 val beforeTotal = beforeWater + pipeMs
                 val decision = step.decide(
                     beforeWater,
@@ -978,12 +1011,33 @@ class CaptureService : Service() {
                     stepBefore = beforeTotal
                     stepWant = decision.frames
                     stepLimited = decision.limited
-                    stepSkipped =
-                        if (decision.limited) 0 else jitter.skipFrames(decision.frames)
-                    stepTotal = jitter.stepTrims
+                    trimFrames = if (decision.limited) 0 else decision.frames
                 }
 
-                code = jitter.pull(0, pipeMs, payload)
+                // 阶跃裁剪必须沿播放顺序**解码后丢弃 PCM**：只推进缓冲游标会让
+                // 有状态 Opus 解码器与发送端脱节（接缝/音染）。这里最多 12 帧，
+                // 且每分钟最多 3 次，锁内解码的代价可以接受。
+                var guard = trimFrames
+                while (guard-- > 0) {
+                    val c = jitter.pullTrim(payload)
+                    when (c) {
+                        Udp2CalProtocol.Pull.PACKET -> {
+                            dec.decode(payload, 0, jitter.pulledLength, pcm)
+                            stepSkipped++
+                        }
+                        Udp2CalProtocol.Pull.PLC -> {
+                            dec.plc(pcm)
+                            stepSkipped++
+                        }
+                        Udp2CalProtocol.Pull.SILENCE -> stepSkipped++
+                        else -> break
+                    }
+                }
+                stepTotal = jitter.stepTrims
+
+                // Android 没有独立 PCM 环：pendingFrames 就是"已提交、未播出"的
+                // 全部余量，用它做 PLC 截止判据（设备缓冲不是固定延迟）。
+                code = jitter.pull(pipeMs, pipeMs, payload)
                 // 可听点之前还压着的媒体量（设备帧 → 媒体样本要用当前比率换算）
                 val queuedMedia = (pipeFrames.toDouble() * resampler.ratio).toLong()
                 val audibleTs = (jitter.nextTs - queuedMedia).coerceAtLeast(0L)
@@ -992,15 +1046,6 @@ class CaptureService : Service() {
                 // 单一口径水位：抖动缓冲 + 解码/播放缓冲（声卡已接手的那段）
                 waterMs = jitter.waterMs() + pipeMs
                 pulledLen = jitter.pulledLength
-                // ── 前馈：最新到达包的时间戳 + 到达时刻 ──
-                val newestTs = jitter.highestTsValue()
-                if (newestTs > fedTs) {
-                    val at = jitter.arrivalNanosAt(newestTs)
-                    if (at > 0L) {
-                        rate.observe(newestTs, at)
-                        fedTs = newestTs
-                    }
-                }
             } finally {
                 linkLock.unlock()
             }
@@ -1017,12 +1062,10 @@ class CaptureService : Service() {
                 }
                 dec.reset()
                 drift.reset()
-                // 前馈估计器的基准是 highestTs，重同步会重建它，必须同处复位
-                rate.reset()
+                deviceRate.reset()
                 step.reset()
                 resampler.reset()
                 player.flush()
-                fedTs = 0
             }
 
             // 阶跃吸收的日志（锁外：Log 会走 binder）。水位一律用**总水位**
@@ -1048,10 +1091,19 @@ class CaptureService : Service() {
                 }
             }
 
-            // ── 比率 = 前馈(管速率) × 反馈(管相位)：两条支路互不污染 ──
-            val ff = rate.feedforward() ?: 0.0
+            // ── 比率 = 设备时钟前馈(管速率) + 水位反馈(管长期残余) ──
+            // 网络到达抖动只进 jitter，绝不进重采样比率。
+            // 设备钟差观测：优先 AudioTrack 时间戳（位置+单调时刻），
+            // 避免把协程调度抖动误当成设备速率差；不可用时退回播放头。
+            val clock = player.deviceClockSample()
+            if (clock != null) {
+                deviceRate.observe(clock.first, clock.second)
+            } else {
+                deviceRate.observe(head, System.nanoTime())
+            }
+            val ff = deviceRate.feedforward() ?: 0.0
             val du = drift.update(waterMs, head)
-            adjust = (1.0 + ff) * (1.0 + du) - 1.0
+            adjust = ff + du
             // 两支路相合后仍须守比率钳位：前馈和反馈各自钳过了，乘积可能越界。
             adjust = adjust.coerceIn(
                 -Udp2CalProtocol.RESAMPLE_MAX_ADJUST,
@@ -1073,7 +1125,7 @@ class CaptureService : Service() {
                     Log.i(
                         TAG,
                         "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${drift.targetMs()}）" +
-                            " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(rate.sigmaPpm())}ppm ${rate.usedBuckets()}桶）"
+                            " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 设备前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(deviceRate.sigmaPpm())}ppm ${deviceRate.buckets()}桶）"
                     )
                 }
             }
@@ -1181,7 +1233,7 @@ class CaptureService : Service() {
         // 状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
         runCatching { jitter.close() }
         runCatching { drift.close() }
-        runCatching { rate.close() }
+        runCatching { deviceRate.close() }
         super.onDestroy()
     }
 }

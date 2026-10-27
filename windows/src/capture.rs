@@ -1,8 +1,10 @@
 // WASAPI 环回捕获 → Opus（10 ms）→ RTP → UDP
 //
 // v3 发送端规则（规范第八节）：
-//   * 采集 → 编码 → 立即发送，**没有应用层音频队列**，失败只丢帧并计数；
-//   * 固定 10 ms 帧，时间戳与序列号**都**每帧 +1（不发包的帧同样 +1）；
+//   * 采集 → 编码 → 立即发送，应用层只允许 ≤40 ms 的组帧缓冲，
+//     丢弃时时间戳必须跟随真实媒体跳变（接收端据此 PLC/重同步）；
+//   * 固定 10 ms 帧，时间戳每帧 +1；序列号只对**真正发出的包** +1
+//     （DTX / 发送失败不占序号，RFC 3550）；
 //   * SSRC 由控制面生成并随 CONNECT_ACK 下发，本模块只使用；
 //   * 反向 Opus 配置来自 CONNECT，**只在变化时**应用（每秒重配会重置编码器状态）。
 use std::net::{SocketAddr, UdpSocket};
@@ -115,6 +117,15 @@ pub struct ReverseStats {
     pub send_errors: AtomicU64,
     /// 发送中断次数（两次发送间隔 > 200 ms，接收端会据此重同步）
     pub gaps: AtomicU64,
+    /// 分段耗时（微秒，30 s 窗口累加）：定位隐藏积压/调度阻塞
+    pub wait_us: AtomicU64,
+    pub read_us: AtomicU64,
+    pub encode_us: AtomicU64,
+    pub send_us: AtomicU64,
+    /// 实际组帧数（用于把耗时累加换算成均值）
+    pub frames: AtomicU64,
+    /// 组帧缓冲峰值（交错样本数；2 样本 = 1 个 48 kHz 帧）
+    pub max_backlog: AtomicU64,
 }
 
 static REVERSE_STATS: ReverseStats = ReverseStats {
@@ -125,11 +136,17 @@ static REVERSE_STATS: ReverseStats = ReverseStats {
     dropped_samples: AtomicU64::new(0),
     send_errors: AtomicU64::new(0),
     gaps: AtomicU64::new(0),
+    wait_us: AtomicU64::new(0),
+    read_us: AtomicU64::new(0),
+    encode_us: AtomicU64::new(0),
+    send_us: AtomicU64::new(0),
+    frames: AtomicU64::new(0),
+    max_backlog: AtomicU64::new(0),
 };
 
 /// 读取并清零（30 s 汇总用，调用方为 UI 线程）
-pub fn take_reverse_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
-    (
+pub fn take_reverse_stats() -> [u64; 13] {
+    [
         REVERSE_STATS.packets.swap(0, Ordering::Relaxed),
         REVERSE_STATS.bytes.swap(0, Ordering::Relaxed),
         REVERSE_STATS.encode_errors.swap(0, Ordering::Relaxed),
@@ -137,7 +154,13 @@ pub fn take_reverse_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
         REVERSE_STATS.dropped_samples.swap(0, Ordering::Relaxed),
         REVERSE_STATS.send_errors.swap(0, Ordering::Relaxed),
         REVERSE_STATS.gaps.swap(0, Ordering::Relaxed),
-    )
+        REVERSE_STATS.wait_us.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.read_us.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.encode_us.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.send_us.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.frames.swap(0, Ordering::Relaxed),
+        REVERSE_STATS.max_backlog.swap(0, Ordering::Relaxed),
+    ]
 }
 
 static REVERSE_CFG: OnceLock<Mutex<OpusReverseConfig>> = OnceLock::new();
@@ -168,8 +191,9 @@ fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig)
     let _ = encoder.set_inband_fec(cfg.fec);
     let _ = encoder.set_packet_loss_perc(cfg.packet_loss);
     let _ = encoder.set_vbr_constraint(if cfg.vbr { cfg.vbr_constraint } else { false });
-    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500 ms 冗余
-    let _ = encoder.set_dred_duration(if cfg.fec { 50 } else { 0 });
+    // DRED 不在本项目中启用：接收端没有 DRED 解析/恢复路径，发送端单方面
+    // 打开只会白占码率。保留 0 显式关闭，避免配置漂移。
+    let _ = encoder.set_dred_duration(0);
     let _ = encoder.set_complexity(cfg.complexity);
     let _ = encoder.set_signal(match cfg.signal {
         1 => audiopus::Signal::Voice,
@@ -288,6 +312,7 @@ impl ReverseSender {
         let mut timestamp: u32 = random_u32();
         let mut first_packet = true;
         let mut last_sent: Option<Instant> = None;
+        let mut last_sent_ts: Option<u32> = None;
         let mut silence_run: u32 = 0;
         // 端点最近一次真正给出数据的时间：只有它够久没更新时才补静音。
         // 缺少这个判据时，事件等待超时与"事件带回 20 ms 数据"会同时成立，
@@ -327,8 +352,16 @@ impl ReverseSender {
             } else {
                 WAIT_TIMEOUT_MS
             };
+            let t_wait = Instant::now();
             let signaled = capture.wait(wait_ms);
+            REVERSE_STATS
+                .wait_us
+                .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let t_read = Instant::now();
             let got_data = capture.read_stereo(&mut loopback).is_some();
+            REVERSE_STATS
+                .read_us
+                .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
 
             if got_data {
                 silence_run = 0;
@@ -339,6 +372,8 @@ impl ReverseSender {
                     let excess = resampled.len() - MAX_FRAME_BACKLOG;
                     REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
                     resampled.drain(..excess);
+                    // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当连续
+                    timestamp = timestamp.wrapping_add((excess / 2) as u32);
                 }
                 for &s in &resampled {
                     let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -361,7 +396,13 @@ impl ReverseSender {
                 let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
                 pcm_buf.drain(..excess);
                 REVERSE_STATS.dropped_samples.fetch_add(excess as u64, Ordering::Relaxed);
+                // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC
+                timestamp = timestamp.wrapping_add((excess / 2) as u32);
             }
+            // 只保留最近 40 ms 的统计峰值；超限时旧数据已经丢掉
+            REVERSE_STATS
+                .max_backlog
+                .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
 
             // 只发到点的帧：节拍整形。落后超过 4 帧（调度抖动/设备暂停）时
             // 重置网格，绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
@@ -373,14 +414,15 @@ impl ReverseSender {
                 frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
                 pcm_buf.drain(..FRAME_INTERLEAVED);
 
+                let t_encode = Instant::now();
                 let encoded = encoder.encode(&frame, &mut payload);
-                // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限），
-                // 但**序列号仍然每帧 +1**：序列号与时间戳必须同频推进。
-                //
-                // 历史上这里按"是否发包"决定是否递增序列号（DTX 不递增，符合
-                // 规范 4.4 的字面表述），但接收端在断流/静音期间会用 PLC/静音
-                // 推进 next_seq，滞后量永不闭合；恢复包会先被"序号迟到"判定
-                // 拦下，M=1 重同步分支永远不可达 → 反向音频永久静音。
+                REVERSE_STATS
+                    .encode_us
+                    .fetch_add(t_encode.elapsed().as_micros() as u64, Ordering::Relaxed);
+                REVERSE_STATS.frames.fetch_add(1, Ordering::Relaxed);
+                // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限）。
+                // 时间戳仍按媒体时间前进，但**序列号不占号**：序号只属于真正
+                // 发到网络上的包。接收端 PLC/静音同样不推进序号，两边一致。
                 let len = match encoded {
                     Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => n,
                     Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
@@ -402,21 +444,34 @@ impl ReverseSender {
                 timestamp = timestamp.wrapping_add(rtp::FRAME_SAMPLES);
                 if len > 0 {
                     let gap_ms = last_sent.map(|t| t.elapsed().as_millis()).unwrap_or(u128::MAX);
+                    let ts_start = timestamp.wrapping_sub(rtp::FRAME_SAMPLES);
+                    let ts_gap_ms = last_sent_ts
+                        .map(|p| ts_start.wrapping_sub(p) as u64 / (rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64))
+                        .unwrap_or(u64::MAX);
                     let marker = first_packet
-                        || gap_ms > rtp::RESYNC_GAP_MS as u128;
+                        || gap_ms > rtp::RESYNC_GAP_MS as u128
+                        || ts_gap_ms > rtp::RESYNC_GAP_MS as u64;
                     if !first_packet && marker {
                         // 发送中断会让接收端重同步（flush + 重建解码器），必须计数备查
                         REVERSE_STATS.gaps.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(total) =
-                        rtp::write_packet(&mut packet, marker, seq, timestamp.wrapping_sub(rtp::FRAME_SAMPLES), ssrc, &payload[..len])
+                        rtp::write_packet(&mut packet, marker, seq, ts_start, ssrc, &payload[..len])
                     {
-                        match send_sock.send_to(&packet[..total], target) {
+                        let t_send = Instant::now();
+                        let sent = send_sock.send_to(&packet[..total], target);
+                        REVERSE_STATS
+                            .send_us
+                            .fetch_add(t_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        match sent {
                             Ok(_) => {
                                 REVERSE_STATS.packets.fetch_add(1, Ordering::Relaxed);
                                 REVERSE_STATS.bytes.fetch_add(total as u64, Ordering::Relaxed);
                                 last_sent = Some(Instant::now());
+                                last_sent_ts = Some(ts_start);
                                 first_packet = false;
+                                // 只有真正发出的包才消耗一个序号
+                                seq = seq.wrapping_add(1);
                             }
                             Err(e) => {
                                 let n = REVERSE_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
@@ -427,8 +482,6 @@ impl ReverseSender {
                         }
                     }
                 }
-                // 序列号与时间戳同频：每帧 +1（发送失败同样 +1）
-                seq = seq.wrapping_add(1);
             }
 
         }

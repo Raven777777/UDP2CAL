@@ -66,7 +66,7 @@ build.bat android --modern --abi armeabi-v7a --release
 
 两端均从仓库根目录的 `opus-src/`（Opus 1.6.1）构建 libopus，不再使用 `audiopus_sys` crate 内置的 Opus 1.3.1：
 
-- **Android**：`android/app/src/main/cpp/CMakeLists.txt` 通过 `add_subdirectory(../../../../../opus-src)` 直接构建；OSCE / DRED / QEXT 等 ML 增强特性保持默认关闭。
+- **Android**：`android/app/src/main/cpp/CMakeLists.txt` 通过 `add_subdirectory(../../../../../opus-src)` 直接构建；只启用 Deep PLC，OSCE / DRED / QEXT 保持关闭。
 - **Windows**：`windows/Cargo.toml` 的 `[patch.crates-io]` 将 `audiopus_sys` 重定向到 `vendor/audiopus_sys` 副本（**该目录必须入库**，patch 依赖本地路径）。其 build.rs 解析 Opus 源码的优先级：
   1. `OPUS_SOURCE_DIR` 环境变量（显式覆盖）
   2. `<repo>/opus-src`（默认，自动解析，日常构建无需任何设置）
@@ -100,21 +100,21 @@ cargo test --offline
 > 启动不了），而是直接用 `clang.exe` + `--target` + `--sysroot`。注意 sysroot 在
 > `ndk/<ver>/toolchains/llvm/prebuilt/windows-x86_64/sysroot`，**`ndk/<ver>/sysroot` 不存在**。
 
-### Opus ML 特性（Deep PLC + DRED）
+### Opus ML 特性（仅 Deep PLC）
 
-两端均以 `OPUS_DEEP_PLC=ON` + `OPUS_DRED=ON` 构建（OSCE / QEXT 保持关闭），产物体积各增约 2 MB：
+两端均以 `OPUS_DEEP_PLC=ON`、`OPUS_DRED=OFF` 构建（OSCE / QEXT 保持关闭）。Deep PLC 产物体积约增 1 MB：
 
 | 特性 | 生效位置 | 运行时条件 | 说明 |
 |------|---------|-----------|------|
-| 经典 PLC | 解码端 | 水位见底 | 缺口在 `pipe_ms <= PLC_LEAD_MS`（可听点之前只剩 20 ms 媒体量）时补一帧 480 采样；连续 12 帧后转静音但仍留在 PLAYING。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡消费节奏决定（协议 7.5/7.8） |
+| 经典 PLC | 解码端 | PCM 环见底 | 缺口在 `ring_ms <= PLC_LEAD_MS`（下一次提交只剩 20 ms 余量）时补一帧 480 采样；连续 12 帧后转静音但仍留在 PLAYING。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡消费节奏决定（协议 7.5/7.8） |
 | 抖动缓冲 | `protocol/rtp.rs` | 自动 | 固定 64 槽、按扩展时间戳索引；序号只用于重复检测。v3 **不再**动态扩缩重排窗口 |
 | **Wi-Fi 省电锁（Android）** | CaptureService | 采集期间 | 采集期间持有 `WIFI_MODE_FULL_LOW_LATENCY` WifiLock，阻止网卡进入省电聚合（周期性 100~500ms 延迟簇的根源），停止采集释放 |
 | Deep PLC | 解码端 | 解码复杂度 ≥ 5 | 两端在解码器创建时设置（Windows `OpusDecoder::new()`、Android `opus_jni_decoder.c`）；v3 固定单解码器 48 kHz 单声道 |
-| DRED | 编码端→解码端 | FEC 开启时激活 | 编码器附带最长 500 ms（50×10ms 帧）深度冗余，码流 +12~32 kb/s；Windows 反向编码器与 Android 编码器均跟随 FEC 开关（`fec ? 50 : 0`）。1.5 与 1.6 的 DRED 互不兼容，两端同为 1.6.1 无此问题 |
+| DRED | 不启用 | — | 接收端没有 DRED 解析/恢复路径；发送端单方面开启只会白占码率。编码器显式 `OPUS_SET_DRED_DURATION(0)`，构建也关闭 `OPUS_DRED` |
 
-DRED 数据在 Opus 码流内传输，`protocol` 层与旧版本兼容（旧解码端忽略冗余层）。
+DRED 数据即使存在也只会被旧解码端忽略；本项目不使用它，因此不宣称“深度冗余恢复”。
 
-`audiopus` 副本（`vendor/audiopus`）为支持上述特性做了本地扩展：`Decoder::set_complexity`（1.5 新增的解码器复杂度接口）与 `Encoder::set_dred_duration`（1.3.1 头文件无此请求码 4050，本地定义）。
+`audiopus` 副本（`vendor/audiopus`）保留了 `Decoder::set_complexity`（1.5 新增的解码器复杂度接口）与 `Encoder::set_dred_duration` 扩展；DRED 当前固定传 0，仅作兼容保留。
 
 ### 环境体检 / ADB 调试
 

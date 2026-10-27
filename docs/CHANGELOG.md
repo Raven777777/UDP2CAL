@@ -4,6 +4,47 @@
 
 ---
 
+## 未发布 — 2026-10-27 · 接收时钟/播放控制重构（按 Plan.md 评审整改）
+
+> 目标不是“再调一次 PI”，而是把**设备钟差**、**网络抖动**、**播放缺口**三件事拆开：
+> 音高只跟设备钟差走，水位只修长期残差，阶跃积压才做整帧消费。
+
+**时钟与 ASRC**
+- 前馈观测改为 `(设备累计帧, QPC/单调时刻)`（Windows `IAudioClock::GetPosition` 经 cpal
+  `OutputCallbackInfo::timestamp().playback`；Android `getTimestamp`，回退播放头），不再用 RTP 到达时刻估计钟差。
+- 新增 `DeviceRateEstimator`（30 s 窗、1 s 桶、最小二乘）；Windows/Android 共用。
+- 水位反馈改为 4 s 低通 + 慢 PI：`PI_KP_PER_MS=2e-5`、`PI_TI_S=180`、`PI_INTEGRAL_MAX=0.001`；
+  `adjust = clamp(ff + Δu, ±RESAMPLE_MAX_ADJUST)` 在合成处再钳一次。
+- 90 ms 级网络攒批不再调制音高。
+
+**抖动缓冲/PLC/阶跃吸收**
+- 启动：连续 ≥3 帧且水位 ≥ 本方向 `start_ms`（默认直接用 150 ms 目标），不再“30 ms 先播再慢慢爬”。
+- PLC 判据改为 PCM 提交余量 `ring_ms <= PLC_LEAD_MS`；设备缓冲不计入，避免深缓冲把 PLC 拖到欠载之后。
+- 阶跃吸收：`occupancy + pipe > target + 100 ms` 持续 1500 ms 才触发；单次 80 ms 增长只记诊断。
+- 删除 `skip_frames`，改为 `pull_trim` 逐帧走正常解码/PLC 后丢弃 PCM；解码器状态连续，接缝不再断。
+- `water_ms`（媒体跨度）与 `occupancy_ms`/`contiguous_ms`（真实占槽/连续可解码）分开统计。
+
+**协议与发送端**
+- DTX/发送失败不再消耗 RTP 序列号；接收端 PLC 不推进 `next_seq`；滞后序号按时间戳接纳并计 `seq_realign`。
+- Windows 反向发送增加 `wait/read/encode/send` 分段耗时、帧数与装配缓冲峰值；丢弃积压时时间戳保留真实缺口。
+- Android ACK 超时后重新生成正向 SSRC，让 Windows 走显式新会话；同 SSRC 保活不重建音频链路。
+- Android ACK 校验 `ConnectAckPayload.isValid()`。
+
+**DRED**
+- 接收端从未实现 DRED 解析/恢复；本版显式关闭发送端 DRED（`OPUS_SET_DRED_DURATION(0)`，构建
+  `OPUS_DRED=OFF`），文档不再宣称深度冗余恢复。Deep PLC 保留。
+
+**测量**
+- 总延迟改为 `now − arrival(audible_ts)`，不再重复加 `device_latency_ms`。
+- 文档/验收补充设备钟差、攒批、丢包/断流、设备缓冲深度四类矩阵，测试信号改用 PRBS/扫频/脉冲。
+
+**验证**
+- `cd protocol && cargo test`：74 passed；`cargo check --features jni` 通过。
+- Windows `cargo check` 通过。
+- Android `:app:testDebugUnitTest`：63 passed（JDK 17）。
+
+---
+
 ## v1.5.1 — 2026-10-26 · 漂移环重新整定：消掉“几十秒一次循环的变调”
 
 > v1.5.0 上线后现场反馈：跳变中断没了，但“30 s 周期循环的变调”出来了。

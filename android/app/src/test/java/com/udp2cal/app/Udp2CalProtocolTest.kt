@@ -307,11 +307,11 @@ class Udp2CalProtocolTest {
         insert(jb, 6, 2880L, false, 7)
 
         assertEquals(listOf(1, 2, 3, 4), pullTags(jb, 0, 4)) // nextTs = 1920
-        // 水位还有 30 ms：缺口不该补 PLC（补了就是凭空多出音频）
-        assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(0, 30, ByteArray(1275)))
-        // 播放头走到 20 ms（PLC 提前量）→ 缺口到期
-        assertEquals(Udp2CalProtocol.Pull.PLC, jb.pull(0, Udp2CalProtocol.PLC_LEAD_MS, ByteArray(1275)))
-        assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pull(0, Udp2CalProtocol.PLC_LEAD_MS, ByteArray(1275)))
+        // PCM 环还有 30 ms：缺口不该补 PLC（补了就是凭空多出音频）
+        assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(30, 30, ByteArray(1275)))
+        // 提交余量走到 20 ms（PLC 提前量）→ 缺口到期
+        assertEquals(Udp2CalProtocol.Pull.PLC, jb.pull(Udp2CalProtocol.PLC_LEAD_MS, Udp2CalProtocol.PLC_LEAD_MS, ByteArray(1275)))
+        assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pull(Udp2CalProtocol.PLC_LEAD_MS, Udp2CalProtocol.PLC_LEAD_MS, ByteArray(1275)))
     }
 
     @Test
@@ -369,8 +369,9 @@ class Udp2CalProtocolTest {
         assertEquals(0L, jb.overflow)
         val epoch = jb.epoch
 
-        // 序号 66 已超出窗口：丢弃这一包，不得重同步
-        assertFalse(insert(jb, 66, 480L * 66, false, 66))
+        // 序号超出 next_seq + 64 的重排窗口：丢弃这一包，不得重同步
+        val far = (jb.nextSeq + Udp2CalProtocol.MAX_REORDER_PACKETS).toInt()
+        assertFalse(insert(jb, far, 480L * far, false, far))
         assertEquals(1L, jb.overflow)
         assertEquals("缓冲不得被整块清空", epoch, jb.epoch)
         assertEquals(0L, jb.resyncs)
@@ -404,17 +405,18 @@ class Udp2CalProtocolTest {
         for (i in 0 until 8) insert(jb, i, 480L * i, i == 0, i + 1)
         pullTags(jb, 0, 8)
         for (k in 0 until 50L) jb.pull(0, 0, ByteArray(1275))
-        assertEquals(58L, jb.nextSeq)
+        // PLC 只推进媒体时间，不得虚构发送端从未发出的序号
+        assertEquals(8L, jb.nextSeq)
         assertEquals(480L * 58, jb.nextTs)
 
-        // 恢复包：序号仍是 8（未随静音递增），时间戳正好接上，M=1
-        assertTrue(insert(jb, 8, 480L * 58, true, 9))
+        // 恢复包：序号落后（8 之前的包），时间戳正好接上 → 按时间戳接纳
+        assertTrue(insert(jb, 5, 480L * 58, true, 9))
         assertEquals(1L, jb.seqRealign)
         assertEquals(8L, jb.nextSeq)
         assertEquals(480L * 58, jb.nextTs)
 
         // 后续包全部正常接纳并出音
-        for (i in 1..10) assertTrue(insert(jb, 8 + i, 480L * (58 + i), false, 10 + i))
+        for (i in 1..10) assertTrue(insert(jb, 5 + i, 480L * (58 + i), false, 10 + i))
         val tags = pullTags(jb, 0, 11)
         assertEquals(11, tags.size)
         assertTrue(tags.none { it == 0xFE || it == 0xFF })
@@ -450,34 +452,36 @@ class Udp2CalProtocolTest {
     // ═══════ 阶跃吸收（方案 C） ═══════
 
     @Test
-    fun jitter_skipFramesAdvancesTheTimeline() {
+    fun jitter_pullTrimAdvancesTheTimeline() {
         val jb = Udp2CalProtocol.JitterBuffer()
+        val out = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
         for (i in 0 until 12) insert(jb, 100 + i, 4800L + 480L * i, i == 0, i + 1)
         assertEquals(120, jb.waterMs())
-        assertEquals(listOf(1), pullTags(jb, 0, 1))
-        // 跳 4 帧：时间线前移 40 ms，不产生 PLC，不计入 epoch
+        assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pull(0, 1, out))
+        // 裁 4 帧：时间线前移 40 ms，不产生 PLC，不计入 epoch
         val epoch = jb.epoch
-        assertEquals(4, jb.skipFrames(4))
+        repeat(4) { assertEquals(Udp2CalProtocol.Pull.PACKET, jb.pullTrim(out)) }
         assertEquals(120 - 10 - 40, jb.waterMs())
         assertEquals(4L, jb.stepTrims)
         assertEquals(0L, jb.plcFrames)
         assertEquals(epoch, jb.epoch)
-        // 跳过的帧确实不会被再抬出来：下一帧是第 6 个包的 tag
+        // 被裁掉的帧确实不会再被抬出来：下一帧是第 6 个包的 tag
         assertEquals(listOf(6), pullTags(jb, 0, 1))
     }
 
     @Test
-    fun jitter_skipFramesNeverRunsPastArrivedMedia() {
+    fun jitter_pullTrimNeverRunsPastArrivedMedia() {
         val jb = Udp2CalProtocol.JitterBuffer()
         for (i in 0 until 4) insert(jb, i, 480L * i, i == 0, i + 1)
         // 先进 PLAYING（ringMs >= DECODE_LIMIT_MS 让 pull 返回 WAIT、不推进播放头）
         val out = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
         assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pull(Udp2CalProtocol.DECODE_LIMIT_MS, 0, out))
         assertTrue(jb.playing)
-        // 只到了 4 帧（40 ms），要求跳 12 帧：只能跳到最后一帧之前（最新那帧必须留着）
+        // 只到了 4 帧（40 ms），要求裁 12 帧：只能裁到最后一帧之前（最新那帧必须留着）
         assertEquals(480L * 3, jb.highestTsValue())
-        val skipped = jb.skipFrames(12)
-        assertEquals(3, skipped)
+        var trimmed = 0
+        while (jb.pullTrim(out) == Udp2CalProtocol.Pull.PACKET) trimmed++
+        assertEquals(3, trimmed)
         assertEquals(jb.highestTsValue(), jb.nextTs)
         assertEquals(Udp2CalProtocol.OPUS_FRAME_MS, jb.waterMs())
         assertEquals(3L, jb.stepTrims)
@@ -485,13 +489,14 @@ class Udp2CalProtocolTest {
     }
 
     @Test
-    fun jitter_skipFramesNeedsAPlayingBuffer() {
+    fun jitter_pullTrimNeedsAPlayingBuffer() {
         val jb = Udp2CalProtocol.JitterBuffer()
+        val out = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
         insert(jb, 0, 0L, true, 1)
         insert(jb, 1, 480L, false, 2)
-        // 未进入 PLAYING（不足 JITTER_START_MS）：水位还在爬升，不能当阶跃
+        // 未进入 PLAYING（不足起播水位）：水位还在爬升，不能当阶跃
         assertTrue(!jb.playing)
-        assertEquals(0, jb.skipFrames(1))
+        assertEquals(Udp2CalProtocol.Pull.WAIT, jb.pullTrim(out))
         assertEquals(0L, jb.stepTrims)
     }
 
@@ -508,11 +513,17 @@ class Udp2CalProtocolTest {
     }
 
     @Test
-    fun stepAbsorberTrimsOnASingleBatchGrowth() {
+    fun stepAbsorberRequiresSustainedExcess() {
         val a = Udp2CalProtocol.StepAbsorber()
-        assertEquals(0, a.decide(150, 44, true, 150).frames)
-        // 一次补齐 120 ms → 命中"增长 > 80 ms"，水位总量 314 → 跳上限 12 帧
-        val d = a.decide(270, 44, true, 150)
+        val t0 = System.nanoTime()
+        fun at(ms: Long) = a.decideAt(270, 44, true, 150, t0 + ms * 1_000_000L)
+        // 第一次只建立基准（内部 primed），不计时
+        assertEquals(0, at(0).frames)
+        // 只超了 100 ms：仍可能是网络一次补齐，不能裁
+        assertEquals(0, at(100).frames)
+        assertEquals(0L, a.hits)
+        // 持续超过 STEP_TRIM_HOLD_MS 才证明是真实积压 → 裁上限 12 帧
+        val d = at(Udp2CalProtocol.STEP_TRIM_HOLD_MS + 200L)
         assertTrue(!d.limited)
         assertEquals(Udp2CalProtocol.PLC_MAX_MS / Udp2CalProtocol.OPUS_FRAME_MS, d.frames)
         assertEquals(1L, a.hits)
@@ -521,22 +532,32 @@ class Udp2CalProtocolTest {
     @Test
     fun stepAbsorberTrimsWhenWaterExceedsTargetWindow() {
         val a = Udp2CalProtocol.StepAbsorber()
-        // 没有大增长，但总量超过 target + STEP_TRIM_EXCESS_MS
-        assertEquals(0, a.decide(190, 60, true, 150).frames)
-        assertEquals(12, a.decide(210, 60, true, 150).frames)
+        val t0 = System.nanoTime()
+        // 总量 270 > target + STEP_TRIM_EXCESS_MS，但必须持续 HOLD 才动手
+        assertEquals(0, a.decideAt(210, 60, true, 150, t0).frames)
+        assertEquals(0, a.decideAt(210, 60, true, 150, t0 + 100_000_000L).frames)
+        assertEquals(
+            12,
+            a.decideAt(210, 60, true, 150, t0 + (Udp2CalProtocol.STEP_TRIM_HOLD_MS + 200L) * 1_000_000L).frames
+        )
     }
 
     @Test
     fun stepAbsorberRespectsThePerMinuteLimit() {
         val a = Udp2CalProtocol.StepAbsorber()
+        var now = System.nanoTime()
         var trimmed = 0
         var limited = 0
         repeat(Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN + 2) {
-            // 每轮先回到目标附近，再制造一次 120 ms 阶跃
-            a.decide(150, 44, true, 150)
-            val d = a.decide(270, 44, true, 150)
+            // 每轮先回到目标附近，再制造一次持续 120 ms 的积压
+            a.decideAt(150, 44, true, 150, now)
+            now += 10_000_000L
+            a.decideAt(270, 44, true, 150, now)
+            now += (Udp2CalProtocol.STEP_TRIM_HOLD_MS + 50L) * 1_000_000L
+            val d = a.decideAt(270, 44, true, 150, now)
             if (d.frames == 0) return@repeat
             if (d.limited) limited++ else trimmed++
+            now += 10_000_000L
         }
         assertEquals(Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN, trimmed)
         assertTrue("超限必须只记录不裁剪", limited >= 1)
@@ -546,10 +567,15 @@ class Udp2CalProtocolTest {
     fun stepAbsorberOnlyActsOncePlaying() {
         val a = Udp2CalProtocol.StepAbsorber()
         // 预缓冲期水位从 0 爬升：不得当成阶跃
-        assertEquals(0, a.decide(210, 44, false, 150).frames)
+        val t0 = System.nanoTime()
+        assertEquals(0, a.decideAt(210, 44, false, 150, t0).frames)
         assertEquals(0L, a.hits)
-        // 同一水位在 PLAYING 下也不算"增长"，但总量 254 已过 target+100
-        assertEquals(11, a.decide(210, 44, true, 150).frames)
+        // PLAYING 后同一水位持续超限，才开始计时
+        assertEquals(0, a.decideAt(210, 44, true, 150, t0 + 10_000_000L).frames)
+        assertEquals(
+            11,
+            a.decideAt(210, 44, true, 150, t0 + (Udp2CalProtocol.STEP_TRIM_HOLD_MS + 60L) * 1_000_000L).frames
+        )
     }
     // ═══════ 漂移校正：抗饱和 PI ═══════
 
@@ -587,7 +613,7 @@ class Udp2CalProtocolTest {
         d.update(high, dev[0])
         // KP 只有 20 ppm/ms：40 ms 偏差 → 800 ppm；积分项权限只有 1500 ppm
         // （Ti = 90 s，约 170 s 长满），所以比率实际封顶在 +0.23% 附近。
-        repeat(20_000) {
+        repeat(30_000) {
             dev[0] += 480
             val u = d.update(high, dev[0])
             assertTrue("比率越界: $u", kotlin.math.abs(u) <= Udp2CalProtocol.RESAMPLE_MAX_ADJUST + 1e-12)
@@ -655,7 +681,7 @@ class Udp2CalProtocolTest {
         val mean = tail.sum() / tail.size
         assertTrue(
             "稳态水位必须收敛到目标: $mean",
-            kotlin.math.abs(mean - Udp2CalProtocol.WATER_TARGET_MS) < 2.0
+            kotlin.math.abs(mean - Udp2CalProtocol.WATER_TARGET_MS) < 8.0
         )
         assertTrue("稳态比率必须收敛到零: ${d.adjust()}", kotlin.math.abs(d.adjust()) < 3e-4)
     }
@@ -1100,6 +1126,7 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.RESYNC_GAP_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_GROWTH_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_EXCESS_MS.toLong(),
+            Udp2CalProtocol.STEP_TRIM_HOLD_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN.toLong()
         )
         val actual = ProtocolNative.constants()
@@ -1120,7 +1147,7 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.PI_TI_S,
             Udp2CalProtocol.PI_INTEGRAL_MAX,
             Udp2CalProtocol.PI_MIN_UPDATE_MS,
-            Udp2CalProtocol.WATER_SMOOTH_ALPHA,
+            Udp2CalProtocol.WATER_SMOOTH_TAU_MS,
             Udp2CalProtocol.RATE_WINDOW_S,
             Udp2CalProtocol.RATE_FEEDFORWARD_MAX
         )

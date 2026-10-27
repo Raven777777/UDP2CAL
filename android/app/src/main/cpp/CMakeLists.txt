@@ -12,10 +12,10 @@ endif()
 
 # Build libopus 1.6.1 from local source
 # OPUS_DEEP_PLC：解码端神经网络 PLC（+约1MB，运行时需解码复杂度>=5）
-# OPUS_DRED：编码端深度冗余（模型600KB，码流+12~32kb/s），与 Windows 端同为 1.6.1 可互操作
+# OPUS_DRED：关闭——本项目接收端没有 DRED 解析/恢复路径。
 # 注意：OPUS_OSCE / QEXT 保持关闭，本项目不使用其语音增强与 96kHz 特性
 set(OPUS_DEEP_PLC ON CACHE BOOL "" FORCE)
-set(OPUS_DRED ON CACHE BOOL "" FORCE)
+set(OPUS_DRED OFF CACHE BOOL "" FORCE)
 add_subdirectory("${UDP2CAL_OPUS_SRC}" opus_build)
 
 # JNI library: Opus encoder + decoder

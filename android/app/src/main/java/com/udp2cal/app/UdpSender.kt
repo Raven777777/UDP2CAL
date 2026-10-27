@@ -149,6 +149,15 @@ class UdpSender(
 
     fun getRemotePort(): Int = port
 
+    /**
+     * 断连后主动更换正向 SSRC：下一次 CONNECT 会让接收端把它识别为
+     * "新会话"，清空旧抖动缓冲并重建反向音频链路。普通保活不会调用。
+     */
+    fun regenerateForwardSsrc(): Int {
+        forwardSsrc = newSsrc()
+        return forwardSsrc
+    }
+
     private fun newSsrc(): Int {
         val rnd = SecureRandom()
         while (true) {
@@ -187,6 +196,9 @@ class UdpSender(
                 val ack = Udp2CalProtocol.ConnectAckPayload.decode(
                     buf, Udp2CalProtocol.CONTROL_HEADER_SIZE, hdr.payloadLen
                 ) ?: continue
+                // 不能只看到 CONNECT_ACK 类型就认：payload 必须描述我们支持的
+                // 媒体格式（PT/10ms），否则是错版本/错会话的对端。
+                if (!ack.isValid()) continue
                 reverseSsrc = ack.reverseSsrc
                 lastAckTime = System.currentTimeMillis()
                 ackGeneration++

@@ -47,9 +47,9 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(packetLoss));
     // 防御：VBR=0 时 constraint 无意义，强制清零防止意外
     opus_encoder_ctl(enc, OPUS_SET_VBR_CONSTRAINT(vbr ? vbrConstraint : 0));
-    // DRED（Opus 1.6 深度冗余）：FEC 开启时附带最长 500ms 冗余（50×10ms 帧），
-    // 供解码端神经网络恢复突发丢包；与 Windows 端同为 1.6.1，DRED 可互操作
-    opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(fec ? 50 : 0));
+    // DRED 不在本项目中启用：接收端没有 DRED 解析/恢复路径，
+    // 发送端单方面打开只会白占码率。
+    opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(0));
     opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
     opus_encoder_ctl(enc, OPUS_SET_SIGNAL(signalType));
     opus_encoder_ctl(enc, OPUS_SET_BANDWIDTH(bandwidth));
@@ -156,9 +156,8 @@ Java_com_udp2cal_app_native_OpusNative_encoderUpdate(
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR(vbr));
     opus_encoder_ctl(state->encoder, OPUS_SET_INBAND_FEC(fec));
     opus_encoder_ctl(state->encoder, OPUS_SET_PACKET_LOSS_PERC(packetLoss));
-    // DRED 与 FEC 联动：运行期关掉 FEC 必须同时撤掉 DRED，否则冗余还在发、
-    // 单帧体积还在涨（创建路径已经这么做了，更新路径以前漏了）
-    opus_encoder_ctl(state->encoder, OPUS_SET_DRED_DURATION(fec ? 50 : 0));
+    // DRED 始终关闭（接收端不支持解析/恢复）
+    opus_encoder_ctl(state->encoder, OPUS_SET_DRED_DURATION(0));
     // 防御：VBR=0 时 constraint 无意义，强制清零防止意外
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR_CONSTRAINT(vbr ? vbrConstraint : 0));
     opus_encoder_ctl(state->encoder, OPUS_SET_BITRATE(bitrate * 1000));

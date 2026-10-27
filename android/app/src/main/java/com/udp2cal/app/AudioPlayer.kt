@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.util.Log
 
@@ -31,7 +32,7 @@ class AudioPlayer(private val context: Context) {
          * 结构上我们每 10 ms 阻塞写一帧，所以缓冲至少要能装下"一帧 + 调度余量"；
          * 2 帧（20 ms）是 low-latency 模式下不因调度抖动周期性断音的下限。
          * 更小的缓冲不会降低听感延迟（延迟主要由抖动缓冲水位决定，
-         * 目标是 60 ms），只会把欠载风险换成爆音。
+         * 目标是 150 ms），只会把欠载风险换成爆音。
          */
         private const val BUFFER_FRAMES = 2 * Udp2CalProtocol.OPUS_FRAME_SAMPLES
     }
@@ -206,6 +207,23 @@ class AudioPlayer(private val context: Context) {
         audioTrack?.getBufferSizeInFrames() ?: 0
     } catch (_: Exception) {
         0
+    }
+
+    /**
+     * 设备时钟采样：优先用 [AudioTrack.getTimestamp] 给出的
+     * “播放位置 + CLOCK_MONOTONIC 时刻”，它不包含协程被调度回来的抖动；
+     * 不可用时返回 null，由调用方退回 `(playbackHeadFrames, System.nanoTime())`。
+     */
+    fun deviceClockSample(): Pair<Long, Long>? = synchronized(trackLock) {
+        val track = audioTrack ?: return@synchronized null
+        val ts = AudioTimestamp()
+        try {
+            if (track.getTimestamp(ts) && ts.nanoTime > 0L) {
+                return@synchronized ts.framePosition to ts.nanoTime
+            }
+        } catch (_: Exception) {
+        }
+        null
     }
 
     /**

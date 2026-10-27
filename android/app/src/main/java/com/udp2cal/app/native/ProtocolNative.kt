@@ -114,7 +114,11 @@ internal object ProtocolNative {
     /** 返回值即 [com.udp2cal.app.Udp2CalProtocol.Pull] 的判别值 */
     external fun jbPull(h: Long, ringMs: Int, pipeMs: Int, out: ByteArray): Int
 
-    external fun jbSkipFrames(h: Long, n: Int): Int
+    /** 取一帧用于阶跃裁剪；调用方必须解码后丢弃 PCM。 */
+    external fun jbPullTrim(h: Long, out: ByteArray): Int
+
+    /** 起播所需的连续媒体水位（毫秒）。 */
+    external fun jbSetStartPrebufferMs(h: Long, ms: Int)
 
     external fun jbNextSeq(h: Long): Long
 
@@ -139,6 +143,12 @@ internal object ProtocolNative {
     external fun jbWaterMs(h: Long): Int
 
     external fun jbContiguousFrames(h: Long): Int
+
+    external fun jbContiguousMs(h: Long): Int
+
+    external fun jbOccupancyFrames(h: Long): Int
+
+    external fun jbOccupancyMs(h: Long): Int
 
     external fun jbArrivalNanosAt(h: Long, ts: Long): Long
 
@@ -171,6 +181,16 @@ internal object ProtocolNative {
     /** 打包返回 `frames shl 32 or (limited ? 1 : 0)` */
     external fun saDecide(h: Long, jbWaterMs: Int, pipeMs: Int, canTrim: Boolean, targetMs: Int): Long
 
+    /** 同 [saDecide]，显式传入 `System.nanoTime()`（单测推进虚拟时间用）。 */
+    external fun saDecideAt(
+        h: Long,
+        jbWaterMs: Int,
+        pipeMs: Int,
+        canTrim: Boolean,
+        targetMs: Int,
+        nowNanos: Long,
+    ): Long
+
     external fun saHits(h: Long): Long
 
     external fun saTrimsInWindow(h: Long): Int
@@ -195,6 +215,23 @@ internal object ProtocolNative {
     external fun reUsedBuckets(h: Long): Int
 
     external fun reObservations(h: Long): Long
+
+    // ── DeviceRateEstimator（声卡时钟前馈） ─────────────────────────────
+
+    external fun deCreate(): Long
+
+    external fun deDestroy(h: Long)
+
+    external fun deReset(h: Long)
+
+    external fun deObserve(h: Long, deviceFrames: Long, playedNanos: Long)
+
+    /** 无估计时返回 NaN */
+    external fun deFeedforward(h: Long): Double
+
+    external fun deSigmaPpm(h: Long): Double
+
+    external fun deBuckets(h: Long): Int
 
     // ── DriftController ──────────────────────────────────────────────────
 

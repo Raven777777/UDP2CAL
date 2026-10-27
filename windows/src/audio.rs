@@ -20,6 +20,15 @@ use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::thread::Thread;
+use std::time::{Duration, Instant};
+
+/// 声卡时钟采样与本地 `Instant` 的公共基准。
+///
+/// cpal 的 WASAPI 后端在每次回调里调用 `IAudioClock::GetPosition`，并把
+/// 返回的 QPC 位置放进 `OutputCallbackInfo::timestamp().playback`。这里把
+/// 第一次回调的 playback 作为零点，之后用 `StreamInstant::duration_since`
+/// 把设备播放位置换算到同一条 `Instant` 时间轴上。
+static CLOCK_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 // ═══════════════════════════════════════════════════════════════════
 // 无锁 SPSC 环形缓冲
@@ -150,6 +159,11 @@ pub struct AudioWriter {
     /// 声卡自报延迟（微秒）：`timestamp().playback - timestamp().callback`。
     /// 这是本进程里唯一能拿到的"playhead 不含的那部分"实测值。
     device_latency_us: Arc<AtomicU64>,
+    /// 设备时钟采样：`(设备帧, QPC 时刻相对于 CLOCK_EPOCH 的纳秒)`。
+    /// 由音频回调在读取 `IAudioClock` 时间戳的同一刻写入，供前馈估计器
+    /// 建立"媒体样本 ↔ 本地 Instant ↔ 设备进度"三者之间的可验证映射。
+    device_clock_frames: Arc<AtomicU64>,
+    device_clock_ns: Arc<AtomicU64>,
     /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
     waker: Arc<OnceLock<Thread>>,
 
@@ -229,6 +243,19 @@ impl AudioWriter {
         let rate = self.device_rate.max(1) as u64;
         // 上限 1 秒：时间戳异常时宁可当作"没测到"，也不能让播放头倒退
         (us.saturating_mul(rate) / 1_000_000).min(rate)
+    }
+
+    /// 取一次设备时钟采样：`(已消费设备帧, 对应的 QPC/Instant 时刻)`。
+    /// 时间来自 cpal 的 `IAudioClock::GetPosition` 时间戳，而不是解码线程
+    /// 被调度到的 `Instant::now()`——后者会把线程唤醒抖动误当成设备速率差。
+    pub fn device_clock_sample(&self) -> Option<(u64, Instant)> {
+        let ns = self.device_clock_ns.load(Ordering::Acquire);
+        if ns == 0 {
+            return None;
+        }
+        let frames = self.device_clock_frames.load(Ordering::Acquire);
+        let epoch = *CLOCK_EPOCH.get()?;
+        Some((frames, epoch + Duration::from_nanos(ns)))
     }
 
     /// 同上，毫秒（诊断展示用）
@@ -475,6 +502,8 @@ fn build_stream<T>(
     stats: &Weak<AudioStats>,
     played: &Weak<AtomicU64>,
     latency: &Arc<AtomicU64>,
+    clock_frames: &Arc<AtomicU64>,
+    clock_ns: &Arc<AtomicU64>,
     waker: &Arc<OnceLock<Thread>>,
 ) -> Result<cpal::Stream, String>
 where
@@ -485,7 +514,11 @@ where
     let stats = stats.clone();
     let played = played.clone();
     let latency = latency.clone();
+    let clock_frames = clock_frames.clone();
+    let clock_ns = clock_ns.clone();
     let waker = waker.clone();
+    // 第一次回调的 playback 位置作为设备时钟零点；回调闭包私有，无锁。
+    let mut playback_base: Option<cpal::StreamInstant> = None;
     device
         .build_output_stream(
             config,
@@ -502,6 +535,18 @@ where
                 if let Some(d) = ts.playback.duration_since(&ts.callback) {
                     let us = d.as_micros().min(u64::MAX as u128) as u64;
                     latency.store(us, Ordering::Release);
+                }
+                // IAudioClock 的播放位置 → 同一条 Instant 时间轴。
+                let _ = CLOCK_EPOCH.get_or_init(Instant::now);
+                let base = match playback_base {
+                    Some(base) => base,
+                    None => {
+                        playback_base = Some(ts.playback);
+                        ts.playback
+                    }
+                };
+                if let Some(d) = ts.playback.duration_since(&base) {
+                    clock_ns.store(d.as_nanos().min(u64::MAX as u128) as u64, Ordering::Release);
                 }
 
                 // 生产者只能"请求"丢弃（flush），由消费者在这里落地
@@ -527,7 +572,10 @@ where
                 // 永久落后欠载量，抖动缓冲的有效水位被被动抬高，PLC 触发点随之
                 // 推迟，形成"欠载 → 延迟增大 → 更易欠载"的正反馈。
                 if let Some(p) = played.upgrade() {
-                    p.fetch_add(need_frames as u64, Ordering::Release);
+                    let total = p.fetch_add(need_frames as u64, Ordering::Release) + need_frames as u64;
+                    // 与上面的 clock_ns 同属一次回调；前馈只在 1 s 桶里取点，
+                    // 两个原子量之间的亚毫秒撕裂不影响斜率。
+                    clock_frames.store(total, Ordering::Release);
                 }
 
                 if filled < need_frames {
@@ -596,6 +644,8 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let ring = Arc::new(Ring::with_frames((actual_rate as usize * 341) / 1000));
     let played = Arc::new(AtomicU64::new(0));
     let device_latency_us = Arc::new(AtomicU64::new(0));
+    let device_clock_frames = Arc::new(AtomicU64::new(0));
+    let device_clock_ns = Arc::new(AtomicU64::new(0));
     let waker: Arc<OnceLock<Thread>> = Arc::new(OnceLock::new());
 
     let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
@@ -605,6 +655,8 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let played_weak = Arc::downgrade(&played);
     let waker_thread = waker.clone();
     let latency_shared = device_latency_us.clone();
+    let clock_frames_shared = device_clock_frames.clone();
+    let clock_ns_shared = device_clock_ns.clone();
 
     std::thread::Builder::new()
         .name("udp2cal-audio".into())
@@ -617,10 +669,10 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
                 let mut cfg = stream_config.clone();
                 cfg.buffer_size = bs;
                 let built = match sample_format {
-                    SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
-                    SampleFormat::I16 => build_stream::<i16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
-                    SampleFormat::U16 => build_stream::<u16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
-                    SampleFormat::I32 => build_stream::<i32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &waker_thread),
+                    SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
+                    SampleFormat::I16 => build_stream::<i16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
+                    SampleFormat::U16 => build_stream::<u16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
+                    SampleFormat::I32 => build_stream::<i32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
                     other => Err(format!("不支持的输出采样格式: {other}")),
                 };
                 match built {
@@ -653,6 +705,8 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             stats,
             played,
             device_latency_us,
+            device_clock_frames,
+            device_clock_ns,
             waker,
             pos: 0.0,
             base_ratio: 1.0,
@@ -803,6 +857,8 @@ mod tests {
                 stats: Arc::new(AudioStats::default()),
                 played: Arc::new(AtomicU64::new(0)),
                 device_latency_us: Arc::new(AtomicU64::new(0)),
+                device_clock_frames: Arc::new(AtomicU64::new(0)),
+                device_clock_ns: Arc::new(AtomicU64::new(0)),
                 waker: Arc::new(OnceLock::new()),
                 pos: 0.0,
                 base_ratio: 1.0,
