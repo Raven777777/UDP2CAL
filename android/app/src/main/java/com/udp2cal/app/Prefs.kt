@@ -69,14 +69,15 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, Udp2CalProtocol.BITRATE_MAX_KBPS)).apply()
 
     var opusFec: Int
-        get() {
-            val v = prefs.getInt("opus_fec", 0)  // 低延迟：局域网不需要FEC
-            return v
-        }
+        // 默认开（2 = 与 UI 勾选状态一致）：10 ms 帧的带内 FEC 只是把上一帧
+        // 的 LBRR 冗余放进当前包，不增加包数/延迟，却能靠单个后续包重建一帧。
+        get() = prefs.getInt("opus_fec", 2)
         set(v) = prefs.edit().putInt("opus_fec", v.coerceIn(0, 2)).apply()
 
     var opusPacketLoss: Int
-        get() = prefs.getInt("opus_packet_loss", 0) // 低延迟：局域网预期丢包率0%
+        // 配合 FEC 开启：告诉编码器预期丢包率，它才会持续生成 LBRR 冗余；
+        // 为 0 时 libopus 认为无需冗余，等于把 FEC 白开。
+        get() = prefs.getInt("opus_packet_loss", 10)
         set(v) = prefs.edit().putInt("opus_packet_loss", v.coerceIn(0, 100)).apply()
 
     var opusVbrConstraint: Int
