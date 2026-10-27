@@ -401,7 +401,12 @@ fn init_audio_worker() {
             //
             // 这一层不再有任何"设备帧 → 媒体时间戳"的换算：播放决策只看
             // 缓冲里还压着多少媒体，比率只改"一帧媒体换多少设备帧"。
-            let device_rate = aw.device_rate;
+            // 设备采样率作除数（ms 换算、ppm 归一、漂移控制器基准）。
+            // `DeviceRateEstimator::with_rate` / `DriftController::new` 与
+            // audio.rs 里的同类换算都要求非零；cpal 理论上不会给出 0，
+            // 但这里是解码线程顶层，除零 = 线程 panic = 整条音频链死亡，
+            // 必须栅位而不是赌。
+            let device_rate = aw.device_rate.max(1);
             let mut drift = protocol::rtp::DriftController::new(device_rate);
             // 前馈只看**声卡设备进度 vs QPC**：网络攒批/重排不进入比率。
             // 发送端媒体时间线 vs Instant 的旧 RateEstimator 已从比率路径移除。
