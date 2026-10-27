@@ -15,4 +15,8 @@
 | [CODE_REVIEW_2026-10-23.md](CODE_REVIEW_2026-10-23.md) | 第一轮全量审查（43 项） | 一次性材料 |
 | [CODE_REVIEW_ROUND2_2026-10-23.md](CODE_REVIEW_ROUND2_2026-10-23.md) | 第二轮全量审查（24 项） | 一次性材料 |
 | [CODE_REVIEW_2026-10-25.md](CODE_REVIEW_2026-10-25.md) | 第三轮全量审查（22 项） | 一次性材料；结论已并入 BUGFIX |
+| [CODE_REVIEW_2026-10-27.md](CODE_REVIEW_2026-10-27.md) | `protocol/` + `windows/` 审查报告（v1.5.1，9789 行，11 个自动修复提交） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |
+| [CODE_REVIEW_2026-10-27_ROUND3.md](CODE_REVIEW_2026-10-27_ROUND3.md) | 全流程审查（`protocol/` + `windows/` + `android/app/src` 跨实现一致性，20 个独立提交） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |
 | [CODE_REVIEW_2026-10-28.md](CODE_REVIEW_2026-10-28.md) | 全流程审查（23 项，8 项已修） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |
+| [CODE_REVIEW_2026-10-28_ROUND2.md](CODE_REVIEW_2026-10-28_ROUND2.md) | 全流程审查二审（4 处修复 R1–R4、保留风险 P2-1…P2-7 与 P3 清单、未执行项） | 一次性材料；修复摘要见该报告，未修项含位置与不修理由 |
+| [SUNSHINE_LOW_LATENCY_RESEARCH.md](SUNSHINE_LOW_LATENCY_RESEARCH.md) | 外部调研：Sunshine（LizardByte，commit `d0b4a88`）源码级拆解——编码管线压到 1 帧、latest-wins 单槽、1 ms 发送整形、带内 RS-FEC 20%、无 ABR 的取舍 | 第三方项目调研，**不是**本项目规范；仅供设计借鉴 |
