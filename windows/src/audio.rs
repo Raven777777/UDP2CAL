@@ -495,28 +495,41 @@ fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConf
         .ok_or_else(|| "无有效输出配置".to_string())
 }
 
+/// `build_stream` 的共享观测点集合。
+///
+/// 七个句柄打包成一个结构，而不是在参数表里排成七行：(1) 回调闭包只捕获一份
+/// 数据；(2) 调用点不再有"同为 `&Arc<AtomicU64>` 的两个参数传反"的空间。
+#[derive(Clone)]
+struct StreamShared {
+    ring: Weak<Ring>,
+    stats: Weak<AudioStats>,
+    played: Weak<AtomicU64>,
+    latency: Arc<AtomicU64>,
+    clock_frames: Arc<AtomicU64>,
+    clock_ns: Arc<AtomicU64>,
+    waker: Arc<OnceLock<Thread>>,
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
-    ring: &Weak<Ring>,
-    stats: &Weak<AudioStats>,
-    played: &Weak<AtomicU64>,
-    latency: &Arc<AtomicU64>,
-    clock_frames: &Arc<AtomicU64>,
-    clock_ns: &Arc<AtomicU64>,
-    waker: &Arc<OnceLock<Thread>>,
+    shared: &StreamShared,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
 {
     let channels = config.channels as usize;
-    let ring = ring.clone();
-    let stats = stats.clone();
-    let played = played.clone();
-    let latency = latency.clone();
-    let clock_frames = clock_frames.clone();
-    let clock_ns = clock_ns.clone();
-    let waker = waker.clone();
+    // 拆包时把 Weak/Arc 按名字绑定到与原签名同名的局部量，
+    // 回调体因此保持一字不改。
+    let StreamShared {
+        ring,
+        stats,
+        played,
+        latency,
+        clock_frames,
+        clock_ns,
+        waker,
+    } = shared.clone();
     // 第一次回调的 playback 位置作为设备时钟零点；回调闭包私有，无锁。
     let mut playback_base: Option<cpal::StreamInstant> = None;
     device
@@ -653,10 +666,15 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let ring_weak = Arc::downgrade(&ring);
     let stats_weak = Arc::downgrade(&stats);
     let played_weak = Arc::downgrade(&played);
-    let waker_thread = waker.clone();
-    let latency_shared = device_latency_us.clone();
-    let clock_frames_shared = device_clock_frames.clone();
-    let clock_ns_shared = device_clock_ns.clone();
+    let shared = StreamShared {
+        ring: ring_weak,
+        stats: stats_weak,
+        played: played_weak,
+        latency: device_latency_us.clone(),
+        clock_frames: device_clock_frames.clone(),
+        clock_ns: device_clock_ns.clone(),
+        waker: waker.clone(),
+    };
 
     std::thread::Builder::new()
         .name("udp2cal-audio".into())
@@ -669,10 +687,10 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
                 let mut cfg = stream_config.clone();
                 cfg.buffer_size = bs;
                 let built = match sample_format {
-                    SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
-                    SampleFormat::I16 => build_stream::<i16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
-                    SampleFormat::U16 => build_stream::<u16>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
-                    SampleFormat::I32 => build_stream::<i32>(&device, &cfg, &ring_weak, &stats_weak, &played_weak, &latency_shared, &clock_frames_shared, &clock_ns_shared, &waker_thread),
+                    SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &shared),
+                    SampleFormat::I16 => build_stream::<i16>(&device, &cfg, &shared),
+                    SampleFormat::U16 => build_stream::<u16>(&device, &cfg, &shared),
+                    SampleFormat::I32 => build_stream::<i32>(&device, &cfg, &shared),
                     other => Err(format!("不支持的输出采样格式: {other}")),
                 };
                 match built {
