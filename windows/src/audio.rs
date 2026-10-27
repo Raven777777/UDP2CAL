@@ -143,7 +143,19 @@ impl Ring {
         let target = self.flush_to.swap(FLUSH_NONE, Ordering::Acquire);
         if target != FLUSH_NONE {
             let head = self.head.load(Ordering::Acquire);
-            self.tail.store(target.min(head), Ordering::Release);
+            // `tail` 归消费者所有且**单调递增**：只允许前移。
+            //
+            // 生产者发出请求（`target = head`）到消费者落地之间，消费者可能
+            // 还停留在上一次回调里继续 pop（生产者在期间又入环了几帧），
+            // 从而已经越过 `target`。此时无条件写 `target` 会把 `tail` 拉回
+            // 更早的位置：声卡会重放已经播过的样本（可听得到的一次 10 ms
+            // 重播），`len()` 也会虚高，解码线程据此误判水位。
+            //
+            // `cur <= head` 是既有不变量，`target.min(head) <= head`，
+            // 因此 `max` 之后仍满足 `tail <= head`。
+            let cur = self.tail.load(Ordering::Relaxed);
+            self.tail
+                .store(cur.max(target.min(head)), Ordering::Release);
         }
     }
 }
@@ -822,6 +834,37 @@ mod tests {
         assert_eq!(ring.pop(), None);
         assert!(ring.push(0.25));
         assert_eq!(ring.len(), 1);
+    }
+
+    #[test]
+    fn flush_never_rewinds_consumer_position() {
+        // 回归：消费者在 flush 落地前已经越过 target 时（同一个回调里继续 pop，
+        // 而生产者在期间又入环了几帧），tail 不得被拉回更早的位置。
+        let ring = Ring::with_frames(1024);
+        for _ in 0..8 {
+            ring.push(1.0);
+        }
+        assert_eq!(ring.pop(), Some(1.0));
+        assert_eq!(ring.pop(), Some(1.0));
+
+        ring.request_flush(); // target = head = 8
+
+        // 消费者仍在同一个回调里：生产者又入环 4 帧，消费者把它们全消费掉
+        for _ in 0..4 {
+            ring.push(2.0);
+        }
+        while ring.pop().is_some() {}
+        let before = ring.tail.load(Ordering::Acquire);
+        assert_eq!(before, 12);
+
+        // 下一次回调开头落地 flush：tail 不得回退
+        ring.apply_pending_flush();
+        let after = ring.tail.load(Ordering::Acquire);
+        assert!(
+            after >= before,
+            "flush 使 tail 回退：{before} → {after}（会重播已播样本）"
+        );
+        assert_eq!(ring.len(), 0);
     }
 
     #[test]
