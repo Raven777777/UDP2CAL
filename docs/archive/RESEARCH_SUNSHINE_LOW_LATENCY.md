@@ -1,5 +1,9 @@
 # Sunshine 为什么在局域网里又快又稳 —— 源码级拆解
 
+> **归档材料（2026-10-28 归档）**。外部项目调研，**不是**本项目的规范、路线图或对照结论；
+> 现行真源仍是 [../PROTOCOL_V3_RTP.md](../PROTOCOL_V3_RTP.md) 与 [../LATENCY_CALIBRATION.md](../LATENCY_CALIBRATION.md)。
+> 与本项目（音频串流、无视频）的逐项对照见 [PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md](PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md)。
+>
 > 调研对象：`github.com/LizardByte/Sunshine`，commit `d0b4a88`，浅克隆于 `C:\Users\21248\Documents\GitHub\sunshine`。
 > 所有结论都带 `文件:行` 证据（行号为该 commit）。标注「推测」的部分依赖未 checkout 的子模块 `third-party/moonlight-common-c`（线格式常量定义在那里）。
 
