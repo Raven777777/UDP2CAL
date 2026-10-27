@@ -46,6 +46,14 @@ class UdpSender(
 
         /** DSCP EF（46）= IP TOS 字节 0xB8：音频流的最高转发优先级 */
         const val DSCP_EF_TOS = 0xB8
+
+        /**
+         * 套接字缓冲（借鉴 Sunshine 的 socket 调优）：把内核收发队列放大到 1 MiB。
+         * Android 默认只有几十 KiB，Wi-Fi 一次漫游/重传退避就可能把突发直接丢掉；
+         * 这里放大的是**内核队列**而不是应用层积压——每帧立即 send/recv，
+         * 队列只用来吸收空口级突发，不引入延迟。
+         */
+        const val SOCKET_BUFFER_BYTES = 1 shl 20
     }
 
     // 跨线程访问：connect()/close() 在 IO 线程，send() 在采集线程，
@@ -89,8 +97,19 @@ class UdpSender(
             } catch (e: Exception) {
                 Log.w(TAG, "正向套接字 DSCP 标记失败：${e.message}")
             }
+            // 收发队列放大：失败（厂商限制/权限）只告警，继续用系统默认值
+            try {
+                sock.sendBufferSize = SOCKET_BUFFER_BYTES
+            } catch (e: Exception) {
+                Log.w(TAG, "正向发送缓冲设置失败：${e.message}")
+            }
             val revSock = DatagramSocket()
             revSockLocal = revSock
+            try {
+                revSock.receiveBufferSize = SOCKET_BUFFER_BYTES
+            } catch (e: Exception) {
+                Log.w(TAG, "反向接收缓冲设置失败：${e.message}")
+            }
             reverseSock = revSock
             reversePort = revSock.localPort
             synchronized(sessionLock) {

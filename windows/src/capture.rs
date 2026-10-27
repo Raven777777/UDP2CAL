@@ -397,6 +397,16 @@ impl ReverseSender {
             ),
         }
 
+        // ── 发送缓冲（借鉴 Sunshine 的 1 MiB `SO_SNDBUF`）──
+        // Windows 默认发送缓冲只有 8 KiB 量级：一次调度抖动里连发几包就可能
+        // `send` 阻塞或丢包，而丢一包就是一个可闻的 PLC。反向音频码率很低
+        // （≤512 kbps，每 10 ms 一包 ≤1275 B），1 MiB 只是把突发吸收掉，
+        // 不会引入排队延迟（发送线程仍是每 10 ms 一包）。
+        const SEND_BUFFER_BYTES: usize = 1 << 20;
+        if let Err(e) = socket2::SockRef::from(&send_sock).set_send_buffer_size(SEND_BUFFER_BYTES) {
+            logf!("[Reverse] 发送缓冲设置失败（{e}），继续使用系统默认值");
+        }
+
         // 环回采集客户端可重建：设备失效（AUDCLNT_E_DEVICE_INVALIDATED）、
         // 音频服务重启、端点切换后，旧客户端可能永远返回错误。不能把它当成
         // “端点空闲”而一直发合成静音，否则重连前手机永远听不到声音。

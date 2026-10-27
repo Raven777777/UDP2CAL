@@ -2096,6 +2096,16 @@ fn udp_receiver_stream(
                     }
                 };
 
+            // 接收缓冲（借鉴 Sunshine 的 socket 调优）：把内核接收队列放大到
+            // 1 MiB。Windows 默认只有 64 KiB 量级，Wi-Fi 一次漫游/重传退避就
+            // 可能把突发直接丢掉；这里放大的是**内核队列**而不是应用层积压
+            // ——循环每轮立即 recv，队列只用来吸收空口级突发，不引入延迟。
+            const RECV_BUFFER_BYTES: usize = 1 << 20;
+            if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(RECV_BUFFER_BYTES)
+            {
+                logf!("[Net] 接收缓冲设置失败（{e}），继续使用系统默认值");
+            }
+
             // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
             let mut retries = 60;
             while AudioInitState::load() == AudioInitState::Pending && retries > 0 {
