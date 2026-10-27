@@ -32,12 +32,6 @@ pub struct HiResTimer {
     handle: HANDLE,
 }
 
-// SAFETY: `HANDLE` 是可等待计时器句柄，本身不绑定线程；Windows 允许任意线程
-// 对该句柄调用 `SetWaitableTimerEx` / `WaitForSingleObject`。结构体不提供共享
-// 引用下的内部可变状态（`wait_until` 对句柄的操作由内核串行化）。
-unsafe impl Send for HiResTimer {}
-unsafe impl Sync for HiResTimer {}
-
 impl HiResTimer {
     /// 创建高精度定时器；系统不支持（Win10 1803 之前）时返回 `None`。
     pub fn new() -> Option<Self> {
