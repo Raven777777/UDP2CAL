@@ -1353,15 +1353,28 @@ class CaptureService : Service() {
     override fun onDestroy() {
         val oldCapture = captureJob
         val oldPlay = reversePlayJob
+        // 反向接收协程也必须等：它是唯一调用 jitter.insert（原生 jbInsert）
+        // 的地方，若在 jitter.close() 之后仍在跑，就是跨线程 use-after-free。
+        val oldRx = reverseRxJob
         stopCapture()
         serviceScope.cancel()
-        // 先等采集/播放协程真正退出，再归还 Rust 堆上的 jlong 句柄；
-        // 否则旧协程可能还在 decode/insert，造成 use-after-free。
-        runBlocking {
+        // 顺序有意义：captureJob 的收尾会调用 udpSender.close() 关闭反向 socket，
+        // 而 reverseRxLoop 阻塞在 sock.receive() 上、协程取消唤不醒它——所以先等
+        // 采集协程退出（socket 被关掉），接收协程才会跟着退出。
+        val allExited = runBlocking {
             withTimeoutOrNull(1000) {
-                oldPlay?.join()
                 oldCapture?.join()
-            }
+                oldRx?.join()
+                oldPlay?.join()
+                true
+            } ?: false
+        }
+        if (!allExited) {
+            // 仍有协程没退出（如 receive() 卡死）：句柄宁可不归还——泄漏一小块
+            // Rust 堆，远好于与还在执行的原生调用竞争。
+            Log.w(TAG, "协程未在 1s 内退出，保留原生句柄以避免 use-after-free")
+            super.onDestroy()
+            return
         }
         // 原生句柄用完之后必须归还：JitterBuffer/DriftController/RateEstimator 的
         // 状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
