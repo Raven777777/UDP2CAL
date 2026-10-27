@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import datetime
+import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional
@@ -152,6 +154,105 @@ def ensure_local_properties(project_dir: Path, sdk: envmod.SdkInfo, logger) -> b
     props.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
     logger.ok("已写入 sdk.dir={}".format(sdk.root))
     return True
+
+
+# ---------------------------------------------------------------- Gradle daemon 注册表
+
+
+# 注册表里的字符串是「长度前缀 + UTF-8 字节」，后面**没有**终止符；真实样例中
+# javaHome 之后紧跟着 javaVersion 的整数字节（首位恰好是 0x00），daemonRegistryDir
+# 之后则直接是 0x01。因此按 NUL 截断会把下一条记录的首字节并进路径，拼出一个并
+# 不存在的目录；这里统一砍掉结尾的控制字节。
+_REGISTRY_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\x00]*")
+
+
+def _java_exe_name() -> str:
+    return "java.exe" if os.name == "nt" else "java"
+
+
+def _strip_control_tail(text: str) -> str:
+    end = len(text)
+    while end and ord(text[end - 1]) < 0x20:
+        end -= 1
+    return text[:end]
+
+
+def _norm_path(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _is_under(path, parent) -> bool:
+    child = _norm_path(path)
+    root = _norm_path(parent)
+    return child == root or child.startswith(root + os.sep)
+
+def heal_daemon_registry(gradle_home, logger) -> int:
+    """删除指向失效 JDK 的 Gradle daemon 注册表缓存。
+
+    Gradle 8.9 的 DaemonCompatibilitySpec.jvmCompatible 会对注册表里**每一条**
+    daemon 记录的 javaHome 做 `javaHome.exists() && Jvm.forHome(javaHome)`：
+    目录还在、但 bin/java 已缺失（半卸载的 JDK）时 Jvm.forHome 抛
+    JavaHomeException 并中断整个构建：
+        The supplied javaHome seems to be invalid. I cannot find the java executable.
+    目录被彻底删除时 Gradle 只判为不兼容，不会抛异常。
+    注册表只是缓存（registry.bin.lock 负责跨进程互斥，保留不动），删掉后 Gradle
+    会重建，因此这里是安全的自修复。
+
+    Returns:
+        实际清理掉的失效记录条数；0 表示没有失效记录或清理失败。
+    """
+    root = Path(gradle_home) / "daemon"
+    if not root.is_dir():
+        return 0
+
+    exe = _java_exe_name()
+    registry_root = root
+    # 注册表里只存两个路径字段：javaHome 和 daemonRegistryDir（<gradle_home>/daemon）。
+    # 后者本身也是个「有目录、没 bin/java」的目录，不排掉会被当成失效 JDK，
+    # 导致每次构建都重清一次注册表；即使 GRADLE_USER_HOME 变了，名称也仍是 daemon。
+    home_itself = _norm_path(gradle_home)
+
+    healed = 0
+    for version_dir in sorted(root.iterdir()):
+        registry = version_dir / "registry.bin"
+        if not version_dir.is_dir() or not registry.is_file():
+            continue
+        try:
+            text = registry.read_bytes().decode("utf-8", "ignore")
+        except OSError:
+            continue
+
+        stale: List[str] = []
+        for match in _REGISTRY_PATH_RE.finditer(text):
+            home = _strip_control_tail(match.group(0)).strip()
+            if not home or _norm_path(home) == home_itself:
+                continue
+            if _is_under(home, registry_root) or Path(home).name.lower() == "daemon":
+                continue
+            path = Path(home)
+            # 目录已彻底消失：Gradle 不会对这条记录调用 Jvm.forHome，无需处理。
+            if not path.is_dir():
+                continue
+            if (path / "bin" / exe).is_file():
+                continue
+            stale.append(home)
+        if not stale:
+            continue
+
+        try:
+            registry.unlink()
+        except OSError as exc:
+            logger.warn("Gradle {} 的 daemon 注册表清理失败: {}".format(version_dir.name, exc))
+            continue
+        healed += len(stale)
+        logger.warn(
+            "已清理 Gradle {} 的 daemon 注册表缓存（{} 条记录指向失效 JDK）".format(
+                version_dir.name, len(stale)
+            )
+        )
+        for home in sorted(set(stale)):
+            logger.detail("  失效 JDK: {}".format(home))
+    return healed
 
 
 # ---------------------------------------------------------------- SDK 组件

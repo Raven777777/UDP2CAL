@@ -186,6 +186,12 @@ def build(ctx, logger) -> int:
             logger.info("已强制启用镜像: {}".format(config.MAVEN_MIRRORS[0][1]))
             base_cmd += ["-I", str(init_script)]
 
+    # 半卸载的 JDK 会在 ~/.gradle/daemon/*/registry.bin 里留下死记录：目录还在但
+    # bin/java 已缺失，Gradle 8.9 的 DaemonCompatibilitySpec.jvmCompatible 会对它
+    # 调用 Jvm.forHome 并抛 JavaHomeException，直接构建失败。
+    # 注册表只是缓存，构建前先清掉指向失效 JDK 的条目。
+    deps.heal_daemon_registry(_gradle_home(), logger)
+
     env = _gradle_env(java, sdk, proxy, init_script)
     result = runner.run(base_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
 
