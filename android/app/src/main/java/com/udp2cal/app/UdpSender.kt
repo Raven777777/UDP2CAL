@@ -54,6 +54,13 @@ class UdpSender(
          * 队列只用来吸收空口级突发，不引入延迟。
          */
         const val SOCKET_BUFFER_BYTES = 1 shl 20
+
+        /**
+         * ACK 线程连续出错时的退避。`receive` 抛异常但 socket 未关（瞬时错误）时
+         * 若直接 `continue`，循环会变成忙等把 CPU 烧在死循环上；10 ms 与一个
+         * RTP 帧同尺度，而 ACK 每秒才 1 个，不会错过。
+         */
+        const val ACK_ERROR_BACKOFF_MS = 10L
     }
 
     // 跨线程访问：connect()/close() 在 IO 线程，send() 在采集线程，
@@ -218,6 +225,11 @@ class UdpSender(
                     sock.receive(pkt)
                 } catch (e: Exception) {
                     if (!running || sock.isClosed) break
+                    try {
+                        Thread.sleep(ACK_ERROR_BACKOFF_MS)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
                     continue
                 }
                 val len = pkt.length
