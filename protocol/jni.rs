@@ -138,14 +138,22 @@ unsafe fn read_device_id(env: Env, arr: jbyteArray) -> Option<[u8; DEVICE_ID_SIZ
     Some(id)
 }
 
-/// 确保复用缓冲至少 `OPUS_MAX_PAYLOAD` 字节。
+/// 确保复用缓冲恰好 `OPUS_MAX_PAYLOAD` 字节、且不超额占用容量。
 ///
 /// `read_bytes` 只取需要的长度（精确缩容），而 `JitterBuffer::pull` 要求
 /// 输出切片容得下队首帧；VBR 下包长在 40–100 字节之间跳，缩过头的缓冲会让
 /// 一个本来可播的帧被当成 `Wait`（时间轴不前进、播放线程空转）。
+///
+/// 反过来，长度与容量也要有上界：`read_bytes` 按调用方传入的 `length` 分配，
+/// 而真实包最大只有 [`OPUS_MAX_PAYLOAD`]（超长包会被 `JitterBuffer::insert`
+/// 丢弃）。一次超大 `jbInsert` 会让这个句柄永久占着那块内存——它不释放，也
+/// 不再被任何合法包用到，属于没有收益的常驻分配。
 fn ensure_payload_capacity(buf: &mut Vec<u8>) {
-    if buf.len() < OPUS_MAX_PAYLOAD {
+    if buf.len() != OPUS_MAX_PAYLOAD {
         buf.resize(OPUS_MAX_PAYLOAD, 0);
+    }
+    if buf.capacity() > OPUS_MAX_PAYLOAD {
+        buf.shrink_to(OPUS_MAX_PAYLOAD);
     }
 }
 
@@ -1607,5 +1615,32 @@ mod tests {
         assert!(!build_control_args_ok(TYPE_CONNECT as jint, jint::MAX));
         // 负长度（GetArrayLength 正常不会给，但 JNI 边界不当假设）
         assert!(!build_control_args_ok(TYPE_CONNECT as jint, -1));
+    }
+
+    /// 复用缓冲的尺寸必须与 `OPUS_MAX_PAYLOAD` 恰好一致：偏小会把可播帧当
+    /// `Wait`，偏大会让一次超大 insert 永久抬高该句柄的常驻内存。
+    #[test]
+    fn payload_scratch_is_normalized_both_ways() {
+        // 偏小（VBR 短包之后）→ 撑到整帧容量，保证 pull 的切片够长
+        let mut small = vec![0u8; 40];
+        ensure_payload_capacity(&mut small);
+        assert_eq!(small.len(), OPUS_MAX_PAYLOAD);
+
+        // 偏大（一次超大 insert 之后）→ 截回整帧，且不保留多余容量
+        let mut big = vec![0u8; 8192];
+        ensure_payload_capacity(&mut big);
+        assert_eq!(big.len(), OPUS_MAX_PAYLOAD);
+        assert!(
+            big.capacity() <= OPUS_MAX_PAYLOAD,
+            "超额容量未释放: {}",
+            big.capacity()
+        );
+
+        // 已经正好：长度与容量都不动
+        let mut exact = vec![0u8; OPUS_MAX_PAYLOAD];
+        let cap = exact.capacity();
+        ensure_payload_capacity(&mut exact);
+        assert_eq!(exact.len(), OPUS_MAX_PAYLOAD);
+        assert_eq!(exact.capacity(), cap);
     }
 }
