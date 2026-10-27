@@ -1049,6 +1049,19 @@ fn short_num(n: u64) -> String {
 }
 
 impl AppState {
+    /// 保存配置，失败必须留证据。
+    ///
+    /// 注册表写入可能被杀毒软件/组策略拦截。用 `let _ =` 吞掉错误会让用户
+    /// 以为设置已持久化：重启后配置静默回退，而日志里没有任何线索。为此把
+    /// 错误写进日志并提示用户（回滚语义由各调用点自己决定，这里不改配置值）。
+    fn persist_config(&mut self) {
+        if let Err(e) = self.config.save() {
+            logf!("[Config] 保存配置失败: {e}");
+            self.notice = format!("配置保存失败：{e}");
+            self.notice_level = NoticeLevel::Error;
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::IpChanged(s) => {
@@ -1065,7 +1078,7 @@ impl AppState {
                 // 写入失败必须回滚开关并告知用户，避免"开关假亮"
                 match self.config.set_auto_start(enabled) {
                     Ok(()) => {
-                        let _ = self.config.save();
+                        self.persist_config();
                         self.notice.clear();
                     }
                     Err(e) => {
@@ -1083,7 +1096,7 @@ impl AppState {
                 self.reverse_enabled = enabled;
                 REVERSE_ENABLED.store(if enabled { 1 } else { 0 }, Ordering::Release);
                 self.config.set_reverse_enabled(enabled);
-                let _ = self.config.save();
+                self.persist_config();
                 Task::none()
             }
             Message::ToggleRunning => {
@@ -1133,7 +1146,7 @@ impl AppState {
 
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;
-                    let _ = self.config.save();
+                    self.persist_config();
                     LISTEN_PORT.store(port as u32, Ordering::Release);
 
                     // 上次音频初始化失败过则重试一次（例如用户刚装好 VB-Cable）
