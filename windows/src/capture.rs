@@ -177,8 +177,20 @@ fn reverse_config() -> &'static Mutex<OpusReverseConfig> {
 /// 由 main.rs 的控制面调用；只有内容真正变化才落盘日志
 pub fn update_reverse_config(cfg: OpusReverseConfig) {
     // 中毒恢复与其他 Mutex 一致：这里只是一份配置快照，没有跨字段不变量。
-    let mut c = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
-    if *c != cfg {
+    //
+    // 锁内只做比较 + 赋值：`logf!` 是同步文件 I/O，而反向发送线程每 500 ms
+    // 要抢同一把锁（capture.rs 的 run_loop）。在锁内落盘意味着磁盘慢时
+    // 会把发送线程一起拖住，反向 RTP 断流。
+    let changed = {
+        let mut c = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
+        if *c == cfg {
+            false
+        } else {
+            *c = cfg;
+            true
+        }
+    };
+    if changed {
         logf!(
             "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
             cfg.bitrate_kbps,
@@ -190,7 +202,6 @@ pub fn update_reverse_config(cfg: OpusReverseConfig) {
             cfg.fec,
             cfg.packet_loss
         );
-        *c = cfg;
     }
 }
 
