@@ -2116,7 +2116,6 @@ fn udp_receiver_stream(
             let mut last_stats = Instant::now();
             let mut last_liveness = Instant::now();
             let mut byte_count: u64 = 0;
-            let mut packet_count: u64 = 0;
 
             loop {
                 // 控制面保活检查必须**与流量无关**地周期性执行（规范 6.4：保活只看
@@ -2176,7 +2175,6 @@ fn udp_receiver_stream(
                             jb.insert(&pkt) != protocol::rtp::InsertResult::Dropped
                         };
                         if accepted {
-                            packet_count += 1;
                             byte_count += len as u64;
                             RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
                             RTP_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
@@ -2196,13 +2194,10 @@ fn udp_receiver_stream(
                         0.0
                     };
                     let level_db = f32::from_bits(AUDIO_LEVEL_DB.load(Ordering::Relaxed));
-                    if packet_count > 0 {
-                        byte_count = 0;
-                        packet_count = 0;
-                    } else {
-                        // 半秒内没有任何 RTP：码率归零（DTX 静音也走这里）
-                        byte_count = 0;
-                    }
+                    // 半秒统计窗口结束：窗口字节数无条件归零（没有 RTP 时下个窗口
+                    // 从 0 重新累计，DTX 静音也走这里；包计数不需要单独保存，
+                    // 全局的 RTP_RX_PACKETS 已经在统计同一件事）。
+                    byte_count = 0;
                     last_stats = Instant::now();
                     let _ = output
                         .send(Message::StatusUpdate(StatusInfo {
