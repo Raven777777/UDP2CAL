@@ -357,6 +357,7 @@ fun OpusSettingsScreen(
     var reverseAudio by remember { mutableStateOf(false) }
     var reverseBitrateKbps by remember { mutableStateOf(0f) }
     var reverseBw by remember { mutableStateOf("") }
+    var reverseJitter by remember { mutableStateOf("") }
 
     // 1kHz 测试音
     var testToneMode by remember { mutableStateOf(Prefs.testToneMode) }
@@ -375,6 +376,7 @@ fun OpusSettingsScreen(
             reverseAudio = status.reverseAudio
             reverseBitrateKbps = status.reverseBitrateKbps
             reverseBw = status.reverseBw
+            reverseJitter = status.reverseJitter
         }
     }
 
@@ -523,6 +525,14 @@ fun OpusSettingsScreen(
                             else "—",
                             fontSize = 13.sp,
                             color = if (reverseBitrateKbps > 0f) Color(0xFF00E676) else Color(0xFF888888)
+                        )
+                    }
+                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                        Text("抖动缓冲", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(
+                            if (reverseAudio && reverseJitter.isNotEmpty()) reverseJitter else "—",
+                            fontSize = 12.sp,
+                            color = Color(0xFFB0B0B0)
                         )
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {

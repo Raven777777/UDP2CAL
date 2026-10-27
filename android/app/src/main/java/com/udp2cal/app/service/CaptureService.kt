@@ -206,6 +206,8 @@ class CaptureService : Service() {
         val reverseAudio: Boolean = false,
         val reverseBitrateKbps: Float = 0f,
         val reverseBw: String = "",
+        /** 反向抖动缓冲摘要（迟到/溢出/PLC/重同步），每秒刷新，空串表示无数据 */
+        val reverseJitter: String = "",
     )
 
     inner class LocalBinder : Binder() {
@@ -914,7 +916,9 @@ class CaptureService : Service() {
             linkLock.unlock()
         }
         audioPlayer?.flush()
-        _status.value = _status.value.copy(reverseAudio = false, reverseBitrateKbps = 0f)
+        _status.value = _status.value.copy(
+            reverseAudio = false, reverseBitrateKbps = 0f, reverseJitter = ""
+        )
     }
 
     /** 需要保证旧循环已退出时使用（会话切换/ACK 超时/播放循环退出）。 */
@@ -931,7 +935,9 @@ class CaptureService : Service() {
             linkLock.unlock()
         }
         audioPlayer?.flush()
-        _status.value = _status.value.copy(reverseAudio = false, reverseBitrateKbps = 0f)
+        _status.value = _status.value.copy(
+            reverseAudio = false, reverseBitrateKbps = 0f, reverseJitter = ""
+        )
     }
 
     /**
@@ -999,8 +1005,13 @@ class CaptureService : Service() {
                 val now = System.currentTimeMillis()
                 if (now - lastReport >= 1000) {
                     if (activeReverseSsrc != 0) {
+                        // 抖动缓冲的“生病”指标必须能被眼睛看到：只写在日志里没人翻。
+                        // 每秒取一次（JNI getter，代价可忽略）。
+                        val jbSummary = "迟到 ${jitter.late} · 溢出 ${jitter.overflow} · " +
+                            "PLC ${jitter.plcFrames}(峰 ${jitter.maxPlcRun}) · 重同步 ${jitter.resyncs}"
                         _status.value = _status.value.copy(
-                            reverseBitrateKbps = byteCount * 8f / (now - lastReport)
+                            reverseBitrateKbps = byteCount * 8f / (now - lastReport),
+                            reverseJitter = jbSummary
                         )
                     }
                     byteCount = 0
