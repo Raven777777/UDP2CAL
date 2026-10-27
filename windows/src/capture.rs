@@ -142,6 +142,11 @@ pub struct ReverseStats {
     pub late_min_us: AtomicU64,
     pub late_max_us: AtomicU64,
     pub late_n: AtomicU64,
+    /// 网格重锚次数：迟到超过半个帧就重锚（见 `slot_is_late`），这类帧
+    /// **不计入**上面的迟到统计——它不是"网格不准"，而是网格被空闲期、
+    /// 线程抢占或设备重开撕开过。混在一起会污染均值：实测一次 8 s 的
+    /// 无声间隔就把窗口均值从 0.3 ms 拉到 4.2 ms。
+    pub reanchors: AtomicU64,
 }
 
 static REVERSE_STATS: ReverseStats = ReverseStats {
@@ -162,6 +167,7 @@ static REVERSE_STATS: ReverseStats = ReverseStats {
     late_min_us: AtomicU64::new(u64::MAX),
     late_max_us: AtomicU64::new(0),
     late_n: AtomicU64::new(0),
+    reanchors: AtomicU64::new(0),
 };
 
 /// 一个统计窗口的快照（读取即清零，调用方为 UI 线程）
@@ -185,6 +191,8 @@ pub struct ReverseSnapshot {
     pub late_min_us: u64,
     pub late_max_us: u64,
     pub late_n: u64,
+    /// 窗口内因迟到超过半个帧而重锚的次数（不计入上面的迟到统计）
+    pub reanchors: u64,
 }
 
 impl ReverseSnapshot {
@@ -222,6 +230,7 @@ pub fn take_reverse_stats() -> ReverseSnapshot {
         late_min_us: REVERSE_STATS.late_min_us.swap(u64::MAX, Ordering::Relaxed),
         late_max_us: REVERSE_STATS.late_max_us.swap(0, Ordering::Relaxed),
         late_n: REVERSE_STATS.late_n.swap(0, Ordering::Relaxed),
+        reanchors: REVERSE_STATS.reanchors.swap(0, Ordering::Relaxed),
     };
     // 窗口内没有任何发送时 min 仍是哨兵值，对外一律报 0
     let late_min_us = if s.late_n == 0 { 0 } else { s.late_min_us };
@@ -608,16 +617,24 @@ impl ReverseSender {
             // 绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
             while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
                 let now = Instant::now();
-                // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
-                let late_us = now.duration_since(next_send_at).as_micros() as u64;
-                REVERSE_STATS.late_us.fetch_add(late_us, Ordering::Relaxed);
-                REVERSE_STATS
-                    .late_min_us
-                    .fetch_min(late_us, Ordering::Relaxed);
-                REVERSE_STATS
-                    .late_max_us
-                    .fetch_max(late_us, Ordering::Relaxed);
-                REVERSE_STATS.late_n.fetch_add(1, Ordering::Relaxed);
+                if slot_is_late(next_send_at, frame_gap, now) {
+                    // 网格已被撕开（空闲期无声、线程被抢占、设备重开）：这一帧的
+                    // "迟到量"描述的是停顿多久，不是网格多准，混进迟到统计会把
+                    // 均值带偏（实测一次 8 s 无声间隔 → 均值 0.3 ms 变 4.2 ms）。
+                    // 只计数。真正的卡顿幅度看 `积压峰值` 与下面的重锚次数。
+                    REVERSE_STATS.reanchors.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
+                    let late_us = now.duration_since(next_send_at).as_micros() as u64;
+                    REVERSE_STATS.late_us.fetch_add(late_us, Ordering::Relaxed);
+                    REVERSE_STATS
+                        .late_min_us
+                        .fetch_min(late_us, Ordering::Relaxed);
+                    REVERSE_STATS
+                        .late_max_us
+                        .fetch_max(late_us, Ordering::Relaxed);
+                    REVERSE_STATS.late_n.fetch_add(1, Ordering::Relaxed);
+                }
                 next_send_at = advance_slot(next_send_at, frame_gap, now);
                 frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
                 pcm_buf.drain(..FRAME_INTERLEAVED);
@@ -728,12 +745,20 @@ impl ReverseSender {
 /// 里积压的第二帧立刻被发出（回退成连发），且迟到量恒等于一个 `gap`
 /// （实测 min/avg = 8945/10007 µs），指标从此失去意义。
 fn advance_slot(slot: Instant, gap: Duration, now: Instant) -> Instant {
-    let half = gap / 2;
-    if now > slot + half {
+    if slot_is_late(slot, gap, now) {
         now + gap
     } else {
         slot + gap
     }
+}
+
+/// 槽位是否已经"过期到该重锚"：迟到超过半个帧就算。
+///
+/// 阈值取半个帧的理由：10 ms 网格上 5 ms 的迟到不可能靠下一帧追回来
+/// （追就是连发突发），只可能是外部停顿；没超过半个帧的迟到反而是网格
+/// 正常抖动的证据，要计入 `late_*` 统计。
+fn slot_is_late(slot: Instant, gap: Duration, now: Instant) -> bool {
+    now > slot + gap / 2
 }
 
 fn random_u32() -> u32 {
@@ -1164,6 +1189,18 @@ mod tests {
     use super::*;
 
     const GAP: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn slot_is_late_uses_half_a_gap_as_the_boundary() {
+        let t0 = Instant::now();
+        // 半个 gap 之内算"准时"（计入迟到统计），超过就算网格被撕开
+        assert!(!slot_is_late(t0, GAP, t0));
+        assert!(!slot_is_late(t0, GAP, t0 + Duration::from_millis(4)));
+        assert!(!slot_is_late(t0, GAP, t0 + GAP / 2));
+        assert!(slot_is_late(t0, GAP, t0 + Duration::from_millis(6)));
+        // 一次哑火几个帧（空闲期无声 / 线程被抢占）必然重锚，且与迟到量无关
+        assert!(slot_is_late(t0, GAP, t0 + Duration::from_secs(8)));
+    }
 
     #[test]
     fn advance_slot_keeps_grid_when_on_time() {

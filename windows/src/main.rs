@@ -1275,13 +1275,14 @@ impl AppState {
                     );
                     // 节拍迟到量（借鉴 Sunshine 的 "Sleep overshoot"）：
                     // 只报 min/max/avg，不做 EWMA——偶发的百毫秒级卡顿才是最该看见的。
-                    if r.late_n > 0 {
+                    if r.late_n > 0 || r.reanchors > 0 {
                         logf!(
-                            "[Pacer] 30s: 节拍迟到 min/avg/max={}/{}/{}us 帧={}",
+                            "[Pacer] 30s: 节拍迟到 min/avg/max={}/{}/{}us 帧={} 重锚={}",
                             r.late_min_us,
                             r.late_avg_us(),
                             r.late_max_us,
-                            r.late_n
+                            r.late_n,
+                            r.reanchors
                         );
                     }
                 }
