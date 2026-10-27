@@ -95,6 +95,21 @@ class Udp2CalProtocolTest {
         assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, payloadType = 110).isValid())
         assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, frameMs = 20).isValid())
         assertFalse(Udp2CalProtocol.ConnectPayload(1, 0).isValid())
+        assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, complexity = 11).isValid())
+        assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, signal = 3).isValid())
+        assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, bandwidth = 5).isValid())
+        assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, opusFlags = 0x10).isValid())
+        assertFalse(Udp2CalProtocol.ConnectPayload(1, 1, packetLoss = 101).isValid())
+        assertTrue(
+            Udp2CalProtocol.ConnectPayload(
+                1,
+                1,
+                complexity = Udp2CalProtocol.OPUS_COMPLEXITY_MAX,
+                signal = 2,
+                bandwidth = 4,
+                packetLoss = 100,
+            ).isValid()
+        )
     }
 
     @Test

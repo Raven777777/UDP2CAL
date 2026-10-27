@@ -47,6 +47,8 @@ object Udp2CalProtocol {
     const val OPUS_FLAG_DTX = 0x02
     const val OPUS_FLAG_VBR_CONSTRAINT = 0x04
     const val OPUS_FLAG_FEC = 0x08
+    const val OPUS_FLAGS_RESERVED_MASK = 0xF0
+    const val OPUS_COMPLEXITY_MAX = 10
 
     // ═══════════════════════ 码率 ═══════════════════════
 
@@ -159,7 +161,14 @@ object Udp2CalProtocol {
             ) ?: ByteArray(CONNECT_PAYLOAD_SIZE)
 
         fun isValid(): Boolean =
-            payloadType == OPUS_PAYLOAD_TYPE && frameMs == OPUS_FRAME_MS && forwardSsrc != 0
+            payloadType == OPUS_PAYLOAD_TYPE &&
+                frameMs == OPUS_FRAME_MS &&
+                forwardSsrc != 0 &&
+                complexity in 0..OPUS_COMPLEXITY_MAX &&
+                signal in 0..2 &&
+                bandwidth in 0..4 &&
+                opusFlags and OPUS_FLAGS_RESERVED_MASK == 0 &&
+                packetLoss in 0..100
 
         val vbr: Boolean get() = opusFlags and OPUS_FLAG_VBR != 0
         val dtx: Boolean get() = opusFlags and OPUS_FLAG_DTX != 0
