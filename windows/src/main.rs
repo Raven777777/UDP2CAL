@@ -208,6 +208,15 @@ static APP_RUNNING: AtomicU8 = AtomicU8::new(0);
 /// 反向串流用户开关（全局，供控制面读取）
 static REVERSE_ENABLED: AtomicU8 = AtomicU8::new(0);
 
+/// 反向发送器重启的**串行化锁**。
+///
+/// 槽位锁（`reverse_sender()`）只用于短平快地 take/store；`stop()` 里的
+/// `join` 必须放在槽位锁之外（否则 keepalive 路径的 `reverse_sender_alive()`
+/// 以及 UI 线程会被一串到底）。但“同一时刻只有一个发送线程持有环回端点”这个
+/// 不变量需要跨线程串行化（控制面 async 任务 + UI 线程都会重启），
+/// 所以单独用一把锁。
+static REVERSE_RESTART: Mutex<()> = Mutex::new(());
+
 /// 反向音频发送器句柄
 static REVERSE_SENDER: OnceLock<Mutex<Option<crate::capture::ReverseSender>>> = OnceLock::new();
 fn reverse_sender() -> &'static Mutex<Option<crate::capture::ReverseSender>> {
@@ -754,13 +763,7 @@ fn reset_to_ready() {
         let mut st = p2p_lock();
         *st = P2pState::new();
     }
-    if let Some(s) = reverse_sender()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    {
-        s.stop();
-    }
+    stop_reverse_sender();
     jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
     wake_decoder();
 }
@@ -1824,16 +1827,39 @@ fn desired_reverse_ssrc(reverse_port: u16, previous: u32, regenerate: bool) -> u
     random_u32_nonzero()
 }
 
-/// 启动/重启反向发送器：先停旧的，保证同一时刻只有一个线程持有环回端点
+/// 启动/重启反向发送器：先停旧的，保证同一时刻只有一个线程持有环回端点。
 fn restart_reverse_sender(addr: SocketAddr, ssrc: u32) {
     // 中毒恢复：槽里只有 Option<ReverseSender>，取回内部值继续操作；
     // 若因中毒直接跳过，旧发送线程会继续跑而日志一无所知。
-    let mut slot = reverse_sender().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = slot.take() {
-        old.stop();
-    }
+    let serial = REVERSE_RESTART.lock().unwrap_or_else(|e| e.into_inner());
+    stop_reverse_sender_under(&serial);
     if ssrc != 0 {
-        *slot = Some(capture::ReverseSender::start(addr, ssrc));
+        let sender = capture::ReverseSender::start(addr, ssrc);
+        *reverse_sender().lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+    }
+}
+
+/// 停止反向发送器（`stop()` 的 `join` 在槽位锁之外完成）。
+fn stop_reverse_sender() {
+    let serial = REVERSE_RESTART.lock().unwrap_or_else(|e| e.into_inner());
+    stop_reverse_sender_under(&serial);
+}
+
+/// 取出槽位并 `stop()`。调用方必须已持有 `REVERSE_RESTART`
+/// （维持“同一时刻只有一个发送线程”的不变量），但**不得**同时持有槽位锁：
+/// `stop()` 会 `join` 发送线程，而该线程的启动阶段（`CoInitializeEx` +
+/// 新建环回端点 + 新建 Opus 编码器）可长达数百毫秒。持有槽位锁做 join 会：
+/// - 阻塞持有唯一 UDP socket 的 async 接收任务（期间不读数据报）；
+/// - 阻塞 UI 线程（`reset_to_ready` 路径），整个窗口冻结；
+/// - 把每次 keepalive 都要抢同一把锁的 `reverse_sender_alive()` 一起串住。
+fn stop_reverse_sender_under(_serial: &std::sync::MutexGuard<'static, ()>) {
+    // 临时守卫在语句结束即释放，`stop()` 在锁外执行。
+    let old = reverse_sender()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(old) = old {
+        old.stop();
     }
 }
 
