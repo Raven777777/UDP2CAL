@@ -105,6 +105,64 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecode(
     return nb_samples * state->channels;
 }
 
+/* 用下一个包里的 LBRR 冗余重建刚刚丢失的那一帧（Opus 带内 FEC）。
+ *
+ * opus_decode(..., decode_fec = 1) 不解析这个包自己的音频，而是用它携带的
+ * 冗余还原**上一帧**；因此调用方必须保证同一个包随后还会用 fec = 0 正常解码
+ * 一次，解码器状态才与发送端连续。包里没有 LBRR（对端没开带内 FEC）时
+ * libopus 自动退化成 PLC，所以这条路径不会比 decoderPlc 更差。
+ *
+ * 注意 frame_size 参数给的是 state->frame_size（480/声道）：opus_decode 在
+ * FEC 模式下会把调用方给的输出长度填满，多出来的帧会被上层当成"这一帧"
+ * 播放，所以这里绝不能给出大于 10 ms 的容量。 */
+JNIEXPORT jint JNICALL
+Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecodeFec(
+    JNIEnv* env, jclass clazz, jlong handle,
+    jbyteArray opusData, jint offset, jint length,
+    jshortArray pcmOut, jint pcmOffset) {
+
+    if (handle == 0) return -1;
+    if (opusData == NULL || pcmOut == NULL) return -1;
+    DecoderState* state = (DecoderState*)(uintptr_t)handle;
+
+    jsize data_len = (*env)->GetArrayLength(env, opusData);
+    jsize pcm_len  = (*env)->GetArrayLength(env, pcmOut);
+    if (offset < 0 || length <= 0 || offset > data_len - length) return -1;
+    if (pcmOffset < 0 || pcmOffset > pcm_len - state->frame_size * state->channels) {
+        return -1;
+    }
+
+    jbyte* opus_bytes = (*env)->GetByteArrayElements(env, opusData, NULL);
+    if (opus_bytes == NULL) return -1;
+    jshort* pcm = (*env)->GetShortArrayElements(env, pcmOut, NULL);
+    if (pcm == NULL) {
+        (*env)->ReleaseByteArrayElements(env, opusData, opus_bytes, JNI_ABORT);
+        return -1;
+    }
+
+    int nb_samples = opus_decode(
+        state->decoder,
+        (const unsigned char*)(opus_bytes + offset),
+        length,
+        (opus_int16*)(pcm + pcmOffset),
+        state->frame_size,
+        1  // FEC on
+    );
+
+    (*env)->ReleaseShortArrayElements(env, pcmOut, pcm, 0);
+    (*env)->ReleaseByteArrayElements(env, opusData, opus_bytes, JNI_ABORT);
+
+    /* 时间线固定 10 ms：只接受恰好一帧，其它长度按失败处理让上层退回 PLC */
+    if (nb_samples != state->frame_size) {
+        if (nb_samples >= 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG,
+                "fec decode returned %d samples, expected %d", nb_samples, state->frame_size);
+        }
+        return -1;
+    }
+    return nb_samples * state->channels;
+}
+
 JNIEXPORT jint JNICALL
 Java_com_udp2cal_app_native_OpusDecodeNative_decoderPlc(
     JNIEnv* env, jclass clazz, jlong handle,

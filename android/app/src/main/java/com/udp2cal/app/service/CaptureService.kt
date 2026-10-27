@@ -1034,6 +1034,9 @@ class CaptureService : Service() {
         }
         if (player == null || dec == null) return
         val payload = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
+        // FEC 前瞻用的独立缓冲：pull 的 payload 与它互不干扰
+        val fecPayload = ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD)
+        var fecFrames = 0 // 本统计窗口内用 LBRR 重建成功的帧数
         val frameSamples = Udp2CalProtocol.OPUS_FRAME_SAMPLES * 2 // 立体声交错
         val pcm = ShortArray(frameSamples)
         val silence = ShortArray(frameSamples)
@@ -1249,8 +1252,10 @@ class CaptureService : Service() {
                     Log.i(
                         TAG,
                         "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${drift.targetMs()}）" +
-                            " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 设备前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(deviceRate.sigmaPpm())}ppm ${deviceRate.buckets()}桶）"
+                            " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 设备前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(deviceRate.sigmaPpm())}ppm ${deviceRate.buckets()}桶）" +
+                            " FEC=$fecFrames"
                     )
+                    fecFrames = 0
                 }
             }
 
@@ -1266,7 +1271,26 @@ class CaptureService : Service() {
                 }
 
                 Udp2CalProtocol.Pull.PLC -> {
-                    val n = dec.plc(pcm)
+                    // 先用 Opus 带内 FEC 重建这一帧：丢帧的 LBRR 冗余在**下一个
+                    // 包里**，所以前瞻一个包（不消费，下一轮 pull 仍会正常取它）
+                    // 来还原；下一个包也还没到时才退回 PLC。发送端没开
+                    // in-band FEC 时 libopus 自动退化成 PLC，故不会更差。
+                    // 现场最常见的就是"包没丢、只是来晚了"（AP 攒批/省电）：
+                    // 一次 >100 ms 的停顿会连丢 3 帧，以前全 PLC，听起来就是
+                    // 一下音量塌陷。判据与 windows/src/main.rs 同源。
+                    var fecLen = 0
+                    linkLock.lock()
+                    try {
+                        fecLen = jitter.peek(fecPayload)
+                    } finally {
+                        linkLock.unlock()
+                    }
+                    var n = if (fecLen > 0) dec.decodeFec(fecPayload, 0, fecLen, pcm) else -1
+                    if (n > 0) {
+                        fecFrames++
+                    } else {
+                        n = dec.plc(pcm)
+                    }
                     if (n > 0) {
                         val produced = resampler.process(pcm, 0, n / 2)
                         if (produced > 0) {

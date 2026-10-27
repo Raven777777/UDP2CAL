@@ -63,6 +63,24 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
         return OpusDecodeNative.decoderPlc(h, pcmOut, 0)
     }
 
+    /**
+     * 用**下一个包**的 LBRR 冗余重建刚刚丢失的那一帧（Opus 带内 FEC）。
+     *
+     * libopus 语义：`opus_decode(..., fec = 1)` 不解析 `data` 自己的音频，而是用
+     * 它携带的冗余还原**上一帧**。所以之后必须再用 [decode] 正常解一次同一个包，
+     * 解码器状态才与发送端连续。包里没有 LBRR（对端没开带内 FEC）时自动退化
+     * 成 PLC，不会比 [plc] 更差。
+     *
+     * @return 重建出的交错采样数，或 -1（调用方退回 [plc]）
+     */
+    @Synchronized
+    fun decodeFec(data: ByteArray, offset: Int, length: Int, pcmOut: ShortArray): Int {
+        val h = handle
+        if (h == 0L) return -1
+        if (offset < 0 || length <= 0 || offset + length > data.size) return -1
+        return OpusDecodeNative.decoderDecodeFec(h, data, offset, length, pcmOut, 0)
+    }
+
     /** 重建解码器状态（重同步 / 新会话） */
     @Synchronized
     fun reset() {
