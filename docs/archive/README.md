@@ -19,4 +19,5 @@
 | [CODE_REVIEW_2026-10-27_ROUND3.md](CODE_REVIEW_2026-10-27_ROUND3.md) | 全流程审查（`protocol/` + `windows/` + `android/app/src` 跨实现一致性，20 个独立提交） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |
 | [CODE_REVIEW_2026-10-28.md](CODE_REVIEW_2026-10-28.md) | 全流程审查（23 项，8 项已修） | 一次性材料；修复摘要已并入 BUGFIX，保留风险见原报告 |
 | [CODE_REVIEW_2026-10-28_ROUND2.md](CODE_REVIEW_2026-10-28_ROUND2.md) | 全流程审查二审（4 处修复 R1–R4、保留风险 P2-1…P2-7 与 P3 清单、未执行项） | 一次性材料；修复摘要见该报告，未修项含位置与不修理由 |
-| [SUNSHINE_LOW_LATENCY_RESEARCH.md](SUNSHINE_LOW_LATENCY_RESEARCH.md) | 外部调研：Sunshine（LizardByte，commit `d0b4a88`）源码级拆解——编码管线压到 1 帧、latest-wins 单槽、1 ms 发送整形、带内 RS-FEC 20%、无 ABR 的取舍 | 第三方项目调研，**不是**本项目规范；仅供设计借鉴 |
+| [RESEARCH_SUNSHINE_LOW_LATENCY.md](RESEARCH_SUNSHINE_LOW_LATENCY.md) | 外部调研：Sunshine（LizardByte，commit `d0b4a88`）源码级拆解——编码管线压到 1 帧、latest-wins 单槽、1 ms 发送整形、带内 RS-FEC 20%、无 ABR 的取舍 | 第三方项目调研，**不是**本项目规范；仅供设计借鉴 |
+| [PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md](PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md) | Sunshine 与本项目的逐项对照：13 项已有等价实现、1 处规范与实现不一致、4 类 19 项候选改进（S1–S20，含成本与验证方式） | 一次性核对材料；未实施项在动手前必须按当时代码重新审查（行号会漂） |

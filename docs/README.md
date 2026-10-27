@@ -82,6 +82,9 @@ docs/
 │  ├─ CODE_REVIEW_2026-10-23.md        # 第一轮审查（43 项）
 │  ├─ CODE_REVIEW_ROUND2_2026-10-23.md # 第二轮审查（24 项）
 │  ├─ CODE_REVIEW_2026-10-25.md        # 第三轮审查（22 项）
+│  ├─ CODE_REVIEW_2026-10-28_ROUND2.md  # 全流程审查二审（4 处修复、保留风险清单）
+│  ├─ RESEARCH_SUNSHINE_LOW_LATENCY.md  # 外部调研：Sunshine 源码级拆解（仅供借鉴）
+│  ├─ PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md # Sunshine 对照：已实现项、候选改进 S1–S20
 │  └─ CODE_REVIEW_2026-10-28.md        # 全流程审查（23 项，8 项已修）
 └─ assets/                    # 界面截图（webp）
 ```
