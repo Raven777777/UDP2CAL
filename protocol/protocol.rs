@@ -359,7 +359,7 @@ impl ConnectPayload {
         if self.bandwidth > 4 {
             return Err("bandwidth > 4");
         }
-        if self.opus_flags & !0x0f != 0 {
+        if self.opus_flags & OPUS_FLAGS_RESERVED_MASK != 0 {
             return Err("reserved opus_flags bits are non-zero");
         }
         if self.packet_loss > 100 {
