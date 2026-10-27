@@ -47,6 +47,15 @@ static CLOCK_EPOCH: OnceLock<Instant> = OnceLock::new();
 /// `flush_to` 的"无挂起请求"哨兵
 const FLUSH_NONE: usize = usize::MAX;
 
+/// `push_latest` 的结果
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PushResult {
+    /// 样本是否真正写入环
+    accepted: bool,
+    /// 环满、且本次投递了“丢弃未播数据”请求
+    flush_requested: bool,
+}
+
 struct Ring {
     data: Box<[AtomicU32]>,
     mask: usize,
@@ -89,6 +98,38 @@ impl Ring {
         self.data[head & self.mask].store(sample.to_bits(), Ordering::Relaxed);
         self.head.store(head.wrapping_add(1), Ordering::Release);
         true
+    }
+
+    /// 生产：“最新优先”——环满时请求**丢弃未播旧数据**，而不是只丢新样本。
+    ///
+    /// 环满说明解码线程的产出已经比声卡消费快了整整一个环的容量。此时若
+    /// 一直丢弃新样本，环会永久保持满载：可听位置永远落在“现在”之后一个
+    /// `capacity`，多出来的延迟再也没有机会消散。反过来丢**旧**数据（借鉴
+    /// Sunshine 的 `drop_oldest` / `_queue.clear()` 语义）只需要一次瞬时缺口，
+    /// 水位随即回到解码线程能重新追上的位置。
+    ///
+    /// 返回：是否真正写入；是否因此投递了 flush 请求（供上层计数）。
+    #[inline]
+    fn push_latest(&self, sample: f32) -> PushResult {
+        if self.push(sample) {
+            return PushResult {
+                accepted: true,
+                flush_requested: false,
+            };
+        }
+        let head = self.head.load(Ordering::Relaxed);
+        // 满载期间每个样本都会走到这里；已有挂起请求时不再重复写 `flush_to`
+        if self.flush_to.load(Ordering::Acquire) == FLUSH_NONE {
+            self.flush_to.store(head, Ordering::Release);
+            return PushResult {
+                accepted: false,
+                flush_requested: true,
+            };
+        }
+        PushResult {
+            accepted: false,
+            flush_requested: false,
+        }
     }
 
     /// 消费：无数据返回 None
@@ -211,6 +252,8 @@ pub struct AudioStats {
     pub resampled: AtomicU64,
     /// 因环形缓冲满被丢弃的样本数
     pub dropped: AtomicU64,
+    /// 因环形缓冲满而“丢弃未播数据”的次数（“最新优先”，见 `Ring::push_latest`）
+    pub flush_on_full: AtomicU64,
     /// 欠载填充的样本数（音频回调侧）
     pub underrun: AtomicU64,
 }
@@ -221,6 +264,7 @@ impl AudioStats {
             writes: self.writes.load(Ordering::Relaxed),
             resampled: self.resampled.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            flush_on_full: self.flush_on_full.load(Ordering::Relaxed),
             underrun: self.underrun.load(Ordering::Relaxed),
         }
     }
@@ -231,6 +275,7 @@ pub struct StatsSnapshot {
     pub writes: u64,
     pub resampled: u64,
     pub dropped: u64,
+    pub flush_on_full: u64,
     pub underrun: u64,
 }
 
@@ -396,10 +441,14 @@ impl AudioWriter {
 
         let mut written = 0usize;
         for &s in &self.resample_buf {
-            if self.ring.push(s) {
+            let r = self.ring.push_latest(s);
+            if r.accepted {
                 written += 1;
             } else {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
+                if r.flush_requested {
+                    self.stats.flush_on_full.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         written
@@ -865,6 +914,31 @@ mod tests {
             "flush 使 tail 回退：{before} → {after}（会重播已播样本）"
         );
         assert_eq!(ring.len(), 0);
+    }
+
+    #[test]
+    fn push_latest_drops_unplayed_data_to_reset_the_latency() {
+        // 回归：环满时必须丢弃**未播**数据（最新优先），否则多出来的延迟
+        // 永久固化——环始终保持满载，可听位置永远落后一个环容量。
+        let ring = Ring::with_frames(1024);
+        for i in 0..1024 {
+            assert!(ring.push_latest(i as f32).accepted);
+        }
+        // 满载：第一次失败要投递 flush 请求，且只投递一次
+        let first = ring.push_latest(9999.0);
+        assert!(!first.accepted);
+        assert!(first.flush_requested, "满载时首次失败必须请求丢弃旧数据");
+        let second = ring.push_latest(9999.0);
+        assert!(!second.accepted);
+        assert!(!second.flush_requested, "已有挂起请求时不得重复写 flush_to");
+        // 挂起后水位按落地后计算：消费者能重新追上
+        assert_eq!(ring.len(), 0);
+        ring.apply_pending_flush();
+        assert_eq!(ring.pop(), None, "旧数据（未播）应被丢弃");
+        // 腾空后又能正常写入
+        let third = ring.push_latest(0.25);
+        assert!(third.accepted && !third.flush_requested);
+        assert_eq!(ring.pop(), Some(0.25));
     }
 
     #[test]

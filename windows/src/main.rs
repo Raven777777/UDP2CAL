@@ -1206,10 +1206,11 @@ impl AppState {
                     };
                     let peer = p2p_snapshot();
                     logf!(
-                        "[Audio] 统计 块={} 重采样={} 丢样={} 欠载={}",
+                        "[Audio] 统计 块={} 重采样={} 丢样={} 满丢旧数据={} 欠载={}",
                         s.writes,
                         s.resampled,
                         s.dropped,
+                        s.flush_on_full,
                         s.underrun
                     );
                     logf!(
