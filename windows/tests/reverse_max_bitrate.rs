@@ -78,7 +78,7 @@ fn run(bitrate_kbps: u16, label: &str) {
                 let packet = audiopus::packet::Packet::try_from(&out[..n]).expect("packet");
                 let sig = audiopus::MutSignals::try_from(pcm.as_mut_slice()).expect("signals");
                 match dec.decode_float(Some(packet), sig, false) {
-                    Ok(samples) if samples == 480 => encoded += 1,
+                    Ok(480) => encoded += 1,
                     _ => decode_errors += 1,
                 }
             }
@@ -130,10 +130,9 @@ fn forbidden_1024kbps_never_exceeds_payload_cap() {
     let mut out = [0u8; OPUS_MAX_PAYLOAD];
     let mut max_len = 0usize;
     for _ in 0..200 {
-        match enc.encode(&frame, &mut out) {
-            Ok(n) => max_len = max_len.max(n),
-            // 缓冲不足时 opus 返回错误，capture.rs 会丢帧并计数——同样不会发出非法包
-            Err(_) => {}
+        // 缓冲不足时 opus 返回错误，capture.rs 会丢帧并计数——同样不会发出非法包
+        if let Ok(n) = enc.encode(&frame, &mut out) {
+            max_len = max_len.max(n);
         }
     }
     assert!(

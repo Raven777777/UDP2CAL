@@ -423,7 +423,7 @@ impl ReverseSender {
                 }
                 ReadOutcome::Error(code) => {
                     read_errors = read_errors.saturating_add(1);
-                    if read_errors == 1 || read_errors % 50 == 0 {
+                    if read_errors == 1 || read_errors.is_multiple_of(50) {
                         logf!(
                             "[Reverse] 环回 GetBuffer 失败（hr=0x{code:08X}，连续 {read_errors} 次）"
                         );
