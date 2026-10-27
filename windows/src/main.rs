@@ -368,7 +368,7 @@ fn init_audio_worker() {
     AudioInitState::Pending.store();
     let stats = audio_stats().clone();
 
-    let _ = std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("udp2cal-decode".into())
         .spawn(move || {
             set_decode_thread(std::thread::current());
@@ -718,6 +718,14 @@ fn init_audio_worker() {
                 }
             }
         });
+
+    // 线程创建失败（极端堆耗尽 / 线程数上限）必须报错：
+    // 原先用 `let _ =` 吞掉，`AudioInitState` 永远停在 Pending，等待超时后
+    // 引擎照常启动 → UI 显示“运行中”但永远没有声音，日志一片空白。
+    if let Err(e) = spawn_result {
+        logf!("[Audio] 解码线程创建失败: {e}");
+        AudioInitState::DeviceFailed.store();
+    }
 }
 
 // ══════════════════════════════════════════════
