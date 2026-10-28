@@ -35,7 +35,9 @@ class StreamResampler(private val channels: Int = 2) {
     /** 每声道的拼接缓冲：hist ++ 本块 */
     private val work = Array(channels) { FloatArray(CAPACITY_FRAMES + HIST) }
     /** 输出（交错） */
-    private val out = ShortArray(CAPACITY_FRAMES * channels)
+    // At the minimum supported ratio (0.1 × 0.995), one input frame can
+    // produce slightly more than 10 output frames. Include FIR history slack.
+    private val out = ShortArray(MAX_OUTPUT_FRAMES * channels)
     private var outLen = 0
 
     /** 当前实际使用的比率：`源/设备 × (1 + adjust)` */
@@ -146,7 +148,9 @@ class StreamResampler(private val channels: Int = 2) {
         const val HIST = TAPS + 1
         /** 与 Udp2CalProtocol.RESAMPLE_MAX_ADJUST 同值（避免循环依赖） */
         private const val MAX_ADJUST = 0.005
-
+        /** Maximum output for a full input block, plus phase/history boundary slack. */
+        private val MAX_OUTPUT_FRAMES =
+            (CAPACITY_FRAMES / (0.1 * (1.0 - MAX_ADJUST))).toInt() + HIST + 1
         /** 零阶修正贝塞尔函数（Kaiser 窗用） */
         private fun besselI0(x: Double): Double {
             val y = x * x / 4.0

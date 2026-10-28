@@ -375,6 +375,7 @@ class CaptureService : Service() {
             } catch (e: Exception) {
                 Log.e(TAG, "采集异常", e)
                 _status.value = _status.value.copy(isRunning = false, errorMsg = e.message ?: "未知错误")
+                hasNewCapture = false
             } finally {
                 controlJob?.cancel()
                 controlJob = null
@@ -437,6 +438,7 @@ class CaptureService : Service() {
 
     private suspend fun fail(message: String) {
         _status.value = _status.value.copy(isRunning = false, errorMsg = message)
+        hasNewCapture = false
         stopSelf()
     }
 
@@ -720,7 +722,10 @@ class CaptureService : Service() {
         // 先置位：即使 activeParams 已失效（正在退出），也不要每 100 ms 重复打日志
         restartPending = true
         val p = activeParams ?: return
-        pendingRestart = p.copy(bitrateKbps = Prefs.opusBitrateKbps)
+        pendingRestart = p.copy(
+            bitrateKbps = Prefs.opusBitrateKbps,
+            testTone = Prefs.testToneMode,
+        )
         captureJob?.cancel()
     }
 
