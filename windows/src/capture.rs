@@ -34,7 +34,7 @@ use windows::Win32::System::Threading::{
 };
 
 /// DSCP EF（46）→ IP TOS 字节 0xB8。反向音频流的转发优先级最高，
-/// 让 Wi-Fi 接入点 / 路由器把它排在其他流量前面，抑制排队抖动。
+/// IPv4 可用时让 Wi-Fi 接入点 / 路由器优先转发，抑制排队抖动；IPv6 在 Windows 上不设置 TCLASS。
 const DSCP_EF_TOS: u32 = 0xB8;
 
 /// 每声道 480 采样 = 10 ms @ 48 kHz
@@ -414,7 +414,7 @@ impl ReverseSender {
             Err(e) => logf!("[Reverse] 读取 Opus lookahead 失败: {e:?}"),
         }
 
-        let send_sock = match UdpSocket::bind("0.0.0.0:0") {
+        let send_sock = match bind_reverse_socket(target) {
             Ok(s) => s,
             Err(e) => {
                 logf!("[Reverse] UDP socket 创建失败: {e}");
@@ -425,12 +425,15 @@ impl ReverseSender {
         // ── DSCP EF 标记（A2）──
         // 设置本身可能被组策略拦下（DisableUserTOSSetting=1）或需要管理员，
         // 失败不影响功能：仅告警，继续用默认优先级发送。
-        match socket2::SockRef::from(&send_sock).set_tos_v4(DSCP_EF_TOS) {
-            Ok(()) => logf!("[Reverse] 发送套接字已标记 DSCP EF（TOS=0xB8）"),
-            Err(e) => logf!(
-                "[Reverse] DSCP 标记失败（{e}）：需管理员权限或 DisableUserTOSSetting=0；音频仍可正常发送"
-            ),
+        if target.is_ipv4() {
+            match socket2::SockRef::from(&send_sock).set_tos_v4(DSCP_EF_TOS) {
+                Ok(()) => logf!("[Reverse] 发送套接字已标记 DSCP EF（TOS=0xB8）"),
+                Err(e) => logf!(
+                    "[Reverse] DSCP 标记失败（{e}）：需管理员权限或 DisableUserTOSSetting=0；音频仍可正常发送"
+                ),
+            }
         }
+        // socket2 在 Windows 不提供 IPv6 的 set_tclass_v6；不对 IPv6 套接字设置 IPv4 TOS。
 
         // ── 发送缓冲（借鉴 Sunshine 的 1 MiB `SO_SNDBUF`）──
         // Windows 默认发送缓冲只有 8 KiB 量级：一次调度抖动里连发几包就可能
@@ -744,6 +747,15 @@ impl ReverseSender {
         }
 
         logf!("[Reverse] 反向音频线程退出");
+    }
+}
+
+// 反向目标可来自 IPv4 或 IPv6 的监听端；源套接字必须使用同一地址族。
+fn bind_reverse_socket(target: SocketAddr) -> std::io::Result<UdpSocket> {
+    if target.is_ipv4() {
+        UdpSocket::bind("0.0.0.0:0")
+    } else {
+        UdpSocket::bind("[::]:0")
     }
 }
 
@@ -1215,6 +1227,23 @@ mod tests {
     use super::*;
 
     const GAP: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn reverse_socket_matches_ipv4_and_ipv6_destinations() -> std::io::Result<()> {
+        for listen_addr in ["127.0.0.1:0", "[::1]:0"] {
+            let receiver = UdpSocket::bind(listen_addr)?;
+            let target = receiver.local_addr()?;
+            let sender = bind_reverse_socket(target)?;
+            assert_eq!(sender.local_addr()?.is_ipv4(), target.is_ipv4());
+            receiver.set_read_timeout(Some(Duration::from_secs(1)))?;
+            sender.send_to(b"rtp", target)?;
+            let mut buf = [0u8; 3];
+            let (len, source) = receiver.recv_from(&mut buf)?;
+            assert_eq!(&buf[..len], b"rtp");
+            assert_eq!(source.is_ipv4(), target.is_ipv4());
+        }
+        Ok(())
+    }
 
     #[test]
     fn slot_is_late_uses_half_a_gap_as_the_boundary() {
