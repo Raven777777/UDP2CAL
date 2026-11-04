@@ -71,13 +71,22 @@ def ensure_gradle_wrapper(project_dir: Path, logger) -> bool:
 # ---------------------------------------------------------------- local.properties
 
 
-def _unescape_property(value: str) -> str:
+_ESCAPES = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
+_ESCAPES_REVERSE = {value: "\\" + key for key, value in _ESCAPES.items()}
+
+
+def _join_surrogates(text: str) -> str:
+    r"""把 `\uD83D\uDE00` 这类 UTF-16 代理对合并成一个字符。"""
     out = []
     index = 0
-    while index < len(value):
-        char = value[index]
-        if char == "\\" and index + 1 < len(value):
-            out.append(value[index + 1])
+    while index < len(text):
+        char = text[index]
+        if (
+            "\ud800" <= char <= "\udbff"
+            and index + 1 < len(text)
+            and "\udc00" <= text[index + 1] <= "\udfff"
+        ):
+            out.append(chr(0x10000 + ((ord(char) - 0xD800) << 10) + (ord(text[index + 1]) - 0xDC00)))
             index += 2
             continue
         out.append(char)
@@ -85,8 +94,80 @@ def _unescape_property(value: str) -> str:
     return "".join(out)
 
 
+def _unescape_property(value: str) -> str:
+    r"""按 Java Properties.load 的规则还原转义（含 \uXXXX 与代理对）。"""
+    out = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char != "\\" or index + 1 >= len(value):
+            out.append(char)
+            index += 1
+            continue
+        nxt = value[index + 1]
+        if nxt == "u":
+            digits = value[index + 2:index + 6]
+            if len(digits) == 4 and all(c in "0123456789abcdefABCDEF" for c in digits):
+                out.append(chr(int(digits, 16)))
+                index += 6
+                continue
+            # 非法 \u 序列：保留反斜杠，避免丢信息
+            out.append(char)
+            index += 1
+            continue
+        out.append(_ESCAPES.get(nxt, nxt))
+        index += 2
+    return _join_surrogates("".join(out))
+
+
 def _escape_property(value: str) -> str:
-    return value.replace("\\", "\\\\").replace(":", "\\:")
+    r"""写成 ASCII 安全的转义形式。
+
+    Java 的 Properties.load 固定按 ISO-8859-1 读文件，中文用户名/emoji 必须转
+    成 \uXXXX（超出 BMP 的拆成代理对），否则报 "SDK location not found"。
+    """
+    out = []
+    for char in value:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == ":":
+            out.append("\\:")
+        elif char in _ESCAPES_REVERSE:
+            out.append(_ESCAPES_REVERSE[char])
+        elif " " <= char <= "~":
+            out.append(char)
+        else:
+            code = ord(char)
+            if code > 0xFFFF:
+                code -= 0x10000
+                out.append("\\u{:04X}".format(0xD800 + (code >> 10)))
+                out.append("\\u{:04X}".format(0xDC00 + (code & 0x3FF)))
+            else:
+                out.append("\\u{:04X}".format(code))
+    return "".join(out)
+
+
+def resolve_sdk(project_dir: Path, detected: envmod.SdkInfo, logger) -> envmod.SdkInfo:
+    """确定唯一生效的 SDK。
+
+    build.gradle.kts 的 ndkRoot() 优先读 local.properties，若这里继续用检测到的
+    另一个 SDK，NDK/CMake 会被装到 Gradle 根本不看的地方，永远报「找不到 NDK」。
+    因此：local.properties 指向有效 SDK 时以它为准，否则用检测到的。
+    """
+    current = read_sdk_dir(project_dir)
+    if not current:
+        return detected
+    path = Path(current)
+    if not path.is_dir() or not envmod.is_valid_sdk(path):
+        logger.warn(
+            "local.properties 的 sdk.dir 无效: {}（改用 {}）".format(current, detected.root)
+        )
+        return detected
+    if path.resolve() != detected.root.resolve():
+        logger.warn(
+            "local.properties 的 sdk.dir({}) 与检测到的 SDK 不同，按 Gradle 的优先级使用它".format(current)
+        )
+    return envmod.SdkInfo(root=path, source="local.properties")
 
 
 def read_sdk_dir(project_dir: Path) -> Optional[str]:
@@ -114,14 +195,19 @@ def ensure_local_properties(project_dir: Path, sdk: envmod.SdkInfo, logger) -> b
     if current:
         current_path = Path(current)
         if current_path.is_dir():
-            if current_path.resolve() == sdk.root.resolve():
+            if current_path.resolve() == sdk.root.resolve() and envmod.is_valid_sdk(current_path):
                 logger.detail("local.properties: sdk.dir 正确")
                 return True
-            logger.warn(
-                "local.properties 的 sdk.dir({}) 与本次使用的 SDK 不同，保持原样".format(current)
-            )
-            return True
-        logger.warn("local.properties 的 sdk.dir 指向不存在的目录: {}".format(current))
+            if not envmod.is_valid_sdk(current_path):
+                logger.warn("local.properties 的 sdk.dir 不是有效的 SDK: {}，将改写".format(current))
+            else:
+                logger.warn(
+                    "local.properties 的 sdk.dir({}) 与本次使用的 SDK 不同，将改写为 {}".format(
+                        current, sdk.root
+                    )
+                )
+        else:
+            logger.warn("local.properties 的 sdk.dir 指向不存在的目录: {}".format(current))
     elif props.exists():
         logger.detail("local.properties: 未设置 sdk.dir，将补写")
 

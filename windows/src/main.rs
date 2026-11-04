@@ -6,17 +6,18 @@ mod audio;
 mod capture;
 mod config;
 mod decoder;
-mod diag;
 mod firewall;
 mod hires;
 mod logger;
 mod protocol;
 
 use iced::futures::SinkExt;
-use iced::widget::{Space, button, column, container, progress_bar, row, text, text_input};
+use iced::widget::{
+    Space, button, column, container, opaque, progress_bar, row, stack, text, text_input,
+};
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM};
@@ -247,6 +248,51 @@ mod control_binding_tests {
             original
         ));
     }
+
+    #[test]
+    fn reverse_restart_is_immediate_when_stale_but_dead_retries_are_limited() {
+        let t0 = Instant::now();
+        let min = Duration::from_secs(2);
+
+        // 地址/SSRC/端口真实变化：不受限流影响，立即重启。
+        assert!(should_restart_reverse(
+            true,
+            true,
+            Some(t0 + Duration::from_millis(100)),
+            t0 + Duration::from_millis(200),
+            min
+        ));
+        // 发送线程健康：无需重启。
+        assert!(!should_restart_reverse(false, false, None, t0, min));
+        // 死线程首次发现：立即重启。
+        assert!(should_restart_reverse(false, true, None, t0, min));
+        // 距上次重启不足 2 s：拒绝。
+        assert!(!should_restart_reverse(
+            false,
+            true,
+            Some(t0),
+            t0 + Duration::from_millis(1999),
+            min
+        ));
+        // 满 2 s：允许重试。
+        assert!(should_restart_reverse(
+            false,
+            true,
+            Some(t0),
+            t0 + Duration::from_secs(2),
+            min
+        ));
+    }
+
+    #[test]
+    fn pairing_prompts_only_until_approved_or_denied() {
+        assert_eq!(pairing_action(0, 0xAA, false, 0), PairingAction::Prompt);
+        assert_eq!(pairing_action(0xAA, 0xAA, false, 0), PairingAction::Allow);
+        assert_eq!(pairing_action(0xAA, 0xBB, false, 0), PairingAction::Prompt);
+        assert_eq!(pairing_action(0, 0xAA, true, 0), PairingAction::Ignore);
+        assert_eq!(pairing_action(0, 0xAA, false, 0xAA), PairingAction::Ignore);
+        assert_eq!(pairing_action(0, 0xAA, false, 0xBB), PairingAction::Ignore);
+    }
 }
 
 static P2P_STATE: OnceLock<Mutex<P2pState>> = OnceLock::new();
@@ -425,7 +471,6 @@ static FEC_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 /// RTP 接收计数（诊断用）
 static RTP_RX_PACKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static RTP_RX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RTP_RX_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 音频诊断计数器（进程级单例，UI 展示 + 落盘日志共用）
@@ -480,7 +525,7 @@ fn init_audio_worker() {
                     return;
                 }
             };
-            let mut aw = match audio::start_audio(stats) {
+            let mut aw = match audio::start_audio(stats.clone()) {
                 Ok(a) => a,
                 Err(e) => {
                     logf!("[Audio] 初始化失败: {e}");
@@ -505,7 +550,7 @@ fn init_audio_worker() {
             // audio.rs 里的同类换算都要求非零；cpal 理论上不会给出 0，
             // 但这里是解码线程顶层，除零 = 线程 panic = 整条音频链死亡，
             // 必须栅位而不是赌。
-            let device_rate = aw.device_rate.max(1);
+            let mut device_rate = aw.device_rate.max(1);
             let mut drift = protocol::rtp::DriftController::new(device_rate);
             // 前馈只看**声卡设备进度 vs QPC**：网络攒批/重排不进入比率。
             // 发送端媒体时间线 vs Instant 的旧 RateEstimator 已从比率路径移除。
@@ -536,10 +581,6 @@ fn init_audio_worker() {
 
             // 最近一次下发的总比率微调（反馈 Δu 与前馈 r̂ 的合成）
             let mut adjust: f64;
-            let mut diag = diag::AsrcDiag::from_env();
-            if diag.is_on() {
-                logf!("[Asrc] P0 诊断打点已开启：{}", diag.path_display());
-            }
 
             loop {
                 if APP_RUNNING.load(Ordering::Acquire) == 0 {
@@ -559,6 +600,46 @@ fn init_audio_worker() {
                     continue;
                 }
                 idle = false;
+
+                // 输出流失效（设备失效/音频服务重启/VB-Cable 重装）时重建，
+                // 否则 played/设备时钟冻结、环永不排空，而 UI 仍显示正常。
+                if aw.failed() {
+                    logf!("[Audio] 输出流失效（设备失效/音频服务重启），尝试重建…");
+                    let mut rebuilt = None;
+                    for (attempt, delay_ms) in [0u64, 500, 1500].into_iter().enumerate() {
+                        if delay_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        match audio::start_audio(stats.clone()) {
+                            Ok(a) => {
+                                a.set_waker(std::thread::current());
+                                rebuilt = Some(a);
+                                break;
+                            }
+                            Err(e) => {
+                                logf!("[Audio] 重建失败（第 {} 次）: {e}", attempt + 1);
+                            }
+                        }
+                    }
+                    match rebuilt {
+                        Some(a) => {
+                            aw = a;
+                            device_rate = aw.device_rate.max(1);
+                            // 新流的设备时钟/播放头从 0 重新开始，旧估计器历史必须作废。
+                            drift = protocol::rtp::DriftController::new(device_rate);
+                            device_rate_est =
+                                protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
+                            step = protocol::rtp::StepAbsorber::new();
+                            AudioInitState::Ready.store();
+                            logf!("[Audio] 输出流已重建（{} Hz）", aw.device_rate);
+                        }
+                        None => {
+                            logf!("[Audio] 输出流重建失败；请检查音频设备/服务后重新开始");
+                            AudioInitState::DeviceFailed.store();
+                            return;
+                        }
+                    }
+                }
 
                 // 新会话 / 重同步：epoch 变化 → 重建解码器与全部估计器。
                 // 速率估计器必须在这里一并复位：resync 会重建 highest_ts 基准。
@@ -583,17 +664,7 @@ fn init_audio_worker() {
                 // 把解码缓冲折回媒体样本，才知道"此刻出声的那一帧"是哪个时间戳
                 let queued_media = (pipe_frames as f64 * aw.current_ratio()) as u64;
 
-                let (
-                    pull,
-                    jb_water,
-                    next_ts,
-                    newest_ts,
-                    arrival,
-                    plc_frames,
-                    trims,
-                    step_hit,
-                    playing,
-                ) = {
+                let (pull, jb_water, newest_ts, arrival, trims, step_hit, playing) = {
                     let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
 
                     // ── 阶跃吸收（方案 C）：持续超额才裁，且逐帧解码后再丢 PCM ──
@@ -636,10 +707,8 @@ fn init_audio_worker() {
                     (
                         r,
                         jb.water_ms(),
-                        next_ts,
                         highest,
                         jb.arrival_of(audible_ts),
-                        jb.stats.plc_frames,
                         jb.stats.step_trims,
                         hit,
                         jb.is_playing(),
@@ -739,13 +808,33 @@ fn init_audio_worker() {
 
                 match pull {
                     protocol::rtp::Pull::Packet { len, .. } => {
-                        if let Some(n) = dec.decode(&payload[..len]) {
-                            let pcm = dec.pcm_mut(n);
-                            rms_sum += pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
-                            rms_count += n as u64;
-                            aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                        // 解码失败不能只“等水位到期”：`pull` 已推进 10 ms 时间线，
+                        // 必须像丢包一样补一帧 PLC，否则播放环出现 10 ms 空洞。
+                        match dec.decode(&payload[..len]) {
+                            Some(n) => {
+                                let pcm = dec.pcm_mut(n);
+                                rms_sum += pcm
+                                    .iter()
+                                    .map(|&x| (x as f64) * (x as f64))
+                                    .sum::<f64>();
+                                rms_count += n as u64;
+                                aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                            }
+                            None => match dec.conceal() {
+                                Some(n) => {
+                                    let pcm = dec.pcm_mut(n);
+                                    rms_sum += pcm
+                                        .iter()
+                                        .map(|&x| (x as f64) * (x as f64))
+                                        .sum::<f64>();
+                                    rms_count += n as u64;
+                                    aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
+                                }
+                                None => {
+                                    aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                                }
+                            },
                         }
-                        // 解码失败按丢包处理：不写数据，水位到期后自然 PLC
                     }
                     protocol::rtp::Pull::Plc { .. } => {
                         // 先用 Opus 带内 FEC 重建这一帧：丢帧的 LBRR 冗余在**下一个
@@ -786,27 +875,6 @@ fn init_audio_worker() {
                         // 现在不该生产：生产节奏由声卡消费节奏约束
                         std::thread::park_timeout(Duration::from_millis(4));
                     }
-                }
-
-                if diag.due() {
-                    diag.row(format_args!(
-                        "{},{},{},{},{},{:.0},{:.1},{:.1},{},{:.3},{},{},{},{},{}",
-                        ring_ms,
-                        pipe_ms,
-                        jb_water,
-                        water,
-                        water_target,
-                        adjust * 1e6,
-                        ff * 1e6,
-                        device_rate_est.sigma_ppm(),
-                        device_rate_est.buckets(),
-                        played as f64 / device_rate as f64,
-                        newest_ts,
-                        next_ts,
-                        plc_frames,
-                        audio_stats().snapshot().underrun,
-                        trims,
-                    ));
                 }
 
                 if last_stats.elapsed() > Duration::from_millis(100) {
@@ -989,6 +1057,10 @@ enum Message {
     /// P2P 绑定/重连状态变化：只触发一次重绘，不携带也不修改任何遥测数据。
     /// （历史实现用 bitrate=0 的 StatusUpdate 充当重绘信号，导致码率显示每秒闪一次 0）
     PeerStateChanged,
+    /// 未配对设备请求连接：必须由本机用户显式允许后才建立绑定。
+    PairingRequest(PairingRequest),
+    AllowPairing,
+    DenyPairing,
     HideWindow,
     ShowWindow,
     Quit,
@@ -998,6 +1070,38 @@ enum Message {
 struct StatusInfo {
     bitrate_kbps: f32,
     level_db: f32,
+}
+
+/// 未配对设备的连接请求。只包含本机需要展示、其余流程不需要的字段。
+#[derive(Debug, Clone, Copy)]
+struct PairingRequest {
+    device_id: u64,
+    addr: SocketAddr,
+}
+
+/// 已批准的手机设备 ID。0 = 未配对：所有 CONNECT 都必须先经过本机确认。
+static PAIRED_DEVICE: AtomicU64 = AtomicU64::new(0);
+/// 当前已提示、等待用户处理的设备 ID（0 = 无）。同一时间只弹一个请求。
+static PAIRING_PROMPTED: AtomicU64 = AtomicU64::new(0);
+/// 本次运行内被拒绝的设备 ID（不落盘；重启后重新征求确认）。
+static PAIRING_DENIED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingAction {
+    Allow,
+    Prompt,
+    Ignore,
+}
+
+/// 纯决策：已批准 → 放行；已拒绝/已有弹窗 → 忽略；否则请求本机确认。
+fn pairing_action(paired: u64, id: u64, denied: bool, prompted: u64) -> PairingAction {
+    if paired == id {
+        PairingAction::Allow
+    } else if denied || prompted != 0 {
+        PairingAction::Ignore
+    } else {
+        PairingAction::Prompt
+    }
 }
 
 /// 提示行的语义级别。
@@ -1027,9 +1131,9 @@ struct AppState {
     last_toggle_instant: Instant,
     /// 上次写音频诊断日志的时间（30s 一次，避免刷盘）
     last_stats_log: Instant,
-    session_id: u32,
-    reverse_audio: bool,
     reverse_enabled: bool,
+    /// 待用户确认的配对请求（有值时显示模态框）
+    pending_pair: Option<PairingRequest>,
 }
 
 fn main() -> Result<(), iced::Error> {
@@ -1102,6 +1206,7 @@ fn main() -> Result<(), iced::Error> {
     let result = iced::application(
         move || {
             let cfg = config::Config::load();
+            PAIRED_DEVICE.store(cfg.paired_device, Ordering::Release);
             REVERSE_ENABLED.store(
                 if cfg.reverse_enabled != 0 { 1 } else { 0 },
                 Ordering::Release,
@@ -1123,12 +1228,11 @@ fn main() -> Result<(), iced::Error> {
                     NoticeLevel::Info
                 },
                 vb_cable_installed: audio::detect_vb_cable().is_some(),
-                reverse_audio: false,
                 reverse_enabled: cfg.reverse_enabled != 0,
                 config: cfg,
                 last_toggle_instant: now,
                 last_stats_log: now,
-                session_id: 0,
+                pending_pair: None,
             };
             (state, Task::none())
         },
@@ -1233,7 +1337,6 @@ impl AppState {
                     return Task::none();
                 }
                 self.last_toggle_instant = Instant::now();
-                self.session_id = self.session_id.wrapping_add(1);
 
                 if self.is_running {
                     APP_RUNNING.store(0, Ordering::Release);
@@ -1241,7 +1344,8 @@ impl AppState {
                     reset_to_ready();
                     self.is_running = false;
                     self.connected = false;
-                    self.reverse_audio = false;
+                    self.pending_pair = None;
+                    PAIRING_PROMPTED.store(0, Ordering::Release);
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
                     self.status_text.clear();
@@ -1273,6 +1377,34 @@ impl AppState {
                         return Task::none();
                     }
 
+                    // 端口变化必须先落实防火墙规则，再提交配置/启动监听。
+                    // 旧实现异步执行并丢弃错误：非管理员时新端口被永久静默阻断，
+                    // 而界面显示启动成功。失败则保留旧端口并明确提示。
+                    let old_port = self.config.listen_port;
+                    if port as u32 != old_port {
+                        if let Err(err) = firewall::add_firewall_rule(port) {
+                            logf!("[Firewall] 端口 {port} 规则添加失败: {err}");
+                            // add 会先删旧规则；失败时尽量把旧端口的规则补回去。
+                            let restore = u16::try_from(old_port)
+                                .ok()
+                                .filter(|p| *p != 0)
+                                .map(firewall::add_firewall_rule)
+                                .transpose()
+                                .err();
+                            self.notice = match restore {
+                                Some(re) => format!(
+                                    "无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}；原端口规则恢复也失败（{re}）。请以管理员身份运行后重试"
+                                ),
+                                None => format!(
+                                    "无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}：{err}。请以管理员身份运行后重试"
+                                ),
+                            };
+                            self.notice_level = NoticeLevel::Error;
+                            self.port_input = old_port.to_string();
+                            return Task::none();
+                        }
+                    }
+
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;
                     let saved = self.persist_config();
@@ -1285,10 +1417,6 @@ impl AppState {
                     ) {
                         init_audio_worker();
                     }
-                    // 端口可能在本次会话中改过，补齐防火墙规则
-                    std::thread::spawn(move || {
-                        let _ = firewall::add_firewall_rule(port);
-                    });
 
                     APP_RUNNING.store(1, Ordering::Release);
                     reset_to_ready();
@@ -1308,6 +1436,13 @@ impl AppState {
                 Task::none()
             }
             Message::StatusUpdate(info) => {
+                // 解码线程重建输出流失败会置 DeviceFailed；此时必须停表并提示，
+                // 不能维持“运行中”假象（played/设备时钟已冻结，永远无声）。
+                if self.is_running && AudioInitState::load() == AudioInitState::DeviceFailed {
+                    return self.update(Message::EngineError(
+                        "音频输出流失效，重建失败：请检查 VB-Cable/音频服务后重新开始".into(),
+                    ));
+                }
                 // 「已连接」= 控制面绑定存在。规范 6.4 明确保活只看控制面，
                 // 不得用"是否收到 RTP"判断存活；历史实现只在 bitrate>0 时置真、
                 // 从不置假，导致 RTP 停止后码率归零而界面仍显示已连接。
@@ -1446,7 +1581,8 @@ impl AppState {
                 reset_to_ready();
                 self.is_running = false;
                 self.connected = false;
-                self.reverse_audio = false;
+                self.pending_pair = None;
+                PAIRING_PROMPTED.store(0, Ordering::Release);
                 self.last_bitrate = 0.0;
                 self.last_level_db = -60.0;
                 self.status_text.clear();
@@ -1455,6 +1591,61 @@ impl AppState {
                 Task::none()
             }
             Message::PeerStateChanged => Task::none(),
+            Message::PairingRequest(req) => {
+                if self.pending_pair.is_none() {
+                    logf!(
+                        "[P2P] 未配对设备 {:016x}（{}）请求连接，等待本机确认",
+                        req.device_id,
+                        req.addr.ip()
+                    );
+                    self.pending_pair = Some(req);
+                }
+                Task::none()
+            }
+            Message::AllowPairing => {
+                if let Some(req) = self.pending_pair.take() {
+                    self.config.paired_device = req.device_id;
+                    PAIRED_DEVICE.store(req.device_id, Ordering::Release);
+                    PAIRING_PROMPTED.store(0, Ordering::Release);
+                    // 保存失败时 persist_config 已写入错误提示，不能覆盖掉。
+                    if self.persist_config() {
+                        self.notice = format!(
+                            "已允许 {}（{:016x}）连接，等待手机重连",
+                            req.addr.ip(),
+                            req.device_id
+                        );
+                        self.notice_level = NoticeLevel::Info;
+                    }
+                    logf!(
+                        "[P2P] 用户已允许设备 {:016x}（{}）",
+                        req.device_id,
+                        req.addr.ip()
+                    );
+                }
+                Task::none()
+            }
+            Message::DenyPairing => {
+                if let Some(req) = self.pending_pair.take() {
+                    let mut denied = PAIRING_DENIED.lock().unwrap_or_else(|e| e.into_inner());
+                    if denied.len() < 16 {
+                        denied.push(req.device_id);
+                    }
+                    drop(denied);
+                    PAIRING_PROMPTED.store(0, Ordering::Release);
+                    self.notice = format!(
+                        "已拒绝 {}（{:016x}）的连接请求",
+                        req.addr.ip(),
+                        req.device_id
+                    );
+                    self.notice_level = NoticeLevel::Info;
+                    logf!(
+                        "[P2P] 用户已拒绝设备 {:016x}（{}）",
+                        req.device_id,
+                        req.addr.ip()
+                    );
+                }
+                Task::none()
+            }
             Message::HideWindow => {
                 latest_window_task(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
             }
@@ -1623,7 +1814,7 @@ impl AppState {
             .into()
         };
 
-        container(
+        let base = container(
             column![
                 row![
                     text("ENJOY ME").size(20),
@@ -1834,8 +2025,52 @@ impl AppState {
         .style(move |_| container::Style {
             background: Some(iced::Background::Color(bg)),
             ..Default::default()
-        })
-        .into()
+        });
+
+        let base: Element<'_, Message> = base.into();
+        let Some(req) = self.pending_pair else {
+            return base;
+        };
+        let card = container(
+            column![
+                text("新设备请求连接").size(14).color(Color::WHITE),
+                text(format!("IP  {}", req.addr.ip())).size(11).color(dim),
+                text(format!("标识  {:016x}", req.device_id))
+                    .size(10)
+                    .color(grey),
+                text("只在确认这是你的手机时允许").size(10).color(grey),
+                Space::new().height(2),
+                row![
+                    mk("允许", accent, Message::AllowPairing).width(Length::FillPortion(1)),
+                    Space::new().width(8),
+                    mk("拒绝", red, Message::DenyPairing).width(Length::FillPortion(1)),
+                ],
+            ]
+            .spacing(6),
+        )
+        .padding(14)
+        .width(Length::Fixed(272.0))
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(card_bg)),
+            border: iced::Border {
+                radius: 8.0.into(),
+                color: border_color,
+                width: 1.0,
+            },
+            ..Default::default()
+        });
+        let modal = opaque(
+            container(card)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(iced::Background::Color(Color { a: 0.72, ..bg })),
+                    ..Default::default()
+                }),
+        );
+        stack(vec![base, modal]).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -2078,6 +2313,27 @@ fn stop_reverse_sender_under(_serial: &std::sync::MutexGuard<'static, ()>) {
     }
 }
 
+/// 死发送线程的最小重试间隔：1 Hz CONNECT 若每次都完整 stop/join + 重建
+/// 设备/Opus，会持续阻塞 RTP 接收。地址/SSRC/端口真实变化仍立即重启。
+static REVERSE_RETRY_AT: Mutex<Option<Instant>> = Mutex::new(None);
+const REVERSE_RETRY_MIN: Duration = Duration::from_secs(2);
+
+fn should_restart_reverse(
+    reverse_stale: bool,
+    sender_dead: bool,
+    last_retry: Option<Instant>,
+    now: Instant,
+    min_interval: Duration,
+) -> bool {
+    if reverse_stale {
+        true
+    } else if !sender_dead {
+        false
+    } else {
+        last_retry.is_none_or(|t| now.duration_since(t) >= min_interval)
+    }
+}
+
 /// 处理一条控制消息。
 ///
 /// 校验顺序（规范 5.7 第 5–7 步）：类型 → 负载布局 → 绑定关系。
@@ -2127,6 +2383,45 @@ async fn handle_control(
         return;
     }
 
+    // ── 配对闸门：绑定前必须由本机用户显式批准 ──
+    // device_id 只是公开标识，不是凭据；未配对的 CONNECT 一律不 ACK、不建立
+    // 绑定、不回调反向编码器，只弹一次确认。用户允许后手机的下一次 1 Hz
+    // CONNECT 才真正建立会话。
+    let device_id = u64::from_be_bytes(header.device_id);
+    let denied = PAIRING_DENIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&device_id);
+    let action = pairing_action(
+        PAIRED_DEVICE.load(Ordering::Acquire),
+        device_id,
+        denied,
+        PAIRING_PROMPTED.load(Ordering::Acquire),
+    );
+    match action {
+        PairingAction::Allow => {}
+        PairingAction::Ignore => return,
+        PairingAction::Prompt => {
+            // 单槽 CAS：同时只允许一个待确认设备，重复 CONNECT 不重复弹窗。
+            if PAIRING_PROMPTED
+                .compare_exchange(0, device_id, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            if output
+                .try_send(Message::PairingRequest(PairingRequest {
+                    device_id,
+                    addr: *src_addr,
+                }))
+                .is_err()
+            {
+                PAIRING_PROMPTED.store(0, Ordering::Release);
+            }
+            return;
+        }
+    }
+
     // 反向编码器配置只描述 Windows → Android；内容相同则不下发（避免每秒重置编码器）
     capture::update_reverse_config(capture::OpusReverseConfig::from(&cfg));
 
@@ -2174,7 +2469,14 @@ async fn handle_control(
     // 槽位里还有 ReverseSender 但线程已经结束：必须重启，否则保活一直显示健康。
     // 这种情况不换 SSRC（换号会让 Android 无谓地重建解码器/播放缓冲）。
     let sender_dead = want_reverse && peer.reverse_ssrc != 0 && !reverse_sender_alive();
-    let need_restart = reverse_stale || sender_dead;
+    let last_retry = *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let need_restart = should_restart_reverse(
+        reverse_stale,
+        sender_dead,
+        last_retry,
+        now,
+        REVERSE_RETRY_MIN,
+    );
 
     let reverse_ssrc = if reverse_stale {
         desired_reverse_ssrc(cfg.reverse_port, peer.reverse_ssrc, true)
@@ -2199,6 +2501,9 @@ async fn handle_control(
         }
     }
     if need_restart {
+        if sender_dead {
+            *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        }
         restart_reverse_sender(
             SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
             reverse_ssrc,
@@ -2218,6 +2523,11 @@ async fn handle_control(
                 );
             }
         }
+    }
+    // 只在线程活过一个完整 CONNECT 周期后清除限流，避免“刚重启就退出”
+    // 的线程把 1 Hz 重试重新放开。
+    if !sender_dead && reverse_sender_alive() {
+        *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     send_connect_ack(socket, src_addr, reverse_ssrc, cfg.forward_ssrc).await;
@@ -2303,7 +2613,17 @@ fn udp_receiver_stream(
                         .await;
                     return;
                 }
-                _ => {}
+                AudioInitState::Pending => {
+                    // start_audio 已有 2.5 s 上限；3 s 后仍 Pending 说明初始化线程
+                    // 卡在设备打开等路径，不能当作已连接放行。
+                    let _ = output
+                        .send(Message::EngineError(
+                            "音频初始化超时（音频设备无响应），请检查音频服务后重新开始".into(),
+                        ))
+                        .await;
+                    return;
+                }
+                AudioInitState::Ready => {}
             }
 
             reset_to_ready();
@@ -2391,7 +2711,6 @@ fn udp_receiver_stream(
                         if accepted {
                             byte_count += len as u64;
                             RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
-                            RTP_RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
                         }
                         wake_decoder();
                     }

@@ -813,121 +813,6 @@ class Udp2CalProtocolTest {
         assertTrue(d.ratioUpdates > 1000)
     }
 
-    // ═══════ 速率前馈估计 ═══════
-
-    /**
-     * 合成观测：发送端媒体时钟按 [skew] 快于本地时钟，到达时刻叠加
-     * [jitterUs] 的**单向**排队延迟（排队只会让包到得更晚）。
-     */
-    private fun feedEstimator(
-        est: Udp2CalProtocol.RateEstimator,
-        seconds: Double,
-        skew: Double,
-        jitterUs: Double,
-    ) {
-        val base = System.nanoTime()
-        val stepUs = 10_000.0 // 每 10 ms 一个包
-        val n = (seconds * 100.0).toInt()
-        var seed = 0x1234_5678L
-        for (i in 0 until n) {
-            seed = seed * 6364136223846793005L + 1442695040888963407L
-            val r = (seed ushr 33).toDouble() / (1L shl 31).toDouble() // [0,1)
-            val tUs = (i + 1) * stepUs
-            val mediaSamples = (tUs * 1e-6 * (1.0 + skew) * 48000.0).toLong()
-            val arriveUs = tUs + r * jitterUs
-            est.observe(mediaSamples, base + (arriveUs * 1000.0).toLong())
-        }
-    }
-
-    @Test
-    fun rateEstimator_needsWindowBeforePublishing() {
-        val est = Udp2CalProtocol.RateEstimator()
-        assertNull(est.feedforward())
-        feedEstimator(est, 3.0, 0.0, 0.0)
-        // 3 s 只有 3 个桶，不够 RATE_MIN_BUCKETS → 不出估计（宁可前馈置 0）
-        assertNull(est.feedforward())
-        val est2 = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est2, 10.0, 0.0, 0.0)
-        assertNotNull("窗口攒够后必须出估计", est2.feedforward())
-    }
-
-    @Test
-    fun rateEstimator_detectsFastSender() {
-        // 发送端快 200 ppm：前馈估计必须是 +200 ppm（±15 ppm）
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 40.0, 200e-6, 0.0)
-        val ppm = est.feedforwardPpm()
-        assertNotNull("必须出估计", ppm)
-        assertTrue("估计偏差过大: $ppm ppm", kotlin.math.abs(ppm!! - 200.0) < 15.0)
-        assertTrue("σ 过大: ${est.sigmaPpm()} ppm", est.sigmaPpm() < 20.0)
-        assertTrue(est.usedBuckets() >= Udp2CalProtocol.RATE_MIN_BUCKETS)
-    }
-
-    @Test
-    fun rateEstimator_detectsSlowSender() {
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 40.0, -300e-6, 0.0)
-        val ppm = est.feedforwardPpm()
-        assertNotNull(ppm)
-        assertTrue("估计偏差过大: $ppm ppm", kotlin.math.abs(ppm!! + 300.0) < 15.0)
-    }
-
-    @Test
-    fun rateEstimator_rejectsQueueingBursts() {
-        // 单向排队延迟（0–20 ms 随机）不得把估计带偏：最小延迟滤波要把它吃掉
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 40.0, 0.0, 20_000.0)
-        val ppm = est.feedforwardPpm()
-        assertNotNull(ppm)
-        assertTrue("排队抖动污染了估计: $ppm ppm", kotlin.math.abs(ppm!!) < 30.0)
-    }
-
-    @Test
-    fun rateEstimator_isClamped() {
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 40.0, 0.10, 0.0) // 10% 的荒谬钟差
-        val ppm = est.feedforwardPpm()
-        assertNotNull(ppm)
-        assertTrue("前馈未钳位: $ppm ppm", ppm!! <= Udp2CalProtocol.RATE_FEEDFORWARD_MAX * 1e6 + 1.0)
-    }
-
-    @Test
-    fun rateEstimator_resetRestartsWindow() {
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 20.0, 200e-6, 0.0)
-        assertNotNull(est.feedforward())
-        est.reset()
-        assertNull(est.feedforward())
-        assertEquals(0, est.usedBuckets())
-        // 重同步换了时间线基准：旧窗口绝不能继续参与回归
-        feedEstimator(est, 2.0, 200e-6, 0.0)
-        assertNull(est.feedforward())
-    }
-
-    @Test
-    fun rateEstimator_discardsRebuiltTimeline() {
-        // 实机：手机重连/断流补齐后 highestTs 会突然跳一大段，而 epoch 未必变。
-        // 旧窗口的 (t_local, media) 对不再可比，必须整窗作废。Rust 侧同名测试。
-        val est = Udp2CalProtocol.RateEstimator()
-        feedEstimator(est, 20.0, 200e-6, 0.0)
-        assertNotNull(est.feedforward())
-        // 下一包比上一包晚了 10 s 的媒体
-        est.observe(30L * 48_000, System.nanoTime())
-        assertNull("跳变后旧窗口必须作废", est.feedforward())
-        assertEquals(0, est.usedBuckets())
-    }
-
-    @Test
-    fun rateEstimator_ignoresRepeatedTimestamp() {
-        val est = Udp2CalProtocol.RateEstimator()
-        val base = System.nanoTime()
-        est.observe(0, base)
-        est.observe(480, base + 10_000_000L)
-        val obs = est.observations
-        est.observe(480, base + 12_000_000L)
-        assertEquals("同一个时间戳只能记一次", obs, est.observations)
-    }
-
     // ═══════ 多相 FIR 重采样 ═══════
 
     @Test
@@ -1183,9 +1068,7 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.PI_TI_S,
             Udp2CalProtocol.PI_INTEGRAL_MAX,
             Udp2CalProtocol.PI_MIN_UPDATE_MS,
-            Udp2CalProtocol.WATER_SMOOTH_TAU_MS,
-            Udp2CalProtocol.RATE_WINDOW_S,
-            Udp2CalProtocol.RATE_FEEDFORWARD_MAX
+            Udp2CalProtocol.WATER_SMOOTH_TAU_MS
         )
         val actual = ProtocolNative.constantsReal()
         assertEquals("浮点常量个数", expected.size, actual.size)

@@ -3,7 +3,7 @@
 两种工作方式：
     无参数        交互式菜单（等价原 build_android.bat / build_windows.bat / debug_adb.bat）
     带参数        纯命令行（适合批处理与 CI），例如：
-                  build.bat android --modern --abi arm64-v8a --release
+                  build.bat android --abi arm64-v8a --release
                   build.bat win --x64 --release --upx
                   build.bat adb --all
 
@@ -181,7 +181,9 @@ def doctor(args) -> int:
                 if not project.exists():
                     continue
                 deps.ensure_gradle_wrapper(project, logger)
-                deps.ensure_local_properties(project, sdks[0], logger)
+                # 与 build 一致：Gradle 会读 local.properties，组件与属性文件必须是同一个 SDK
+                sdk = deps.resolve_sdk(project, sdks[0], logger)
+                deps.ensure_local_properties(project, sdk, logger)
         if rust and rust.rustup:
             for triple in config.WINDOWS_TARGETS.values():
                 deps.ensure_rust_target(rust, triple, logger)
@@ -410,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例:\n"
             "  build.bat                                   交互菜单\n"
-            "  build.bat android --modern --abi arm64-v8a --release\n"
+            "  build.bat android --abi arm64-v8a --release\n"
             "  build.bat win --x64 --release --upx\n"
             "  build.bat adb --all\n"
             "  build.bat doctor --fix\n"
@@ -457,7 +459,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_win.set_defaults(func=cmd_win)
 
     p_android = sub.add_parser("android", aliases=["apk"], help="构建 Android APK")
-    p_android.add_argument("--modern", action="store_true", help="使用 android（Android 10+，默认且唯一目标）")
     p_android.add_argument("--abi", default="arm64-v8a", choices=config.ANDROID_ABIS, help="目标 ABI")
     android_mode = p_android.add_mutually_exclusive_group()
     android_mode.add_argument("--release", action="store_true", help="Release 构建（默认）")
@@ -472,7 +473,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_adb.add_argument("--monitor", action="store_true", help="Logcat 监控")
     p_adb.add_argument("--winlog", action="store_true", help="打开 Windows 调试日志")
     p_adb.add_argument("--all", action="store_true", help="执行全部操作")
-    p_adb.add_argument("--modern", action="store_true", help="调试 android（默认且唯一目标）")
     p_adb.add_argument("--abi", default="arm64-v8a", choices=config.ANDROID_ABIS)
     p_adb.add_argument("--adb", help="指定 adb.exe 路径")
     add_common(p_adb)

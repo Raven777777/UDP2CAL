@@ -51,6 +51,8 @@ const MAX_FRAME_BACKLOG: usize = FRAME_INTERLEAVED * 4;
 const FRAME_MS: u32 = rtp::FRAME_MS;
 /// WASAPI 事件等待上限：超时仅用于轮询/重建判断，不用于播放节拍
 const WAIT_TIMEOUT_MS: u32 = 10;
+/// UDP 发送超时：保证 `send_to` 不会无限阻塞 10 ms 发送节拍与 stop() 的 join
+const SEND_TIMEOUT_MS: u64 = 20;
 
 /// AUDCLNT_BUFFERFLAGS_SILENT：置位时缓冲内容未定义，必须按静音处理
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
@@ -367,8 +369,10 @@ impl ReverseSender {
     /// 请求停止并等待线程退出。
     ///
     /// 旧的异步 join 会让 `restart_reverse_sender` 在新线程启动时仍持有
-    /// 环回端点，正是“重启后无声”的竞态来源。反向线程的等待上限是
-    /// `WAIT_TIMEOUT_MS`（10 ms），同步 join 的阻塞可接受。
+    /// 环回端点，正是“重启后无声”的竞态来源。进入发送循环后，反向线程的
+    /// 等待上限是 `WAIT_TIMEOUT_MS`（10 ms）+ `SEND_TIMEOUT_MS`（20 ms）；
+    /// 若 stop 恰逢线程启动阶段（设备/Opus 初始化），join 需等初始化结束，
+    /// 但不会无限阻塞。
     pub fn stop(mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
@@ -421,6 +425,13 @@ impl ReverseSender {
                 return;
             }
         };
+
+        // 发送超时：网络栈/发送缓冲卡住时 `send_to` 最多阻塞 20 ms，
+        // 既避免拖垮 10 ms 发送节拍，也保证 stop() 的 join 有界（10 + 20 ms）。
+        // 超时按发送失败计数，下一帧继续。
+        if let Err(e) = send_sock.set_write_timeout(Some(Duration::from_millis(SEND_TIMEOUT_MS))) {
+            logf!("[Reverse] 发送超时设置失败（{e}），继续使用阻塞发送");
+        }
 
         // ── DSCP EF 标记（A2）──
         // 设置本身可能被组策略拦下（DisableUserTOSSetting=1）或需要管理员，
@@ -615,12 +626,7 @@ impl ReverseSender {
                     timestamp = timestamp.wrapping_add((excess / 2) as u32);
                 }
                 let new_ms = (resampled.len() as u64 / 2) * 1000 / 48_000;
-                let gap_ms = idle_ms.saturating_sub(new_ms);
-                if gap_ms > (rtp::FRAME_MS as u64 * 2) {
-                    timestamp = timestamp.wrapping_add(
-                        (gap_ms * rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64) as u32,
-                    );
-                }
+                timestamp = timestamp.wrapping_add(gap_advance_samples(idle_ms, new_ms));
                 for &s in &resampled {
                     let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(v);
@@ -737,7 +743,18 @@ impl ReverseSender {
                             Err(e) => {
                                 let n = REVERSE_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
                                 if n == 0 {
-                                    logf!("[Reverse] 发送失败（后续同类错误不再打印）: {e}");
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) {
+                                        logf!(
+                                            "[Reverse] 发送超时（{} ms），已计入发送错误（后续同类错误不再打印）",
+                                            SEND_TIMEOUT_MS
+                                        );
+                                    } else {
+                                        logf!("[Reverse] 发送失败（后续同类错误不再打印）: {e}");
+                                    }
                                 }
                             }
                         }
@@ -797,6 +814,18 @@ fn advance_slot(slot: Instant, gap: Duration, now: Instant) -> Instant {
 /// 正常抖动的证据，要计入 `late_*` 统计。
 fn slot_is_late(slot: Instant, gap: Duration, now: Instant) -> bool {
     now > slot + gap / 2
+}
+
+/// 环回断流补偿：只有超过 2 帧的缺口才推进 RTP 时间戳。
+/// 读到的样本已覆盖一段时间（`covered_ms`），必须从墙钟缺口里扣掉，
+/// 否则正常抖动会被重复计时。返回要补的采样数（10 ms = 480）。
+fn gap_advance_samples(idle_ms: u64, covered_ms: u64) -> u32 {
+    let gap_ms = idle_ms.saturating_sub(covered_ms);
+    if gap_ms > u64::from(rtp::FRAME_MS) * 2 {
+        (gap_ms * u64::from(rtp::FRAME_SAMPLES) / u64::from(rtp::FRAME_MS)) as u32
+    } else {
+        0
+    }
 }
 
 fn random_u32() -> u32 {
@@ -1255,6 +1284,18 @@ mod tests {
         assert!(slot_is_late(t0, GAP, t0 + Duration::from_millis(6)));
         // 一次哑火几个帧（空闲期无声 / 线程被抢占）必然重锚，且与迟到量无关
         assert!(slot_is_late(t0, GAP, t0 + Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn gap_advance_ignores_normal_jitter_and_counts_long_gaps() {
+        // 正常抖动/读取覆盖：不补时间戳，避免重复计时
+        assert_eq!(gap_advance_samples(0, 10), 0);
+        assert_eq!(gap_advance_samples(20, 0), 0);
+        assert_eq!(gap_advance_samples(20, 5), 0);
+        // 超过 2 帧才补；21 ms -> 1008 采样
+        assert_eq!(gap_advance_samples(21, 0), 1008);
+        // 扣掉样本自身覆盖的时间：100 - 40 = 60 ms -> 2880 采样
+        assert_eq!(gap_advance_samples(100, 40), 2880);
     }
 
     #[test]

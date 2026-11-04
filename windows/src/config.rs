@@ -12,6 +12,8 @@ pub struct Config {
     pub listen_port: u32,
     pub auto_start: u32,
     pub device_id: u64,
+    /// 已批准的手机设备 ID；0 = 尚未配对。首次连接必须由本机用户确认。
+    pub paired_device: u64,
     pub reverse_enabled: u32,
 }
 
@@ -42,6 +44,7 @@ impl Default for Config {
             listen_port: DEFAULT_LISTEN_PORT,
             auto_start: 0,
             device_id: 0,
+            paired_device: 0,
             reverse_enabled: 0,
         }
     }
@@ -101,6 +104,7 @@ impl Config {
             listen_port: sanitize_port(get_dword(&path, "listen_port", DEFAULT_LISTEN_PORT)),
             auto_start: get_dword(&path, "auto_start", 0),
             device_id: resolve_device_id(stored_id),
+            paired_device: get_qword(&path, "paired_device", 0),
             reverse_enabled: get_dword(&path, "reverse_enabled", 0),
         }
     }
@@ -113,6 +117,7 @@ impl Config {
         key.set_value("auto_start", &self.auto_start)?;
         // 注意：写回的是已缓存的稳定 ID，不会重新生成
         key.set_value("device_id", &self.get_device_id())?;
+        key.set_value("paired_device", &self.paired_device)?;
         key.set_value("reverse_enabled", &self.reverse_enabled)?;
         Ok(())
     }

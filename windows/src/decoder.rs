@@ -20,7 +20,6 @@ const DEEP_PLC_COMPLEXITY: u8 = 5;
 pub struct OpusDecoder {
     decoder: Decoder,
     pcm_buf: Vec<f32>,
-    last_n: usize,
 }
 
 impl OpusDecoder {
@@ -32,7 +31,6 @@ impl OpusDecoder {
         Ok(Self {
             decoder,
             pcm_buf: vec![0.0f32; MAX_FRAME_SAMPLES],
-            last_n: 0,
         })
     }
 
@@ -43,7 +41,6 @@ impl OpusDecoder {
             let _ = dec.set_complexity(DEEP_PLC_COMPLEXITY);
             self.decoder = dec;
         }
-        self.last_n = 0;
     }
 
     /// 解码一个 10 ms Opus 包。返回 480（成功）或 `None`（解码失败，按丢包处理）。
@@ -54,10 +51,7 @@ impl OpusDecoder {
         let packet = Packet::try_from(data).ok()?;
         let signals = MutSignals::try_from(self.pcm_buf.as_mut_slice()).ok()?;
         match self.decoder.decode_float(Some(packet), signals, false) {
-            Ok(n) if n == OPUS_FRAME_SAMPLES as usize => {
-                self.last_n = n;
-                Some(n)
-            }
+            Ok(n) if n == OPUS_FRAME_SAMPLES as usize => Some(n),
             // 帧长不符（非法包 / 120 ms 包）一律按失败处理：
             // 时间线固定 10 ms，多出来的采样没有地方放
             _ => None,
@@ -85,10 +79,7 @@ impl OpusDecoder {
         let want = OPUS_FRAME_SAMPLES as usize;
         let signals = MutSignals::try_from(&mut self.pcm_buf[..want]).ok()?;
         match self.decoder.decode_float(Some(packet), signals, true) {
-            Ok(n) if n == want => {
-                self.last_n = n;
-                Some(n)
-            }
+            Ok(n) if n == want => Some(n),
             _ => None,
         }
     }
@@ -111,7 +102,6 @@ impl OpusDecoder {
                 if n < want {
                     self.pcm_buf[n..want].fill(0.0);
                 }
-                self.last_n = want;
                 Some(want)
             }
             _ => None,

@@ -101,6 +101,13 @@ Java_com_udp2cal_app_native_OpusDecodeNative_decoderDecode(
         __android_log_print(ANDROID_LOG_WARN, TAG, "decode error: %d", nb_samples);
         return -1;
     }
+    // 时间线固定 10 ms：只接受恰好一帧（与 FEC 路径一致），否则上层按丢包
+    // 处理退回 PLC，避免把多帧/少帧当成一帧推进时间线。
+    if (nb_samples != state->frame_size) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "decode returned %d samples, expected %d", nb_samples, state->frame_size);
+        return 0;
+    }
     // 返回实际解码的总采样数（nb_samples × channels）
     return nb_samples * state->channels;
 }

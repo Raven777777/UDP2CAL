@@ -123,12 +123,18 @@ val cargoBuildAndroidProtocol = tasks.register<Exec>("cargoBuildAndroidProtocol"
         "CARGO_TARGET_${rustTriple.uppercase().replace('-', '_')}_LINKER",
         clang.absolutePath
     )
-    // 用 per-target 变量，避免覆盖用户自己设的 RUSTFLAGS（那会作用到所有 crate 并丢掉 -C target-cpu 之类）
-    environment(
-        "CARGO_TARGET_${rustTriple.uppercase().replace('-', '_')}_RUSTFLAGS",
-        "-C link-arg=--target=$clangTriple$androidApi" +
-            " -C link-arg=--sysroot=${sysroot.absolutePath}"
-    )
+    // 用 CARGO_ENCODED_RUSTFLAGS（0x1f 分隔 token）而不是 RUSTFLAGS：路径里的空格
+    // 会被 RUSTFLAGS 按空白切分，导致 --sysroot 被截断。这里保留用户已有的 flag。
+    val encodedFlags = mutableListOf<String>()
+    System.getenv("CARGO_ENCODED_RUSTFLAGS")?.let { raw ->
+        encodedFlags += raw.split('\u001f').filter { it.isNotEmpty() }
+    }
+    System.getenv("RUSTFLAGS")?.let { raw ->
+        encodedFlags += raw.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+    }
+    encodedFlags += "-Clink-arg=--target=$clangTriple$androidApi"
+    encodedFlags += "-Clink-arg=--sysroot=${sysroot.absolutePath}"
+    environment("CARGO_ENCODED_RUSTFLAGS", encodedFlags.joinToString("\u001f"))
     commandLine(cargoBuildArgs("--target", rustTriple))
 }
 

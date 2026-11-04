@@ -57,23 +57,38 @@ def needs_shell(program: str) -> bool:
     return program.lower().endswith((".bat", ".cmd"))
 
 
+# cmd 二次解析时仍有特殊含义的字符。双引号只能保住空格，保不住这些。
+_CMD_ESCAPE = "&|<>()^%!"
+
+
+def _quote_cmd_arg(text: str) -> str:
+    """按 cmd.exe 的规则引用一个参数。
+
+    cmd 把参数转交给 `.bat` 时会再解析一次：实测 `"x&y"` 仍会被拆成两条命令，
+    必须逐个加 `^` 转义；`^` 自身与 `%`（变量展开）同理。`!` 只在延迟展开时
+    生效，这里一并转义，命令串由 build_command 强制 `/v:off`。
+    """
+    escaped = "".join("^" + char if char in _CMD_ESCAPE else char for char in text)
+    return '"{}"'.format(escaped)
+
+
 def build_command(cmd: Sequence[str]) -> Union[str, List[str]]:
     """返回可直接交给 `subprocess` 的命令行。
 
-    `.bat`/`.cmd` 需要包一层 `cmd /c`，否则 CreateProcess 无法直接执行。
-
-    返回 `str` 时表示已按 cmd.exe 的规则拼好（Windows 上传 `str` 给 Popen 会
-    原样交给 CreateProcess，不再二次转义）。
-
-    cmd.exe 的引号规则：命令串里**超过两个**引号时，cmd 会剥掉首尾各一个再解析。
-    因此 `["cmd", "/c", bat, "--flag", "a b"]` 被 list2cmdline 拼成
-    `cmd /c "C:\\..\\sp ace\\gw.bat" --flag "a b"` 后，cmd 先剥引号再按空格切分，
-    会在 bat 路径的空格处断开（实测报错 `'C:/Users/.../sp' is not recognized`）。
-    官方写法是把整条命令再包一层引号：`cmd /c ""bat" "arg with space""`。
+    `.bat`/`.cmd` 需要包一层 `cmd /d /v:off /s /c`，否则 CreateProcess 无法
+    直接执行。返回 `str` 时表示已按 cmd.exe 的规则拼好（Windows 上传 `str` 给
+    Popen 会原样交给 CreateProcess，不再二次转义）：参数加引号（保住空格）并
+    转义命令元字符（`line & del` 不会被拆开），整串再包一层引号，`/s` 让 cmd
+    剥掉这层引号后执行。可执行文件本身只加引号——引号已能保住其中的 `&`，
+    而 `^` 在引号里不会被 cmd 剥掉，会让路径找不到。
     """
     parts = [str(c) for c in cmd]
     if parts and needs_shell(parts[0]):
-        return 'cmd /c "{}"'.format(subprocess.list2cmdline(parts))
+        args = " ".join(_quote_cmd_arg(part) for part in parts[1:])
+        command = '"{}"'.format(parts[0])
+        if args:
+            command += " " + args
+        return 'cmd /d /v:off /s /c "{}"'.format(command)
     return parts
 
 

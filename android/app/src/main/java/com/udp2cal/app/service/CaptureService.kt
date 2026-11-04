@@ -29,6 +29,7 @@ import com.udp2cal.app.UdpSender
 import com.udp2cal.app.native.OpusDecoder as ReverseOpusDecoder
 import com.udp2cal.app.native.OpusEncoder
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -36,6 +37,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
@@ -80,7 +82,9 @@ class CaptureService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     @Volatile private var captureJob: Job? = null
-    private var controlJob: Job? = null
+    /** 串行化「安装新链路」与「旧链路收尾」；旧任务拆除完对象前不得被覆盖 */
+    private val lifecycleLock = Any()
+    @Volatile private var controlJob: Job? = null
     private var reverseRxJob: Job? = null
     private var reversePlayJob: Job? = null
     private var lastReverseStartAt = 0L
@@ -94,7 +98,8 @@ class CaptureService : Service() {
     private val _status = MutableStateFlow(CaptureStatus())
     val status: StateFlow<CaptureStatus> = _status.asStateFlow()
 
-    private var audioRecord: AudioRecord? = null
+    // stopCapture 在主线程调用，采集协程在 IO 线程写，必须 volatile
+    @Volatile private var audioRecord: AudioRecord? = null
     private var encoder: OpusEncoder? = null
     // 跨协程（不同调度线程）访问，必须 volatile 保证可见性
     @Volatile private var udpSender: UdpSender? = null
@@ -254,13 +259,19 @@ class CaptureService : Service() {
         targetPort: Int,
         testTone: Boolean = false,
     ) {
-        if (captureJob?.isActive == true) {
-            pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
-            captureJob?.cancel()
-            return
+        synchronized(lifecycleLock) {
+            val old = captureJob
+            if (old != null) {
+                // 旧任务可能仍在拆除对象（已 cancel 但 finally 没跑完）：先登记
+                // 重启，由它自己的 finally 在收尾**完全结束**后再安装新链路。
+                // 若在旧 finally 之前直接 doStartCapture，旧任务会关掉新对象。
+                pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
+                old.cancel()
+                return
+            }
+            pendingRestart = null
+            doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
         }
-        pendingRestart = null
-        doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
     }
 
     /** 语音模式：VOICE_COMMUNICATION + 硬件降噪 + AEC */
@@ -300,9 +311,13 @@ class CaptureService : Service() {
         activeParams = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
         restartPending = false
 
-        captureJob = serviceScope.launch {
+        // ATOMIC：launch 后立刻 stopCapture 也不会在“未启动”状态被取消，
+        // 否则协程体（含 finally 拆除）永远不跑，captureJob 会永久占位。
+        captureJob = serviceScope.launch(start = CoroutineStart.ATOMIC) {
             _status.value = _status.value.copy(isRunning = true, errorMsg = "")
             try {
+                // 被 stop 取消时尽早失败，finally 仍会执行完整拆除
+                ensureActive()
                 // ── 网络层 ──
                 val sender = UdpSender(targetIp, targetPort)
                 if (!sender.connect()) {
@@ -377,8 +392,12 @@ class CaptureService : Service() {
                 _status.value = _status.value.copy(isRunning = false, errorMsg = e.message ?: "未知错误")
                 hasNewCapture = false
             } finally {
-                controlJob?.cancel()
+                // 控制协程可能在 NonCancellable 里调用 jitter.reset()；必须等它
+                // 真正退出再清引用，否则 onDestroy 拿不到句柄可 join，原生堆已
+                // 释放而它还在调用（use-after-free）。
+                val ctrl = controlJob
                 controlJob = null
+                withContext(NonCancellable) { ctrl?.cancelAndJoin() }
                 stopReverseAudioAndJoin()
                 try { audioRecord?.stop() } catch (_: Exception) {}
                 try { audioRecord?.release() } catch (_: Exception) {}
@@ -408,19 +427,22 @@ class CaptureService : Service() {
                     pendingRestart = null
                 }
 
-                val restart = pendingRestart
-                pendingRestart = null
-                if (restart != null) {
-                    serviceScope.launch {
+                // 对象已全部拆除，此时才清空任务槽并安装下一条链路；两者与
+                // startCapture 共用 lifecycleLock，避免旧 finally 覆盖新任务。
+                synchronized(lifecycleLock) {
+                    captureJob = null
+                    val restart = pendingRestart
+                    pendingRestart = null
+                    if (restart != null) {
                         doStartCapture(
                             restart.sampleRateHz, restart.bitrateKbps,
                             restart.targetIp, restart.targetPort, restart.testTone
                         )
+                    } else if (!hasNewCapture) {
+                        _status.value = _status.value.copy(isRunning = false)
+                        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
+                        stopSelf()
                     }
-                } else if (!hasNewCapture) {
-                    _status.value = _status.value.copy(isRunning = false)
-                    try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-                    stopSelf()
                 }
             }
         }
@@ -1385,16 +1407,27 @@ class CaptureService : Service() {
     // ══════════════════════════════════════════════════════════
 
     fun stopCapture() {
-        pendingRestart = null
-        activeParams = null
-        restartPending = false
-        hasNewCapture = false
-        try { wifiLock?.release() } catch (_: Exception) {}
-        wifiLock = null
-        captureJob?.cancel()
-        captureJob = null
-        controlJob?.cancel()
-        controlJob = null
+        val recordToStop: AudioRecord?
+        synchronized(lifecycleLock) {
+            pendingRestart = null
+            activeParams = null
+            restartPending = false
+            hasNewCapture = false
+            try { wifiLock?.release() } catch (_: Exception) {}
+            wifiLock = null
+            // 不在这里把 captureJob 置空：旧任务的 finally 拆除完对象后才清空。
+            // 提前置空会让下一次 startCapture 与旧收尾并行，旧 finally 会关掉
+            // 新任务的 audioRecord/encoder/udpSender/audioPlayer。
+            captureJob?.cancel()
+            controlJob?.cancel()
+            // 保留 controlJob 引用到它自己的协程结束：onDestroy 需要 cancelAndJoin
+            // 它，才能确认没有线程还停在 jitter.reset() 的原生调用里。
+            // 只停本次要拆的实例；若随后 startCapture 拉起新链路，不能误停它
+            recordToStop = audioRecord
+        }
+        // 阻塞在 AudioRecord.read 里的采集线程只有 stop() 能唤醒；否则
+        // finally 的清理要等到下一次读返回，麦克风会一直开着。
+        try { recordToStop?.stop() } catch (_: Exception) {}
         stopReverseAudio()
         _status.value = _status.value.copy(connected = false, reverseAudio = false)
     }
@@ -1427,6 +1460,7 @@ class CaptureService : Service() {
 
     override fun onDestroy() {
         val oldCapture = captureJob
+        val oldControl = controlJob
         val oldPlay = reversePlayJob
         // 反向接收协程也必须等：它是唯一调用 jitter.insert（原生 jbInsert）
         // 的地方，若在 jitter.close() 之后仍在跑，就是跨线程 use-after-free。
@@ -1438,6 +1472,9 @@ class CaptureService : Service() {
         // 采集协程退出（socket 被关掉），接收协程才会跟着退出。
         val allExited = runBlocking {
             withTimeoutOrNull(1000) {
+                // controlLoop 的 jitter.reset() 在 NonCancellable 里；必须等它
+                // 退出（或超时放弃归还句柄），不能先 close 再去竞争原生调用。
+                oldControl?.cancelAndJoin()
                 oldCapture?.join()
                 oldRx?.join()
                 oldPlay?.join()
@@ -1451,8 +1488,8 @@ class CaptureService : Service() {
             super.onDestroy()
             return
         }
-        // 原生句柄用完之后必须归还：JitterBuffer/DriftController/RateEstimator 的
-        // 状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
+        // 原生句柄用完之后必须归还：JitterBuffer/DriftController/DeviceRateEstimator
+        // 的状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
         runCatching { jitter.close() }
         runCatching { drift.close() }
         runCatching { deviceRate.close() }

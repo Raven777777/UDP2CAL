@@ -63,10 +63,28 @@ class AudioPlayer(private val context: Context) {
     @Volatile private var startedVoiceMode: Boolean = true
     @Volatile private var startedSessionId: Int = 0
 
+    /** start() 前的路由快照；stop() 只恢复本次确实改过的部分 */
+    private var savedAudioMode: Int = AudioManager.MODE_NORMAL
+    private var savedSpeakerphone: Boolean = false
+    private var routeSnapshotValid: Boolean = false
+    private var routeChanged: Boolean = false
+
     fun start(audioSessionId: Int = 0, voiceMode: Boolean = true): Boolean {
         startedVoiceMode = voiceMode
         startedSessionId = audioSessionId
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        routeChanged = false
+        routeSnapshotValid = false
+        try {
+            audioManager?.let {
+                savedAudioMode = it.mode
+                @Suppress("DEPRECATION")
+                savedSpeakerphone = it.isSpeakerphoneOn
+                routeSnapshotValid = true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "读取音频路由失败", e)
+        }
 
         val minBufSize = AudioTrack.getMinBufferSize(
             SAMPLE_RATE,
@@ -309,10 +327,29 @@ class AudioPlayer(private val context: Context) {
             headFrames = 0
             writtenFrames = 0
         }
-        routeToEarpiece(false)
+        restoreAudioRoute()
+    }
+
+    /**
+     * start() 前的路由快照。只恢复本次真的改过的值：音乐模式从不碰路由，
+     * stop() 不能反过来强行把系统切到扬声器。
+     */
+    private fun restoreAudioRoute() {
+        if (!routeChanged) return
+        routeChanged = false
+        if (!routeSnapshotValid) return
+        try {
+            audioManager?.mode = savedAudioMode
+            @Suppress("DEPRECATION")
+            audioManager?.isSpeakerphoneOn = savedSpeakerphone
+        } catch (e: Exception) {
+            Log.w(TAG, "恢复音频路由失败", e)
+        }
     }
 
     private fun routeToEarpiece(toEarpiece: Boolean) {
+        if (audioManager == null) return
+        routeChanged = true
         try {
             audioManager?.mode =
                 if (toEarpiece) AudioManager.MODE_IN_COMMUNICATION else AudioManager.MODE_NORMAL

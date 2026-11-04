@@ -209,7 +209,7 @@ def select_java(
 # ---------------------------------------------------------------- Android SDK
 
 
-def _valid_sdk(root: Path) -> bool:
+def is_valid_sdk(root: Path) -> bool:
     return root.is_dir() and any((root / sub).exists() for sub in config.SDK_COMPONENT_SUBDIRS)
 
 
@@ -239,7 +239,7 @@ def detect_sdks(extra_roots: Optional[List[Path]] = None) -> List[SdkInfo]:
         if key in seen:
             continue
         seen.add(key)
-        if _valid_sdk(root):
+        if is_valid_sdk(root):
             result.append(SdkInfo(root=root, source=source))
     return result
 

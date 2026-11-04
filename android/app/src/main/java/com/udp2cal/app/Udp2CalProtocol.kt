@@ -106,11 +106,6 @@ object Udp2CalProtocol {
     const val PI_MIN_UPDATE_MS = 5.0
     /** 水位低通时间常数：只让“长期残余”进入反馈，不追每次网络突发。 */
     const val WATER_SMOOTH_TAU_MS = 4000.0
-    const val RATE_WINDOW_S = 30.0
-    const val RATE_BUCKETS = 30
-    const val RATE_MIN_BUCKETS = 6
-    const val RATE_JUMP_MAX_SAMPLES = 96000
-    const val RATE_FEEDFORWARD_MAX = 0.02
 
     // ═══════════════════════ 控制包头 ═══════════════════════
 
@@ -318,16 +313,11 @@ object Udp2CalProtocol {
         val nextSeq: Long get() = ProtocolNative.jbNextSeq(handle)
         val nextTs: Long get() = ProtocolNative.jbNextTs(handle)
         fun highestTsValue(): Long = ProtocolNative.jbHighestTs(handle)
-        val started: Boolean get() = ProtocolNative.jbStarted(handle)
         val playing: Boolean get() = ProtocolNative.jbPlaying(handle)
-        val plcRun: Int get() = ProtocolNative.jbPlcRun(handle)
         val epoch: Long get() = ProtocolNative.jbEpoch(handle)
         val lastRebaseReason: String get() = ProtocolNative.jbLastRebaseReason(handle) ?: ""
         val pulledLength: Int get() = ProtocolNative.jbPulledLength(handle)
-        val pulledTs: Long get() = ProtocolNative.jbPulledTs(handle)
-        val received: Long get() = ProtocolNative.jbReceived(handle)
         val late: Long get() = ProtocolNative.jbLate(handle)
-        val duplicate: Long get() = ProtocolNative.jbDuplicate(handle)
         val resyncs: Long get() = ProtocolNative.jbResyncs(handle)
         val seqRealign: Long get() = ProtocolNative.jbSeqRealign(handle)
         val overflow: Long get() = ProtocolNative.jbOverflow(handle)
@@ -349,15 +339,6 @@ object Udp2CalProtocol {
 
         /** 抖动缓冲里还有多少毫秒可播。 */
         fun waterMs(): Int = ProtocolNative.jbWaterMs(handle)
-
-        /** 从 `nextTs` 起连续有多少帧（用于起播判定）。 */
-        fun contiguousFrames(): Int = ProtocolNative.jbContiguousFrames(handle)
-
-        /** 从 `nextTs` 起连续可解码的毫秒数。 */
-        fun contiguousMs(): Int = ProtocolNative.jbContiguousMs(handle)
-
-        /** 实际占用的帧数（不含空洞）。 */
-        fun occupancyFrames(): Int = ProtocolNative.jbOccupancyFrames(handle)
 
         /** 实际占用的毫秒数（不含空洞）——比 waterMs 更接近“能播多久”。 */
         fun occupancyMs(): Int = ProtocolNative.jbOccupancyMs(handle)
@@ -384,8 +365,6 @@ object Udp2CalProtocol {
          * 0 表示播放位的包还没到。之后 [pull] 仍会正常取出同一个包。
          */
         fun peek(out: ByteArray): Int = ProtocolNative.jbPeek(handle, out)
-
-        fun destroyed(): Boolean = handle == 0L
 
         override fun close() {
             if (handle != 0L) {
@@ -455,47 +434,6 @@ object Udp2CalProtocol {
         override fun close() {
             if (handle != 0L) {
                 ProtocolNative.saDestroy(handle)
-                handle = 0L
-            }
-        }
-
-        @Suppress("deprecation")
-        protected fun finalize() {
-            close()
-        }
-    }
-
-    // ═══════════════════════ 速率前馈估计（Rust 实现） ═══════════════════════
-
-    /**
-     * 用 (RTP 时间戳, 本地到达时刻) 做最小延迟滤波 + 最小二乘拟合，
-     * 得到链路速率的"前馈残差"（无量纲，≈ 时钟偏差比例）。
-     */
-    class RateEstimator : AutoCloseable {
-        private var handle: Long = ProtocolNative.reCreate()
-
-        val observations: Long get() = ProtocolNative.reObservations(handle)
-
-        fun reset() {
-            ProtocolNative.reReset(handle)
-        }
-
-        fun feedforward(): Double? =
-            ProtocolNative.reFeedforward(handle).let { if (it.isNaN()) null else it }
-
-        fun feedforwardPpm(): Double? = feedforward()?.times(1e6)
-
-        fun sigmaPpm(): Double = ProtocolNative.reSigmaPpm(handle)
-
-        fun usedBuckets(): Int = ProtocolNative.reUsedBuckets(handle)
-
-        fun observe(ts: Long, arrivedNanos: Long) {
-            ProtocolNative.reObserve(handle, ts, arrivedNanos)
-        }
-
-        override fun close() {
-            if (handle != 0L) {
-                ProtocolNative.reDestroy(handle)
                 handle = 0L
             }
         }

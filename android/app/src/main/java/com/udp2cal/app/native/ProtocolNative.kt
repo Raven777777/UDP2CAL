@@ -208,25 +208,6 @@ internal object ProtocolNative {
 
     external fun saTakeLimitedLog(h: Long): Boolean
 
-    // ── RateEstimator ────────────────────────────────────────────────────
-
-    external fun reCreate(): Long
-
-    external fun reDestroy(h: Long)
-
-    external fun reReset(h: Long)
-
-    external fun reObserve(h: Long, ts: Long, arrivedNanos: Long)
-
-    /** 无估计时返回 NaN */
-    external fun reFeedforward(h: Long): Double
-
-    external fun reSigmaPpm(h: Long): Double
-
-    external fun reUsedBuckets(h: Long): Int
-
-    external fun reObservations(h: Long): Long
-
     // ── DeviceRateEstimator（声卡时钟前馈） ─────────────────────────────
 
     external fun deCreate(): Long

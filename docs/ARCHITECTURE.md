@@ -30,7 +30,6 @@ udp2cal/
 │  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
 │  │  ├─ config.rs     # 注册表配置读写
 │  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧；含带内 FEC 重建）
-│  │  ├─ diag.rs       # ASRC 高频诊断 CSV（`UDP2CAL_ASRC_DIAG`，默认关闭）
 │  │  ├─ firewall.rs   # 防火墙规则
 │  │  ├─ hires.rs      # 高精度可等待定时器（反向发送节拍）
 │  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
@@ -58,22 +57,22 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | 位置 | 角色 |
 | --- | --- |
 | `protocol/protocol.rs`、`protocol/rtp.rs` | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
-| `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，60 个 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
+| `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，全部 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
 | `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
 | `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
 
 三个接线点：
 
-1. **句柄**：`JitterBuffer` / `StepAbsorber` / `RateEstimator` / `DriftController` 在 Kotlin 侧只是一个
+1. **句柄**：`JitterBuffer` / `StepAbsorber` / `DriftController` 在 Kotlin 侧只是一个
    `Long`；Rust 用 `Box::into_raw` 造对象、`*Destroy` 收回。`JitterBuffer` 会被接收线程
    （`insert`）与播放线程（`pull`）同时使用，故内部包一层 `Mutex`——纯 Kotlin 版本在这里是
    数据竞争。Kotlin 侧 `AutoCloseable.close()`（句柄清零）+ `finalize()` 兜底
    （minSdk 29 没有 `java.lang.ref.Cleaner`），`CaptureService` 在停机时主动 `close()`。
 2. **时钟桥**：Rust 的到达时刻用 `Instant`，Kotlin 用 `System.nanoTime()`。`clockSync(System.nanoTime())`
-   在库加载时记下 `(Instant, java_nanos)` 基准，`arrivalNanosAt` 与 `RateEstimator::observe` 双向换算——
+   在库加载时记下 `(Instant, java_nanos)` 基准，`arrivalNanosAt` 与原生到达时刻双向换算——
    两端都是单调时钟，不需要 `GetJavaVM`。
 3. **常量**：Kotlin 仍需 `const val`（编译期），但值由测试看守：`nativeConstantsMatchKotlinConstants`
-   与 `nativeRealConstantsMatchKotlinConstants` 把 Rust 导出的 43 个整数 + 8 个浮点常量逐项比对。
+   与 `nativeRealConstantsMatchKotlinConstants` 把 Rust 导出的整数 + 浮点常量逐项比对。
 
 构建接线（`android/app/build.gradle.kts`）：
 
@@ -103,7 +102,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | --- | --- | --- |
 | UI（Android） | Jetpack Compose + Material 3 | 全参数设置面板 + 状态卡片；卡片显示**已生效**值（编码器上报），不显示"期望值" |
 | UI（Windows） | iced 0.14（tiny-skia 软件渲染，禁用 wgpu） | 固定窗口、深色卡片、实时电平；单行状态栏按连接状态切换 |
-| 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用；Windows 防火墙仅对 Private profile 放行 |
+| 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用；Windows 防火墙覆盖专用/公用网络，仅对本地子网放行 |
 | 采集（Android） | `AudioRecord` 48 kHz 单声道 | `READ_BLOCKING` 累积到整帧再编码；语音模式决定音源与 AEC（创建时定型） |
 | 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
 | 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | Deep PLC；DRED 不启用（接收端无解析/恢复路径）；负载上限 1275 字节，超限丢帧不截断 |
@@ -211,8 +210,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 - **Release 构建不写任何日志文件**：`logger::ENABLED = cfg!(debug_assertions)`，
   release 下 `init()` 连目录都不创建（不 `metadata` / 不轮转 / 不 open），`logf!`
-  宏在编译期短路，日志相关 Disk I/O 恒为 0；同一开关同样封死 `asrc_diag.csv`
-  （release 下即使设置 `UDP2CAL_ASRC_DIAG` 也不落盘）。需要现场证据时用
+  宏在编译期短路，日志相关 Disk I/O 恒为 0。需要现场证据时用
   `cargo build` 出的 debug 二进制，或在 `windows/` 下 `cargo run`。
 - 历史日志不会被 release 清理（不删不移）：升级后 `%LOCALAPPDATA%\UDP2CAL\`
   下的旧文件保留原样，需要时手动删除
@@ -235,7 +233,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 |--------|------|
 | `● 等待连接 / ● 已断开` | 红色 — 正在监听但无数据流 |
 | `● 已连接` | 绿色 — 收到音频数据 |
-| `● 已占用` | 橙色 — TYPE_CONNECT 独占绑定，异设备 CONNECT 将被静默拒绝（不显示设备识别码） |
+| `● 已占用` | 橙色 — 已配对设备 TYPE_CONNECT 独占绑定；占用中异设备 CONNECT 将被静默拒绝（不显示设备识别码） |
 | `● 空闲` | 绿色 — 已启动但无可信连接 |
 | `● VB-Cable` / `● VB-Cable 未安装` | 绿色/橙色 — 虚拟声卡检测状态 |
 | `● 广播中` / `● 已静音` | 绿色/灰色 — 广播状态机 Ready/Silent |
@@ -264,6 +262,16 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 - `build.rs` 另将 `icon.png` 转为 ICO 嵌入 EXE 文件资源（资源管理器图标）
 - 若 `icon.png` 缺失或无法解码，回退到程序绘制的 32×32 绿色圆点
 
+### 首次连接确认
+
+`device_id` 不是凭据，首次 CONNECT 必须由本机用户确认：
+
+| 角色 | 行为 |
+|------|------|
+| **Windows 端** | 未配对设备的 CONNECT 不回复 ACK、不建立绑定、不更新反向编码器；只弹一次确认框（单槽 CAS，1 Hz 重发不会重复弹窗） |
+| **用户** | 「允许」→ 写入注册表 `paired_device`，手机下一次 CONNECT 建立会话；「拒绝」→ 本次运行内静默丢弃该设备 |
+| **已配对设备** | 直接放行；占用中异设备仍静默拒绝 |
+
 ### P2P 防抢占拒绝行为
 
 当 Windows 端处于 `DEVICE_BUSY`（已绑定一台 Android）时，第三方设备手动输入 IP:端口发送 `TYPE_CONNECT`：
@@ -278,7 +286,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 > 唯一例外：极低概率的 8 字节 device_id 碰撞会导致 Windows 误判为同设备保活，回复 `CONNECT_ACK` 到第三方。但由于第三方无合法音频采集流，仍无法发送音频数据。
 >
-> **威胁模型**：`device_id` 随 `DISCOVER_REPLY` 每秒明文广播，本机制只用于"防误连、防抢占"，**不具备抗伪造能力**——同网段的恶意主机嗅探到 ID 后可冒充绑定设备。需要抗伪造时应在 `CONNECT` 中引入一次性 nonce 或预共享密钥 HMAC。
+> **威胁模型**：首次连接确认能阻止陌生设备直接取走环回音频；但 `device_id` 随 `DISCOVER_REPLY` 每秒明文广播，**不是凭据**。同网段恶意主机若同时嗅探并伪造已配对手机的源 IP:端口，仍可能冒充该设备。需要抗伪造时应引入一次性 nonce 或预共享密钥 HMAC。
 
 ### 释放独占的途径
 

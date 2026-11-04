@@ -88,7 +88,7 @@ object DiscoveryManager {
         return newId
     }
 
-    private fun hexStringToByteArray(s: String): ByteArray {
+    internal fun hexStringToByteArray(s: String): ByteArray {
         val len = s.length
         val data = ByteArray(len / 2)
         var i = 0

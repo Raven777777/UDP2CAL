@@ -4,7 +4,7 @@ rem  UDP2CAL 统一构建入口
 rem
 rem  用法:
 rem    build.bat                                  交互式菜单
-rem    build.bat android --modern --abi arm64-v8a --release
+rem    build.bat android --abi arm64-v8a --release
 rem    build.bat win --x64 --release --upx
 rem    build.bat adb --all
 rem    build.bat doctor --fix

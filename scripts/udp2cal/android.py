@@ -148,6 +148,8 @@ def build(ctx, logger) -> int:
     if base is None:
         return 1
     java, sdk = base["java"], base["sdk"]
+    # Gradle 优先读 local.properties；组件安装必须装进同一个 SDK，否则 --fix 也治不好
+    sdk = deps.resolve_sdk(project_dir, sdk, logger)
 
     proxy = proxymod.resolve(getattr(ctx, "proxy_mode", "direct"), logger)
     mirror_mode = getattr(ctx, "mirror_mode", "auto")

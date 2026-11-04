@@ -17,9 +17,9 @@
 use crate::protocol::rtp;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::thread::Thread;
+use std::thread::{JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 /// 声卡时钟采样与本地 `Instant` 的公共基准。
@@ -222,6 +222,12 @@ pub struct AudioWriter {
     device_clock_ns: Arc<AtomicU64>,
     /// 解码线程句柄：回调每次运行后 unpark 它（原子置位，无分配）
     waker: Arc<OnceLock<Thread>>,
+    /// cpal 流错误标志：设备失效/音频服务重启时由错误回调置位（回调内只做原子置位）
+    failed: Arc<AtomicBool>,
+    /// 停止信号：Drop 时置位并唤醒音频线程，让它释放 cpal 流
+    cancel: Arc<AtomicBool>,
+    /// 音频线程：Drop 时 join，确保旧流被销毁而不是泄漏
+    stream_thread: Option<JoinHandle<()>>,
 
     // ── 相位连续多相 FIR 重采样器 ──
     /// 当前输出点落在输入上的连续位置（源样本，可为负＝仍落在历史段）
@@ -283,6 +289,13 @@ impl AudioWriter {
     /// 登记解码线程，供音频回调在每次运行后唤醒它
     pub fn set_waker(&self, thread: Thread) {
         let _ = self.waker.set(thread);
+    }
+
+    /// 输出流是否已失效（设备失效/音频服务重启等）。
+    /// 错误回调只置位；重建由解码线程负责。
+    #[inline]
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// 声卡真实输出位置（设备帧，单调递增）。
@@ -567,7 +580,7 @@ fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConf
 
 /// `build_stream` 的共享观测点集合。
 ///
-/// 七个句柄打包成一个结构，而不是在参数表里排成七行：(1) 回调闭包只捕获一份
+/// 八个句柄打包成一个结构，而不是在参数表里排成八行：(1) 回调闭包只捕获一份
 /// 数据；(2) 调用点不再有"同为 `&Arc<AtomicU64>` 的两个参数传反"的空间。
 #[derive(Clone)]
 struct StreamShared {
@@ -578,6 +591,7 @@ struct StreamShared {
     clock_frames: Arc<AtomicU64>,
     clock_ns: Arc<AtomicU64>,
     waker: Arc<OnceLock<Thread>>,
+    failed: Arc<AtomicBool>,
 }
 
 fn build_stream<T>(
@@ -599,6 +613,7 @@ where
         clock_frames,
         clock_ns,
         waker,
+        failed,
     } = shared.clone();
     // 第一次回调的 playback 位置作为设备时钟零点；回调闭包私有，无锁。
     let mut playback_base: Option<cpal::StreamInstant> = None;
@@ -675,7 +690,10 @@ where
                     thread.unpark();
                 }
             },
-            |_| {},
+            move |_err| {
+                // 回调约束：只置位，不加锁、不写日志；由解码线程负责重建。
+                failed.store(true, Ordering::Release);
+            },
             None,
         )
         .map_err(|e| format!("创建流失败: {e}"))
@@ -729,6 +747,8 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let device_clock_frames = Arc::new(AtomicU64::new(0));
     let device_clock_ns = Arc::new(AtomicU64::new(0));
     let waker: Arc<OnceLock<Thread>> = Arc::new(OnceLock::new());
+    let failed = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
 
     let (err_tx, err_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
@@ -743,9 +763,11 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
         clock_frames: device_clock_frames.clone(),
         clock_ns: device_clock_ns.clone(),
         waker: waker.clone(),
+        failed: failed.clone(),
     };
 
-    std::thread::Builder::new()
+    let cancel_thread = cancel.clone();
+    let audio_thread = std::thread::Builder::new()
         .name("udp2cal-audio".into())
         .spawn(move || {
             // 固定 10 ms 失败（驱动拒绝该周期）时退回驱动默认值，
@@ -779,13 +801,15 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
                 return;
             }
             let _ = err_tx.send(Ok(()));
-            loop {
+            // 取消后立即释放流：超时的初始化线程不能把流永久泄漏在 park 里。
+            while !cancel_thread.load(Ordering::Acquire) {
                 std::thread::park();
             }
+            drop(stream);
         })
         .map_err(|e| format!("线程创建失败: {e}"))?;
 
-    match err_rx.recv() {
+    match err_rx.recv_timeout(Duration::from_millis(2500)) {
         Ok(Ok(())) => Ok(AudioWriter {
             ring,
             device_rate: actual_rate,
@@ -795,6 +819,9 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             device_clock_frames,
             device_clock_ns,
             waker,
+            failed,
+            cancel,
+            stream_thread: Some(audio_thread),
             pos: 0.0,
             base_ratio: 1.0,
             adjust: 0.0,
@@ -804,7 +831,26 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             resample_buf: Vec::with_capacity(4096),
         }),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("音频线程异常退出".into()),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // 设备打开可能永久阻塞（驱动/音频服务挂起）：有界等待后放弃这次初始化。
+            // 置取消并唤醒线程；线程若稍后完成构建会自行 drop 流，不会泄漏。
+            cancel.store(true, Ordering::Release);
+            audio_thread.thread().unpark();
+            Err("音频初始化超时（设备无响应）".into())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("音频线程异常退出".into()),
+    }
+}
+
+impl Drop for AudioWriter {
+    fn drop(&mut self) {
+        // 重建/退出时先停旧流，再 join。线程只在 park 或构建中，取消后很快退出；
+        // 构建阶段即使卡住也不会阻塞正常的失败重建路径（该路径不持有 Writer）。
+        self.cancel.store(true, Ordering::Release);
+        if let Some(thread) = self.stream_thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
     }
 }
 
@@ -1003,6 +1049,9 @@ mod tests {
                 device_clock_frames: Arc::new(AtomicU64::new(0)),
                 device_clock_ns: Arc::new(AtomicU64::new(0)),
                 waker: Arc::new(OnceLock::new()),
+                failed: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                stream_thread: None,
                 pos: 0.0,
                 base_ratio: 1.0,
                 adjust: 0.0,

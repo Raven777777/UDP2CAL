@@ -51,6 +51,28 @@ def _ensure_device(adb: Path, logger) -> bool:
     return True
 
 
+# 只有签名冲突/版本降级能靠卸载解决；存储不足、设备离线等卸载只会丢数据。
+_UNINSTALL_MARKERS = (
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE",
+    "INSTALL_FAILED_VERSION_DOWNGRADE",
+)
+
+
+def should_uninstall(output: str) -> bool:
+    """安装输出是否属于「卸载重装才能过」的失败。"""
+    text = output.upper()
+    return any(marker in text for marker in _UNINSTALL_MARKERS)
+
+
+def _failure_reason(output: str) -> str:
+    """从 adb 输出里取一行失败原因，用于日志。"""
+    for line in output.splitlines():
+        text = line.strip()
+        if "Failure [" in text or text.startswith("adb: failed"):
+            return text
+    return ""
+
+
 def _install(adb: Path, apk: Path, logger) -> bool:
     logger.info("安装 {} ...".format(apk.name))
     result = runner.run([str(adb), "install", "-r", str(apk)], logger=logger, tail_lines=40)
@@ -58,7 +80,12 @@ def _install(adb: Path, apk: Path, logger) -> bool:
         logger.ok("安装成功")
         return True
 
-    logger.warn("安装失败，可能存在签名冲突，尝试卸载后重装")
+    if not should_uninstall(result.tail):
+        reason = _failure_reason(result.tail)
+        logger.error("安装失败（未卸载，避免丢失应用数据）: {}".format(reason or "原因见上方 adb 输出"))
+        return False
+
+    logger.warn("安装失败（签名冲突或版本降级），卸载后重装")
     runner.run([str(adb), "uninstall", PACKAGE_NAME], logger=logger, tail_lines=20)
     retry = runner.run([str(adb), "install", "-r", str(apk)], logger=logger, tail_lines=40)
     if retry.ok:

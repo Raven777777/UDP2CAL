@@ -56,11 +56,11 @@ build.bat win --x64 --release --upx
 ### Android 客户端
 
 ```bat
-build.bat android --modern --abi arm64-v8a --release
-build.bat android --modern --abi armeabi-v7a --release
+build.bat android --abi arm64-v8a --release
+build.bat android --abi armeabi-v7a --release
 ```
 
-`--modern` 为默认且唯一目标（`android/`）。
+构建目标固定为 `android/`（Android 10+）。
 
 ### Opus 源码共用（Windows / Android 同源）
 

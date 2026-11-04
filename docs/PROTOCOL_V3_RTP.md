@@ -900,7 +900,7 @@ total_latency = now − arrival_of(audible_ts)          # 不再额外加 device
 只取决于链路环境（Wi-Fi 省电、AP 缓冲、手机扫描），不是协议能拍的常数。换环境就要重新
 定值——这一点 v1.3.0 与 v1.4.0 相同，变的是环境。
 
-**v1.3.0 的 260 ms 从哪来**：P0 实机打点（`UDP2CAL_ASRC_DIAG=20`，每轮 300 s，
+**v1.3.0 的 260 ms 从哪来**：P0 实机打点（当时版本用 `UDP2CAL_ASRC_DIAG=20`，每轮 300 s，
 Android 发送端 + Wi-Fi + VB-Cable）发现网络**周期性断供**：
 
 | 观测量 | 实测值 |
@@ -1247,7 +1247,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 
 刻意不用 DSCP 34（AF41）：实测 PC 下行方向反而劣化（超额 13.8%，p99 41.9 ms）。
 验证只能间接：标记生效后空口超额延迟从 ~25%（p99 38 ms）降到 ~7%（p99 17 ms），表现为
-diag CSV 里 `adjust_ppm` 贴满占比下降、`water_ms` 标准差变小。AP 是否真的尊重 DSCP 无法从
+`[Latency]` 日志里比率顶满占比下降、水位标准差变小。AP 是否真的尊重 DSCP 无法从
 本机确认；标记无效只是回到尽力而为，不会引入错误。
 
 ### 8.7 传输层调优（借鉴 Sunshine 的实践）

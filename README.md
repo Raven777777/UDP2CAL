@@ -38,7 +38,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 
 ```bat
 build.bat win --release                              :: 编译 Windows 接收端
-build.bat android --modern --abi arm64-v8a --release  :: 编译 Android 客户端
+build.bat android --abi arm64-v8a --release          :: 编译 Android 客户端
 build.bat doctor --fix                               :: 环境体检与自动修复
 ```
 
