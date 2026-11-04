@@ -45,7 +45,7 @@ object Prefs {
             .apply()
 
     var opusSignal: Int
-        get() = prefs.getInt("opus_signal", 3001) // OPUS_SIGNAL_VOICE (默认语音)
+        get() = prefs.getInt("opus_signal", 3002) // OPUS_SIGNAL_MUSIC (默认音乐)
         set(v) = prefs.edit().putInt("opus_signal", v).apply()
 
     var opusBandwidth: Int
@@ -69,15 +69,13 @@ object Prefs {
         set(v) = prefs.edit().putInt("opus_bitrate_kbps", v.coerceIn(0, Udp2CalProtocol.BITRATE_MAX_KBPS)).apply()
 
     var opusFec: Int
-        // 默认开（2 = 与 UI 勾选状态一致）：10 ms 帧的带内 FEC 只是把上一帧
-        // 的 LBRR 冗余放进当前包，不增加包数/延迟，却能靠单个后续包重建一帧。
-        get() = prefs.getInt("opus_fec", 2)
+        // 默认关（0 = 与 UI 勾选状态一致）；需要时可手动开启。
+        get() = prefs.getInt("opus_fec", 0)
         set(v) = prefs.edit().putInt("opus_fec", v.coerceIn(0, 2)).apply()
 
     var opusPacketLoss: Int
-        // 配合 FEC 开启：告诉编码器预期丢包率，它才会持续生成 LBRR 冗余；
-        // 为 0 时 libopus 认为无需冗余，等于把 FEC 白开。
-        get() = prefs.getInt("opus_packet_loss", 10)
+        // 默认 0：无丢包预期，编码器不生成 LBRR 冗余。
+        get() = prefs.getInt("opus_packet_loss", 0)
         set(v) = prefs.edit().putInt("opus_packet_loss", v.coerceIn(0, 100)).apply()
 
     var opusVbrConstraint: Int
