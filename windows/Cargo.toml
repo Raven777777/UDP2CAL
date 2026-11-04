@@ -1,28 +1,28 @@
 [package]
 name = "udp2cal"
 version = "1.5.1"
-edition = "2021"
+edition = "2024"
 description = "UDP2CAL - 局域网音频串流Windows接收端"
 build = "build.rs"
 
 [profile.release]
-opt-level = 3   # 实时音频路径优先速度，体积换性能不划算
-lto = true
+# 实时音频/解码路径优先速度：全量 LTO、单 CGU，不为了体积裁剪
+opt-level = 2
+lto = "fat"
 codegen-units = 1
 panic = "unwind"
-strip = "symbols"
 
 [build-dependencies]
 winres = "0.1"
-image = "0.24"
+image = "0.25"
 
 [dependencies]
 udp2cal-protocol = { path = "../protocol" }
 iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia", "image"] }
-tokio = { version = "1.40", features = ["net", "sync", "rt", "macros", "time"] }
-cpal = "0.15"
+tokio = { version = "1.54", features = ["net", "sync", "rt", "macros", "time"] }
+cpal = "0.18"
 socket2 = "0.6"
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
@@ -37,10 +37,10 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
 ] }
-winreg = "0.52"
+winreg = "0.56"
 audiopus = "0.3.0-rc.0"
-tray-icon = "0.24.0"
-image = "0.24"
+tray-icon = "0.26"
+image = "0.25"
 
 # 共用仓库根目录的 opus-src 树（Android/Windows 同源），替代 crate 内置的 Opus 1.3.1
 # audiopus 副本增加解码器 set_complexity 与编码器 set_dred_duration 扩展

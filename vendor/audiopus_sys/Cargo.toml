@@ -11,7 +11,7 @@
 # will likely look very different (and much more reasonable)
 
 [package]
-edition = "2018"
+edition = "2024"
 name = "audiopus_sys"
 version = "0.2.2"
 authors = ["Lakelezz <lakelezz@protonmail.ch>"]
@@ -25,7 +25,7 @@ repository = "https://github.com/lakelezz/audiopus_sys.git"
 
 [dependencies]
 [build-dependencies.bindgen]
-version = "0.58"
+version = "0.73"
 optional = true
 
 [build-dependencies.cmake]

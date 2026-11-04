@@ -13,19 +13,19 @@ mod logger;
 mod protocol;
 
 use iced::futures::SinkExt;
-use iced::widget::{button, column, container, progress_bar, row, text, text_input, Space};
+use iced::widget::{Space, button, column, container, progress_bar, row, text, text_input};
 use iced::{Alignment, Color, Element, Length, Subscription, Task, Theme};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GetLastError, BOOL, ERROR_ALREADY_EXISTS, HWND, LPARAM};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
-    MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONINFORMATION, MB_OK, SW_RESTORE,
+    MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
+use windows::core::{BOOL, PCWSTR};
 
 // ==========================================
 // 图标加载 (编译期嵌入 icon.png)
@@ -1356,9 +1356,17 @@ impl AppState {
                     );
                     logf!(
                         "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) FEC={} 水位={}ms SSRC={:#010x}",
-                        j.received, j.bytes, j.late, j.duplicate, j.overflow, j.resyncs,
-                        j.plc_frames, j.max_plc_run,
-                        FEC_FRAMES.swap(0, Ordering::Relaxed), water, peer.forward_ssrc
+                        j.received,
+                        j.bytes,
+                        j.late,
+                        j.duplicate,
+                        j.overflow,
+                        j.resyncs,
+                        j.plc_frames,
+                        j.max_plc_run,
+                        FEC_FRAMES.swap(0, Ordering::Relaxed),
+                        water,
+                        peer.forward_ssrc
                     );
                     // 丢包估计 = 序号跨度 − 成功入槽数（自上次重同步起）：把“真丢”
                     // 与本地丢弃（迟到/溢出的计数在旁边）分开看，才谈得上调水位/开 FEC。
@@ -1383,8 +1391,14 @@ impl AppState {
                     let r = capture::take_reverse_stats();
                     logf!(
                         "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={} 帧={} 均值us(wait/read/encode/send)={:.0}/{:.0}/{:.0}/{:.0} 积压峰值={}ms",
-                        r.packets, r.bytes, r.encode_errors, r.oversize, r.dropped_samples,
-                        r.send_errors, r.gaps, r.frames,
+                        r.packets,
+                        r.bytes,
+                        r.encode_errors,
+                        r.oversize,
+                        r.dropped_samples,
+                        r.send_errors,
+                        r.gaps,
+                        r.frames,
                         r.avg_us(r.wait_us),
                         r.avg_us(r.read_us),
                         r.avg_us(r.encode_us),
@@ -1961,13 +1975,13 @@ struct WindowSearch {
 /// 回调是同步的，指针在该调用期间有效且不与其它借用冲突。
 unsafe extern "system" fn find_window_for_process(hwnd: HWND, data: LPARAM) -> BOOL {
     // SAFETY: 见上，`data` 来自 restore_native_window 的 `&mut search`。
-    let search = &mut *(data.0 as *mut WindowSearch);
+    let search = unsafe { &mut *(data.0 as *mut WindowSearch) };
     let mut process_id = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
     if process_id != search.process_id {
         return BOOL(1);
     }
-    if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() || unsafe { GetWindowTextLengthW(hwnd) } == 0 {
         return BOOL(1);
     }
     search.window = hwnd;

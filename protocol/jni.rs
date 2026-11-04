@@ -43,7 +43,7 @@
 //!    `this` 与参数引用合法。本模块不把 `env`/`jobject`/`jbyteArray` 存进任何
 //!    全局或结构体，因此不存在跨调用悬垂。
 //! 2. **函数表非空**：`JNINativeInterface_` 的函数指针由 JVM 在创建/附着线程时
-//!    填满，JNI 规范要求非空，故 `f.GetXxx.unwrap()(...)` 不会 panic（见 [`fns`]）。
+//!    填满，JNI 规范要求非空，故 `(f.GetXxx)(...)` 不会 panic（见 [`fns`]）。
 //! 3. **句柄生命周期归 Kotlin 侧**：`Box::into_raw` 只出现在 `*Create`，
 //!    `Box::from_raw` 只出现在对应的 `*Destroy` 且均先判 `h != 0`。重复 destroy
 //!    或使用已释放句柄属于 Kotlin 侧契约违反（见 `docs/PROTOCOL_V3_RTP.md` §12），
@@ -57,6 +57,8 @@
 //
 // crate 根是 `#![deny(unsafe_code)]`，本模块是全 crate 唯一的例外。
 #![allow(unsafe_code)]
+// 整个模块就是一层 JNI unsafe 契约（见上），逐点再包 unsafe 块只是噪声
+#![allow(unsafe_op_in_unsafe_fn)]
 #![allow(non_snake_case)]
 #![allow(clippy::missing_safety_doc)]
 
@@ -64,34 +66,35 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use jni_sys::{
-    jboolean, jbyte, jbyteArray, jchar, jdouble, jdoubleArray, jint, jintArray, jlong, jlongArray,
-    jobject, jsize, jstring, JNIEnv, JNINativeInterface_,
+    JNIEnv, JNINativeInterface__1_1, jboolean, jbyte, jbyteArray, jchar, jdouble, jdoubleArray,
+    jint, jintArray, jlong, jlongArray, jobject, jsize, jstring,
 };
 
 use crate::rtp::{
-    extend_seq, extend_ts, water_target_ms, DeviceRateEstimator, DriftController, InsertResult,
-    JitterBuffer, Pull, RateEstimator, RtpHeader, RtpPacket, StepAbsorber, ARRIVAL_TRACE,
-    OPUS_FRAME_SAMPLES, OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, RTP_HEADER_SIZE,
+    ARRIVAL_TRACE, DeviceRateEstimator, DriftController, InsertResult, JitterBuffer,
+    OPUS_FRAME_SAMPLES, OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, Pull, RTP_HEADER_SIZE, RateEstimator,
+    RtpHeader, RtpPacket, StepAbsorber, extend_seq, extend_ts, water_target_ms,
 };
 use crate::{
-    build_control, clamp_bitrate_kbps, parse_control, snap_bitrate_kbps, ConnectAckPayload,
-    ConnectPayload, ControlHeader, DiscoverReply, BITRATE_AUTO_KBPS, BITRATE_MAX_KBPS,
-    BITRATE_STEPS_KBPS, CONNECT_ACK_PAYLOAD_SIZE, CONNECT_PAYLOAD_SIZE, CONTROL_HEADER_SIZE,
-    CONTROL_MAX_PAYLOAD, CONTROL_VERSION, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE, DEVICE_NAME_MAX,
-    DISCOVER_PORT, OPUS_FRAME_MS, OPUS_PAYLOAD_TYPE, TYPE_CONNECT, TYPE_CONNECT_ACK, TYPE_DATA,
-    TYPE_DISCOVER_REPLY, TYPE_DISCOVER_REQ, TYPE_MAX_KNOWN,
+    BITRATE_AUTO_KBPS, BITRATE_MAX_KBPS, BITRATE_STEPS_KBPS, CONNECT_ACK_PAYLOAD_SIZE,
+    CONNECT_PAYLOAD_SIZE, CONTROL_HEADER_SIZE, CONTROL_MAX_PAYLOAD, CONTROL_VERSION,
+    ConnectAckPayload, ConnectPayload, ControlHeader, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE,
+    DEVICE_NAME_MAX, DISCOVER_PORT, DiscoverReply, OPUS_FRAME_MS, OPUS_PAYLOAD_TYPE, TYPE_CONNECT,
+    TYPE_CONNECT_ACK, TYPE_DATA, TYPE_DISCOVER_REPLY, TYPE_DISCOVER_REQ, TYPE_MAX_KNOWN,
+    build_control, clamp_bitrate_kbps, parse_control, snap_bitrate_kbps,
 };
 
 /// 原生方法收到的 `JNIEnv`：与 `jni-sys` 函数表字段同型，直接透传。
 type Env = *mut JNIEnv;
 type Handle = jlong;
 
+/// 本模块只用到 JNI 1.1 就有的函数，故固定取 1.1 版函数表。
 #[inline]
-unsafe fn fns(env: Env) -> &'static JNINativeInterface_ {
+unsafe fn fns(env: Env) -> &'static JNINativeInterface__1_1 {
     // SAFETY: `env` 由 JVM 在本次 native 调用期间保证有效且非空；它指向的
-    // `JNINativeInterface_` 在 JVM 生命周期内不可变且一直存活，因此返回
-    // `'static` 引用是成立的（实际只在本模块内按本次调用的作用域使用）。
-    &**env
+    // 函数表在 JVM 生命周期内不可变且一直存活，因此返回 `'static` 引用是
+    // 成立的（实际只在本模块内按本次调用的作用域使用）。
+    &(**env).v1_1
 }
 
 #[inline]
@@ -115,14 +118,14 @@ unsafe fn read_bytes(
         return false;
     }
     let f = fns(env);
-    let total = f.GetArrayLength.unwrap()(env, arr);
+    let total = (f.GetArrayLength)(env, arr);
     if total < 0 || (offset as i64 + len as i64) > total as i64 {
         return false;
     }
     out.clear();
     out.resize(len as usize, 0);
     if len > 0 {
-        f.GetByteArrayRegion.unwrap()(env, arr, offset, len, out.as_mut_ptr() as *mut jbyte);
+        (f.GetByteArrayRegion)(env, arr, offset, len, out.as_mut_ptr() as *mut jbyte);
     }
     true
 }
@@ -163,12 +166,12 @@ unsafe fn write_bytes(env: Env, arr: jbyteArray, offset: jint, data: &[u8]) -> b
         return false;
     }
     let f = fns(env);
-    let total = f.GetArrayLength.unwrap()(env, arr);
+    let total = (f.GetArrayLength)(env, arr);
     if total < 0 || (offset as i64 + data.len() as i64) > total as i64 {
         return false;
     }
     if !data.is_empty() {
-        f.SetByteArrayRegion.unwrap()(
+        (f.SetByteArrayRegion)(
             env,
             arr,
             offset,
@@ -181,12 +184,12 @@ unsafe fn write_bytes(env: Env, arr: jbyteArray, offset: jint, data: &[u8]) -> b
 
 unsafe fn new_bytes(env: Env, data: &[u8]) -> jbyteArray {
     let f = fns(env);
-    let arr = f.NewByteArray.unwrap()(env, data.len() as jsize);
+    let arr = (f.NewByteArray)(env, data.len() as jsize);
     if arr.is_null() {
         return null();
     }
     if !data.is_empty() {
-        f.SetByteArrayRegion.unwrap()(
+        (f.SetByteArrayRegion)(
             env,
             arr,
             0,
@@ -199,38 +202,38 @@ unsafe fn new_bytes(env: Env, data: &[u8]) -> jbyteArray {
 
 unsafe fn new_longs(env: Env, data: &[jlong]) -> jlongArray {
     let f = fns(env);
-    let arr = f.NewLongArray.unwrap()(env, data.len() as jsize);
+    let arr = (f.NewLongArray)(env, data.len() as jsize);
     if arr.is_null() {
         return null();
     }
-    f.SetLongArrayRegion.unwrap()(env, arr, 0, data.len() as jsize, data.as_ptr());
+    (f.SetLongArrayRegion)(env, arr, 0, data.len() as jsize, data.as_ptr());
     arr
 }
 
 unsafe fn new_ints(env: Env, data: &[jint]) -> jintArray {
     let f = fns(env);
-    let arr = f.NewIntArray.unwrap()(env, data.len() as jsize);
+    let arr = (f.NewIntArray)(env, data.len() as jsize);
     if arr.is_null() {
         return null();
     }
-    f.SetIntArrayRegion.unwrap()(env, arr, 0, data.len() as jsize, data.as_ptr());
+    (f.SetIntArrayRegion)(env, arr, 0, data.len() as jsize, data.as_ptr());
     arr
 }
 
 unsafe fn new_doubles(env: Env, data: &[jdouble]) -> jdoubleArray {
     let f = fns(env);
-    let arr = f.NewDoubleArray.unwrap()(env, data.len() as jsize);
+    let arr = (f.NewDoubleArray)(env, data.len() as jsize);
     if arr.is_null() {
         return null();
     }
-    f.SetDoubleArrayRegion.unwrap()(env, arr, 0, data.len() as jsize, data.as_ptr());
+    (f.SetDoubleArrayRegion)(env, arr, 0, data.len() as jsize, data.as_ptr());
     arr
 }
 
 /// 返回 `null` 当 `s` 含无法编码的内容（现代 JNI 用 UTF-16，不会再出现 MUTF-8 问题）。
 unsafe fn new_string(env: Env, s: &str) -> jstring {
     let units: Vec<u16> = s.encode_utf16().collect();
-    fns(env).NewString.unwrap()(env, units.as_ptr() as *const jchar, units.len() as jsize)
+    (fns(env).NewString)(env, units.as_ptr() as *const jchar, units.len() as jsize)
 }
 
 // ═══════════════════════ 时钟桥 ═══════════════════════
@@ -286,7 +289,7 @@ fn nanos_from_instant(at: Instant) -> i64 {
 ///
 /// Kotlin 侧在库加载完成后**立刻**调用一次（[`ProtocolNative`] 的 `init`）。
 /// 重复调用是允许的：每次覆盖基准。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_clockSync(
     _env: Env,
     _this: jobject,
@@ -298,7 +301,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_clockSy
 // ═══════════════════════ 常量导出（防两端漂移） ═══════════════════════
 
 /// 全部整数常量，顺序见 `Udp2CalProtocolTest.nativeConstantsMatchKotlinConstants`。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constants(
     env: Env,
     _this: jobject,
@@ -353,7 +356,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
 }
 
 /// 全部浮点常量。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constantsReal(
     env: Env,
     _this: jobject,
@@ -375,7 +378,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
 // ═══════════════════════ 控制面（纯函数） ═══════════════════════
 
 /// `[msg_type, payload_len, id0..id7]`，解析失败返回 null。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_decodeControlHeader(
     env: Env,
     _this: jobject,
@@ -400,7 +403,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_decodeC
 }
 
 /// 与 `decodeControlHeader` 相同，但要求数据报长度精确等于 `15 + payload_len`。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseControl(
     env: Env,
     _this: jobject,
@@ -441,7 +444,7 @@ fn build_control_args_ok(msg_type: jint, payload_len: jint) -> bool {
         && (0..=CONTROL_MAX_PAYLOAD as jint).contains(&payload_len)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_buildControl(
     env: Env,
     _this: jobject,
@@ -457,7 +460,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_buildCo
     if payload.is_null() {
         return null();
     }
-    let payload_len = fns(env).GetArrayLength.unwrap()(env, payload);
+    let payload_len = (fns(env).GetArrayLength)(env, payload);
     if !build_control_args_ok(msg_type, payload_len) {
         return null();
     }
@@ -471,7 +474,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_buildCo
 
 /// `[reversePort, forwardSsrc, payloadType, frameMs, complexity, signal,
 ///   bandwidth, opusFlags, bitrateKbps, packetLoss]`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connectDecode(
     env: Env,
     _this: jobject,
@@ -502,7 +505,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connect
     new_ints(env, &out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connectEncode(
     env: Env,
     _this: jobject,
@@ -533,7 +536,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connect
 }
 
 /// `[reverseSsrc, payloadType, frameMs, forwardSsrc]`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackDecode(
     env: Env,
     _this: jobject,
@@ -558,7 +561,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackDeco
     new_ints(env, &out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackEncode(
     env: Env,
     _this: jobject,
@@ -577,7 +580,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackEnco
 }
 
 /// DISCOVER_REPLY 的监听端口；非法返回 0。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_discoverPort(
     env: Env,
     _this: jobject,
@@ -596,7 +599,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_discove
 }
 
 /// DISCOVER_REPLY 的设备名；非法返回 null（空名已在 Rust 侧回落为 `"UDP2CAL PC"`）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_discoverName(
     env: Env,
     _this: jobject,
@@ -614,7 +617,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_discove
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_clampBitrate(
     _env: Env,
     _this: jobject,
@@ -626,7 +629,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_clampBi
     clamp_bitrate_kbps(kbps.min(BITRATE_MAX_KBPS as jint) as u16) as jint
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_snapBitrate(
     _env: Env,
     _this: jobject,
@@ -641,7 +644,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_snapBit
 // ═══════════════════════ RTP ═══════════════════════
 
 /// `[marker, seq, timestamp, ssrc, payloadOffset, payloadLength]`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseRtp(
     env: Env,
     _this: jobject,
@@ -667,7 +670,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseRt
     new_longs(env, &out)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_writeRtpHeader(
     env: Env,
     _this: jobject,
@@ -678,18 +681,14 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_writeRt
     timestamp: jint,
     ssrc: jint,
 ) -> jboolean {
-    let hdr = RtpHeader::new(marker != 0, seq as u16, timestamp as u32, ssrc as u32);
+    let hdr = RtpHeader::new(marker, seq as u16, timestamp as u32, ssrc as u32);
     let mut raw = [0u8; RTP_HEADER_SIZE];
     hdr.encode(&mut raw);
     // 目标数组太小/offset 非法时返回 false，上层可记录；不再静默发旧头
-    if write_bytes(env, dest, offset, &raw) {
-        1
-    } else {
-        0
-    }
+    write_bytes(env, dest, offset, &raw)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_extendSeq(
     _env: Env,
     _this: jobject,
@@ -699,7 +698,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_extendS
     extend_seq(highest as u64, seq as u16) as jlong
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_extendTs(
     _env: Env,
     _this: jobject,
@@ -790,7 +789,7 @@ unsafe fn device_rate_ref(h: Handle) -> Option<&'static DeviceRateHandle> {
 
 // ═══════════════════════ JitterBuffer ═══════════════════════
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbCreate(
     _env: Env,
     _this: jobject,
@@ -808,7 +807,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbCreat
     Box::into_raw(handle) as Handle
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbDestroy(
     _env: Env,
     _this: jobject,
@@ -821,7 +820,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbDestr
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbReset(
     _env: Env,
     _this: jobject,
@@ -836,7 +835,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbReset
 }
 
 /// 显式启动预缓冲：攒到本方向目标水位才起播（不再 30 ms 起播后慢慢爬）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbSetStartPrebufferMs(
     _env: Env,
     _this: jobject,
@@ -850,7 +849,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbSetSt
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbInsert(
     env: Env,
     _this: jobject,
@@ -864,7 +863,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbInser
 ) -> jboolean {
     let handle = match jb_ref(h) {
         Some(x) => x,
-        None => return 0,
+        None => return false,
     };
     let mut g = lock(&handle.inner);
     // 暂存区借出：同一结构字段的不可变/可变借用无法通过 `g.` 路径共存
@@ -873,7 +872,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbInser
     if read_bytes(env, buf, offset, length, &mut scratch) {
         let len = scratch.len();
         let pkt = RtpPacket {
-            marker: marker != 0,
+            marker,
             payload_type: OPUS_PAYLOAD_TYPE,
             seq: seq as u16,
             timestamp: ts as u32,
@@ -886,15 +885,11 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbInser
     // 否则下一次 pull 会因输出切片不够长而把可播帧当成 Wait（VBR 下必现）
     ensure_payload_capacity(&mut scratch);
     g.scratch = scratch;
-    if ok {
-        1
-    } else {
-        0
-    }
+    ok
 }
 
 /// 返回 `Pull` 的判别值（0=WAIT、1=PACKET、2=PLC、3=SILENCE）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
     env: Env,
     _this: jobject,
@@ -943,7 +938,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
 /// 返回负载长度；`0` 表示播放位的包还没到（或句柄无效），调用方退回 PLC。
 /// 与 `jbPull` 的 `WAIT`(0) 同值但语义不同：本函数**不推进**任何游标，
 /// 也不会改变 `pulledLen`/`pulledTs`（那两个描述的是上一次 `jbPull` 的结果）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPeek(
     env: Env,
     _this: jobject,
@@ -966,16 +961,12 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPeek(
     };
     let ok = write_bytes(env, out, 0, &scratch[..len]);
     g.scratch = scratch;
-    if ok {
-        len as jint
-    } else {
-        0
-    }
+    if ok { len as jint } else { 0 }
 }
 
 /// 阶跃裁剪：按播放顺序取一帧，调用方必须**解码后丢弃 PCM**，
 /// 让有状态 Opus 解码器跟住发送端。返回判别值同 `jbPull`。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPullTrim(
     env: Env,
     _this: jobject,
@@ -1012,7 +1003,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPullT
 
 macro_rules! jb_scalar {
     ($name:ident, $ret:ty, $body:expr) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub unsafe extern "system" fn $name(_env: Env, _this: jobject, h: Handle) -> $ret {
             match jb_ref(h) {
                 Some(handle) => {
@@ -1044,12 +1035,12 @@ jb_scalar!(
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbStarted,
     jboolean,
-    |g: &JbInner| if g.jb.is_started() { 1 } else { 0 }
+    |g: &JbInner| g.jb.is_started()
 );
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbPlaying,
     jboolean,
-    |g: &JbInner| if g.jb.is_playing() { 1 } else { 0 }
+    |g: &JbInner| g.jb.is_playing()
 );
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbPlcRun,
@@ -1143,7 +1134,7 @@ jb_scalar!(
 );
 
 /// 到达时刻换算成 Java `System.nanoTime()` 口径；查不到返回 -1。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbArrivalNanosAt(
     _env: Env,
     _this: jobject,
@@ -1163,7 +1154,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbArriv
 }
 
 /// 最近一次重同步原因；从未重同步返回空串。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbLastRebaseReason(
     env: Env,
     _this: jobject,
@@ -1179,7 +1170,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbLastR
 
 // ═══════════════════════ StepAbsorber ═══════════════════════
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saCreate(
     _env: Env,
     _this: jobject,
@@ -1189,7 +1180,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saCreat
     })) as Handle
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDestroy(
     _env: Env,
     _this: jobject,
@@ -1200,7 +1191,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDestr
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saReset(
     _env: Env,
     _this: jobject,
@@ -1212,7 +1203,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saReset
 }
 
 /// 返回值打包：`frames << 32 | limited`。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecide(
     _env: Env,
     _this: jobject,
@@ -1230,7 +1221,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecid
     let d = g.decide(
         jb_water_ms.max(0) as u32,
         pipe_ms.max(0) as u32,
-        can_trim != 0,
+        can_trim,
         target_ms.max(0) as u32,
     );
     // 高 32 位帧数、低 1 位限额标志。隐式契约：`frames <= PLC_MAX_MS / FRAME_MS`（=12），
@@ -1240,7 +1231,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecid
 
 /// 与 [`..._saDecide`] 相同，但显式传入 `System.nanoTime()` 基准时刻，
 /// 供单测推进虚拟时间（生产路径仍用实时时钟）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecideAt(
     _env: Env,
     _this: jobject,
@@ -1259,14 +1250,14 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecid
     let d = g.decide_at(
         jb_water_ms.max(0) as u32,
         pipe_ms.max(0) as u32,
-        can_trim != 0,
+        can_trim,
         target_ms.max(0) as u32,
         instant_from_nanos(now_nanos),
     );
     ((d.frames as jlong) << 32) | (d.limited as jlong)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saHits(
     _env: Env,
     _this: jobject,
@@ -1278,7 +1269,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saHits(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saTrimsInWindow(
     _env: Env,
     _this: jobject,
@@ -1290,21 +1281,21 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saTrims
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saTakeLimitedLog(
     _env: Env,
     _this: jobject,
     h: Handle,
 ) -> jboolean {
     match step_ref(h) {
-        Some(handle) => lock(&handle.inner).take_limited_log() as jboolean,
-        None => 0,
+        Some(handle) => lock(&handle.inner).take_limited_log(),
+        None => false,
     }
 }
 
 // ═══════════════════════ RateEstimator ═══════════════════════
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reCreate(
     _env: Env,
     _this: jobject,
@@ -1314,7 +1305,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reCreat
     })) as Handle
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reDestroy(
     _env: Env,
     _this: jobject,
@@ -1325,7 +1316,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reDestr
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reReset(
     _env: Env,
     _this: jobject,
@@ -1337,7 +1328,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reReset
 }
 
 /// `arrived_nanos` 是 Java `System.nanoTime()`，内部换算成 `Instant`。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reObserve(
     _env: Env,
     _this: jobject,
@@ -1351,7 +1342,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reObser
 }
 
 /// 无估计时返回 NaN（Kotlin 侧转成 null）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reFeedforward(
     _env: Env,
     _this: jobject,
@@ -1363,7 +1354,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reFeedf
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reSigmaPpm(
     _env: Env,
     _this: jobject,
@@ -1375,7 +1366,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reSigma
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reUsedBuckets(
     _env: Env,
     _this: jobject,
@@ -1387,7 +1378,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reUsedB
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reObservations(
     _env: Env,
     _this: jobject,
@@ -1401,7 +1392,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_reObser
 
 // ═══════════════════ DeviceRateEstimator（设备时钟前馈） ═══════════════════
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deCreate(
     _env: Env,
     _this: jobject,
@@ -1411,7 +1402,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deCreat
     })) as Handle
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deDestroy(
     _env: Env,
     _this: jobject,
@@ -1422,7 +1413,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deDestr
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deReset(
     _env: Env,
     _this: jobject,
@@ -1434,7 +1425,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deReset
 }
 
 /// `played_nanos` 用 Java `System.nanoTime()`，与 `Instant` 同源。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deObserve(
     _env: Env,
     _this: jobject,
@@ -1451,7 +1442,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deObser
 }
 
 /// 无估计时返回 NaN。正值表示设备时钟偏慢。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deFeedforward(
     _env: Env,
     _this: jobject,
@@ -1463,7 +1454,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deFeedf
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deSigmaPpm(
     _env: Env,
     _this: jobject,
@@ -1475,7 +1466,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deSigma
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deBuckets(
     _env: Env,
     _this: jobject,
@@ -1489,7 +1480,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deBucke
 
 // ═══════════════════════ DriftController ═══════════════════════
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcCreate(
     _env: Env,
     _this: jobject,
@@ -1511,7 +1502,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcCreat
     })) as Handle
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcDestroy(
     _env: Env,
     _this: jobject,
@@ -1522,7 +1513,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcDestr
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcReset(
     _env: Env,
     _this: jobject,
@@ -1533,7 +1524,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcReset
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcUpdate(
     _env: Env,
     _this: jobject,
@@ -1548,7 +1539,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcUpdat
     lock(&handle.inner).update(water_ms.max(0) as u32, device_frames.max(0) as u64)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcAdjust(
     _env: Env,
     _this: jobject,
@@ -1560,7 +1551,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcAdjus
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcWater(
     _env: Env,
     _this: jobject,
@@ -1572,7 +1563,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcWater
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcIntegral(
     _env: Env,
     _this: jobject,
@@ -1584,7 +1575,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcInteg
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcTargetMs(
     _env: Env,
     _this: jobject,
@@ -1596,7 +1587,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcTarge
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcRatioUpdates(
     _env: Env,
     _this: jobject,
@@ -1609,7 +1600,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcRatio
 }
 
 /// 环境变量给出的目标水位（Android 无环境变量，恒为 [`WATER_TARGET_MS`]）。
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_waterTargetMs(
     _env: Env,
     _this: jobject,

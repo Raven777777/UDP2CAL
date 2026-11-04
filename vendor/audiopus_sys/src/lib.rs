@@ -82,14 +82,14 @@ pub type opus_int32 = ::std::os::raw::c_int;
 pub type opus_uint32 = ::std::os::raw::c_uint;
 pub type opus_int16 = ::std::os::raw::c_short;
 pub type opus_uint16 = ::std::os::raw::c_ushort;
-extern "C" {
+unsafe extern "C" {
     #[doc = " Converts an opus error code into a human readable string."]
     #[doc = ""]
     #[doc = " @param[in] error <tt>int</tt>: Error number"]
     #[doc = " @returns Error string"]
     pub fn opus_strerror(error: ::std::os::raw::c_int) -> *const ::std::os::raw::c_char;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the libopus version string."]
     #[doc = ""]
     #[doc = " Applications may look for the substring \"-fixed\" in the version string to"]
@@ -104,14 +104,14 @@ extern "C" {
 pub struct OpusEncoder {
     _unused: [u8; 0],
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the size of an <code>OpusEncoder</code> structure."]
     #[doc = " @param[in] channels <tt>int</tt>: Number of channels."]
     #[doc = "                                   This must be 1 or 2."]
     #[doc = " @returns The size in bytes."]
     pub fn opus_encoder_get_size(channels: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Allocates and initializes an encoder state."]
     #[doc = " There are three coding modes:"]
     #[doc = ""]
@@ -150,7 +150,7 @@ extern "C" {
         error: *mut ::std::os::raw::c_int,
     ) -> *mut OpusEncoder;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Initializes a previously allocated encoder state"]
     #[doc = " The memory pointed to by st must be at least the size returned by opus_encoder_get_size()."]
     #[doc = " This is intended for applications which use their own allocator instead of malloc."]
@@ -170,7 +170,7 @@ extern "C" {
         application: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Encodes an Opus frame."]
     #[doc = " @param [in] st <tt>OpusEncoder*</tt>: Encoder state"]
     #[doc = " @param [in] pcm <tt>opus_int16*</tt>: Input signal (interleaved if 2 channels). length is frame_size*channels*sizeof(opus_int16)"]
@@ -206,7 +206,7 @@ extern "C" {
         max_data_bytes: opus_int32,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Encodes an Opus frame from floating point input."]
     #[doc = " @param [in] st <tt>OpusEncoder*</tt>: Encoder state"]
     #[doc = " @param [in] pcm <tt>float*</tt>: Input in float format (interleaved if 2 channels), with a normal range of +/-1.0."]
@@ -247,12 +247,12 @@ extern "C" {
         max_data_bytes: opus_int32,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Frees an <code>OpusEncoder</code> allocated by opus_encoder_create()."]
     #[doc = " @param[in] st <tt>OpusEncoder*</tt>: State to be freed."]
     pub fn opus_encoder_destroy(st: *mut OpusEncoder);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Perform a CTL function on an Opus encoder."]
     #[doc = ""]
     #[doc = " Generally the request and subsequent arguments are generated"]
@@ -274,14 +274,14 @@ extern "C" {
 pub struct OpusDecoder {
     _unused: [u8; 0],
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the size of an <code>OpusDecoder</code> structure."]
     #[doc = " @param [in] channels <tt>int</tt>: Number of channels."]
     #[doc = "                                    This must be 1 or 2."]
     #[doc = " @returns The size in bytes."]
     pub fn opus_decoder_get_size(channels: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Allocates and initializes a decoder state."]
     #[doc = " @param [in] Fs <tt>opus_int32</tt>: Sample rate to decode at (Hz)."]
     #[doc = "                                     This must be one of 8000, 12000, 16000,"]
@@ -302,7 +302,7 @@ extern "C" {
         error: *mut ::std::os::raw::c_int,
     ) -> *mut OpusDecoder;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Initializes a previously allocated decoder state."]
     #[doc = " The state must be at least the size returned by opus_decoder_get_size()."]
     #[doc = " This is intended for applications which use their own allocator instead of malloc. @see opus_decoder_create,opus_decoder_get_size"]
@@ -319,7 +319,7 @@ extern "C" {
         channels: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Decode an Opus packet."]
     #[doc = " @param [in] st <tt>OpusDecoder*</tt>: Decoder state"]
     #[doc = " @param [in] data <tt>char*</tt>: Input payload. Use a NULL pointer to indicate packet loss"]
@@ -344,7 +344,7 @@ extern "C" {
         decode_fec: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Decode an Opus packet with floating point output."]
     #[doc = " @param [in] st <tt>OpusDecoder*</tt>: Decoder state"]
     #[doc = " @param [in] data <tt>char*</tt>: Input payload. Use a NULL pointer to indicate packet loss"]
@@ -369,7 +369,7 @@ extern "C" {
         decode_fec: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Perform a CTL function on an Opus decoder."]
     #[doc = ""]
     #[doc = " Generally the request and subsequent arguments are generated"]
@@ -386,12 +386,12 @@ extern "C" {
         ...
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Frees an <code>OpusDecoder</code> allocated by opus_decoder_create()."]
     #[doc = " @param[in] st <tt>OpusDecoder*</tt>: State to be freed."]
     pub fn opus_decoder_destroy(st: *mut OpusDecoder);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Parse an opus packet into one or more frames."]
     #[doc = " Opus_decode will perform this operation internally so most applications do"]
     #[doc = " not need to use this function."]
@@ -413,7 +413,7 @@ extern "C" {
         payload_offset: *mut ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the bandwidth of an Opus packet."]
     #[doc = " @param [in] data <tt>char*</tt>: Opus packet"]
     #[doc = " @retval OPUS_BANDWIDTH_NARROWBAND Narrowband (4kHz bandpass)"]
@@ -425,7 +425,7 @@ extern "C" {
     pub fn opus_packet_get_bandwidth(data: *const ::std::os::raw::c_uchar)
         -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the number of samples per frame from an Opus packet."]
     #[doc = " @param [in] data <tt>char*</tt>: Opus packet."]
     #[doc = "                                  This must contain at least one byte of"]
@@ -439,7 +439,7 @@ extern "C" {
         Fs: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the number of channels from an Opus packet."]
     #[doc = " @param [in] data <tt>char*</tt>: Opus packet"]
     #[doc = " @returns Number of channels"]
@@ -448,7 +448,7 @@ extern "C" {
         data: *const ::std::os::raw::c_uchar,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the number of frames in an Opus packet."]
     #[doc = " @param [in] packet <tt>char*</tt>: Opus packet"]
     #[doc = " @param [in] len <tt>opus_int32</tt>: Length of packet"]
@@ -460,7 +460,7 @@ extern "C" {
         len: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the number of samples of an Opus packet."]
     #[doc = " @param [in] packet <tt>char*</tt>: Opus packet"]
     #[doc = " @param [in] len <tt>opus_int32</tt>: Length of packet"]
@@ -476,7 +476,7 @@ extern "C" {
         Fs: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the number of samples of an Opus packet."]
     #[doc = " @param [in] dec <tt>OpusDecoder*</tt>: Decoder state"]
     #[doc = " @param [in] packet <tt>char*</tt>: Opus packet"]
@@ -490,7 +490,7 @@ extern "C" {
         len: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Applies soft-clipping to bring a float signal within the [-1,1] range. If"]
     #[doc = " the signal is already in that range, nothing is done. If there are values"]
     #[doc = " outside of [-1,1], then the signal is clipped as smoothly as possible to"]
@@ -512,12 +512,12 @@ extern "C" {
 pub struct OpusRepacketizer {
     _unused: [u8; 0],
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the size of an <code>OpusRepacketizer</code> structure."]
     #[doc = " @returns The size in bytes."]
     pub fn opus_repacketizer_get_size() -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " (Re)initializes a previously allocated repacketizer state."]
     #[doc = " The state must be at least the size returned by opus_repacketizer_get_size()."]
     #[doc = " This can be used for applications which use their own allocator instead of"]
@@ -536,18 +536,18 @@ extern "C" {
     #[doc = " @returns A pointer to the same repacketizer state that was passed in."]
     pub fn opus_repacketizer_init(rp: *mut OpusRepacketizer) -> *mut OpusRepacketizer;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Allocates memory and initializes the new repacketizer with"]
     #[doc = " opus_repacketizer_init()."]
     pub fn opus_repacketizer_create() -> *mut OpusRepacketizer;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Frees an <code>OpusRepacketizer</code> allocated by"]
     #[doc = " opus_repacketizer_create()."]
     #[doc = " @param[in] rp <tt>OpusRepacketizer*</tt>: State to be freed."]
     pub fn opus_repacketizer_destroy(rp: *mut OpusRepacketizer);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Add a packet to the current repacketizer state."]
     #[doc = " This packet must match the configuration of any packets already submitted"]
     #[doc = " for repacketization since the last call to opus_repacketizer_init()."]
@@ -600,7 +600,7 @@ extern "C" {
         len: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Construct a new packet from data previously submitted to the repacketizer"]
     #[doc = " state via opus_repacketizer_cat()."]
     #[doc = " @param rp <tt>OpusRepacketizer*</tt>: The repacketizer state from which to"]
@@ -639,7 +639,7 @@ extern "C" {
         maxlen: opus_int32,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Return the total number of frames contained in packet data submitted to"]
     #[doc = " the repacketizer state so far via opus_repacketizer_cat() since the last"]
     #[doc = " call to opus_repacketizer_init() or opus_repacketizer_create()."]
@@ -651,7 +651,7 @@ extern "C" {
     #[doc = "          to the repacketizer state."]
     pub fn opus_repacketizer_get_nb_frames(rp: *mut OpusRepacketizer) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Construct a new packet from data previously submitted to the repacketizer"]
     #[doc = " state via opus_repacketizer_cat()."]
     #[doc = " This is a convenience routine that returns all the data submitted so far"]
@@ -686,7 +686,7 @@ extern "C" {
         maxlen: opus_int32,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Pads a given Opus packet to a larger size (possibly changing the TOC sequence)."]
     #[doc = " @param[in,out] data <tt>const unsigned char*</tt>: The buffer containing the"]
     #[doc = "                                                   packet to pad."]
@@ -704,7 +704,7 @@ extern "C" {
         new_len: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Remove all padding from a given Opus packet and rewrite the TOC sequence to"]
     #[doc = " minimize space usage."]
     #[doc = " @param[in,out] data <tt>const unsigned char*</tt>: The buffer containing the"]
@@ -717,7 +717,7 @@ extern "C" {
     #[doc = " @retval #OPUS_INVALID_PACKET \\a data did not contain a valid Opus packet."]
     pub fn opus_packet_unpad(data: *mut ::std::os::raw::c_uchar, len: opus_int32) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Pads a given Opus multi-stream packet to a larger size (possibly changing the TOC sequence)."]
     #[doc = " @param[in,out] data <tt>const unsigned char*</tt>: The buffer containing the"]
     #[doc = "                                                   packet to pad."]
@@ -738,7 +738,7 @@ extern "C" {
         nb_streams: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Remove all padding from a given Opus multi-stream packet and rewrite the TOC sequence to"]
     #[doc = " minimize space usage."]
     #[doc = " @param[in,out] data <tt>const unsigned char*</tt>: The buffer containing the"]
@@ -767,7 +767,7 @@ pub struct OpusMSEncoder {
 pub struct OpusMSDecoder {
     _unused: [u8; 0],
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the size of an OpusMSEncoder structure."]
     #[doc = " @param streams <tt>int</tt>: The total number of streams to encode from the"]
     #[doc = "                              input."]
@@ -787,13 +787,13 @@ extern "C" {
         coupled_streams: ::std::os::raw::c_int,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn opus_multistream_surround_encoder_get_size(
         channels: ::std::os::raw::c_int,
         mapping_family: ::std::os::raw::c_int,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Allocates and initializes a multistream encoder state."]
     #[doc = " Call opus_multistream_encoder_destroy() to release"]
     #[doc = " this object when finished."]
@@ -846,7 +846,7 @@ extern "C" {
         error: *mut ::std::os::raw::c_int,
     ) -> *mut OpusMSEncoder;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn opus_multistream_surround_encoder_create(
         Fs: opus_int32,
         channels: ::std::os::raw::c_int,
@@ -858,7 +858,7 @@ extern "C" {
         error: *mut ::std::os::raw::c_int,
     ) -> *mut OpusMSEncoder;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Initialize a previously allocated multistream encoder state."]
     #[doc = " The memory pointed to by \\a st must be at least the size returned by"]
     #[doc = " opus_multistream_encoder_get_size()."]
@@ -916,7 +916,7 @@ extern "C" {
         application: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn opus_multistream_surround_encoder_init(
         st: *mut OpusMSEncoder,
         Fs: opus_int32,
@@ -928,7 +928,7 @@ extern "C" {
         application: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Encodes a multistream Opus frame."]
     #[doc = " @param st <tt>OpusMSEncoder*</tt>: Multistream encoder state."]
     #[doc = " @param[in] pcm <tt>const opus_int16*</tt>: The input signal as interleaved"]
@@ -966,7 +966,7 @@ extern "C" {
         max_data_bytes: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Encodes a multistream Opus frame from floating point input."]
     #[doc = " @param st <tt>OpusMSEncoder*</tt>: Multistream encoder state."]
     #[doc = " @param[in] pcm <tt>const float*</tt>: The input signal as interleaved"]
@@ -1011,13 +1011,13 @@ extern "C" {
         max_data_bytes: opus_int32,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Frees an <code>OpusMSEncoder</code> allocated by"]
     #[doc = " opus_multistream_encoder_create()."]
     #[doc = " @param st <tt>OpusMSEncoder*</tt>: Multistream encoder state to be freed."]
     pub fn opus_multistream_encoder_destroy(st: *mut OpusMSEncoder);
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Perform a CTL function on a multistream Opus encoder."]
     #[doc = ""]
     #[doc = " Generally the request and subsequent arguments are generated by a"]
@@ -1035,7 +1035,7 @@ extern "C" {
         ...
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Gets the size of an <code>OpusMSDecoder</code> structure."]
     #[doc = " @param streams <tt>int</tt>: The total number of streams coded in the"]
     #[doc = "                              input."]
@@ -1055,7 +1055,7 @@ extern "C" {
         coupled_streams: ::std::os::raw::c_int,
     ) -> opus_int32;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Allocates and initializes a multistream decoder state."]
     #[doc = " Call opus_multistream_decoder_destroy() to release"]
     #[doc = " this object when finished."]
@@ -1093,7 +1093,7 @@ extern "C" {
         error: *mut ::std::os::raw::c_int,
     ) -> *mut OpusMSDecoder;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Intialize a previously allocated decoder state object."]
     #[doc = " The memory pointed to by \\a st must be at least the size returned by"]
     #[doc = " opus_multistream_encoder_get_size()."]
@@ -1136,7 +1136,7 @@ extern "C" {
         mapping: *const ::std::os::raw::c_uchar,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Decode a multistream Opus packet."]
     #[doc = " @param st <tt>OpusMSDecoder*</tt>: Multistream decoder state."]
     #[doc = " @param[in] data <tt>const unsigned char*</tt>: Input payload."]
@@ -1174,7 +1174,7 @@ extern "C" {
         decode_fec: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Decode a multistream Opus packet with floating point output."]
     #[doc = " @param st <tt>OpusMSDecoder*</tt>: Multistream decoder state."]
     #[doc = " @param[in] data <tt>const unsigned char*</tt>: Input payload."]
@@ -1212,7 +1212,7 @@ extern "C" {
         decode_fec: ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Perform a CTL function on a multistream Opus decoder."]
     #[doc = ""]
     #[doc = " Generally the request and subsequent arguments are generated by a"]
@@ -1230,7 +1230,7 @@ extern "C" {
         ...
     ) -> ::std::os::raw::c_int;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " Frees an <code>OpusMSDecoder</code> allocated by"]
     #[doc = " opus_multistream_decoder_create()."]
     #[doc = " @param st <tt>OpusMSDecoder</tt>: Multistream decoder state to be freed."]

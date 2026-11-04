@@ -10,7 +10,7 @@
 //!
 //! 历史条目（v2）里的「1472 字节上限 / 20 ms 帧 / 自动码率 1024k」已随 v3 失效。
 
-use audiopus::{coder::Encoder, Application, Bandwidth, Bitrate, Channels, SampleRate};
+use audiopus::{Application, Bandwidth, Bitrate, Channels, SampleRate, coder::Encoder};
 
 /// 协议上限：单个 Opus 负载
 const OPUS_MAX_PAYLOAD: usize = 1275;

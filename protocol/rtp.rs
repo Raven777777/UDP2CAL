@@ -1871,7 +1871,7 @@ mod tests {
         insert(&mut jb, 2, 960, false, 22);
         insert(&mut jb, 3, 1440, false, 23);
         assert_eq!(pull_tags(&mut jb, 0, 2), vec![20, 21]); // next_ts = 960
-                                                            // 重复（已在槽里）与迟到（已经播过）
+        // 重复（已在槽里）与迟到（已经播过）
         assert_eq!(insert(&mut jb, 2, 960, false, 99), InsertResult::Dropped);
         assert_eq!(insert(&mut jb, 1, 480, false, 98), InsertResult::Dropped);
         assert_eq!(pull_tags(&mut jb, 0, 2), vec![22, 23]);
@@ -1888,7 +1888,7 @@ mod tests {
         insert(&mut jb, 5, 2400, false, 6);
         insert(&mut jb, 6, 2880, false, 7);
         assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]); // next_ts = 1920
-                                                                // 播放头还停在 0：缺口远未到期 → 等待，不生成 PLC
+        // 播放头还停在 0：缺口远未到期 → 等待，不生成 PLC
         assert_eq!(
             jb.pull(PLC_LEAD_MS + 10, PLC_LEAD_MS + 10, &mut [0u8; 1275]),
             Pull::Wait
@@ -1936,7 +1936,7 @@ mod tests {
         insert(&mut jb, 2, 960, false, 3);
         insert(&mut jb, 3, 1440, false, 4);
         assert_eq!(pull_tags(&mut jb, 0, 3), vec![1, 2, 3]); // next_ts = 1440
-                                                             // 输出缓冲放不下 → None（不得截断成半包给解码器）
+        // 输出缓冲放不下 → None（不得截断成半包给解码器）
         assert_eq!(jb.peek_current(&mut [0u8; 0]), None);
         let mut out = [0u8; OPUS_MAX_PAYLOAD];
         assert_eq!(jb.peek_current(&mut out), Some(1));
@@ -2120,8 +2120,8 @@ mod tests {
         let mut d = DriftController::new(48_000);
         let mut dev = 0u64;
         d.update(0, dev); // 起播瞬间：水位 0
-                          // 120 s 的“水位远低于目标”（预缓冲 + 断流）：积分以 ≈12 ppm/s 往下积，
-                          // 约 82 s 触到 -1000 ppm 的权限下限。
+        // 120 s 的“水位远低于目标”（预缓冲 + 断流）：积分以 ≈12 ppm/s 往下积，
+        // 约 82 s 触到 -1000 ppm 的权限下限。
         for _ in 0..12_000 {
             dev += 480; // 10 ms
             d.update(40, dev);

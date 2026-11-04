@@ -2,7 +2,8 @@ fn main() {
     // 动态查找 Windows Kits rc.exe 路径
     if let Some(kits_bin) = find_rc_path() {
         let current_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{};{}", kits_bin, current_path));
+        // SAFETY: 构建脚本单线程执行，此处改 PATH 无人并发读取。
+        unsafe { std::env::set_var("PATH", format!("{};{}", kits_bin, current_path)) };
     }
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

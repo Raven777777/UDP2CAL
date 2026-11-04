@@ -809,21 +809,25 @@ mod tests {
                 "invalid payload accepted: {invalid:?}"
             );
         }
-        assert!(ConnectPayload {
-            complexity: 0,
-            ..ConnectPayload::default()
-        }
-        .validate()
-        .is_ok());
-        assert!(ConnectPayload {
-            complexity: 10,
-            signal: 2,
-            bandwidth: 4,
-            packet_loss: 100,
-            ..ConnectPayload::default()
-        }
-        .validate()
-        .is_ok());
+        assert!(
+            ConnectPayload {
+                complexity: 0,
+                ..ConnectPayload::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ConnectPayload {
+                complexity: 10,
+                signal: 2,
+                bandwidth: 4,
+                packet_loss: 100,
+                ..ConnectPayload::default()
+            }
+            .validate()
+            .is_ok()
+        );
 
         // 负载长度必须恰好 15
         assert!(ConnectPayload::decode(&[0u8; 14]).is_none());

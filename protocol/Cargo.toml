@@ -1,7 +1,7 @@
 [package]
 name = "udp2cal-protocol"
 version = "1.5.1"
-edition = "2021"
+edition = "2024"
 description = "UDP2CAL 协议 v3：控制面 + RTP/Opus 媒体面 (Rust实现)"
 
 [lib]
@@ -17,4 +17,4 @@ jni = ["dep:jni-sys"]
 
 [dependencies]
 # 只用到 JNI 函数表本身，不需要 jni crate 的封装层
-jni-sys = { version = "0.3", optional = true }
+jni-sys = { version = "0.4", optional = true }

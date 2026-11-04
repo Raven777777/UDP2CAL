@@ -604,7 +604,7 @@ where
     let mut playback_base: Option<cpal::StreamInstant> = None;
     device
         .build_output_stream(
-            config,
+            *config,
             move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
                 // 回调约束：无锁、无分配、不调用 Opus、不写日志、不做复杂计算
                 let need_frames = data.len() / channels;
@@ -615,10 +615,9 @@ where
                 // WASAPI 侧由 IAudioClock 给出，已包含引擎缓冲与 DMA 排队。
                 // 这是回答"playhead_ts 含不含 DMA 缓冲"的唯一实测口径。
                 let ts = info.timestamp();
-                if let Some(d) = ts.playback.duration_since(&ts.callback) {
-                    let us = d.as_micros().min(u64::MAX as u128) as u64;
-                    latency.store(us, Ordering::Release);
-                }
+                let d = ts.playback.duration_since(ts.callback);
+                let us = d.as_micros().min(u64::MAX as u128) as u64;
+                latency.store(us, Ordering::Release);
                 // IAudioClock 的播放位置 → 同一条 Instant 时间轴。
                 let _ = CLOCK_EPOCH.get_or_init(Instant::now);
                 let base = match playback_base {
@@ -628,9 +627,8 @@ where
                         ts.playback
                     }
                 };
-                if let Some(d) = ts.playback.duration_since(&base) {
-                    clock_ns.store(d.as_nanos().min(u64::MAX as u128) as u64, Ordering::Release);
-                }
+                let d = ts.playback.duration_since(base);
+                clock_ns.store(d.as_nanos().min(u64::MAX as u128) as u64, Ordering::Release);
 
                 // 生产者只能"请求"丢弃（flush），由消费者在这里落地
                 if let Some(ring) = ring.upgrade() {
@@ -694,18 +692,15 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     let sample_format = supported_config.sample_format();
     let supported_buffer = *supported_config.buffer_size();
 
-    let mut stream_config: StreamConfig = if supported_config.min_sample_rate()
-        <= cpal::SampleRate(48000)
-        && supported_config.max_sample_rate() >= cpal::SampleRate(48000)
+    let mut stream_config: StreamConfig = if supported_config.min_sample_rate() <= 48_000
+        && supported_config.max_sample_rate() >= 48_000
     {
-        supported_config
-            .with_sample_rate(cpal::SampleRate(48000))
-            .into()
+        supported_config.with_sample_rate(48_000).into()
     } else {
         supported_config.with_max_sample_rate().into()
     };
 
-    let actual_rate = stream_config.sample_rate.0;
+    let actual_rate = stream_config.sample_rate;
 
     // ── 显式 10 ms 输出缓冲 ──
     //
@@ -817,15 +812,15 @@ pub fn detect_vb_cable() -> Option<String> {
     let host = cpal::default_host();
     host.output_devices()
         .ok()?
-        .filter_map(|d| d.name().ok())
+        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
         .find(|n| n.contains("VB-Audio Virtual Cable"))
 }
 
 fn find_vb_cable_device() -> Option<cpal::Device> {
     let host = cpal::default_host();
     for d in host.output_devices().ok()? {
-        if let Ok(name) = d.name() {
-            if name.contains("VB-Audio Virtual Cable") {
+        if let Ok(desc) = d.description() {
+            if desc.name().contains("VB-Audio Virtual Cable") {
                 return Some(d);
             }
         }

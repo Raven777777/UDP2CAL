@@ -1,7 +1,7 @@
 // 配置管理 - 注册表读写
 use std::sync::OnceLock;
-use winreg::enums::*;
 use winreg::RegKey;
+use winreg::enums::*;
 
 const REG_PATH: &str = "Software\\UDP2CAL";
 const RUN_VALUE: &str = "UDP2CAL";

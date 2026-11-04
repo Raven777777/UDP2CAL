@@ -21,16 +21,16 @@ use crate::protocol::rtp;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, SetThreadPriority, WaitForSingleObject, THREAD_PRIORITY_HIGHEST,
+    CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, WaitForSingleObject,
 };
 
 /// DSCP EF（46）→ IP TOS 字节 0xB8。反向音频流的转发优先级最高，
@@ -1171,7 +1171,7 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     if fmt.is_null() {
         return None;
     }
-    let wf = &*fmt;
+    let wf = unsafe { &*fmt };
     let channels = wf.nChannels as usize;
     if channels == 0 || channels > 32 {
         return None;
@@ -1187,7 +1187,7 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
         (3, _) => true,  // WAVE_FORMAT_IEEE_FLOAT
         (1, _) => false, // WAVE_FORMAT_PCM
         (0xFFFE, cb_size) if cb_size >= 22 => {
-            let ext = &*(fmt as *const WAVEFORMATEXTENSIBLE);
+            let ext = unsafe { &*(fmt as *const WAVEFORMATEXTENSIBLE) };
             ext.SubFormat.data1 == 3
         }
         _ => return None,
@@ -1403,13 +1403,13 @@ mod tests {
 
         let mut small = base;
         small.nBlockAlign = 4; // 小于 2ch * 4B → 会越界读
-                               // SAFETY: 同上。
+        // SAFETY: 同上。
         let small = unsafe { parse_mix_format(&small as *const WAVEFORMATEX) };
         assert!(small.is_none(), "nBlockAlign 偏小必须拒绝");
 
         let mut large = base;
         large.nBlockAlign = 16; // 大于 2ch * 4B → 会读到相邻帧
-                                // SAFETY: 同上。
+        // SAFETY: 同上。
         let large = unsafe { parse_mix_format(&large as *const WAVEFORMATEX) };
         assert!(large.is_none(), "nBlockAlign 偏大必须拒绝");
     }

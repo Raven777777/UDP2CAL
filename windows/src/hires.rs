@@ -15,12 +15,12 @@
 
 use std::time::{Duration, Instant};
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
-    CreateWaitableTimerExW, SetWaitableTimerEx, WaitForSingleObject,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimerEx,
+    TIMER_ALL_ACCESS, WaitForSingleObject,
 };
+use windows::core::PCWSTR;
 
 /// 一次等待最多睡多久（毫秒）。真实的 `due` 由 `SetWaitableTimerEx` 指定，
 /// 这里只是给 `WaitForSingleObject` 一个上界：即使计时器句柄异常失效，
