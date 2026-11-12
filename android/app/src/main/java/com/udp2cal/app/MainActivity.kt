@@ -561,12 +561,39 @@ fun OpusSettingsScreen(
         Text("编码复杂度 (Complexity): ${complexity.toInt()}", fontSize = 14.sp, color = Color.White)
         Slider(value = complexity, onValueChange = { complexity = it; Prefs.opusComplexity = it.toInt() }, valueRange = 1f..10f, steps = 8, modifier = Modifier.fillMaxWidth())
 
-        Text("信号类型 (Signal Type)", fontSize = 14.sp, color = Color.White)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            val options = listOf(3001 to "语音", 3002 to "音乐")
-            options.forEach { (valOf, label) ->
-                FilterChip(selected = signalType == valOf, onClick = { signalType = valOf; Prefs.opusSignal = valOf }, label = { Text(label) })
+        Text("麦克风音源 (Mic Source)", fontSize = 14.sp, color = Color.White)
+        run {
+            val values = intArrayOf(3001, 3002, 3003, 3004)
+            val labels = arrayOf(
+                "语音通话(硬件降噪+AEC)", "麦克风直出",
+                "原始直出(UNPROCESSED)", "语音识别(VOICE_RECOGNITION)"
+            )
+            val shortLabels = arrayOf("语音", "直出", "原始", "识别")
+            val lastIdx = values.lastIndex
+            val idx = values.indexOf(signalType).takeIf { it >= 0 } ?: 1
+            Text("当前: ${labels[idx]}", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+            Slider(
+                value = idx.toFloat(),
+                onValueChange = { v ->
+                    val i = v.roundToInt().coerceIn(0, lastIdx)
+                    if (values[i] != signalType) {
+                        signalType = values[i]
+                        Prefs.opusSignal = values[i]
+                    }
+                },
+                valueRange = 0f..lastIdx.toFloat(),
+                steps = values.size - 2,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                shortLabels.forEachIndexed { i, code ->
+                    Text(code, fontSize = 10.sp, color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888))
+                }
             }
+            Text(
+                "原始/识别不走系统降噪处理；换源会自动重建采集链路，音源不支持时自动回退 MIC 直出",
+                fontSize = 11.sp, color = Color(0xFF888888)
+            )
         }
 
         Text("音频带宽 (Bandwidth)", fontSize = 14.sp, color = Color.White)

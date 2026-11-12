@@ -138,7 +138,7 @@ class CaptureService : Service() {
     //     都是创建时定型的，只能重建链路。
     /** 已生效的编码器参数快照；null 表示尚未与编码器对齐 */
     @Volatile private var appliedCfg: EncoderCfg? = null
-    @Volatile private var appliedVoiceMode: Boolean? = null
+    @Volatile private var appliedSignal: Int = Int.MIN_VALUE
     @Volatile private var appliedTestTone: Boolean = false
     /** 已因参数变化投递重启，避免 100 ms 检查重复触发 */
     @Volatile private var restartPending: Boolean = false
@@ -190,6 +190,9 @@ class CaptureService : Service() {
     /** 音源描述枚举 */
     object AudioSourceLabel {
         const val MIC_RAW = "MIC直出"
+        const val MIC_RAW_FALLBACK = "已回退MIC直出"
+        const val RAW_UNPROCESSED = "原始直出(UNPROCESSED)"
+        const val VOICE_RECOGNITION = "语音识别(VOICE_RECOGNITION)"
         const val SYSTEM_NS = "系统硬件降噪"
         const val SYSTEM_NS_FALLBACK = "系统硬件降噪(已回退MIC)"
         const val AEC_ENABLED = " + AEC已启用"
@@ -349,7 +352,7 @@ class CaptureService : Service() {
                 )
                 encoder = enc
                 appliedCfg = cfg0
-                appliedVoiceMode = voiceMode
+                appliedSignal = Prefs.opusSignal
                 appliedTestTone = testTone
                 if (!enc.start()) {
                     fail("编码器初始化失败")
@@ -555,8 +558,7 @@ class CaptureService : Service() {
 
     private fun mapSignal(sig: Int): Int = when (sig) {
         3001 -> 1 // OPUS_SIGNAL_VOICE
-        3002 -> 2 // OPUS_SIGNAL_MUSIC
-        else -> 0
+        else -> 2 // OPUS_SIGNAL_MUSIC（3002/3003/3004 均按音乐信号提示编码器）
     }
 
     private fun mapBandwidth(bw: Int): Int = when (bw) {
@@ -591,34 +593,40 @@ class CaptureService : Service() {
         }
         val bufferSize = minBufSize.coerceAtLeast(FRAME * 2 * 4)
 
-        var sourceLabel: String
-        if (voiceMode) {
+        // 音源候选（按优先级）：首选音源初始化失败时回退 MIC 直出。
+        // 3003=UNPROCESSED / 3004=VOICE_RECOGNITION 都不做系统降噪处理，
+        // 用于绕过系统级 AI 降噪对高频的削切。
+        val attempts: List<Pair<Int, String>> = when (Prefs.opusSignal) {
+            3001 -> listOf(
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION to AudioSourceLabel.SYSTEM_NS,
+                MediaRecorder.AudioSource.MIC to AudioSourceLabel.SYSTEM_NS_FALLBACK,
+            )
+            3003 -> listOf(
+                MediaRecorder.AudioSource.UNPROCESSED to AudioSourceLabel.RAW_UNPROCESSED,
+                MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW_FALLBACK,
+            )
+            3004 -> listOf(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION to AudioSourceLabel.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW_FALLBACK,
+            )
+            else -> listOf(MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW)
+        }
+        var sourceLabel: String = AudioSourceLabel.MIC_RAW
+        for ((source, label) in attempts) {
             try {
                 audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    source,
                     Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufferSize
                 )
             } catch (_: Exception) {
             }
             if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                sourceLabel = AudioSourceLabel.SYSTEM_NS
-            } else {
-                audioRecord?.release()
-                audioRecord = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT, bufferSize
-                )
-                sourceLabel = AudioSourceLabel.SYSTEM_NS_FALLBACK
+                sourceLabel = label
+                break
             }
-        } else {
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, bufferSize
-            )
-            sourceLabel = AudioSourceLabel.MIC_RAW
+            audioRecord?.release()
+            audioRecord = null
         }
 
         val record = audioRecord
@@ -691,13 +699,13 @@ class CaptureService : Service() {
      * 第二类先判：重建期间不去打 ctl（新编码器还没建好）。
      */
     private fun applyRuntimeConfig(enc: OpusEncoder) {
-        val voiceMode = isVoiceMode()
+        val signal = Prefs.opusSignal
         val testTone = Prefs.testToneMode
-        if (voiceMode != appliedVoiceMode || testTone != appliedTestTone) {
+        if (signal != appliedSignal || testTone != appliedTestTone) {
             if (!restartPending) {
                 Log.i(
                     TAG,
-                    "采集链路参数变化（语音模式 $appliedVoiceMode→$voiceMode，测试音 $appliedTestTone→$testTone），重建采集链路"
+                    "采集链路参数变化（音源 $appliedSignal→$signal，测试音 $appliedTestTone→$testTone），重建采集链路"
                 )
                 restartCapture()
             }
