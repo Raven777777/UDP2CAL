@@ -547,7 +547,23 @@ fn coef_table() -> &'static CoefTable {
     })
 }
 
-/// 优先选择 f32，其次 i16/u16/i32；同等格式下优先单声道（回调会复制到所有声道）
+/// 排序键：优先覆盖 48000 Hz 的采样率范围，其次格式（f32 > i16/u16/i32），
+/// 再次单声道（回调会复制到所有声道）。
+///
+/// 覆盖 48 k 必须排在最前：cpal 0.18 起 WASAPI 输出端**不再探测**格式
+/// （`usable = is_output || …`），会枚举出 8000–384000 全部“可用”范围；
+/// 若只按格式排序，首个 f32 范围是 8000 Hz，`start_audio` 退到
+/// `with_max_sample_rate()` 后以 8 kHz 开流，48 kHz 源被 FIR 重采样到
+/// 8 kHz（通带 ≈3.4 kHz），听感为高音全部消失。
+fn output_config_sort_key(min_rate: u32, max_rate: u32, fmt_rank: u8, channels: u16) -> (u8, u8, u8, u16) {
+    (
+        if min_rate <= 48_000 && max_rate >= 48_000 { 0 } else { 1 },
+        fmt_rank,
+        if channels == 1 { 0 } else { 1 },
+        channels,
+    )
+}
+
 fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfigRange, String> {
     fn rank(f: SampleFormat) -> u8 {
         match f {
@@ -569,9 +585,10 @@ fn pick_output_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConf
     configs
         .into_iter()
         .min_by_key(|c| {
-            (
+            output_config_sort_key(
+                c.min_sample_rate(),
+                c.max_sample_rate(),
                 rank(c.sample_format()),
-                if c.channels() == 1 { 0 } else { 1 },
                 c.channels(),
             )
         })
@@ -881,6 +898,17 @@ fn find_vb_cable_device() -> Option<cpal::Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_prefers_range_covering_48k_over_low_rate_f32() {
+        // 回归：cpal 0.18 枚举全部“可用”范围后，8 kHz f32 不得赢过 48 kHz i16
+        let eight_k_f32 = output_config_sort_key(8000, 8000, 0, 2);
+        let forty_eight_k_i16 = output_config_sort_key(48000, 48000, 1, 2);
+        assert!(forty_eight_k_i16 < eight_k_f32);
+        // 任意覆盖 48 k 的宽范围同样优先于 8 k，且 f32 在同覆盖度下仍优先
+        let wide_f32 = output_config_sort_key(8000, 96000, 0, 2);
+        assert!(wide_f32 < eight_k_f32);
+    }
 
     #[test]
     fn ring_preserves_order_and_bounds() {

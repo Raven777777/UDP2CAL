@@ -4,6 +4,16 @@
 
 ---
 
+## 未发布 — 2026-11-12 · 修复 cpal 0.18 导致的 8 kHz 输出回归（高音消失）
+
+- **现象**：新版 Windows 端声音发闷，高频全部消失；与手机系统更新时间巧合，一度误诊为安卓端问题。
+- **根因**：`c1524db` 升级 cpal 0.15.3 → 0.18.2 后，WASAPI 输出端不再探测格式，
+  枚举出 8000–384000 全部“可用”采样率；`pick_output_config` 不看采样率，
+  选中首个 f32 范围 = 8000 Hz，最终以 8 kHz 开流，48 kHz 源被重采样
+  （通带 ≈3.4 kHz）。详见 [BUGFIX.md](BUGFIX.md) 2026-11-12 条目。
+- **修复**：`pick_output_config` 排序键最前增加“覆盖 48000 Hz 优先”；
+  无 48 k 范围的设备行为不变。回归测试：`audio::tests::pick_prefers_range_covering_48k_over_low_rate_f32`。
+
 ## 未发布 — 2026-10-28 · 可观测性、线程优先级与 FEC 默认值（对齐检查第一批）
 
 > 依据 [archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md](archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md)
