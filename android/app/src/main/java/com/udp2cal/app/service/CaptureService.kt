@@ -234,7 +234,7 @@ class CaptureService : Service() {
         val reverseAudio: Boolean = false,
         val reverseBitrateKbps: Float = 0f,
         val reverseBw: String = "",
-        /** 反向抖动缓冲摘要（迟到/溢出/PLC/重同步），每秒刷新，空串表示无数据 */
+        /** 反向抖动缓冲摘要（仅非零项），每秒刷新，空串表示无数据或全为零 */
         val reverseJitter: String = "",
     )
 
@@ -1057,8 +1057,12 @@ class CaptureService : Service() {
                     if (activeReverseSsrc != 0) {
                         // 抖动缓冲的“生病”指标必须能被眼睛看到：只写在日志里没人翻。
                         // 每秒取一次（JNI getter，代价可忽略）。
-                        val jbSummary = "迟到 ${jitter.late} · 溢出 ${jitter.overflow} · " +
-                            "PLC ${jitter.plcFrames}(峰 ${jitter.maxPlcRun}) · 重同步 ${jitter.resyncs}"
+                        val jbSummary = buildList {
+                            if (jitter.late > 0) add("迟到 ${jitter.late}")
+                            if (jitter.overflow > 0) add("溢出 ${jitter.overflow}")
+                            if (jitter.plcFrames > 0) add("PLC ${jitter.plcFrames}(峰 ${jitter.maxPlcRun})")
+                            if (jitter.resyncs > 0) add("重同步 ${jitter.resyncs}")
+                        }.joinToString(" · ")
                         _status.value = _status.value.copy(
                             reverseBitrateKbps = byteCount * 8f / (now - lastReport),
                             reverseJitter = jbSummary

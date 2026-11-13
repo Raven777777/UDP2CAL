@@ -18,9 +18,20 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -30,10 +41,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -190,10 +204,41 @@ class MainActivity : ComponentActivity() {
                         }
 
                         if (blackout) {
+                            // 息屏画面：中央呼吸圆环提示采集仍在进行，触屏任意处退出
+                            val blackoutBreath = rememberInfiniteTransition(label = "blackoutBreath")
+                            val bb by blackoutBreath.animateFloat(
+                                initialValue = 0f,
+                                targetValue = 1f,
+                                animationSpec = infiniteRepeatable(
+                                    tween(2000, easing = FastOutSlowInEasing),
+                                    RepeatMode.Reverse
+                                ),
+                                label = "blackoutBreath"
+                            )
                             Box(
                                 Modifier.fillMaxSize().background(Color.Black)
-                                    .pointerInput(Unit) { detectTapGestures { blackout = false } }
-                            )
+                                    .pointerInput(Unit) { detectTapGestures { blackout = false } },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Box(
+                                    Modifier.size(150.dp)
+                                        .scale(1f + bb * 0.12f)
+                                        .alpha(0.06f + bb * 0.10f)
+                                        .border(1.dp, Color(0xFF00E676), CircleShape)
+                                )
+                                Box(
+                                    Modifier.size(110.dp)
+                                        .scale(1f + bb * 0.07f)
+                                        .alpha(0.15f + bb * 0.25f)
+                                        .border(2.dp, Color(0xFF00E676), CircleShape)
+                                )
+                                Box(
+                                    Modifier.size(70.dp)
+                                        .scale(1f + bb * 0.05f)
+                                        .alpha(0.25f + bb * 0.45f)
+                                        .border(3.dp, Color(0xFF00E676), CircleShape)
+                                )
+                            }
                         }
                     }
                 }
@@ -261,8 +306,10 @@ fun MainScreen(
     var targetIp by remember { mutableStateOf(Prefs.targetIp) }
     var targetPort by remember { mutableStateOf(Prefs.targetPort.toString()) }
     var isRunning by remember { mutableStateOf(false) }
+    var connected by remember { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf("") }
     var isSearching by remember { mutableStateOf(false) }
+    var showManualConfig by remember { mutableStateOf(false) }
     // 设备发现列表
     var showDeviceDialog by remember { mutableStateOf(false) }
     var discoveredDevices by remember { mutableStateOf<List<DiscoveryManager.DiscoverResult>>(emptyList()) }
@@ -271,101 +318,245 @@ fun MainScreen(
     LaunchedEffect(service) {
         service?.status?.collect { status ->
             isRunning = status.isRunning; errorMsg = status.errorMsg
+            connected = status.connected
         }
     }
+
+    val discover: () -> Unit = {
+        scope.launch {
+            isSearching = true
+            errorMsg = "正在搜索局域网内的PC端..."
+            val devices = DiscoveryManager.discoverServers()
+            if (devices.isEmpty()) {
+                errorMsg = "未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下"
+            } else {
+                discoveredDevices = devices
+                showDeviceDialog = true
+                errorMsg = "找到 ${devices.size} 个设备，请选择"
+            }
+            isSearching = false
+        }
+        Unit
+    }
+
+    val statusColor = when {
+        connected && isRunning -> Color(0xFF00E676)
+        isRunning -> Color(0xFF00B0FF)
+        else -> Color(0xFF888888)
+    }
+    val statusText = when {
+        connected && isRunning -> "已连接"
+        isRunning -> "正在连接…"
+        else -> "未连接"
+    }
+    val statusPulse = rememberInfiniteTransition(label = "statusPulse")
+    val statusDotAlpha by statusPulse.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.35f,
+        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
+        label = "statusDotAlpha"
+    )
+    val shownPort = targetPort.ifBlank { "44044" }
+    val ringTransition = rememberInfiniteTransition(label = "startRing")
+    val breath by ringTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            tween(if (isRunning) 1800 else 2400, easing = FastOutSlowInEasing),
+            RepeatMode.Reverse
+        ),
+        label = "startRingBreath"
+    )
+    val ringColor by animateColorAsState(
+        targetValue = if (isRunning) Color(0xFFFF5252) else Color(0xFF00E676),
+        animationSpec = tween(220),
+        label = "startRingColor"
+    )
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(top = 44.dp, start = 20.dp, end = 20.dp, bottom = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
+        Text("UDP2CAL", fontSize = 24.sp, color = Color(0xFF00E676))
+        Text("Android ↔ PC · 局域网音频", fontSize = 11.sp, color = Color(0xFF777777))
 
-        OutlinedTextField(value = targetIp, onValueChange = {
-            if (it != targetIp) Prefs.targetDeviceId = ""
-            targetIp = it
-        },
-            label = { Text("目标 IP") }, singleLine = true,
-            modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
-                if (!fs.isFocused) { Prefs.targetIp = targetIp }
-            },
-            trailingIcon = {
-                Box(modifier = Modifier.clickable(enabled = !isSearching && !isRunning) {
-                    scope.launch {
-                        isSearching = true
-                        errorMsg = "正在搜索局域网内的PC端..."
-                        val devices = DiscoveryManager.discoverServers()
-                        if (devices.isEmpty()) {
-                            errorMsg = "未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下"
-                        } else {
-                            discoveredDevices = devices
-                            showDeviceDialog = true
-                            errorMsg = "找到 ${devices.size} 个设备，请选择"
-                        }
-                        isSearching = false
-                    }
-                }) {
-                    Icon(
-                        imageVector = AutorenewIcon,
-                        contentDescription = "自动搜索",
-                        tint = if (isSearching) Color(0xFF888888) else Color(0xFF00B0FF),
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
-            })
-
-        OutlinedTextField(value = targetPort, onValueChange = {
-            if (it != targetPort) Prefs.targetDeviceId = ""
-            targetPort = it
-        },
-            label = { Text("端口") }, singleLine = true,
-            modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
-                if (!fs.isFocused) { Prefs.targetPort = targetPort.toIntOrNull() ?: 44044 }
-            })
-
-        Spacer(Modifier.height(4.dp))
-
-        Button(onClick = {
-            if (isRunning) { onStop() }
-            else { val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p) }
-        }, modifier = Modifier.fillMaxWidth().height(48.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFD32F2F) else Color(0xFF00C853))
-        ) { Text(if (isRunning) "停止采集" else "开始采集", fontSize = 18.sp) }
-
-        OutlinedButton(onClick = onBlackout, modifier = Modifier.fillMaxWidth()) {
-            Text("息屏省电", color = Color(0xFF00B0FF))
+        Surface(
+            color = statusColor.copy(alpha = 0.12f),
+            shape = RoundedCornerShape(50)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.size(7.dp)
+                        .alpha(if (isRunning && !connected) statusDotAlpha else 1f)
+                        .background(statusColor, CircleShape)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(statusText, fontSize = 12.sp, color = statusColor)
+            }
         }
 
-        OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) { Text("高级设置", color = Color(0xFFAAAAAA)) }
+        // ── 开始/停止按钮（顶部，双层呼吸光晕；运行时呼吸更快、变红） ──
+        Box(Modifier.fillMaxWidth().height(80.dp), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier.fillMaxWidth(0.90f).height(60.dp)
+                    .scale(1f + breath * 0.07f)
+                    .alpha(0.05f + breath * 0.08f)
+                    .border(1.dp, ringColor, RoundedCornerShape(50))
+            )
+            Box(
+                Modifier.fillMaxWidth(0.96f).height(66.dp)
+                    .scale(1f + breath * 0.045f)
+                    .alpha(0.12f + breath * 0.15f)
+                    .border(2.dp, ringColor, RoundedCornerShape(50))
+            )
+            Button(
+                onClick = {
+                    if (isRunning) { onStop() }
+                    else { val p = targetPort.toIntOrNull() ?: 44044; onStart(targetIp, p) }
+                },
+                modifier = Modifier.fillMaxWidth().height(58.dp)
+                    .scale(1f + breath * 0.02f),
+                shape = RoundedCornerShape(29.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isRunning) Color(0xFFD32F2F) else Color(0xFF00C853)
+                )
+            ) {
+                Text(
+                    if (isRunning) "停止" else "开始",
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.Medium,
+                    letterSpacing = 2.sp
+                )
+            }
+        }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
+            shape = MaterialTheme.shapes.medium
+        ) {
+            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("目标设备", fontSize = 13.sp, color = Color(0xFF888888))
+                        Text(
+                            if (targetIp.isBlank()) "未选择" else "$targetIp:$shownPort",
+                            fontSize = 16.sp,
+                            color = if (targetIp.isBlank()) Color(0xFFAAAAAA) else Color.White
+                        )
+                    }
+                    TextButton(
+                        onClick = { showManualConfig = !showManualConfig },
+                        enabled = !isRunning
+                    ) {
+                        Text(if (showManualConfig) "收起" else "手动输入", color = Color(0xFF00B0FF))
+                    }
+                }
+                OutlinedButton(
+                    onClick = { discover() },
+                    enabled = !isSearching && !isRunning,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(AutorenewIcon, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (isSearching) "搜索中…" else "自动发现")
+                }
+                AnimatedVisibility(showManualConfig) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = targetIp,
+                            onValueChange = {
+                                if (it != targetIp) Prefs.targetDeviceId = ""
+                                targetIp = it
+                            },
+                            label = { Text("目标 IP") },
+                            singleLine = true,
+                            enabled = !isRunning,
+                            modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
+                                if (!fs.isFocused) { Prefs.targetIp = targetIp }
+                            }
+                        )
+                        OutlinedTextField(
+                            value = targetPort,
+                            onValueChange = {
+                                if (it != targetPort) Prefs.targetDeviceId = ""
+                                targetPort = it
+                            },
+                            label = { Text("端口") },
+                            singleLine = true,
+                            enabled = !isRunning,
+                            modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
+                                if (!fs.isFocused) { Prefs.targetPort = targetPort.toIntOrNull() ?: 44044 }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedButton(
+                onClick = onBlackout,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(22.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp)
+            ) { Text("息屏省电", color = Color(0xFF00B0FF), fontSize = 13.sp) }
+            OutlinedButton(
+                onClick = onOpenSettings,
+                modifier = Modifier.weight(1f).height(44.dp),
+                shape = RoundedCornerShape(22.dp),
+                contentPadding = PaddingValues(horizontal = 8.dp)
+            ) { Text("高级设置", color = Color(0xFFAAAAAA), fontSize = 13.sp) }
+        }
 
         // 息屏断流引导：仅当未加入电池优化白名单时显示。
         // 每秒一次的 CONNECT 心跳就是系统认账的保活，白名单足够，无需加密心跳。
         if (!batteryWhitelisted) {
             val ctx = LocalContext.current
-            OutlinedButton(
-                onClick = {
-                    // 优先直跳"请求忽略电池优化"确认页；个别 ROM 拦截该意图时
-                    // 退回电池优化设置列表页
-                    try {
-                        ctx.startActivity(
-                            Intent(
-                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                                Uri.parse("package:" + ctx.packageName)
-                            )
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
+                shape = MaterialTheme.shapes.medium
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("息屏保持连接", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                        Text(
+                            "加入电池优化白名单；国产 ROM 还需允许自启动与后台联网",
+                            fontSize = 11.sp, color = Color(0xFF777777)
                         )
-                    } catch (_: Exception) {
-                        try {
-                            ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                        } catch (_: Exception) {
-                        }
                     }
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("息屏保持连接（加入电池优化白名单）", color = Color(0xFF00B0FF)) }
-            Text(
-                "国产 ROM（vivo/小米/OPPO 等）息屏断流还需在系统设置中允许本应用「自启动」与「后台联网」。",
-                fontSize = 12.sp, color = Color(0xFF888888)
-            )
+                    TextButton(
+                        onClick = {
+                            // 优先直跳"请求忽略电池优化"确认页；个别 ROM 拦截该意图时
+                            // 退回电池优化设置列表页
+                            try {
+                                ctx.startActivity(
+                                    Intent(
+                                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                        Uri.parse("package:" + ctx.packageName)
+                                    )
+                                )
+                            } catch (_: Exception) {
+                                try {
+                                    ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                                } catch (_: Exception) {
+                                }
+                            }
+                        }
+                    ) { Text("去设置", color = Color(0xFF00B0FF)) }
+                }
+            }
         }
 
         if (errorMsg.isNotEmpty()) {
@@ -391,6 +582,7 @@ fun MainScreen(
                                 Prefs.targetDeviceId = Udp2CalProtocol.deviceIdToString(device.deviceId)
                                 errorMsg = "已选择: ${device.ip}:${device.port} (${device.deviceName})"
                                 showDeviceDialog = false
+                                showManualConfig = false
                             },
                             colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E))
                         ) {
@@ -451,7 +643,6 @@ fun OpusSettingsScreen(
 
     // ── 运行时状态 ──
     var isRunning by remember { mutableStateOf(false) }
-    var audioSource by remember { mutableStateOf("") }
     var opusMode by remember { mutableStateOf("") }
     var realtimeKbps by remember { mutableStateOf(0f) }
     var sampleRateHz by remember { mutableStateOf(0) }
@@ -470,7 +661,6 @@ fun OpusSettingsScreen(
     LaunchedEffect(service) {
         service?.status?.collect { status ->
             isRunning = status.isRunning
-            audioSource = status.audioSource
             opusMode = status.opusMode
             realtimeKbps = status.bitrateKbps
             sampleRateHz = status.sampleRateHz
@@ -524,36 +714,6 @@ fun OpusSettingsScreen(
 
         // ═══ 运行时状态卡片（仅采集运行时显示） ═══
         if (isRunning) {
-            // ── 音源状态卡片 ──
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-                shape = MaterialTheme.shapes.medium
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("音源状态", fontSize = 13.sp, color = Color(0xFF888888))
-                    val (srcColor, srcIcon) = when {
-                        audioSource.contains("回退") -> Color(0xFFFF9800) to "⚠"
-                        audioSource.contains("MIC直出") -> Color(0xFF00B0FF) to "🎤"
-                        audioSource.contains("硬件降噪") -> Color(0xFF00E676) to "🔇"
-                        else -> Color(0xFFAAAAAA) to "●"
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("$srcIcon ", fontSize = 16.sp)
-                        Text(audioSource.ifEmpty { "等待启动..." }, fontSize = 15.sp, color = srcColor)
-                    }
-                    Text(
-                        when {
-                            audioSource.contains("MIC直出") -> "裸麦克风采集，系统硬件降噪已关闭"
-                            audioSource.contains("回退") -> "VOICE_COMMUNICATION不可用，已自动回退MIC裸采集"
-                            audioSource.contains("硬件降噪") -> "安卓系统原生硬件降噪(NS+AGC)已启用"
-                            else -> ""
-                        },
-                        fontSize = 11.sp, color = Color(0xFF666666)
-                    )
-                }
-            }
-
             // ── Opus 编码状态卡片（含 P2P 独占连接状态 + 实时带宽） ──
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -609,48 +769,36 @@ fun OpusSettingsScreen(
                 }
             }
 
-            // ── 反向串流状态卡片 ──
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-                shape = MaterialTheme.shapes.medium
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("反向串流 (PC→Phone)", fontSize = 13.sp, color = Color(0xFF888888))
-                        Text(if (reverseAudio) "● 活跃" else "● 等待中",
-                            fontSize = 11.sp,
-                            color = if (reverseAudio) Color(0xFF00E676) else Color(0xFF666666))
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(
-                            if (reverseAudio && reverseBitrateKbps > 0f) "%.1fkbps".format(reverseBitrateKbps)
-                            else if (reverseAudio) "解码中..."
-                            else "—",
-                            fontSize = 13.sp,
-                            color = if (reverseBitrateKbps > 0f) Color(0xFF00E676) else Color(0xFF888888)
-                        )
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("抖动缓冲", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(
-                            if (reverseAudio && reverseJitter.isNotEmpty()) reverseJitter else "—",
-                            fontSize = 12.sp,
-                            color = Color(0xFFB0B0B0)
-                        )
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("音频带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(
-                            when {
-                                !reverseAudio -> "—"
-                                reverseBw.isNotEmpty() -> reverseBw
-                                else -> "等待数据..."
-                            },
-                            fontSize = 13.sp,
-                            color = Color.White
-                        )
+            // ── 反向串流状态卡片（仅反向活跃时显示，零值项不显示） ──
+            if (reverseAudio) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
+                    shape = MaterialTheme.shapes.medium
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                            Text("反向串流 (PC→Phone)", fontSize = 13.sp, color = Color(0xFF888888))
+                            Text("● 活跃", fontSize = 11.sp, color = Color(0xFF00E676))
+                        }
+                        if (reverseBitrateKbps > 0f) {
+                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                                Text("码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text("%.1fkbps".format(reverseBitrateKbps), fontSize = 13.sp, color = Color(0xFF00E676))
+                            }
+                        }
+                        if (reverseJitter.isNotEmpty()) {
+                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                                Text("抖动缓冲", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text(reverseJitter, fontSize = 12.sp, color = Color(0xFFB0B0B0))
+                            }
+                        }
+                        if (reverseBw.isNotEmpty()) {
+                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                                Text("音频带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text(reverseBw, fontSize = 13.sp, color = Color.White)
+                            }
+                        }
                     }
                 }
             }
@@ -669,14 +817,9 @@ fun OpusSettingsScreen(
         Text("麦克风音源 (Mic Source)", fontSize = 14.sp, color = Color.White)
         run {
             val values = intArrayOf(3001, 3002, 3003, 3004)
-            val labels = arrayOf(
-                "语音通话(硬件降噪+AEC)", "麦克风直出",
-                "原始直出(UNPROCESSED)", "语音识别(VOICE_RECOGNITION)"
-            )
             val shortLabels = arrayOf("语音", "直出", "原始", "识别")
             val lastIdx = values.lastIndex
             val idx = values.indexOf(signalType).takeIf { it >= 0 } ?: 1
-            Text("当前: ${labels[idx]}", fontSize = 13.sp, color = Color(0xFFB0B0B0))
             Slider(
                 value = idx.toFloat(),
                 onValueChange = { v ->
@@ -706,10 +849,6 @@ fun OpusSettingsScreen(
             // 与码率滑块保持完全一致的版式：标题 → 当前值 → 滑块 → 刻度 → 说明
             val lastIdx = BW_CODES.lastIndex
             val idx = BW_CODES.indexOf(bandwidth).takeIf { it >= 0 } ?: lastIdx
-            Text(
-                "当前: ${BW_LABELS[idx]}",
-                fontSize = 13.sp, color = Color(0xFFB0B0B0)
-            )
             Slider(
                 value = idx.toFloat(),
                 onValueChange = { v ->
@@ -744,7 +883,6 @@ fun OpusSettingsScreen(
             val steps = Udp2CalProtocol.BITRATE_STEPS_KBPS
             val lastIdx = steps.lastIndex
             val idx = steps.indexOf(bitrate).takeIf { it >= 0 } ?: lastIdx
-            Text("当前: ${steps[idx]} kbps", fontSize = 13.sp, color = Color(0xFFB0B0B0))
             Slider(
                 value = idx.toFloat(),
                 onValueChange = { v ->
