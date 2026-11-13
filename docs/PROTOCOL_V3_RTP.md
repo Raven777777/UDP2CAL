@@ -570,7 +570,7 @@ Reconnecting ──(ACK)──> Connected
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
 | `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧连续）；实际启动还要求水位达到本方向的启动目标 |
-| `WATER_TARGET_MS` | PC 正向 80 ms / Android 反向 150 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
+| `WATER_TARGET_MS` | PC 正向 200 ms / Android 反向 200 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
 | `STEP_TRIM_GROWTH_MS` | 80 ms | 仅诊断：记录“单次 tick 增长超过该值”的次数，**不再作为裁剪判据** |
 | `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据：总水位 > `target + 100` ms 且持续 `STEP_TRIM_HOLD_MS` |
@@ -742,7 +742,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 **启动**
 
 - 首包建立基准；不要求首包序列号是某个固定值。
-- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（PC 正向 80 / Android 反向 150），所以不存在“30 ms 先播、再用 24 秒慢慢爬到 150 ms”的过程；`JITTER_START_MS` 只是硬下限。
+- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（PC 正向 200 / Android 反向 200），所以不存在“30 ms 先播、再用 24 秒慢慢爬到目标值”的过程；`JITTER_START_MS` 只是硬下限。
 - `start_ms` 每个方向独立，可取 [30, WATER_TARGET_MS]；当前实现取目标值，以一次可闻的启动等待换取稳态不欠载。
 - 若首包丢失，以第一个收到的包为基准；不得无限等待“第 0 帧”。
 - Windows cpal 回调在预缓冲完成前输出静音；播放进度由回调侧的 `played_frames` 表达，并通过 `OutputCallbackInfo::timestamp().playback`（WASAPI `IAudioClock::GetPosition` + QPC）建立设备进度映射。
@@ -894,7 +894,7 @@ total_latency = now − arrival_of(audible_ts)          # 不再额外加 device
 绝对精度仍需**实测校准一次**（见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)），
 校准值只作为日志/展示的修正量，不参与水位控制。
 
-### 7.10.1 为什么 PC 正向是 80 ms、Android 反向是 150 ms（以及它为什么会被环境改变）
+### 7.10.1 为什么两端默认是 200 ms（历史 80/150，以及它为什么会被环境改变）
 
 这个数**不是算出来的**，而是由网络环境决定的：它要盖住「一次断供有多深」，而断供深度
 只取决于链路环境（Wi-Fi 省电、AP 缓冲、手机扫描），不是协议能拍的常数。换环境就要重新
@@ -950,10 +950,21 @@ A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600
 没有实质断供穿过缓冲）。随之 PC 正向默认降到 **80 ms**（恰为下限 `WATER_TARGET_MIN_MS`，
 也是 `PLC_LEAD_MS + DECODE_LIMIT_MS = 60` 之上的安全点）。代价要写明：同一链路 >100 ms 级
 到达停顿，目标 150 时是 1–3 帧 PLC，目标 80 时会变成 7–10 帧。**反向（Android 接收）未按
-80 重测且空档更深，仍取 150**——两方向独立定值，这正是 PC 抬下去而 Android 不动的理由。
+80 重测且空档更深，当时仍取 150**——两方向独立定值，这正是 PC 抬下去而 Android 不动的理由。
 
-**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 80`（PC 正向；Android 反向用
-Kotlin 常量 150）；环境变量
+**2026-11-13 复测：为什么回到 200 ms（稳定性优先）**：Android→Windows 单向 pktmon 抓包
+（`--comp all`，180 s，18,056 个 RTP 包，100.0 pps，无丢包）记录到 Wi-Fi/AP 把 10 个
+10 ms 包扣住 **99 ms** 后一次性交付；同一链路另一次 180 s 复测在关闭 PC 网卡省电后仍有
+109 ms 的 11 包攒批。802.11ax + 手机屏幕常亮后 >100 ms 事件消失，剩余最大空档 **82.9 ms**
+（手机 `WifiScanner: onFullResults` 全扫描，应用 PLC +12 帧）。按目标 80 ms 含声卡约
+39 ms 计算，真正能等网络的只有 ~41 ms，99 ms 空档必然打成 7–9 帧 PLC；150 ms 是下限，
+160–165 ms 才稳。20 ms 帧只把 10 包变 5 包，扣包仍按时间发生；FEC 需要下一包先在缓冲，
+NACK/WSOLA/双流同样受“数据必须在播放头前到”的约束，均不能消除这段等待。因此两端默认
+目标统一改为 **200 ms**，把“不断音”放在“低延迟”之前；100 ms 总延迟只在没有 100 ms 级
+扣包的干净链路上才可能。
+
+**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 200`（PC 正向；Android 反向用
+Kotlin 常量 200）；环境变量
 `UDP2CAL_WATER_TARGET_MS` 可覆盖，允许区间
 `WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位，进程内首次读取后缓存
 （`protocol::rtp::water_target_ms()`）。取值经 `DriftController::with_target()` 注入，PI 的
@@ -1275,9 +1286,9 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 **实测（v1.5.1，同一条 Wi-Fi 链路、同一台机器）**：加高精度定时器之前 `[Pacer]` 迟到
 `min/avg/max=11204/15788/17927 µs`（稳定 15.8 ms ≈ 一个系统 tick，且槽位偏移一旦形成就逐帧复制）；
 加定时器后为 `21/300/1000 µs`，`重锚` 只在空闲期无声或线程被抢占时 +1。目标水位 150 → 总延迟
-156–168 ms；目标 80 → 83–99 ms。默认值仍取 150：同一链路上出现过一次 >100 ms 的到达停顿，
-目标 80（抖动缓冲只有 30–50 ms）会把那次停顿放大成 7–10 帧 PLC。实测明细见
-[LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5.2。
+156–168 ms；目标 80 → 83–99 ms。v1.5.1 PC 正向默认 80、Android 反向 150；2026-11-13 抓包复测后两端默认改为
+**200 ms**（稳定性优先，见 §7.10.1 与 LATENCY_CALIBRATION.md §5.3）：同一链路上出现过
+>100 ms 的到达停顿，目标 80 会把那次停顿放大成 7–10 帧 PLC。
 
 **刻意不做**（视频专属，或与“100 包/秒、每 10 ms 一包”的节拍无关）：
 
@@ -1309,7 +1320,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
 | `JITTER_START_MS` | `30` | 预缓冲（3 帧） |
-| `WATER_TARGET_MS` | `80` | PC 正向目标总水位（抖动缓冲 + PCM 环 + 声卡）；Android 反向独立取 150 |
+| `WATER_TARGET_MS` | `200` | PC 正向目标总水位（抖动缓冲 + PCM 环 + 声卡）；Android 反向独立取 200 |
 | `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 端运行时覆盖目标水位的环境变量 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 覆盖值允许区间，越界钳位 |
 | `STEP_TRIM_GROWTH_MS` | `80` | 仅诊断：不再单独触发裁剪 |
@@ -1498,7 +1509,7 @@ FEC 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低
    本版不为此提高目标水位（那会让有线用户白白多等），需要时由上层应用自行补偿。
 2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()` 的粒度不同（典型 5–20 ms，
    低延迟模式下更细）。协议侧只要求播放头单调，不假设其精度。
-3. **Wi-Fi 抖动**：正向 80 ms / 反向 150 ms 的目标水位覆盖关闭扫描后的常见家用/办公
+3. **Wi-Fi 抖动**：正向 200 ms / 反向 200 ms 的目标水位覆盖关闭扫描后的常见家用/办公
    环境（稳态空档 68–90 ms），偶发台阶由阶跃吸收（§7.10.2）兜住。若环境重新出现
    数百毫秒级断供，
    表现会转向 PLC 与阶跃裁剪，而不是自动抬水位——抬水位会把延迟永久留在链路上；

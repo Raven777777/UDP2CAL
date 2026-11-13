@@ -13,10 +13,13 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -29,11 +32,17 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import com.udp2cal.app.service.CaptureService
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -122,26 +131,70 @@ class MainActivity : ComponentActivity() {
         setContent {
             val activity = LocalContext.current as Activity
             var showOpusSettings by remember { mutableStateOf(false) }
+            var blackout by remember { mutableStateOf(false) }
+            val window = activity.window
+
+            // 息屏省电：纯黑全屏 + 隐藏系统栏，保持屏幕常亮；触屏/返回退出。
+            DisposableEffect(blackout) {
+                val controller = WindowCompat.getInsetsController(window, window.decorView)
+                if (blackout) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    WindowCompat.setDecorFitsSystemWindows(window, false)
+                    controller.systemBarsBehavior =
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                    controller.hide(WindowInsetsCompat.Type.systemBars())
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    WindowCompat.setDecorFitsSystemWindows(window, true)
+                    controller.show(WindowInsetsCompat.Type.systemBars())
+                }
+                onDispose {
+                    if (blackout) {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                        WindowCompat.setDecorFitsSystemWindows(window, true)
+                        controller.show(WindowInsetsCompat.Type.systemBars())
+                    }
+                }
+            }
+
+            LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+                if (blackout) {
+                    WindowCompat.getInsetsController(window, window.decorView)
+                        .hide(WindowInsetsCompat.Type.systemBars())
+                }
+            }
 
             BackHandler(enabled = true) {
-                if (showOpusSettings) showOpusSettings = false else activity.moveTaskToBack(false)
+                if (blackout) blackout = false
+                else if (showOpusSettings) showOpusSettings = false
+                else activity.moveTaskToBack(false)
             }
 
             MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF00E676), secondary = Color(0xFF00B0FF))) {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    if (showOpusSettings) {
-                        OpusSettingsScreen(
-                            onBack = { showOpusSettings = false },
-                            service = serviceState.value
-                        )
-                    } else {
-                        MainScreen(
-                            onStart = { ip, port -> doStart(ip, port) },
-                            onStop = { doStop() },
-                            service = serviceState.value,
-                            onOpenSettings = { showOpusSettings = true },
-                            batteryWhitelisted = batteryWhitelisted.value
-                        )
+                    Box(Modifier.fillMaxSize()) {
+                        if (showOpusSettings) {
+                            OpusSettingsScreen(
+                                onBack = { showOpusSettings = false },
+                                service = serviceState.value
+                            )
+                        } else {
+                            MainScreen(
+                                onStart = { ip, port -> doStart(ip, port) },
+                                onStop = { doStop() },
+                                onBlackout = { blackout = true },
+                                service = serviceState.value,
+                                onOpenSettings = { showOpusSettings = true },
+                                batteryWhitelisted = batteryWhitelisted.value
+                            )
+                        }
+
+                        if (blackout) {
+                            Box(
+                                Modifier.fillMaxSize().background(Color.Black)
+                                    .pointerInput(Unit) { detectTapGestures { blackout = false } }
+                            )
+                        }
                     }
                 }
 
@@ -200,6 +253,7 @@ class MainActivity : ComponentActivity() {
 fun MainScreen(
     onStart: (String, Int) -> Unit,
     onStop: () -> Unit,
+    onBlackout: () -> Unit,
     service: CaptureService?,
     onOpenSettings: () -> Unit,
     batteryWhitelisted: Boolean
@@ -277,6 +331,10 @@ fun MainScreen(
         }, modifier = Modifier.fillMaxWidth().height(48.dp),
             colors = ButtonDefaults.buttonColors(containerColor = if (isRunning) Color(0xFFD32F2F) else Color(0xFF00C853))
         ) { Text(if (isRunning) "停止采集" else "开始采集", fontSize = 18.sp) }
+
+        OutlinedButton(onClick = onBlackout, modifier = Modifier.fillMaxWidth()) {
+            Text("息屏省电", color = Color(0xFF00B0FF))
+        }
 
         OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) { Text("高级设置", color = Color(0xFFAAAAAA)) }
 

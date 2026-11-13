@@ -69,17 +69,20 @@ pub const JITTER_START_MS: u32 = 30;
 ///   总延迟 83–99 ms 且 `PLC=0`。PC 正向（本端接收）默认随之降到 **80 ms**。
 ///   代价要写明：同一链路 >100 ms 级到达停顿，目标 150 时是 1–3 帧 PLC，
 ///   目标 80 时会变成 7–10 帧——所以 80 只适合**实测稳态空档 <40 ms** 的
-///   链路，且反向链路（Android 接收）未按 80 重测，仍取 150（见
+///   链路；反向链路（Android 接收）未按 80 重测，当时仍取 150（见
 ///   `Udp2CalProtocol.kt` 的同名 Kotlin 常量，两端各自独立定值）。
+/// * 2026-11-13 pktmon 复测：Wi-Fi/AP 会按 ~100 ms 把 10 个 10 ms 包攒批交付，
+///   目标 80 下必然 7–9 帧 PLC；802.11ax + 屏幕常亮后仍有 83 ms 扫描空档。
+///   为稳定优先，两端默认统一回到 **200 ms**（见 docs/LATENCY_CALIBRATION.md §5.3）。
 /// * 若环境里重新出现扫描源（换路由器 / 换手机 / 对方装新 App），水位会
 ///   周期性地被顶穿、`adjust` 贴回 ±5000。此时用环境变量
 ///   [`WATER_TARGET_ENV`] 临时抬高目标（`UDP2CAL_WATER_TARGET_MS=220`），
 ///   不要改编译常数；定值规则是"目标 ≥ 实测最大空档 ×1.5"。
 ///
-/// 这仍是整套实现里唯一跟环境相关的常数。**不要靠压低它去赢延迟**：80 是
-/// 实测结论，不是普适值；空档更深的链路上压低目标只会把延迟换成 PLC 破音
+/// 这仍是整套实现里唯一跟环境相关的常数。**不要靠压低它去赢延迟**：80 只是
+/// 干净链路的实测值，不是普适值；空档更深的链路上压低目标只会把延迟换成 PLC 破音
 /// 与常年变调（见 [`STEP_TRIM_EXCESS_MS`] 的配套措施）。
-pub const WATER_TARGET_MS: u32 = 80;
+pub const WATER_TARGET_MS: u32 = 200;
 
 /// 目标水位的环境变量覆盖名（现场调参不改编译，见 [`water_target_ms`]）。
 pub const WATER_TARGET_ENV: &str = "UDP2CAL_WATER_TARGET_MS";
@@ -1976,7 +1979,9 @@ mod tests {
         // 这里要求稳态偏差 → 0，且稳态比率 → 0（不再有任何变调）。
         let mut d = DriftController::new(48_000);
         let mut dev = 0u64;
-        let mut water = 20.0f64; // 起步水位远低于目标
+        // 生产在预缓冲阶段门控 PI（见 prebuffer_phase...），这里从目标下方
+        // 20 ms 起步，避免把预缓冲亏空误当成稳态偏差。
+        let mut water = WATER_TARGET_MS as f64 - 20.0;
         d.update(water as u32, dev);
         let mut tail = Vec::new();
         for i in 0..40_000u64 {
@@ -2331,9 +2336,9 @@ mod tests {
     // ── 阶跃吸收（方案 C）──
 
     #[test]
-    fn water_target_default_is_80_and_override_is_clamped() {
-        assert_eq!(WATER_TARGET_MS, 80);
-        // 同上：编译期求值（默认值可以取到下界：clamp(80, 80, 600) 合法）
+    fn water_target_default_is_200_and_override_is_clamped() {
+        assert_eq!(WATER_TARGET_MS, 200);
+        // 同上：编译期求值（默认值必须落在允许区间内）
         const { assert!(WATER_TARGET_MIN_MS <= WATER_TARGET_MS) };
         const { assert!(WATER_TARGET_MS < WATER_TARGET_MAX_MS) };
         // 环境变量缓存后的值必须落在允许区间内（未设置时等于常数）

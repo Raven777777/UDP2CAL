@@ -705,7 +705,9 @@ class Udp2CalProtocolTest {
         // 这里要求稳态偏差 → 0，且稳态比率 → 0（不再有任何变调）。
         val d = Udp2CalProtocol.DriftController()
         val dev = longArrayOf(0)
-        var water = 20.0 // 起步水位远低于目标
+        // 生产在预缓冲阶段门控 PI（见 prebuffer 测试），这里从目标下方 20 ms
+        // 起步，避免把预缓冲亏空误当成稳态偏差。
+        var water = Udp2CalProtocol.WATER_TARGET_MS - 20.0
         d.update(water.toInt(), dev[0])
         val tail = ArrayList<Double>()
         for (i in 0 until 40_000) {
@@ -931,8 +933,8 @@ class Udp2CalProtocolTest {
         assertEquals(44043, Udp2CalProtocol.DISCOVER_PORT)
         assertEquals(44044, Udp2CalProtocol.DEFAULT_LISTEN_PORT)
         assertEquals(30, Udp2CalProtocol.JITTER_START_MS)
-        // 目标水位含声卡缓冲（单一口径），按实机批次交付特征定到 150
-        assertEquals(150, Udp2CalProtocol.WATER_TARGET_MS)
+        // 目标水位含声卡缓冲（单一口径），按实机批次交付特征定到 200
+        assertEquals(200, Udp2CalProtocol.WATER_TARGET_MS)
         assertEquals(40, Udp2CalProtocol.DECODE_LIMIT_MS)
         assertTrue(Udp2CalProtocol.PLC_LEAD_MS < Udp2CalProtocol.DECODE_LIMIT_MS)
         assertTrue(Udp2CalProtocol.DECODE_LIMIT_MS < Udp2CalProtocol.WATER_TARGET_MS)

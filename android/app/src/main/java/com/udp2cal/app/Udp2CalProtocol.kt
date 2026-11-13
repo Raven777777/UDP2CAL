@@ -79,13 +79,14 @@ object Udp2CalProtocol {
      *
      * 这个值**由网络环境决定**，不是固定值：v1.3.0 用 260 ms 是因为手机全频段
      * 扫描（每次 1.85 s 静默）会让链路停摆 600–1100 ms；关掉扫描后 150 ms 就够。
-     * v1.5.1 起 PC 正向接收默认降到 80（同链路实测 PLC=0，见
-     * docs/LATENCY_CALIBRATION.md §5.2）；反向（Android）链路空档更深且未按
-     * 80 重测，保持 150。桌面端可用 `UDP2CAL_WATER_TARGET_MS` 环境变量覆盖；
+     * v1.5.1 曾把 PC 正向降到 80；2026-11-13 pktmon 复测发现 Wi-Fi/AP 会按
+     * ~100 ms 把 10 个 10 ms 包攒批交付，80 下必然 7–9 帧 PLC，故两端统一回到
+     * 200 ms，稳定性优先（见 docs/LATENCY_CALIBRATION.md §5.3）。桌面端可用
+     * `UDP2CAL_WATER_TARGET_MS` 环境变量覆盖；
      * Android 没有环境变量，
      * 但 [DriftController] 保留了可注入的 `targetMs` 通道。
      */
-    const val WATER_TARGET_MS = 150
+    const val WATER_TARGET_MS = 200
     const val WATER_TARGET_MIN_MS = 80
     const val WATER_TARGET_MAX_MS = 600
 

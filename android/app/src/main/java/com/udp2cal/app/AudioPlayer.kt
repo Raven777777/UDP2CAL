@@ -32,7 +32,7 @@ class AudioPlayer(private val context: Context) {
          * 结构上我们每 10 ms 阻塞写一帧，所以缓冲至少要能装下"一帧 + 调度余量"；
          * 2 帧（20 ms）是 low-latency 模式下不因调度抖动周期性断音的下限。
          * 更小的缓冲不会降低听感延迟（延迟主要由抖动缓冲水位决定，
-         * 目标是 150 ms），只会把欠载风险换成爆音。
+         * 目标水位默认 200 ms），只会把欠载风险换成爆音。
          */
         private const val BUFFER_FRAMES = 2 * Udp2CalProtocol.OPUS_FRAME_SAMPLES
     }

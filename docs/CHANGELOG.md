@@ -4,6 +4,23 @@
 
 ---
 
+## 未发布 — 2026-11-13 · 稳定性优先：水位 200 ms + 安卓息屏省电
+
+> 依据同日 pktmon 抓包复测（[LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5.3）：
+> Wi-Fi/AP 会按 ~100 ms 把 10 个 10 ms 包攒批交付，目标 80 ms 下必然打成 7–10 帧 PLC。
+> 本轮把“不断音”放在“低延迟”之前。
+
+**两端水位目标 200 ms**
+- `protocol/rtp.rs` `WATER_TARGET_MS = 200`；`Udp2CalProtocol.kt` 同名 Kotlin 常量 = 200。
+  两个方向独立定值但本轮同取 200；接收端总延迟约 200 ms，换取覆盖 99–109 ms 实测空档的余量。
+  100 ms 总延迟不再作为默认目标；干净链路可现场用 `UDP2CAL_WATER_TARGET_MS` 下探。
+- 更新 `water_target_default_is_200_and_override_is_clamped` 与 Android 常量测试。
+
+**Android 首页「息屏省电」**
+- 主界面新增按钮：进入纯黑全屏（OLED 黑色像素不发光），隐藏状态栏/导航栏，保持屏幕常亮与串流；
+  点击屏幕或返回键退出。实现用 `FLAG_KEEP_SCREEN_ON` + `WindowInsetsControllerCompat`，
+  不新增依赖。
+
 ## 未发布 — 2026-11-13 · 第一梯队低风险优化（正向水位 80 / 专用线程 / 解码锁外化）
 
 > 不改协议语义：只动 PC 正向默认水位、线程归属与锁粒度。依据 v1.5.1 同链路
