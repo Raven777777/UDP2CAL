@@ -15,7 +15,7 @@ import org.junit.Test
  * 覆盖三类易错点：
  *   1. 控制头/RTP 头的字节级正确性（与 Rust 端共用同一组向量）
  *   2. 抖动缓冲的时序（乱序、重复、迟到、缺口、重同步、回绕）
- *   3. 跨端常量一致性（Kotlin 是镜像实现，必须逐项锁死）
+ *   3. 跨端常量一致性（Kotlin facade 常量逐项与 Rust native 常量校验）
  *
  * 运行：`./gradlew :app:testDebugUnitTest`
  */

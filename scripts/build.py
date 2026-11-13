@@ -98,10 +98,14 @@ def doctor(args) -> int:
     logger.info("系统    {} {}".format(platform.system(), platform.release()))
     if sys.version_info < (3, 8):
         logger.error("Python 版本过低，需要 3.8+")
+        logger.close()
         return 1
 
     logger.section("代理")
     proxymod.report(logger)
+    tool_problems = 0
+    sdk_component_problems = 0
+    rust_target_problems = 0
 
     logger.section("JDK（受支持区间 {}-{}）".format(config.JDK_MIN_MAJOR, config.JDK_MAX_MAJOR))
     javas = envmod.detect_javas()
@@ -111,6 +115,9 @@ def doctor(args) -> int:
         logger.info("将使用: {}".format(chosen.describe()))
     elif chosen:
         logger.warn("将降级使用: {}（不保证可构建）".format(chosen.describe()))
+        tool_problems += 1
+    else:
+        tool_problems += 1
 
     logger.section("Android SDK")
     roots = [Path(args.sdk_dir)] if getattr(args, "sdk_dir", None) else []
@@ -118,6 +125,7 @@ def doctor(args) -> int:
     if not sdks:
         logger.error("未找到 Android SDK")
         logger.hint("设置 ANDROID_HOME 或使用 --sdk-dir 指定")
+        tool_problems += 1
     else:
         for sdk in sdks:
             logger.ok("{}  (来源: {})".format(sdk.root, sdk.source))
@@ -127,6 +135,7 @@ def doctor(args) -> int:
             label = config.ANDROID_TARGETS[key]["label"]
             if missing:
                 logger.warn("{} 缺少: {}".format(label, ", ".join(missing)))
+                sdk_component_problems += len(missing)
             else:
                 logger.ok("{} 组件齐全".format(label))
 
@@ -135,32 +144,45 @@ def doctor(args) -> int:
     if rust:
         logger.ok("Rust  {}".format(rust.version or rust.rustc))
         if rust.rustup:
-            targets = envmod.installed_rust_targets(rust)
+            targets = set(envmod.installed_rust_targets(rust))
             for arch, triple in config.WINDOWS_TARGETS.items():
                 if triple in targets:
                     logger.ok("target {} 已安装".format(triple))
                 else:
                     logger.warn("target {} 未安装（可用 doctor --fix 补齐）".format(triple))
+                    rust_target_problems += 1
             # Android 端的协议层同样由 Rust 交叉编译（libudp2cal_protocol.so）
             for abi, triple in config.ANDROID_RUST_TARGETS.items():
                 if triple in targets:
                     logger.ok("target {} 已安装（Android {}）".format(triple, abi))
                 else:
                     logger.warn("target {} 未安装（Android {} 构建需要；可用 doctor --fix 补齐）".format(triple, abi))
+                    rust_target_problems += 1
+        else:
+            logger.warn("未找到 rustup，无法管理交叉编译 target")
+            rust_target_problems = 1
     else:
         logger.error("未找到 Rust（https://rustup.rs）")
+        tool_problems += 1
 
     cmake_path, cmake_version = envmod.detect_cmake()
     if cmake_path:
-        logger.ok("CMake {} ({})".format(cmake_version or "?", cmake_path))
+        version_parts = tuple(int(part) for part in cmake_version.split(".") if part.isdigit())
+        if len(version_parts) < 2 or version_parts < (3, 22):
+            logger.error("CMake {} 不满足版本要求（需要 3.22+）".format(cmake_version or "版本未知"))
+            tool_problems += 1
+        else:
+            logger.ok("CMake {} ({})".format(cmake_version, cmake_path))
     else:
         logger.error("未找到 CMake")
+        tool_problems += 1
 
     msvc = envmod.detect_msvc()
     if msvc:
         logger.ok("MSVC  {}".format(msvc))
     else:
         logger.warn("未检测到 MSVC 工具链")
+        tool_problems += 1
 
     adb = envmod.detect_adb(sdks[0] if sdks else None, getattr(args, "adb", None))
     if adb:
@@ -169,14 +191,16 @@ def doctor(args) -> int:
         logger.warn("未找到 adb（platform-tools 未安装？）")
 
     logger.section("项目自检")
-    problems = _check_projects(logger)
+    project_problems = _check_projects(logger)
+    problems = tool_problems + sdk_component_problems + rust_target_problems + project_problems
 
     if getattr(args, "fix", False):
         logger.section("自动修复")
         if not sdks:
             logger.error("缺少 SDK，无法修复 local.properties")
         else:
-            for target in config.ANDROID_TARGETS.values():
+            sdk_component_problems = 0
+            for key, target in config.ANDROID_TARGETS.items():
                 project = Path(target["dir"])
                 if not project.exists():
                     continue
@@ -184,6 +208,8 @@ def doctor(args) -> int:
                 # 与 build 一致：Gradle 会读 local.properties，组件与属性文件必须是同一个 SDK
                 sdk = deps.resolve_sdk(project, sdks[0], logger)
                 deps.ensure_local_properties(project, sdk, logger)
+                deps.ensure_sdk_components(sdk, key, logger)
+                sdk_component_problems += len(envmod.missing_components(sdk, key))
         if rust and rust.rustup:
             for triple in config.WINDOWS_TARGETS.values():
                 deps.ensure_rust_target(rust, triple, logger)
@@ -191,7 +217,14 @@ def doctor(args) -> int:
                 deps.ensure_rust_target(rust, triple, logger)
         # 修复后必须复检：否则摘要恒为"发现 N 项待处理"，与实际情况不符
         logger.section("修复后复检")
-        problems = _check_projects(logger)
+        project_problems = _check_projects(logger)
+        if rust and rust.rustup:
+            installed = set(envmod.installed_rust_targets(rust))
+            rust_target_problems = sum(
+                triple not in installed
+                for triple in (*config.WINDOWS_TARGETS.values(), *config.ANDROID_RUST_TARGETS.values())
+            )
+        problems = tool_problems + sdk_component_problems + rust_target_problems + project_problems
 
     logger.blank()
     if problems == 0:
@@ -202,7 +235,7 @@ def doctor(args) -> int:
         logger.warn("体检完成，发现 {} 项待处理；可执行 `build.bat doctor --fix`".format(problems))
     logger.info("日志: {}".format(logger.path))
     logger.close()
-    return 0
+    return 1 if problems else 0
 
 
 # ---------------------------------------------------------------- 子命令

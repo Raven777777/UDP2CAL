@@ -167,9 +167,13 @@ def run(
     if stdin_text is not None and proc.stdin is not None:
         try:
             proc.stdin.write(stdin_text.encode("utf-8", "replace"))
-            proc.stdin.close()
         except OSError:
             pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
 
     collected: List[str] = []
     assert proc.stdout is not None
@@ -184,6 +188,8 @@ def run(
     except KeyboardInterrupt:
         _terminate(proc)
         raise
+    finally:
+        proc.stdout.close()
 
     code = proc.wait()
     return RunResult(code=code, lines=collected[-tail_lines:], command=displayed)

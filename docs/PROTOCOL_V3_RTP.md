@@ -1,6 +1,6 @@
 # UDP2CAL 协议 v3：RTP/Opus 媒体 + 控制面
 
-> **状态：已实现（v1.5.1）。**
+> **状态：已实现（v1.5.2）。**
 > 本文档描述 v3 的线格式与接收端时钟模型；`protocol/`、`windows/`、`android/` 均已按本文实现，
 > v2 代码路径已删除（`archive/PROTOCOL_V2.md` 仅作历史存档）。
 >

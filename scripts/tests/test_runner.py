@@ -1,13 +1,30 @@
 """runner.build_command 的 cmd.exe 引用规则。"""
 
+import io
 import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import support  # noqa: F401  (把 scripts/ 加入 sys.path)
 from udp2cal import runner
+
+
+class RunnerPipeCleanupTest(unittest.TestCase):
+    def test_closes_stdin_and_stdout_pipes(self):
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b"output\n")
+        process = SimpleNamespace(stdin=stdin, stdout=stdout, wait=Mock(return_value=0))
+
+        with patch.object(runner.subprocess, "Popen", return_value=process):
+            result = runner.run(["fake-command"], stdin_text="input")
+
+        self.assertEqual(result.lines, ["output"])
+        self.assertTrue(stdin.closed)
+        self.assertTrue(stdout.closed)
 
 
 class BuildCommandQuotingTest(unittest.TestCase):

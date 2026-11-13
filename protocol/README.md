@@ -14,5 +14,5 @@ UDP2CAL **协议 v3** 的 Rust 实现（协议唯一真源）。
 cargo test          # 协议单元测试（含附录 B 的全部字节向量）
 ```
 
-被 `windows/` 作为本地依赖引用；Android 端 `Udp2CalProtocol.kt` 是手动对齐的镜像实现，
-两端测试共用同一组十六进制向量，任何字段改动必须同时更新三处。
+被 `windows/` 作为本地依赖引用；Android 端将本 crate 编译为 JNI 库，`Udp2CalProtocol.kt` 只是薄 Kotlin 门面，
+不再维护第二份协议实现。Rust 与 Android 测试共用同一组十六进制向量；字段变更需同步更新协议规范和测试向量。

@@ -146,6 +146,7 @@ class CaptureService : Service() {
     )
 
     private var pendingRestart: CaptureParams? = null
+    private var pendingRestartIsExplicit = false
     /** 当前会话的采集参数（重启时复用；码率以 Prefs 为准，见 restartCapture） */
     @Volatile private var activeParams: CaptureParams? = null
 
@@ -289,10 +290,13 @@ class CaptureService : Service() {
                 // 重启，由它自己的 finally 在收尾**完全结束**后再安装新链路。
                 // 若在旧 finally 之前直接 doStartCapture，旧任务会关掉新对象。
                 pendingRestart = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
+                pendingRestartIsExplicit = true
+                restartPending = true
                 old.cancel()
                 return
             }
             pendingRestart = null
+            pendingRestartIsExplicit = false
             doStartCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
         }
     }
@@ -440,22 +444,25 @@ class CaptureService : Service() {
                 activeReverseSsrc = 0
                 try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception) {}
 
-                // 硬件初始化硬故障时不得无限重启
+                // 硬件初始化硬故障时不得无限重启。
                 val fatal = _status.value.errorMsg.let {
                     it.contains("麦克风初始化失败") || it.contains("麦克风不支持") ||
                         it.contains("编码器初始化失败") || it.contains("编码器帧大小无效")
                 }
-                if (fatal) {
-                    Log.e(TAG, "硬件初始化硬故障，清空挂起任务")
-                    pendingRestart = null
-                }
+                if (fatal) Log.e(TAG, "硬件初始化硬故障，禁止自动重试")
 
                 // 对象已全部拆除，此时才清空任务槽并安装下一条链路；两者与
                 // startCapture 共用 lifecycleLock，避免旧 finally 覆盖新任务。
                 synchronized(lifecycleLock) {
                     captureJob = null
+                    if (fatal && !pendingRestartIsExplicit) {
+                        // 硬件硬故障不自动重试，但不能丢弃用户刚明确请求的新会话。
+                        pendingRestart = null
+                        restartPending = false
+                    }
                     val restart = pendingRestart
                     pendingRestart = null
+                    pendingRestartIsExplicit = false
                     if (restart != null) {
                         doStartCapture(
                             restart.sampleRateHz, restart.bitrateKbps,
@@ -769,14 +776,20 @@ class CaptureService : Service() {
      * 码率取当前 Prefs（用户可能在触发重建的同一时刻也改了码率）。
      */
     private fun restartCapture() {
-        // 先置位：即使 activeParams 已失效（正在退出），也不要每 100 ms 重复打日志
-        restartPending = true
-        val p = activeParams ?: return
-        pendingRestart = p.copy(
-            bitrateKbps = Prefs.opusBitrateKbps,
-            testTone = Prefs.testToneMode,
-        )
-        captureJob?.cancel()
+        synchronized(lifecycleLock) {
+            // 与 stopCapture 串行，防止 stop 清空后又被旧采集线程排入重启。
+            // 先置位：即使参数已失效，也不要每 100 ms 重复打日志。
+            if (restartPending) return
+            restartPending = true
+            if (pendingRestart != null || !hasNewCapture) return
+            val p = activeParams ?: return
+            pendingRestart = p.copy(
+                bitrateKbps = Prefs.opusBitrateKbps,
+                testTone = Prefs.testToneMode,
+            )
+            pendingRestartIsExplicit = false
+            captureJob?.cancel()
+        }
     }
 
     /**
@@ -1458,6 +1471,7 @@ class CaptureService : Service() {
         val recordToStop: AudioRecord?
         synchronized(lifecycleLock) {
             pendingRestart = null
+            pendingRestartIsExplicit = false
             activeParams = null
             restartPending = false
             hasNewCapture = false

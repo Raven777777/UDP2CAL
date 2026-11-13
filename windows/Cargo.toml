@@ -1,6 +1,6 @@
 [package]
 name = "udp2cal"
-version = "1.5.1"
+version = "1.5.2"
 edition = "2024"
 description = "UDP2CAL - 局域网音频串流Windows接收端"
 build = "build.rs"
