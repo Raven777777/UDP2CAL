@@ -65,14 +65,21 @@ pub const JITTER_START_MS: u32 = 30;
 /// * v1.4.0 关掉扫描（外加双端 DSCP 46）后，同一链路 4 次长跑 **0 次 >200 ms**，
 ///   最大空档 68–90 ms；按 ×1.6 余量取整 → **150 ms**（PCM 环 44 + 声卡 10 +
 ///   抖动缓冲 ~96），比 260 低 110 ms。
+/// * v1.5.1 同链路双目标实测（docs/LATENCY_CALIBRATION.md §5.2）：目标 80 →
+///   总延迟 83–99 ms 且 `PLC=0`。PC 正向（本端接收）默认随之降到 **80 ms**。
+///   代价要写明：同一链路 >100 ms 级到达停顿，目标 150 时是 1–3 帧 PLC，
+///   目标 80 时会变成 7–10 帧——所以 80 只适合**实测稳态空档 <40 ms** 的
+///   链路，且反向链路（Android 接收）未按 80 重测，仍取 150（见
+///   `Udp2CalProtocol.kt` 的同名 Kotlin 常量，两端各自独立定值）。
 /// * 若环境里重新出现扫描源（换路由器 / 换手机 / 对方装新 App），水位会
 ///   周期性地被顶穿、`adjust` 贴回 ±5000。此时用环境变量
 ///   [`WATER_TARGET_ENV`] 临时抬高目标（`UDP2CAL_WATER_TARGET_MS=220`），
 ///   不要改编译常数；定值规则是"目标 ≥ 实测最大空档 ×1.5"。
 ///
-/// 这是整套实现里唯一跟环境相关的常数。**不要靠压低它去赢延迟**：压低只会
-/// 把延迟换成 PLC 破音与常年变调（见 [`STEP_TRIM_EXCESS_MS`] 的配套措施）。
-pub const WATER_TARGET_MS: u32 = 150;
+/// 这仍是整套实现里唯一跟环境相关的常数。**不要靠压低它去赢延迟**：80 是
+/// 实测结论，不是普适值；空档更深的链路上压低目标只会把延迟换成 PLC 破音
+/// 与常年变调（见 [`STEP_TRIM_EXCESS_MS`] 的配套措施）。
+pub const WATER_TARGET_MS: u32 = 80;
 
 /// 目标水位的环境变量覆盖名（现场调参不改编译，见 [`water_target_ms`]）。
 pub const WATER_TARGET_ENV: &str = "UDP2CAL_WATER_TARGET_MS";
@@ -1887,11 +1894,11 @@ mod tests {
         let mut d = DriftController::new(48_000);
         let mut dev = 0u64;
         d.update(0, dev); // 起播瞬间：水位 0
-        // 120 s 的“水位远低于目标”（预缓冲 + 断流）：积分以 ≈12 ppm/s 往下积，
-        // 约 82 s 触到 -1000 ppm 的权限下限。
+        // 120 s 的“水位远低于目标”（预缓冲 + 断流，水位 0）：积分以
+        // ≈8.9 ppm/s 往下积，约 113 s 触到 -1000 ppm 的权限下限。
         for _ in 0..12_000 {
             dev += 480; // 10 ms
-            d.update(40, dev);
+            d.update(0, dev);
         }
         assert!(
             d.integral() <= -PI_INTEGRAL_MAX + 1e-9,
@@ -2324,10 +2331,10 @@ mod tests {
     // ── 阶跃吸收（方案 C）──
 
     #[test]
-    fn water_target_default_is_150_and_override_is_clamped() {
-        assert_eq!(WATER_TARGET_MS, 150);
-        // 同上：编译期求值
-        const { assert!(WATER_TARGET_MIN_MS < WATER_TARGET_MS) };
+    fn water_target_default_is_80_and_override_is_clamped() {
+        assert_eq!(WATER_TARGET_MS, 80);
+        // 同上：编译期求值（默认值可以取到下界：clamp(80, 80, 600) 合法）
+        const { assert!(WATER_TARGET_MIN_MS <= WATER_TARGET_MS) };
         const { assert!(WATER_TARGET_MS < WATER_TARGET_MAX_MS) };
         // 环境变量缓存后的值必须落在允许区间内（未设置时等于常数）
         assert!((WATER_TARGET_MIN_MS..=WATER_TARGET_MAX_MS).contains(&water_target_ms()));

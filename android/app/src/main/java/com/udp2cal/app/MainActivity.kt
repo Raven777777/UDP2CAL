@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -60,6 +61,18 @@ class MainActivity : ComponentActivity() {
     /** 麦克风权限被拒（Compose 侧据此弹窗） */
     private val permissionDenied = mutableStateOf(false)
 
+    /** 是否已加入电池优化白名单（息屏不断流；Compose 侧据此显示引导按钮） */
+    private val batteryWhitelisted = mutableStateOf(true)
+
+    private fun refreshBatteryWhitelist() {
+        batteryWhitelisted.value = try {
+            (getSystemService(Context.POWER_SERVICE) as PowerManager)
+                .isIgnoringBatteryOptimizations(packageName)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
     private val micPermLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         // 拒绝后必须给出明确指引：否则用户点"开始采集"只会看到
         // "网络连接失败 / 麦克风初始化失败"，完全看不出根因是权限
@@ -83,7 +96,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 用户从系统设置返回后重新判定
+        // 用户从系统设置返回后重新判定（电池优化白名单 + 麦克风权限）
+        refreshBatteryWhitelist()
         if (permissionDenied.value &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         ) {
@@ -96,6 +110,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         Prefs.init(applicationContext)
+        refreshBatteryWhitelist()
         bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -124,7 +139,8 @@ class MainActivity : ComponentActivity() {
                             onStart = { ip, port -> doStart(ip, port) },
                             onStop = { doStop() },
                             service = serviceState.value,
-                            onOpenSettings = { showOpusSettings = true }
+                            onOpenSettings = { showOpusSettings = true },
+                            batteryWhitelisted = batteryWhitelisted.value
                         )
                     }
                 }
@@ -185,7 +201,8 @@ fun MainScreen(
     onStart: (String, Int) -> Unit,
     onStop: () -> Unit,
     service: CaptureService?,
-    onOpenSettings: () -> Unit
+    onOpenSettings: () -> Unit,
+    batteryWhitelisted: Boolean
 ) {
     var targetIp by remember { mutableStateOf(Prefs.targetIp) }
     var targetPort by remember { mutableStateOf(Prefs.targetPort.toString()) }
@@ -262,6 +279,36 @@ fun MainScreen(
         ) { Text(if (isRunning) "停止采集" else "开始采集", fontSize = 18.sp) }
 
         OutlinedButton(onClick = onOpenSettings, modifier = Modifier.fillMaxWidth()) { Text("高级设置", color = Color(0xFFAAAAAA)) }
+
+        // 息屏断流引导：仅当未加入电池优化白名单时显示。
+        // 每秒一次的 CONNECT 心跳就是系统认账的保活，白名单足够，无需加密心跳。
+        if (!batteryWhitelisted) {
+            val ctx = LocalContext.current
+            OutlinedButton(
+                onClick = {
+                    // 优先直跳"请求忽略电池优化"确认页；个别 ROM 拦截该意图时
+                    // 退回电池优化设置列表页
+                    try {
+                        ctx.startActivity(
+                            Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:" + ctx.packageName)
+                            )
+                        )
+                    } catch (_: Exception) {
+                        try {
+                            ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                        } catch (_: Exception) {
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("息屏保持连接（加入电池优化白名单）", color = Color(0xFF00B0FF)) }
+            Text(
+                "国产 ROM（vivo/小米/OPPO 等）息屏断流还需在系统设置中允许本应用「自启动」与「后台联网」。",
+                fontSize = 12.sp, color = Color(0xFF888888)
+            )
+        }
 
         if (errorMsg.isNotEmpty()) {
             Spacer(Modifier.height(4.dp))

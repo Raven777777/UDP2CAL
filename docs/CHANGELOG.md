@@ -4,6 +4,46 @@
 
 ---
 
+## 未发布 — 2026-11-13 · 第一梯队低风险优化（正向水位 80 / 专用线程 / 解码锁外化）
+
+> 不改协议语义：只动 PC 正向默认水位、线程归属与锁粒度。依据 v1.5.1 同链路
+> 实测（[LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) §5.2：目标 80 →
+> 总延迟 83–99 ms 且 PLC=0）。
+
+**PC 正向水位目标 150 → 80 ms**
+- `protocol/rtp.rs` `WATER_TARGET_MS = 80`：正向接收端总延迟 ~160 → ~90 ms。反向链路
+  （Android 接收）空档更深且未按 80 重测，`Udp2CalProtocol.kt` 的 Kotlin 常量保持 150
+  ——两方向独立定值。代价：>100 ms 级到达停顿从 1–3 帧 PLC 变成 7–10 帧；链路劣化时用
+  `UDP2CAL_WATER_TARGET_MS` 现场抬回（见 PROTOCOL_V3_RTP.md §7.10.1、§5.2）。
+
+**Android 三个热循环钉到专用单线程**
+- 采集/发送（`udp2cal-mic`）、反向接收（`udp2cal-rx`）、反向播放（`udp2cal-play`）各用
+  一个 `Executors.newSingleThreadExecutor().asCoroutineDispatcher()`，不再跑在
+  `Dispatchers.IO` 池上：池线程会在 delay/yield 后迁移，`setThreadPriority` 无法钉住，
+  还会把 URGENT_AUDIO 留给复用该线程的其他任务。优先级在线程体里设置一次即全程有效；
+  反向接收的"保存/退出还原"舞蹈随之删除。onDestroy 统一 `close()` 三个 dispatcher。
+
+**息屏使用引导（Android UI）**
+- `MainActivity` 主界面新增引导按钮：未加入电池优化白名单时显示，直跳
+  `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`（个别 ROM 拦截时退回电池优化设置列表页），
+  附国产 ROM「自启动/后台联网」文字指引。不加高频心跳：每秒一次的 CONNECT 本来就是
+  系统认账的保活，高频心跳只会放大 AP 攒批。
+
+**Windows 解码线程提优先级**
+- 解码线程首行 `SetThreadPriority(THREAD_PRIORITY_HIGHEST)`（不进 MMCSS、不新增
+  crate feature，失败只告警）：负载高的机器上消除周期性 underrun，无延迟代价。
+
+**Windows 接收任务不再被同步 join / 锁内解码拖住**
+- 新会话与 keepalive 分支的 `restart_reverse_sender`（内部含最长几百 ms 的同步 join）
+  移到 `spawn_blocking`：RTP/CONNECT 入栈不再被顶住；限流清除随 restart 一并移入。
+- 三处 `send().await` 改 `try_send`：托盘事件（满了丢点击）、状态卡每 500 ms 刷新
+  （满了丢本条，下一条补上）、断连通知（满了才阻塞等待——该消息一次性，不能丢）。
+- Android 反向解码：阶跃裁剪帧（≤12 帧/次）锁内只收集负载与帧型，解码移到 linkLock
+  外补做——攒批交付时正是 insert 与 pull 同时要锁的时刻，锁内解码会拖住接收端。
+
+回归测试：`protocol::rtp::water_target_default_is_80_and_override_is_clamped`
+（原 150 断言改名改值）。
+
 ## 未发布 — 2026-11-12 · 修复 cpal 0.18 导致的 8 kHz 输出回归（高音消失）
 
 - **现象**：新版 Windows 端声音发闷，高频全部消失；与手机系统更新时间巧合，一度误诊为安卓端问题。

@@ -570,7 +570,7 @@ Reconnecting ──(ACK)──> Connected
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
 | `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧连续）；实际启动还要求水位达到本方向的启动目标 |
-| `WATER_TARGET_MS` | 150 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
+| `WATER_TARGET_MS` | PC 正向 80 ms / Android 反向 150 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
 | `STEP_TRIM_GROWTH_MS` | 80 ms | 仅诊断：记录“单次 tick 增长超过该值”的次数，**不再作为裁剪判据** |
 | `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据：总水位 > `target + 100` ms 且持续 `STEP_TRIM_HOLD_MS` |
@@ -742,7 +742,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 **启动**
 
 - 首包建立基准；不要求首包序列号是某个固定值。
-- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（150 ms），所以不存在“30 ms 先播、再用 24 秒慢慢爬到 150 ms”的过程；`JITTER_START_MS` 只是硬下限。
+- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（PC 正向 80 / Android 反向 150），所以不存在“30 ms 先播、再用 24 秒慢慢爬到 150 ms”的过程；`JITTER_START_MS` 只是硬下限。
 - `start_ms` 每个方向独立，可取 [30, WATER_TARGET_MS]；当前实现取目标值，以一次可闻的启动等待换取稳态不欠载。
 - 若首包丢失，以第一个收到的包为基准；不得无限等待“第 0 帧”。
 - Windows cpal 回调在预缓冲完成前输出静音；播放进度由回调侧的 `played_frames` 表达，并通过 `OutputCallbackInfo::timestamp().playback`（WASAPI `IAudioClock::GetPosition` + QPC）建立设备进度映射。
@@ -894,7 +894,7 @@ total_latency = now − arrival_of(audible_ts)          # 不再额外加 device
 绝对精度仍需**实测校准一次**（见 [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md)），
 校准值只作为日志/展示的修正量，不参与水位控制。
 
-### 7.10.1 为什么 `WATER_TARGET_MS` 是 150 ms（以及它为什么会被环境改变）
+### 7.10.1 为什么 PC 正向是 80 ms、Android 反向是 150 ms（以及它为什么会被环境改变）
 
 这个数**不是算出来的**，而是由网络环境决定的：它要盖住「一次断供有多深」，而断供深度
 只取决于链路环境（Wi-Fi 省电、AP 缓冲、手机扫描），不是协议能拍的常数。换环境就要重新
@@ -945,7 +945,15 @@ A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600
 原来靠水位预留的那部分（每隔几十秒一次的 ~200 ms 台阶）改由 §7.10.2 的**阶跃吸收**当场
 吃掉：台阶到达时直接前移时间线，而不是让 PI 顶 40 s 钳位。
 
-**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 150`；环境变量
+**v1.5.1 为什么 PC 正向降到 80 ms**：同一条链路、双目标实测（docs/LATENCY_CALIBRATION.md
+§5.2）显示目标 80 → 总延迟 83–99 ms 且 `PLC=0`（稳态空档 68–90 ms 的链路，`迟到=0` 说明
+没有实质断供穿过缓冲）。随之 PC 正向默认降到 **80 ms**（恰为下限 `WATER_TARGET_MIN_MS`，
+也是 `PLC_LEAD_MS + DECODE_LIMIT_MS = 60` 之上的安全点）。代价要写明：同一链路 >100 ms 级
+到达停顿，目标 150 时是 1–3 帧 PLC，目标 80 时会变成 7–10 帧。**反向（Android 接收）未按
+80 重测且空档更深，仍取 150**——两方向独立定值，这正是 PC 抬下去而 Android 不动的理由。
+
+**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 80`（PC 正向；Android 反向用
+Kotlin 常量 150）；环境变量
 `UDP2CAL_WATER_TARGET_MS` 可覆盖，允许区间
 `WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位，进程内首次读取后缓存
 （`protocol::rtp::water_target_ms()`）。取值经 `DriftController::with_target()` 注入，PI 的
@@ -959,7 +967,7 @@ A1 条目）。该扫描每 60–120 s 占用无线 1.85 s，会造成双向 600
 
 这个参数仍是**唯一**跟环境相关的常数：换路由器、换手机、对方装新 App 都可能重新引入扫描源
 或改变空档幅度，此时应重跑 P0 打点按实测最大空档 ×1.5–1.6 重新定值；现场调参优先用
-`UDP2CAL_WATER_TARGET_MS`（不必重编译），确定后回写常量并同步 Android。
+`UDP2CAL_WATER_TARGET_MS`（不必重编译），确定后回写常量（Android 反向同步改 Kotlin 常量）。
 
 ### 7.10.2 阶跃吸收（step trim）
 
@@ -1301,7 +1309,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
 | `JITTER_START_MS` | `30` | 预缓冲（3 帧） |
-| `WATER_TARGET_MS` | `150` | 目标总水位（抖动缓冲 + PCM 环 + 声卡）；每个方向独立定值 |
+| `WATER_TARGET_MS` | `80` | PC 正向目标总水位（抖动缓冲 + PCM 环 + 声卡）；Android 反向独立取 150 |
 | `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 端运行时覆盖目标水位的环境变量 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 覆盖值允许区间，越界钳位 |
 | `STEP_TRIM_GROWTH_MS` | `80` | 仅诊断：不再单独触发裁剪 |
@@ -1490,8 +1498,9 @@ FEC 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低
    本版不为此提高目标水位（那会让有线用户白白多等），需要时由上层应用自行补偿。
 2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()` 的粒度不同（典型 5–20 ms，
    低延迟模式下更细）。协议侧只要求播放头单调，不假设其精度。
-3. **Wi-Fi 抖动**：150 ms 的目标水位覆盖关闭扫描后的常见家用/办公环境（稳态空档
-   68–90 ms），偶发台阶由阶跃吸收（§7.10.2）兜住。若环境重新出现数百毫秒级断供，
+3. **Wi-Fi 抖动**：正向 80 ms / 反向 150 ms 的目标水位覆盖关闭扫描后的常见家用/办公
+   环境（稳态空档 68–90 ms），偶发台阶由阶跃吸收（§7.10.2）兜住。若环境重新出现
+   数百毫秒级断供，
    表现会转向 PLC 与阶跃裁剪，而不是自动抬水位——抬水位会把延迟永久留在链路上；
    此时应用 `UDP2CAL_WATER_TARGET_MS` 现场重定目标（§7.10.1）。
 4. **干净断代**：v2/v3 不能互通，发布时必须同时升级两端（见第二章）。

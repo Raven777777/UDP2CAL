@@ -46,6 +46,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import java.util.concurrent.Executors
 import kotlinx.coroutines.yield
 import androidx.core.content.ContextCompat
 import java.security.SecureRandom
@@ -63,6 +66,10 @@ import kotlin.coroutines.coroutineContext
  * 反向播放协程（AudioTrack 播放头拉取 → 解码/PLC → 阻塞写）
  * ```
  * 音频路径上**没有**应用层 PCM 队列、没有 `soTimeout` 驱动、没有 PLC 定时器。
+ *
+ * 采集/发送、反向接收、反向播放三个热循环各钉在一条**专用单线程**上
+ * （micDispatcher / reverseRxDispatcher / reversePlayDispatcher）：协程在
+ * delay/yield 后可能被 Dispatchers.IO 换池线程，优先级无法钉住。
  */
 class CaptureService : Service() {
     companion object {
@@ -80,6 +87,19 @@ class CaptureService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // ── 音频热循环专用线程 ──
+    // 协程跑在 Dispatchers.IO 上时，delay/yield 之后可能被换到另一个池线程：
+    // setThreadPriority 设在“当时的线程”上不稳定，还会把 URGENT_AUDIO 留给
+    // 后续复用该线程的任务。三个单线程执行器让热循环从首次 dispatch 到退出
+    // 都钉在同一线程，优先级在线程体里设置一次即全程有效。
+    private val micDispatcher = singleThreadDispatcher("udp2cal-mic")
+    private val reverseRxDispatcher = singleThreadDispatcher("udp2cal-rx")
+    private val reversePlayDispatcher = singleThreadDispatcher("udp2cal-play")
+
+    /** 单线程执行器 → 协程调度器（热循环专用，onDestroy 时统一 close） */
+    private fun singleThreadDispatcher(name: String): ExecutorCoroutineDispatcher =
+        Executors.newSingleThreadExecutor { r -> Thread(r, name) }.asCoroutineDispatcher()
 
     @Volatile private var captureJob: Job? = null
     /** 串行化「安装新链路」与「旧链路收尾」；旧任务拆除完对象前不得被覆盖 */
@@ -384,10 +404,10 @@ class CaptureService : Service() {
                 // ── 控制协程 ──
                 controlJob = launch { controlLoop() }
 
-                if (testTone) {
-                    runTestToneLoop(enc, sender, voiceMode)
-                } else {
-                    runMicCaptureLoop(enc, sender, voiceMode)
+                // 热循环钉到专用线程（见 micDispatcher）：优先级设一次即稳定
+                withContext(micDispatcher) {
+                    if (testTone) runTestToneLoop(enc, sender, voiceMode)
+                    else runMicCaptureLoop(enc, sender, voiceMode)
                 }
             } catch (_: CancellationException) {
             } catch (e: Exception) {
@@ -920,7 +940,7 @@ class CaptureService : Service() {
         } finally {
             linkLock.unlock()
         }
-        reversePlayJob = serviceScope.launch(Dispatchers.IO) { reversePlayLoop() }
+        reversePlayJob = serviceScope.launch(reversePlayDispatcher) { reversePlayLoop() }
         _status.value = _status.value.copy(
             reverseAudio = true,
             reverseBw = "FB 48 kHz 立体声"
@@ -934,7 +954,7 @@ class CaptureService : Service() {
      */
     private fun launchReverseReceiver() {
         if (reverseRxJob?.isActive == true) return
-        reverseRxJob = serviceScope.launch(Dispatchers.IO) { reverseRxLoop() }
+        reverseRxJob = serviceScope.launch(reverseRxDispatcher) { reverseRxLoop() }
     }
 
     private fun stopReverseAudio() {
@@ -989,14 +1009,9 @@ class CaptureService : Service() {
         var lastReport = System.currentTimeMillis()
 
         // 接收线程是音频数据通路上游：被后台线程抢占一次就等于丢包。
-        // Dispatchers.IO 的线程是共享复用的，退出时必须还原优先级，否则会把
-        // URGENT_AUDIO 留在池线程上。还原只在协程仍跑在同一个线程时生效
-        // （只有 socket 报错路径会 delay 而可能换线程）。
-        val rxTid = android.os.Process.myTid()
-        val rxPreviousPriority = android.os.Process.getThreadPriority(rxTid)
-        android.os.Process.setThreadPriority(
-            rxTid, android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
-        )
+        // 专用线程（reverseRxDispatcher）不迁移，设置一次即全程有效；
+        // 线程只服务本循环，随会话结束停用，无需退出还原。
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         try {
             while (coroutineContext.isActive) {
                 pkt.length = buf.size
@@ -1054,10 +1069,7 @@ class CaptureService : Service() {
                 }
             }
         } finally {
-            val exitTid = android.os.Process.myTid()
-            if (exitTid == rxTid) {
-                android.os.Process.setThreadPriority(exitTid, rxPreviousPriority)
-            }
+            // 专用线程不迁移，优先级无需还原（见函数头注释）
         }
     }
 
@@ -1089,6 +1101,9 @@ class CaptureService : Service() {
      * `linkLock.wait(5)` 只是"等包"的存活等待，不承担节拍。
      */
     private suspend fun reversePlayLoop() {
+        // 专用线程（reversePlayDispatcher）不迁移，线程体首行提优先级：
+        // 设一次即全程有效。
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
         // 播放器在 AudioRecord 之后创建（为了复用 sessionId 接 AEC）。
         // ACK 可能先于麦克风初始化到达，这里必须等依赖就绪而不是直接退出，
         // 否则反向串流会永久沉默。
@@ -1111,6 +1126,11 @@ class CaptureService : Service() {
         val frameSamples = Udp2CalProtocol.OPUS_FRAME_SAMPLES * 2 // 立体声交错
         val pcm = ShortArray(frameSamples)
         val silence = ShortArray(frameSamples)
+        // 阶跃裁剪的锁外解码缓冲：上限 = PLC_MAX_MS / OPUS_FRAME_MS 帧；
+        // trimLens[i] ≥ 0 是正常帧的负载长度，< 0 是缺口帧（锁外走 PLC）
+        val trimMax = Udp2CalProtocol.PLC_MAX_MS / Udp2CalProtocol.OPUS_FRAME_MS
+        val trimPayloads = Array(trimMax) { ByteArray(Udp2CalProtocol.OPUS_MAX_PAYLOAD) }
+        val trimLens = IntArray(trimMax)
         // 受控重采样：媒体 48 kHz、设备 48 kHz，基础比率 1.0，只做 ±0.5% 微调。
         // 它现在是**唯一**的执行手段（不再有样本级丢/插），重采样器本身是
         // 多相 FIR，所以比率怎么扫都不会在 12 kHz 处起伏。
@@ -1152,6 +1172,7 @@ class CaptureService : Service() {
             var stepTotal = 0L
             var stepLimited = false
             var trimFrames = 0
+            var trimN = 0
 
             linkLock.lock()
             try {
@@ -1192,17 +1213,23 @@ class CaptureService : Service() {
 
                 // 阶跃裁剪必须沿播放顺序**解码后丢弃 PCM**：只推进缓冲游标会让
                 // 有状态 Opus 解码器与发送端脱节（接缝/音染）。这里最多 12 帧，
-                // 且每分钟最多 3 次，锁内解码的代价可以接受。
+                // 且每分钟最多 3 次。锁内只收集负载与帧型，解码移到锁外（见
+                // unlock 之后）：linkLock 同时保护网络的 insert，攒批交付时正是
+                // 两边同时要锁的时刻，锁内解码（0.1–1 ms/帧 × ≤12）会拖住接收端。
                 var guard = trimFrames
                 while (guard-- > 0) {
                     val c = jitter.pullTrim(payload)
                     when (c) {
                         Udp2CalProtocol.Pull.PACKET -> {
-                            dec.decode(payload, 0, jitter.pulledLength, pcm)
+                            val len = jitter.pulledLength
+                            payload.copyInto(trimPayloads[trimN], 0, 0, len)
+                            trimLens[trimN] = len
+                            trimN++
                             stepSkipped++
                         }
                         Udp2CalProtocol.Pull.PLC -> {
-                            dec.plc(pcm)
+                            trimLens[trimN] = -1
+                            trimN++
                             stepSkipped++
                         }
                         Udp2CalProtocol.Pull.SILENCE -> stepSkipped++
@@ -1225,6 +1252,15 @@ class CaptureService : Service() {
                 pulledLen = jitter.pulledLength
             } finally {
                 linkLock.unlock()
+            }
+
+            // 阶跃裁剪帧的解码在锁外补做：只推进解码器状态，PCM 不进
+            // AudioTrack。needReset 会重建解码器，此时不能补解码。
+            if (!needReset) {
+                for (i in 0 until trimN) {
+                    val len = trimLens[i]
+                    if (len >= 0) dec.decode(trimPayloads[i], 0, len, pcm) else dec.plc(pcm)
+                }
             }
 
             if (needReset) {
@@ -1496,6 +1532,10 @@ class CaptureService : Service() {
             super.onDestroy()
             return
         }
+        // 热循环专用线程此时都已空闲：随服务一起停掉，不留孤儿线程。
+        runCatching { micDispatcher.close() }
+        runCatching { reverseRxDispatcher.close() }
+        runCatching { reversePlayDispatcher.close() }
         // 原生句柄用完之后必须归还：JitterBuffer/DriftController/DeviceRateEstimator
         // 的状态在 Rust 堆上（protocol/jni.rs），Kotlin 只是持有 jlong 句柄。
         runCatching { jitter.close() }

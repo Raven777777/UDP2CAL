@@ -21,7 +21,9 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
     MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_RESTORE, SetForegroundWindow, ShowWindow,
@@ -515,6 +517,16 @@ fn init_audio_worker() {
     let spawn_result = std::thread::Builder::new()
         .name("udp2cal-decode".into())
         .spawn(move || {
+            // 解码线程的节拍由声卡播放头驱动：被后台线程抢占一次就是一个
+            // 10 ms 块的迟写，负载高的机器上表现为周期性 underrun（规范 8.2）。
+            // 提到 HIGHEST 而不进 MMCSS：单次调用、不新增 crate feature，
+            // 失败（受限权限/组策略）只告警，继续用默认优先级。
+            // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
+            unsafe {
+                if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+                    logf!("[Audio] 解码线程提权失败（{e}），继续用默认优先级");
+                }
+            }
             set_decode_thread(std::thread::current());
 
             let mut dec = match decoder::OpusDecoder::new() {
@@ -2239,8 +2251,12 @@ fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> {
                     }
                     TrayCommand::Quit => Message::Quit,
                 };
-                if output.send(message).await.is_err() {
-                    break;
+                // 托盘事件是可重复的用户点击：UI 卡住时丢一次点击比阻塞托盘
+                // 线程好；仅接收端已退出才退出转发循环。
+                if let Err(e) = output.try_send(message) {
+                    if e.is_disconnected() {
+                        break;
+                    }
                 }
             }
         },
@@ -2441,10 +2457,11 @@ async fn handle_control(
         // 新会话：抖动缓冲与解码器状态全部重建
         jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
         wake_decoder();
-        restart_reverse_sender(
-            SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
-            reverse_ssrc,
-        );
+        // restart 里的 stop 是同步 join，旧线程卡在启动段时可达几百 ms；
+        // 移出接收任务（spawn_blocking），避免顶住 RTP/CONNECT 入栈。
+        // ACK 不等线程起来：反向包晚 ~百 ms 到达只多喂几帧 PLC。
+        let addr = SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1));
+        tokio::task::spawn_blocking(move || restart_reverse_sender(addr, reverse_ssrc));
         if should_log_control_event() {
             logf!(
                 "[P2P] 手机端 {} 已绑定（forward_ssrc={:#010x} reverse_ssrc={:#010x} reverse_port={}）",
@@ -2504,29 +2521,28 @@ async fn handle_control(
         if sender_dead {
             *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
         }
-        restart_reverse_sender(
-            SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1)),
-            reverse_ssrc,
-        );
-        if should_log_control_event() {
-            if reverse_stale {
-                logf!(
-                    "[P2P] 反向发送更新：ssrc={:#010x} port={}",
-                    reverse_ssrc,
-                    cfg.reverse_port
-                );
-            } else {
-                logf!(
-                    "[P2P] 反向发送线程已退出，已重启：ssrc={:#010x} port={}",
-                    reverse_ssrc,
-                    cfg.reverse_port
-                );
+        // 同上：restart 含同步 join，移出接收任务；串行锁保证与后续 restart
+        // 互斥，限流清除（依赖 restart 完成）也一并移入。
+        let addr = SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1));
+        let dead = sender_dead;
+        let stale = reverse_stale;
+        let port = cfg.reverse_port;
+        tokio::task::spawn_blocking(move || {
+            restart_reverse_sender(addr, reverse_ssrc);
+            if should_log_control_event() {
+                if stale {
+                    logf!("[P2P] 反向发送更新：ssrc={reverse_ssrc:#010x} port={port}");
+                } else {
+                    logf!("[P2P] 反向发送线程已退出，已重启：ssrc={reverse_ssrc:#010x} port={port}");
+                }
             }
-        }
-    }
-    // 只在线程活过一个完整 CONNECT 周期后清除限流，避免“刚重启就退出”
-    // 的线程把 1 Hz 重试重新放开。
-    if !sender_dead && reverse_sender_alive() {
+            if !dead && reverse_sender_alive() {
+                *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        });
+    } else if !sender_dead && reverse_sender_alive() {
+        // 只在线程活过一个完整 CONNECT 周期后清除限流，避免“刚重启就退出”
+        // 的线程把 1 Hz 重试重新放开。
         *REVERSE_RETRY_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
@@ -2643,7 +2659,14 @@ fn udp_receiver_stream(
                 if last_liveness.elapsed() >= Duration::from_millis(100) {
                     last_liveness = Instant::now();
                     if check_peer_timeout() {
-                        let _ = output.send(Message::Disconnected).await;
+                        // Disconnected 每次断连只发一次（check_peer_timeout 触发
+                        // reset_to_ready 后续 tick 直接 false），不能无脑丢：先试
+                        // 非阻塞投递，通道真满（UI 落后 ≥64 条）才阻塞等待。
+                        if let Err(e) = output.try_send(Message::Disconnected) {
+                            // 该消息一次性不能丢：满了才阻塞等待；UI 已退出时
+                            // send 立刻报错被忽略
+                            let _ = output.send(e.into_inner()).await;
+                        }
                     }
                 }
 
@@ -2732,12 +2755,11 @@ fn udp_receiver_stream(
                     // 全局的 RTP_RX_PACKETS 已经在统计同一件事）。
                     byte_count = 0;
                     last_stats = Instant::now();
-                    let _ = output
-                        .send(Message::StatusUpdate(StatusInfo {
-                            bitrate_kbps: kbps,
-                            level_db,
-                        }))
-                        .await;
+                    // 每 500 ms 重发：满了丢本条，下一条自然补上，不倒灌接收任务
+                    let _ = output.try_send(Message::StatusUpdate(StatusInfo {
+                        bitrate_kbps: kbps,
+                        level_db,
+                    }));
                 }
             }
         },
