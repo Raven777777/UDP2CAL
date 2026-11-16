@@ -138,6 +138,9 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             let mut last_packet_at = Instant::now();
             let mut last_newest_ts = 0u64;
             let mut idle_feedback = false;
+            // PLC→Silence 接缝的 10 ms 淡出：记录上一块**成功写出**的末样本。
+            // 解码失败补零 / 重同步 / 设备重建时清空，避免从过时电平起坡。
+            let mut last_pcm: Option<f32> = None;
 
             // 最近一次下发的总比率微调（反馈 Δu 与前馈 r̂ 的合成）
             let mut adjust: f64;
@@ -154,6 +157,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                         aw.flush();
                         last_packet_at = Instant::now();
                         idle_feedback = false;
+                        last_pcm = None;
                         AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
                     }
                     std::thread::park_timeout(Duration::from_millis(50));
@@ -190,6 +194,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                             device_rate_est =
                                 protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
                             step = protocol::rtp::StepAbsorber::new();
+                            last_pcm = None;
                             spawn_session.set_audio_state(AudioInitState::Ready);
                             logf!("[Audio] 输出流已重建（{} Hz）", aw.device_rate);
                         }
@@ -211,6 +216,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     device_rate_est.reset();
                     step.reset();
                     aw.flush();
+                    last_pcm = None;
                 }
 
                 // ── 水位（唯一观测量）──
@@ -378,6 +384,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                                     .map(|&x| (x as f64) * (x as f64))
                                     .sum::<f64>();
                                 rms_count += n as u64;
+                                last_pcm = pcm.last().copied();
                                 aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
                             }
                             None => match dec.conceal() {
@@ -388,9 +395,12 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                                         .map(|&x| (x as f64) * (x as f64))
                                         .sum::<f64>();
                                     rms_count += n as u64;
+                                    last_pcm = pcm.last().copied();
                                     aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
                                 }
                                 None => {
+                                    // 解码与 PLC 都失败：补零不走淡出（没有可接续的电平）
+                                    last_pcm = None;
                                     aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
                                 }
                             },
@@ -419,17 +429,35 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                                 rms_sum +=
                                     pcm.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
                                 rms_count += n as u64;
+                                last_pcm = pcm.last().copied();
                                 aw.write(pcm, protocol::rtp::OPUS_SAMPLE_RATE);
                             }
                             None => {
+                                // 生成不出 PLC：补零，不参与淡出
+                                last_pcm = None;
                                 aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
                             }
                         }
                     }
                     protocol::rtp::Pull::Silence { .. } => {
-                        // 连续 PLC 已达上限：输出静音但**继续推进媒体时间**
-                        // （`pull` 内部已 advance），否则恢复时真包会被判迟到
-                        aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                        // 中段洞 PLC 到上限 / 尾部洞 hold 超时：`pull` 已推进一帧
+                        // 媒体时间，否则恢复时真包会被判迟到。PLC→静音的接缝做
+                        // 一帧 10 ms 线性淡出（从上一块最后写出的样本到 0），
+                        // 避免硬切出“咔”声；之后保持纯静音。
+                        match last_pcm.take() {
+                            Some(last) => {
+                                let mut fade =
+                                    [0.0f32; protocol::rtp::FRAME_SAMPLES as usize];
+                                let n = fade.len();
+                                for (i, s) in fade.iter_mut().enumerate() {
+                                    *s = last * (n - 1 - i) as f32 / (n - 1) as f32;
+                                }
+                                aw.write(&fade, protocol::rtp::OPUS_SAMPLE_RATE);
+                            }
+                            None => {
+                                aw.write(&silence_frame, protocol::rtp::OPUS_SAMPLE_RATE);
+                            }
+                        }
                     }
                     protocol::rtp::Pull::Wait => {
                         // 现在不该生产：生产节奏由声卡消费节奏约束

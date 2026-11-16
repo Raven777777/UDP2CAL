@@ -578,7 +578,9 @@ Reconnecting ──(ACK)──> Connected
 | `STEP_TRIM_MAX_PER_MIN` | 3 | 60 s 窗口内最多裁剪次数，超限只记录不裁剪 |
 | `DECODE_LIMIT_MS` | 40 ms | 解码缓冲深度上限：到顶就暂停生产（生产节奏由声卡消费节奏约束） |
 | `PLC_LEAD_MS` | 20 ms | 解码提交余量：PCM 环 `ring_ms <= 20` 才允许补 PLC；声卡缓冲不计入该判据 |
-| `PLC_MAX_MS` | 120 ms | 连续 PLC 上限（12 帧） |
+| `PLC_MAX_MS` | 120 ms | 阶跃裁剪（`pull_trim`）的连续 PLC 上限（12 帧） |
+| `PLC_HOLE_MAX_MS` | 300 ms | 中段洞（`highest_ts > next_ts`，终点已知）的 PLC 上限（30 帧） |
+| `PLC_HOLD_MS` | 120 ms | 尾部洞（终点未知）hold 上限（12 帧）；桌面端可用 `UDP2CAL_PLC_HOLD_MS` 覆盖，钳到 10–600 ms |
 | `MAX_REORDER_PACKETS` | 64 | 编码包重排槽位 |
 | `RESYNC_GAP_MS` | 200 ms | 触发重同步的时间戳跳变阈值 |
 | `RESAMPLE_MAX_ADJUST` | ±0.005 | 重采样比率微调上限（±0.5%） |
@@ -610,8 +612,9 @@ JitterBuffer {
     highest_ts: u64               // 已见最大扩展时间戳
     started: bool                 // 是否已建立基准
     playing: bool                 // 是否已进入 PLAYING
-    plc_run: u32                  // 连续 PLC 帧数
-    stats: ...                    // 含 seq_realign：因序号滞后触发的重新对齐次数
+    plc_run: u32                  // 中段洞连续 PLC 帧数（hold 不计入）
+    hold: Idle | Active(n) | TimedOut  // 尾部洞 hold 状态；Active 期间不推进 next_ts
+    stats: ...                    // 含 seq_realign、hold_frames（PLC 总数中 hold 的部分）
 }
 ```
 
@@ -684,18 +687,32 @@ if slot[next_ts] 存在:
     next_seq = max(next_seq, slot.seq + 1)   # 只反映真实收到的包
     next_ts  += 480
     plc_run = 0
+    hold = Idle
     return PCM
 
-if ring_ms <= PLC_LEAD_MS:              # 解码提交余量见底 → 缺口确定
-    if plc_run < PLC_MAX_MS / 10:
-        pcm = opus_plc_10ms()
-        plc_run += 1
+if ring_ms > PLC_LEAD_MS:               # 还有提交余量，继续等
+    return 等待
+
+ts = next_ts
+if highest_ts > next_ts:                # 中段洞：缺帧后已有真包，终点已知
+    hold = Idle
+    next_ts += 480
+    if plc_run < PLC_HOLE_MAX_MS / 10:  # 上限 30 帧（300 ms）
+        pcm = opus_plc_10ms(); plc_run += 1
     else:
         pcm = silence_10ms()
-    next_ts  += 480                     # PLC 不占发送端序号
     return pcm
 
-return 等待            // 还有余量，继续等
+# 尾部洞：后面没有真包，终点未知。hold 期间 PLC 只消费、不推进时间线
+if hold == Idle:
+    hold = Active(PLC_HOLD_MS / 10)     # 默认 12 帧
+if hold == Active(n > 0):
+    hold = Active(n - 1)
+    return opus_plc_10ms()              # 迟到包在倒计时内到达 → 下一轮直接播出
+# Active(0) 或已 TimedOut
+hold = TimedOut
+next_ts += 480
+return silence_10ms()                   # 消费侧接 10 ms 淡出
 ```
 
 关键点：
@@ -706,10 +723,18 @@ return 等待            // 还有余量，继续等
 - 两个判据都是水位：`ring_ms` 决定“现在该不该生产下一帧”（生产节奏跟声卡走），
   `ring_ms <= PLC_LEAD_MS` 决定“这一帧还来不来得及”（要不要补 PLC）。设备缓冲是提交余量，
   不能计入 PLC 判据：声卡缓冲再深，也不能证明 PCM 环里还有可提交的数据。
+- **缺口分支有两种推进语义，消费侧不得假设 `Pull::Plc` 一定推进时间线**：
+  - 中段洞（`highest_ts > next_ts`）：洞的终点已知，PLC/静音都按帧推进，
+    PLC 上限 `PLC_HOLE_MAX_MS`（30 帧）。
+  - 尾部洞（`highest_ts <= next_ts`）：终点未知，hold 期内返回 PLC 但 `next_ts` 不动；
+    倒计时耗尽才推进一帧并转 `Pull::Silence`。迟到包在倒计时内到达 `next_ts` 时
+    下一轮 pull 直接取出，内容无损；损失上界因此是 `H`（默认 120 ms）。
 - 有真实包到达但 `next_ts` 已经越过它：按迟到丢弃；不得回退 `next_ts`。
 - `PLC_LEAD_MS` 是“下一次向设备提交 PCM 的最后时刻”，不是“可听点还剩多少”。
   Windows 的 `ring_ms` 只统计 PCM 环；Android 的 AudioTrack 阻塞写没有独立环，
   用 `written − playbackHead` 作为同一口径（它反映尚未被混音器消费的提交量）。
+- `hold_frames` 是 `plc_frames` 中 hold 期的子集，仅用于诊断；`plc_run` 仍是
+  “推进时间线的连续 PLC”计数，hold 不参与。
 
 ### 7.6 状态机
 
@@ -723,7 +748,10 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
   │                              │     └─> GAP（等待，不消耗媒体时间）
   │                              │
   │                              ├─ next_ts 缺失且 ring_ms <= PLC_LEAD_MS
-  │                              │     └─> PLC（最多 12 帧）→ 之后静音
+  │                              │     ├─ highest_ts > next_ts（中段洞，终点已知）
+  │                              │     │     └─> PLC（最多 30 帧）→ 之后静音
+  │                              │     └─ 否则（尾部洞，终点未知）
+  │                              │           └─> hold（PLC 不推进，最多 12 帧）→ 静音
   │                              │
   │                              └─ M=1 且跳变 > 200ms
   │                                    └─> RESYNC
@@ -733,9 +761,15 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 
 - `GAP` 不是定时器状态：只要 PCM 环里还压着超过 `PLC_LEAD_MS` 的已解码数据，就继续等；
   设备缓冲不参与这个判据。
-- `PLC` 由 **PCM 环见底**（`ring_ms <= PLC_LEAD_MS`）触发，不是由时钟触发；
-  `plc_run` 达到 12 后输出静音，但仍保持 `PLAYING`，直到真实包恢复。
-- 真实包恢复且时间戳跳变大于 200 ms：进入 `RESYNC`；否则直接继续 `PLAYING`，`plc_run=0`。
+- `PLC` 由 **PCM 环见底**（`ring_ms <= PLC_LEAD_MS`）触发，不是由时钟触发。
+  中段洞（`highest_ts > next_ts`）按帧推进，`plc_run` 达到 30（300 ms）后输出静音；
+  尾部洞（`highest_ts <= next_ts`）先 hold：PLC 帧照常输出但播放头不动，最多 H 帧
+  （默认 12 帧 / 120 ms），迟到的包仍可无损接回；倒计时耗尽才推进一帧并转静音。
+  两种路径都保持 `PLAYING`，直到真实包恢复。
+- 真实包恢复且时间戳跳变大于 200 ms：进入 `RESYNC`；否则直接继续 `PLAYING`，`plc_run=0`、
+  hold 状态复位。
+- `stats.hold_frames` 记录尾部洞 hold 的填充帧（是 `stats.plc_frames` 的子集）；
+  诊断日志据此区分“hold”与“普通 PLC”。
 
 ### 7.7 启动与重同步
 
@@ -769,10 +803,21 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 
 - 使用 Opus 解码器的 PLC 接口；每次请求 **10 ms / 480 采样**。
 - 不得一次请求 120 ms（5760 采样）后当成一帧播放。
-- 连续 PLC 上限 12 帧（120 ms）。
-- 真实包到达或重同步时，`plc_run=0`。
+- **中段洞**（`highest_ts > next_ts`，洞后已有真包）：PLC 按帧推进时间线，
+  上限 `PLC_HOLE_MAX_MS`（30 帧 / 300 ms）；到顶后输出静音但继续按帧推进。
+- **尾部洞**（`highest_ts <= next_ts`，终点未知）：hold 倒计时，PLC **不推进**
+  `next_ts`，上限 H = `PLC_HOLD_MS`（默认 12 帧 / 120 ms；桌面端可用
+  `UDP2CAL_PLC_HOLD_MS` 覆盖，钳到 10–600 ms）。迟到的包在倒计时内到达
+  `ts == next_ts` 时，下一轮 pull 直接播出，内容无损；倒计时耗尽则判阻塞：
+  推进一帧、转静音，已越过部分视为损失（上界 H）。
+- `plc_run` 只统计**推进时间线**的连续 PLC（中段洞）；hold 不改变它。
+  `stats.hold_frames` 单独统计 hold 填充帧（包含在 `stats.plc_frames` 内）。
+- PLC→静音的接缝由消费侧做一帧 10 ms 线性淡出（从上一块最后写出的样本到 0）；
+  解码失败补零与本地空闲静音不走淡出。
+- 真实包到达或重同步时，`plc_run=0`、hold 状态复位。
 - Opus 解码失败按丢包处理：丢弃该包，水位见底后 PLC。
-- PLC 不得由网络线程、定时器或“超过 N 毫秒没收到包”的计时器触发。
+- PLC 不得由网络线程、定时器或“超过 N 毫秒没收到包”的计时器触发；
+  尾部洞 hold 的倒计时单位是**填充帧 / 消费节拍**，不是墙钟。
 - PLC 输出必须进入与真实 PCM 相同的输出路径，参与水位统计。
 
 ### 7.9 漂移校正：设备钟差走慢环，网络抖动不进入音高
@@ -998,7 +1043,7 @@ Kotlin 常量 200）；环境变量
 
 ```text
 n = ceil((occupancy_ms + pipe_ms − target) / FRAME_MS)   # 只跳到目标，向上取整到整帧
-n = min(n, PLC_MAX_MS / FRAME_MS)                        # 上限 12 帧（120 ms）
+n = min(n, PLC_MAX_MS / FRAME_MS)                        # 阶跃裁剪仍为 12 帧（120 ms），不随中段洞放宽
 ```
 
 **怎么裁（关键变化）**：
@@ -1094,7 +1139,8 @@ AudioTrack / 声卡
 - **空闲期供数**：发送端只在有真实媒体时发 RTP，不再为空闲合成静音（否则端点
   失效会被静音掩盖）。没有可播放包且播放缓冲低于 `PLC_LEAD_MS` 时，Android 写线程
   本地写静音，保持 AudioTrack 不断流。这种“起播/无包可拉”的本地静音不是媒体时间线
-  的一部分，不推进 `next_ts`；PLC 达到 12 帧上限后的 `Silence` 仍按 §7.5 推进媒体时间线。
+  的一部分，不推进 `next_ts`；缺口期的 PLC 与随后的 `Silence` 仍按 §7.5 推进媒体时间线
+  （尾部洞 hold 期例外：PLC 不推进，超时后的 `Silence` 才推进）。
 - **空闲恢复**：RTP 连续空闲超过 1 s 后，下个通过校验的包到达时先 `JitterBuffer.reset()`，
   再按首包重新起播，避免本地静音把 `next_ts` 推过新包时间戳后把恢复包判成 late。
   发送端在恢复时按墙钟缺口补偿 RTP 时间戳并置 marker。
@@ -1106,7 +1152,7 @@ AudioTrack / 声卡
 - 收到 RTP 包数、字节数；
 - 丢包/迟到/重复/乱序数；
 - 抖动缓冲当前水位（ms）；
-- PLC 帧数、连续 PLC 最大值；
+- PLC 帧数（其中尾部洞 hold 填充帧数 `hold_frames`）、连续 PLC 最大值；
 - 阶跃吸收：累计消费的整帧数（`step_trims`，逐帧解码后丢弃 PCM，**单独计数**，不进 `plc_frames`）、当前 60 s 窗口
   内已用次数（`StepAbsorber::trims_in_window` / `trimsInWindow()`，两端都在限额日志里打印）；
 - 漂移校正：当前比率微调量（%）、反馈量（ppm）、前馈量 `r̂`（ppm）、其标准差 σ（ppm）、
@@ -1329,7 +1375,9 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | `STEP_TRIM_MAX_PER_MIN` | `3` | 阶跃裁剪的每分钟限额（超限只记录） |
 | `DECODE_LIMIT_MS` | `40` | 解码缓冲深度上限（生产节流） |
 | `PLC_LEAD_MS` | `20` | PCM 环提交余量判据（设备缓冲不计入） |
-| `PLC_MAX_MS` | `120` | PLC 上限 |
+| `PLC_MAX_MS` | `120` | 阶跃裁剪（`pull_trim`）的 PLC 上限 |
+| `PLC_HOLE_MAX_MS` | `300` | 中段洞（终点已知）PLC 上限（30 帧） |
+| `PLC_HOLD_MS` | `120` | 尾部洞（终点未知）hold 上限（12 帧）；桌面可用 `UDP2CAL_PLC_HOLD_MS` 覆盖 |
 | `MAX_REORDER_PACKETS` | `64` | 重排槽位 |
 | `RESYNC_GAP_MS` | `200` | 重同步阈值 |
 | `RESAMPLE_MAX_ADJUST` | `0.005` | 比率微调上限（±0.5%） |
@@ -1405,7 +1453,10 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 - 重复包；
 - 迟到包；
 - 丢包 + PLC 10 ms × N；
-- 连续 PLC 上限；
+- 中段洞（缺帧后已有真包）：整段洞用 PLC 填满，上限 30 帧；
+- 尾部洞 hold：填充期间 `next_ts` 不动、`plc_run` 保持 0、`hold_frames` 计数；
+  迟到包在倒计时内到达后按原时间戳无损播出；超时推进一帧转静音；真包出现后不再 hold；
+- 连续 PLC 上限（`pull_trim` 仍为 12 帧）；
 - `pull_trim(out)`：调用方循环最多 `n` 次，逐帧取包并走正常解码/PLC 路径，PCM 由调用方丢弃；
   不得越过 `highest_ts`（`next_ts >= highest_ts` 时返回 `Wait`）；未进入 PLAYING 时不动作；
   每消费一帧计入 `stats.step_trims`，真实包成功后 `plc_run` 归零；

@@ -58,7 +58,7 @@ pub(crate) fn log_periodic_stats(session: &Session) {
         f32::from_bits(DRIFT_ADJUST_BITS.load(Ordering::Relaxed)) * 100.0
     );
     logf!(
-        "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(峰值{}) FEC={} 水位={}ms SSRC={:#010x}",
+        "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(hold {}) 峰值={} FEC={} 水位={}ms SSRC={:#010x}",
         j.received,
         j.bytes,
         j.late,
@@ -66,6 +66,7 @@ pub(crate) fn log_periodic_stats(session: &Session) {
         j.overflow,
         j.resyncs,
         j.plc_frames,
+        j.hold_frames,
         j.max_plc_run,
         FEC_FRAMES.swap(0, Ordering::Relaxed),
         water,

@@ -185,6 +185,8 @@ internal object ProtocolNative {
 
     external fun jbMaxPlcRun(h: Long): Int
 
+    external fun jbHoldFrames(h: Long): Long
+
     external fun jbStepTrims(h: Long): Long
 
     // ── StepAbsorber ─────────────────────────────────────────────────────

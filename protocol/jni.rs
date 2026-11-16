@@ -383,7 +383,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
     env: Env,
     _this: jobject,
 ) -> jlongArray {
-    let v: [jlong; 44] = [
+    let v: [jlong; 46] = [
         CONTROL_VERSION as jlong,
         CONTROL_HEADER_SIZE as jlong,
         CONTROL_MAX_PAYLOAD as jlong,
@@ -423,6 +423,8 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
         crate::rtp::DECODE_LIMIT_MS as jlong,
         crate::rtp::PLC_LEAD_MS as jlong,
         crate::rtp::PLC_MAX_MS as jlong,
+        crate::rtp::PLC_HOLE_MAX_MS as jlong,
+        crate::rtp::PLC_HOLD_MS as jlong,
         crate::rtp::RESYNC_GAP_MS as jlong,
         crate::rtp::STEP_TRIM_GROWTH_MS as jlong,
         crate::rtp::STEP_TRIM_EXCESS_MS as jlong,
@@ -1259,6 +1261,11 @@ jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbMaxPlcRun,
     jint,
     |g: &JbInner| g.jb.stats.max_plc_run as jint
+);
+jb_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_jbHoldFrames,
+    jlong,
+    |g: &JbInner| g.jb.stats.hold_frames as jlong
 );
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbStepTrims,

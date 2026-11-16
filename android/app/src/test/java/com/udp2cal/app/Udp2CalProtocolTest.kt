@@ -372,23 +372,33 @@ class Udp2CalProtocolTest {
     }
 
     @Test
-    fun jitter_plcRunCappedThenSilence() {
+    fun jitter_tailHoleHoldsThenSilences() {
         val jb = Udp2CalProtocol.JitterBuffer()
         for (i in 0 until 4) insert(jb, i, 480L * i, i == 0, i)
         pullTags(jb, 0, 4)
 
+        // 尾部洞（终点未知）：hold 期间 PLC 只消费、不推进播放头；
+        // 倒计时耗尽后转静音，plc_run 不参与（它不是普通连续 PLC）。
+        val hold = Udp2CalProtocol.PLC_HOLD_MS / Udp2CalProtocol.OPUS_FRAME_MS
+        val heldTs = jb.nextTs
         var plc = 0
         var silence = 0
         for (step in 0 until 30L) {
             when (jb.pull(0, Udp2CalProtocol.PLC_LEAD_MS, ByteArray(1275))) {
-                Udp2CalProtocol.Pull.PLC -> plc++
+                Udp2CalProtocol.Pull.PLC -> {
+                    plc++
+                    assertEquals(heldTs, jb.nextTs)
+                }
                 Udp2CalProtocol.Pull.SILENCE -> silence++
                 else -> {}
             }
         }
-        assertEquals(Udp2CalProtocol.PLC_MAX_MS / Udp2CalProtocol.OPUS_FRAME_MS, plc)
+        assertEquals(hold, plc)
+        assertEquals(hold.toLong(), jb.holdFrames)
         assertTrue(silence > 0)
         assertTrue(jb.playing)
+        assertEquals(0, jb.plcRun)
+        jb.close()
     }
 
     @Test
@@ -462,18 +472,21 @@ class Udp2CalProtocolTest {
         for (i in 0 until 8) insert(jb, i, 480L * i, i == 0, i + 1)
         pullTags(jb, 0, 8)
         for (k in 0 until 50L) jb.pull(0, 0, ByteArray(1275))
-        // PLC 只推进媒体时间，不得虚构发送端从未发出的序号
+        // PLC/静音只推进媒体时间，不得虚构发送端从未发出的序号；
+        // 尾部洞先 hold H 帧（不推进），耗尽后才按静音逐帧推进。
         assertEquals(8L, jb.nextSeq)
-        assertEquals(480L * 58, jb.nextTs)
+        val hold = Udp2CalProtocol.PLC_HOLD_MS / Udp2CalProtocol.OPUS_FRAME_MS
+        val resumeTs = jb.nextTs
+        assertEquals(480L * (8 + 50 - hold), resumeTs)
 
-        // 恢复包：序号落后（8 之前的包），时间戳正好接上 → 按时间戳接纳
-        assertTrue(insert(jb, 5, 480L * 58, true, 9))
+        // 恢复包：序号落后（8 之前的包），时间戳正好接上播放头 → 按时间戳接纳
+        assertTrue(insert(jb, 5, resumeTs, true, 9))
         assertEquals(1L, jb.seqRealign)
         assertEquals(8L, jb.nextSeq)
-        assertEquals(480L * 58, jb.nextTs)
+        assertEquals(resumeTs, jb.nextTs)
 
         // 后续包全部正常接纳并出音
-        for (i in 1..10) assertTrue(insert(jb, 5 + i, 480L * (58 + i), false, 10 + i))
+        for (i in 1..10) assertTrue(insert(jb, 5 + i, resumeTs + 480L * i, false, 10 + i))
         val tags = pullTags(jb, 0, 11)
         assertEquals(11, tags.size)
         assertTrue(tags.none { it == 0xFE || it == 0xFF })
@@ -1067,6 +1080,8 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.DECODE_LIMIT_MS.toLong(),
             Udp2CalProtocol.PLC_LEAD_MS.toLong(),
             Udp2CalProtocol.PLC_MAX_MS.toLong(),
+            Udp2CalProtocol.PLC_HOLE_MAX_MS.toLong(),
+            Udp2CalProtocol.PLC_HOLD_MS.toLong(),
             Udp2CalProtocol.RESYNC_GAP_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_GROWTH_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_EXCESS_MS.toLong(),

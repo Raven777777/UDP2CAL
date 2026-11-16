@@ -290,7 +290,7 @@ internal class ReverseLink(
                     val jbSummary = buildList {
                         if (jitter.late > 0) add("迟到 ${jitter.late}")
                         if (jitter.overflow > 0) add("溢出 ${jitter.overflow}")
-                        if (jitter.plcFrames > 0) add("PLC ${jitter.plcFrames}(峰 ${jitter.maxPlcRun})")
+                        if (jitter.plcFrames > 0) add("PLC ${jitter.plcFrames}(hold ${jitter.holdFrames}，峰 ${jitter.maxPlcRun})")
                         if (jitter.resyncs > 0) add("重同步 ${jitter.resyncs}")
                     }.joinToString(" · ")
                     status.update {
@@ -387,6 +387,11 @@ internal class ReverseLink(
         // ≈12 ppm/s 慢慢退，稳态水位被顶在目标之上 10–30 ms 长达几分钟，
         // 期间还带着几分音分的音高偏移。与 windows/src/main.rs 解码线程同源。
         var idleFeedback = false
+        // PLC→Silence 接缝的 10 ms 淡出：记录上一块**成功写出**的末样本（L/R）。
+        // 解码/PLC 失败补零、重同步时清空，避免从过时电平起坡。
+        var lastL = 0
+        var lastR = 0
+        var hasLast = false
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
         try {
@@ -478,6 +483,8 @@ internal class ReverseLink(
 
                 // Android 没有独立 PCM 环：pendingFrames 就是"已提交、未播出"的
                 // 全部余量，用它做 PLC 截止判据（设备缓冲不是固定延迟）。
+                // 尾部洞 hold 期间返回 PLC 但不推进 nextTs；播放节拍仍由 AudioTrack
+                // 的阻塞写决定，不靠时间戳推进。
                 code = jitter.pull(pipeMs, pipeMs, payload)
                 // 可听点之前还压着的媒体量（设备帧 → 媒体样本要用当前比率换算）
                 val queuedMedia = (pipeFrames.toDouble() * resampler.ratio).toLong()
@@ -517,6 +524,7 @@ internal class ReverseLink(
                 step.reset()
                 resampler.reset()
                 player.flush()
+                hasLast = false
             }
 
             // 阶跃吸收的日志（锁外：Log 会走 binder）。水位一律用**总水位**
@@ -598,7 +606,7 @@ internal class ReverseLink(
                         TAG,
                         "反向延迟≈${latencyMs}ms 水位=${waterMs}ms（抖动 ${jitter.waterMs()} + 播放 $pipeMs，目标 ${drift.targetMs()}）" +
                             " 比率=${"%.3f".format(adjust * 100)}%（反馈 ${"%.0f".format(du * 1e6)}ppm / 设备前馈 ${"%.1f".format(ffPpm)}ppm，σ ${"%.1f".format(deviceRate.sigmaPpm())}ppm ${deviceRate.buckets()}桶）" +
-                            " FEC=$fecFrames"
+                            " FEC=$fecFrames PLC=${jitter.plcFrames}(hold ${jitter.holdFrames}，峰 ${jitter.maxPlcRun})"
                     )
                     fecFrames = 0
                 }
@@ -609,6 +617,11 @@ internal class ReverseLink(
                     val n = dec.decode(payload, 0, pulledLen, pcm)
                     if (n <= 0) continue // 解码失败按丢包处理，水位见底后 PLC
                     // PLC 帧和真实帧走同一条时间线，所以都过同一个重采样器
+                    if (n >= 2) {
+                        lastL = pcm[n - 2].toInt()
+                        lastR = pcm[n - 1].toInt()
+                        hasLast = true
+                    }
                     val produced = resampler.process(pcm, 0, n / 2)
                     if (produced > 0) {
                         if (!writeOrRecover(player, resampler.buffer(), produced)) return
@@ -636,13 +649,20 @@ internal class ReverseLink(
                     } else {
                         n = dec.plc(pcm)
                     }
+                    if (n >= 2) {
+                        lastL = pcm[n - 2].toInt()
+                        lastR = pcm[n - 1].toInt()
+                        hasLast = true
+                    }
                     if (n > 0) {
                         val produced = resampler.process(pcm, 0, n / 2)
                         if (produced > 0) {
                             if (!writeOrRecover(player, resampler.buffer(), produced)) return
                         }
                     } else {
-                        // 生成不出 PLC：补静音，同样过重采样器以保持相位连续
+                        // 生成不出 PLC：补静音，同样过重采样器以保持相位连续；
+                        // 补零不参与淡出（没有可接续的电平）
+                        hasLast = false
                         val produced = resampler.process(silence, 0, silence.size / 2)
                         if (produced > 0) {
                             if (!writeOrRecover(player, resampler.buffer(), produced)) return
@@ -651,10 +671,26 @@ internal class ReverseLink(
                 }
 
                 Udp2CalProtocol.Pull.SILENCE -> {
-                    // 连续 PLC 已达上限：输出静音但继续推进媒体时间
-                    val produced = resampler.process(silence, 0, silence.size / 2)
-                    if (produced > 0) {
-                        if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                    // 中段洞 PLC 到上限 / 尾部洞 hold 超时：时间线已按帧推进。
+                    // PLC→静音的接缝做一帧 10 ms 线性淡出（L/R 各自从上一块
+                    // 末样本到 0），复用 pcm 并走同一重采样器以保持相位连续。
+                    val frames = pcm.size / 2
+                    if (hasLast) {
+                        for (i in 0 until frames) {
+                            val k = (frames - 1 - i).toFloat() / (frames - 1).toFloat()
+                            pcm[i * 2] = (lastL * k).toInt().toShort()
+                            pcm[i * 2 + 1] = (lastR * k).toInt().toShort()
+                        }
+                        hasLast = false
+                        val produced = resampler.process(pcm, 0, frames)
+                        if (produced > 0) {
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                        }
+                    } else {
+                        val produced = resampler.process(silence, 0, silence.size / 2)
+                        if (produced > 0) {
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                        }
                     }
                 }
 

@@ -93,6 +93,15 @@ object Udp2CalProtocol {
     const val DECODE_LIMIT_MS = 40
     const val PLC_LEAD_MS = 20
     const val PLC_MAX_MS = 120
+    /** 中段洞（缺帧后已有真包，终点已知）的 PLC 上限：30 帧。 */
+    const val PLC_HOLE_MAX_MS = 300
+    /**
+     * 尾部洞（终点未知）hold 上限：默认 12 帧。
+     *
+     * Android 进程没有环境变量，实际生效值就是此默认值；桌面端可用
+     * `UDP2CAL_PLC_HOLD_MS` 覆盖（钳到 10–600 ms）。
+     */
+    const val PLC_HOLD_MS = 120
     const val RESYNC_GAP_MS = 200
 
     /** 仅用于诊断：单 tick 涨幅不再直接触发裁剪。 */
@@ -339,7 +348,11 @@ object Udp2CalProtocol {
         val seqRealign: Long get() = ProtocolNative.jbSeqRealign(handle)
         val overflow: Long get() = ProtocolNative.jbOverflow(handle)
         val plcFrames: Long get() = ProtocolNative.jbPlcFrames(handle)
+        /** 中段洞连续 PLC 帧数（尾部洞 hold 不计入）。 */
+        val plcRun: Int get() = ProtocolNative.jbPlcRun(handle)
         val maxPlcRun: Int get() = ProtocolNative.jbMaxPlcRun(handle)
+        /** PLC 总数中尾部洞 hold 的部分（不推进播放头）。 */
+        val holdFrames: Long get() = ProtocolNative.jbHoldFrames(handle)
         val stepTrims: Long get() = ProtocolNative.jbStepTrims(handle)
 
         fun reset() {

@@ -1,5 +1,6 @@
 //! 接收抖动缓冲：按时间戳存放、拉取与 PLC 决策。
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::header::{OPUS_MAX_PAYLOAD, RtpPacket, extend_seq, extend_ts};
@@ -26,8 +27,55 @@ pub const DECODE_LIMIT_MS: u32 = 40;
 /// 额外的解码时间。旧判据 `ring + device <= 20 ms` 在 30 ms 设备延迟下永远
 /// 不成立，回调只能输出静音。
 pub const PLC_LEAD_MS: u32 = 20;
-/// 连续 PLC 上限（12 帧）
+/// 连续 PLC 上限（12 帧）：阶跃裁剪（[`JitterBuffer::pull_trim`]）的缺口上限。
+///
+/// 它仍是 [`StepAbsorber`](super::StepAbsorber) 单次裁剪帧数的上界（见
+/// `step.rs`），Android 常量表也按 12 帧对照。**不要**拿它当中段洞的填充上限：
+/// 中段洞有 [`PLC_HOLE_MAX_MS`]。
 pub const PLC_MAX_MS: u32 = 120;
+/// 中段洞 PLC 上限（30 帧 / 300 ms）。
+///
+/// 判据：`highest_ts > next_ts`，即缺帧之后**已经有真包入槽**——洞的终点已知，
+/// PLC 只是按消费节拍把这段洞填满。旧上限 120 ms 会把 120–300 ms 的网络空档
+/// 后半段切成静音，恢复时接缝反而更明显。
+///
+/// 只用于 [`JitterBuffer::pull`] 的缺口分支；`pull_trim`（阶跃裁剪）仍按
+/// [`PLC_MAX_MS`]，因为裁剪每帧都要过解码器、单次跳段必须短。
+pub const PLC_HOLE_MAX_MS: u32 = 300;
+/// 尾部洞 hold 上限（默认 12 帧 / 120 ms）。
+///
+/// 判据：`highest_ts <= next_ts`，缺口之后**没有**真包——终点未知，接收端
+/// 无法区分“包还在路上”与“发送端已停”。hold 期间按消费节拍返回 PLC 但
+/// **不推进** `next_ts`：迟到的包在倒计时内到达 `ts == next_ts` 时，下一轮
+/// pull 仍能按原时间戳播出，整段无损。倒计时耗尽才判阻塞。
+pub const PLC_HOLD_MS: u32 = 120;
+/// hold 时长的环境变量覆盖名（现场调参不改编译，风格同 `water_target_ms()`）。
+pub const PLC_HOLD_ENV: &str = "UDP2CAL_PLC_HOLD_MS";
+/// 覆盖下界：至少 1 帧。单帧尾丢不能直接硬切到零，否则接缝就是一次爆音。
+pub const PLC_HOLD_MIN_MS: u32 = FRAME_MS;
+/// 覆盖上界：再长就不是 concealment，而是用 PLC 掩盖断流。
+pub const PLC_HOLD_MAX_MS: u32 = 600;
+
+/// 运行时尾部洞 hold 时长：默认 [`PLC_HOLD_MS`]，可用 [`PLC_HOLD_ENV`] 覆盖。
+///
+/// 与 `water_target_ms()` 同口径：只读一次环境变量（`OnceLock` 缓存），
+/// 非法值（非数字、空串）静默退回默认值，结果钳到
+/// [`PLC_HOLD_MIN_MS`, `PLC_HOLD_MAX_MS`]。
+pub fn plc_hold_ms() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var(PLC_HOLD_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(PLC_HOLD_MIN_MS, PLC_HOLD_MAX_MS))
+            .unwrap_or(PLC_HOLD_MS)
+    })
+}
+
+/// 尾部洞 hold 的填充帧数（[`plc_hold_ms`] / 10 ms，至少 1 帧）。
+pub fn plc_hold_frames() -> u32 {
+    (plc_hold_ms() / FRAME_MS).max(1)
+}
 /// 触发重同步的时间戳跳变阈值
 pub const RESYNC_GAP_MS: u32 = 200;
 
@@ -50,10 +98,25 @@ pub enum Pull {
     Packet { len: usize, ts: u64 },
     /// 缺口已到播放头：请求一帧 PLC
     Plc { ts: u64 },
-    /// 连续 PLC 已到上限：输出静音
+    /// PLC 已到上限 / 尾部洞 hold 超时：输出静音（该帧的播放头已越过）
     Silence { ts: u64 },
     /// 水位不足或还没到缺口：调用方继续等（不得用定时器"补"）
     Wait,
+}
+
+/// 尾部洞（终点未知）的 hold 状态。
+///
+/// 中段洞后面已有真包，终点已知，PLC 按帧推进 `next_ts` 即可；尾部洞后面
+/// 什么都没有，接收端无法区分“包还在路上”与“发送端已停”。因此先倒计时喂
+/// PLC 且**不推进** `next_ts`，把“这一帧还来不来得及”的裁决推迟到倒计时结束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldState {
+    /// 不在 hold：初始 / 真包已拉出 / 重同步复位
+    Idle,
+    /// 倒计时中，值为还可填充的帧数（每消费一帧 -1，不推进 `next_ts`）
+    Active(u32),
+    /// 倒计时耗尽：判定流已阻塞，之后每帧推进时间线并输出静音
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -68,6 +131,8 @@ pub struct JitterStats {
     /// 其中因"时间戳合法而序号落后"触发的重新对齐次数（断流/DTX 自愈计数）
     pub seq_realign: u64,
     pub plc_frames: u64,
+    /// 其中尾部洞 hold 期的填充帧（不推进播放头；是 `plc_frames` 的子集）
+    pub hold_frames: u64,
     pub max_plc_run: u32,
     /// 因阶跃吸收被消费的整帧总数（逐帧解码后丢弃 PCM，见 [`JitterBuffer::pull_trim`]）
     pub step_trims: u64,
@@ -128,7 +193,10 @@ pub struct JitterBuffer {
     base_inserted: u64,
     started: bool,
     playing: bool,
+    /// 中段洞的连续 PLC 帧数（推进时间线的那一类；尾部洞 hold 不计入）
     plc_run: u32,
+    /// 尾部洞 hold 状态（见 [`HoldState`]）
+    hold: HoldState,
     /// 每次重同步/复位自增，播放线程据此重建解码器状态
     pub epoch: u64,
     /// 最近一次重同步的原因（诊断用）。`reset()` 清空、首包建立基准时清空，
@@ -156,6 +224,7 @@ impl JitterBuffer {
             started: false,
             playing: false,
             plc_run: 0,
+            hold: HoldState::Idle,
             epoch: 0,
             last_rebase_reason: String::new(),
             stats: JitterStats::default(),
@@ -386,6 +455,14 @@ impl JitterBuffer {
     ///   播放/PLC 判定**；设备里排队的音频不会给解码器额外的时间。
     ///
     /// 返回 `Wait` 表示“现在不该生产”，调用方必须继续等待，而不得用定时器补帧。
+    ///
+    /// # 缺口分支的推进不变量
+    ///
+    /// * 中段洞（`highest_ts > next_ts`，终点已知）：PLC/静音都推进 `next_ts`，
+    ///   PLC 上限 [`PLC_HOLE_MAX_MS`]。
+    /// * 尾部洞（`highest_ts <= next_ts`，终点未知）：hold 期内返回 [`Pull::Plc`]
+    ///   但**不推进** `next_ts`；倒计时耗尽才推进一帧并转 [`Pull::Silence`]。
+    ///   因此消费侧不得假设“每收到一个 PLC 时间线就前进 10 ms”。
     pub fn pull(&mut self, ring_ms: u32, _pipe_ms: u32, out: &mut [u8]) -> Pull {
         if !self.started {
             return Pull::Wait;
@@ -418,14 +495,25 @@ impl JitterBuffer {
             self.advance();
             self.next_seq = self.next_seq.max(played_seq + 1);
             self.plc_run = 0;
+            self.hold = HoldState::Idle;
             return Pull::Packet { len, ts };
         }
 
-        // PCM 提交缓冲已经见底：下一帧现在就要，否则声卡回调只能输出静音。
+        // PCM 提交缓冲还有余量：缺口尚未到期，继续等。
         // 设备延迟（pipe_ms 里的 device 部分）不能作为“再等等”的理由。
-        if ring_ms <= PLC_LEAD_MS {
-            let ts = self.next_ts;
-            let max_run = PLC_MAX_MS / FRAME_MS;
+        if ring_ms > PLC_LEAD_MS {
+            return Pull::Wait;
+        }
+
+        // 提交余量已经见底：下一帧现在就要，否则声卡回调只能输出静音。
+        let ts = self.next_ts;
+
+        // 中段洞：缺帧之后已经有真包入槽（`highest_ts > next_ts`），终点已知。
+        // 按消费节拍用 PLC 填满整段洞，时间线照常推进——恢复时接缝两侧都是
+        // 连续媒体，不需要靠“提前切静音”表达断流。
+        if self.highest_ts > self.next_ts {
+            self.hold = HoldState::Idle;
+            let max_run = PLC_HOLE_MAX_MS / FRAME_MS;
             self.advance();
             if self.plc_run < max_run {
                 self.plc_run += 1;
@@ -433,12 +521,31 @@ impl JitterBuffer {
                 if self.plc_run > self.stats.max_plc_run {
                     self.stats.max_plc_run = self.plc_run;
                 }
-                Pull::Plc { ts }
-            } else {
+                return Pull::Plc { ts };
+            }
+            return Pull::Silence { ts };
+        }
+
+        // 尾部洞：终点未知。hold 期间返回 PLC 但**不推进** next_ts——每帧 PLC
+        // 只对应一次消费，迟到的包在倒计时内到达 `ts == next_ts` 时，下一轮
+        // pull 仍能按原时间戳播出，整段无损。倒计时耗尽才判阻塞：推进一帧、
+        // 转静音（消费侧接 10 ms 淡出），之后的损失上界就是 H。
+        if matches!(self.hold, HoldState::Idle) {
+            self.hold = HoldState::Active(plc_hold_frames());
+        }
+        match self.hold {
+            HoldState::Active(0) | HoldState::TimedOut => {
+                self.hold = HoldState::TimedOut;
+                self.advance();
                 Pull::Silence { ts }
             }
-        } else {
-            Pull::Wait
+            HoldState::Active(left) => {
+                self.hold = HoldState::Active(left - 1);
+                self.stats.plc_frames += 1;
+                self.stats.hold_frames += 1;
+                Pull::Plc { ts }
+            }
+            HoldState::Idle => unreachable!("hold 已在上面初始化"),
         }
     }
 
@@ -492,6 +599,7 @@ impl JitterBuffer {
             self.advance();
             self.next_seq = self.next_seq.max(played_seq + 1);
             self.plc_run = 0;
+            self.hold = HoldState::Idle;
             self.stats.step_trims += 1;
             return Pull::Packet { len, ts };
         }
@@ -527,6 +635,7 @@ impl JitterBuffer {
         self.started = false;
         self.playing = false;
         self.plc_run = 0;
+        self.hold = HoldState::Idle;
         // 注意：**不重置** `start_ms`。它是上层按本方向目标注入的配置，
         // 重连后仍应生效。
         // 必须清空：否则新会话会打印上一次会话的重同步原因（诊断误导）
@@ -552,6 +661,7 @@ impl JitterBuffer {
         self.started = true;
         self.playing = false;
         self.plc_run = 0;
+        self.hold = HoldState::Idle;
         if bump_epoch {
             self.epoch += 1;
         }
@@ -776,6 +886,8 @@ mod tests {
             jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]),
             Pull::Plc { ts: 1920 }
         );
+        // 一帧洞后面已有真包（终点已知）：必须按中段洞推进，不得被 hold 拖住
+        assert_eq!(jb.next_ts(), 2400);
         // 下一帧是真实包
         assert_eq!(
             jb.pull(PLC_LEAD_MS, PLC_LEAD_MS, &mut [0u8; 1275]),
@@ -848,26 +960,183 @@ mod tests {
     }
 
     #[test]
-    fn jb_plc_run_is_capped() {
+    fn jb_tail_hole_holds_then_silences_without_advancing_plc_run() {
         let mut jb = JitterBuffer::new();
         insert(&mut jb, 0, 0, true, 1);
         for i in 1..4u16 {
-            insert(&mut jb, i, 480 * i as u32, false, i as u8);
+            insert(&mut jb, i, 480 * i as u32, false, i as u8 + 1);
         }
-        // 播完后长时间没有新包，播放头一路推进
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+        // 播完后长时间没有新包：尾部洞（终点未知）→ hold 倒计时
+        let hold = plc_hold_frames();
+        let held_ts = jb.next_ts();
         let mut plc = 0;
         let mut silence = 0;
-        for _ in 0..30u64 {
+        for _ in 0..(hold as u64 + 10) {
             match jb.pull(0, 0, &mut [0u8; 1275]) {
-                Pull::Plc { .. } => plc += 1,
+                Pull::Plc { ts } => {
+                    assert_eq!(ts, held_ts, "hold 期间 PLC 必须对准播放头");
+                    assert_eq!(jb.next_ts(), held_ts, "hold 期间不得推进播放头");
+                    plc += 1;
+                }
                 Pull::Silence { .. } => silence += 1,
                 _ => {}
             }
         }
-        assert_eq!(plc, (PLC_MAX_MS / FRAME_MS) as usize);
+        assert_eq!(plc, hold as usize);
         assert!(silence > 0);
         assert!(jb.is_playing());
-        assert_eq!(jb.plc_run(), PLC_MAX_MS / FRAME_MS);
+        assert_eq!(jb.plc_run(), 0, "hold 不是普通连续 PLC");
+        assert_eq!(jb.stats.hold_frames, hold as u64);
+        assert_eq!(jb.stats.plc_frames, hold as u64);
+    }
+
+    #[test]
+    fn jb_mid_hole_plc_fills_the_whole_hole() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        // 跳 4..34（30 帧），第 34 帧到达：洞的终点已知
+        insert(&mut jb, 34, 480 * 34, false, 99);
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        let mut plc = 0;
+        for expected_ts in (480u64 * 4..480 * 34).step_by(480) {
+            assert_eq!(
+                jb.pull(0, 0, &mut out),
+                Pull::Plc { ts: expected_ts },
+                "中段洞必须整段用 PLC 填满"
+            );
+            plc += 1;
+        }
+        assert_eq!(plc, (PLC_HOLE_MAX_MS / FRAME_MS) as usize);
+        assert!(
+            plc > (PLC_MAX_MS / FRAME_MS) as usize,
+            "中段洞上限必须宽于 12 帧"
+        );
+        assert_eq!(
+            jb.pull(0, 0, &mut out),
+            Pull::Packet {
+                len: 1,
+                ts: 480 * 34
+            }
+        );
+        assert_eq!(out[0], 99);
+        assert_eq!(jb.plc_run(), 0, "真包拉出后归零");
+        assert_eq!(jb.stats.hold_frames, 0, "终点已知不得走 hold");
+    }
+
+    #[test]
+    fn jb_tail_hole_hold_takes_a_late_packet_losslessly() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+        let held_ts = jb.next_ts();
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+
+        assert_eq!(jb.pull(0, 0, &mut out), Pull::Plc { ts: held_ts });
+        assert_eq!(jb.next_ts(), held_ts, "hold 尚未到期，播放头必须停住");
+
+        // 迟到的第 4 帧在倒计时内到达：下一轮按原时间戳播出，内容无损
+        assert_eq!(
+            insert(&mut jb, 4, held_ts as u32, false, 42),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            jb.pull(0, 0, &mut out),
+            Pull::Packet {
+                len: 1,
+                ts: held_ts
+            }
+        );
+        assert_eq!(out[0], 42);
+        assert_eq!(jb.plc_run(), 0);
+        assert_eq!(jb.stats.hold_frames, 1);
+
+        // 再次断流：hold 必须重新从满额开始（与 plc_run 同生命周期）
+        let hold = plc_hold_frames();
+        let mut plc = 0;
+        for _ in 0..hold {
+            match jb.pull(0, 0, &mut out) {
+                Pull::Plc { .. } => plc += 1,
+                other => panic!("尾部洞应持续 hold，得到 {other:?}"),
+            }
+        }
+        assert_eq!(plc, hold);
+        let timeout_ts = jb.next_ts();
+        assert_eq!(jb.pull(0, 0, &mut out), Pull::Silence { ts: timeout_ts });
+        assert_eq!(jb.next_ts(), timeout_ts + FRAME_SAMPLES as u64);
+    }
+
+    #[test]
+    fn jb_tail_hold_timeout_advances_and_recovers_on_late_packet() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        let hold = plc_hold_frames();
+        let held_ts = jb.next_ts();
+        for _ in 0..hold {
+            assert!(matches!(jb.pull(0, 0, &mut out), Pull::Plc { .. }));
+            assert_eq!(jb.next_ts(), held_ts);
+        }
+        // 倒计时耗尽：推进一帧、转静音
+        assert_eq!(jb.pull(0, 0, &mut out), Pull::Silence { ts: held_ts });
+        assert_eq!(jb.next_ts(), held_ts + FRAME_SAMPLES as u64);
+        // 之后按帧推进；迟到的恢复包仍能按当前播放头播出
+        let resume_ts = jb.next_ts();
+        assert_eq!(
+            insert(&mut jb, 4, resume_ts as u32, false, 7),
+            InsertResult::Inserted
+        );
+        assert_eq!(
+            jb.pull(0, 0, &mut out),
+            Pull::Packet {
+                len: 1,
+                ts: resume_ts
+            }
+        );
+        assert_eq!(out[0], 7);
+    }
+
+    #[test]
+    fn jb_packet_ahead_ends_tail_hold_and_switches_to_mid_hole() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        let held_ts = jb.next_ts();
+        assert_eq!(jb.pull(0, 0, &mut out), Pull::Plc { ts: held_ts });
+        assert_eq!(jb.next_ts(), held_ts, "hold 中播放头不动");
+
+        // 缺包没到，但更远的包到了：洞的终点已知，必须改走中段洞推进
+        insert(&mut jb, 6, 480 * 6, false, 7);
+        assert_eq!(jb.pull(0, 0, &mut out), Pull::Plc { ts: held_ts });
+        assert_eq!(jb.next_ts(), held_ts + FRAME_SAMPLES as u64);
+        // 下一帧缺口（held_ts+480）同样终点已知
+        assert_eq!(
+            jb.pull(0, 0, &mut out),
+            Pull::Plc {
+                ts: held_ts + FRAME_SAMPLES as u64
+            }
+        );
+        assert_eq!(
+            jb.pull(0, 0, &mut out),
+            Pull::Packet {
+                len: 1,
+                ts: 480 * 6
+            }
+        );
+        assert_eq!(jb.stats.hold_frames, 1, "终点已知后不得继续 hold");
+        assert_eq!(jb.plc_run(), 0);
     }
 
     #[test]
@@ -1013,21 +1282,23 @@ mod tests {
         }
         // 全部播掉（next_seq 停在 8，next_ts = 3840）
         pull_tags(&mut jb, 0, 8);
-        // 断流 500 ms：播放头推进 50 帧，但 next_seq 不动
+        // 断流 500 ms：尾部洞先 hold H 帧（不推进），耗尽后按静音推进；next_seq 不动
+        let hold = plc_hold_frames() as u64;
         for _ in 0..50u64 {
             let _ = jb.pull(0, 0, &mut [0u8; 1275]);
         }
         assert_eq!(jb.next_seq(), 8, "PLC/静音不得发明发送端序号");
-        assert_eq!(jb.next_ts(), 480 * 58);
+        let resume_ts = 480 * (8 + 50 - hold);
+        assert_eq!(jb.next_ts(), resume_ts);
         let epoch = jb.epoch;
 
-        // 恢复包序号看起来“倒退”（2 < 8），时间戳未来且连续
-        let r = insert(&mut jb, 2, 480 * 58, false, 9);
+        // 恢复包序号看起来“倒退”（2 < 8），时间戳正好接上播放头
+        let r = insert(&mut jb, 2, resume_ts as u32, false, 9);
         assert_eq!(r, InsertResult::Inserted, "序号滞后不得丢弃真实音频");
         assert_eq!(jb.stats.seq_realign, 1);
         assert_eq!(jb.stats.resyncs, 0, "不得整块清空缓冲");
         assert_eq!(jb.epoch, epoch);
-        assert_eq!(jb.next_ts(), 480 * 58);
+        assert_eq!(jb.next_ts(), resume_ts);
         assert_eq!(pull_tags(&mut jb, 0, 1), vec![9]);
     }
 
