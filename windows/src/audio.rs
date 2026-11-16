@@ -736,19 +736,22 @@ impl Drop for AudioWriter {
     }
 }
 
+/// VB-Cable 的播放端点名为 "CABLE Input"：应用写入它，对端从 "CABLE Output" 录制。
+const VB_CABLE_RENDER_NAME: &str = "CABLE Input";
+
 pub fn detect_vb_cable() -> Option<String> {
     let host = cpal::default_host();
     host.output_devices()
         .ok()?
         .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
-        .find(|n| n.contains("VB-Audio Virtual Cable"))
+        .find(|n| n.contains(VB_CABLE_RENDER_NAME))
 }
 
 fn find_vb_cable_device() -> Option<cpal::Device> {
     let host = cpal::default_host();
     for d in host.output_devices().ok()? {
         if let Ok(desc) = d.description() {
-            if desc.name().contains("VB-Audio Virtual Cable") {
+            if desc.name().contains(VB_CABLE_RENDER_NAME) {
                 return Some(d);
             }
         }
