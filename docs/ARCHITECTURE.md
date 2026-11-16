@@ -16,7 +16,7 @@ udp2cal/
 │     │  ├─ UdpSender.kt             # 主 socket：CONNECT + 正向 RTP；独立 ACK 线程；反向 socket 只收 RTP
 │     │  ├─ Udp2CalProtocol.kt       # 协议常量与 DTO 胶水（行为全部由 Rust 提供，见「协议单一实现」）
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
-│     │  ├─ StreamResampler.kt       # 反向流的受控重采样（32 相 × 48 抽头多相 FIR）
+│     │  ├─ StreamResampler.kt       # 反向流重采样的 JNI 胶水（实现见 protocol/resampler.rs）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
 │     │  ├─ service/CaptureService.kt    # 前台服务外壳：Binder/通知/Wi-Fi 回调/停机 join
 │     │  ├─ service/CaptureLifecycle.kt  # 会话编排：链路启停/重启排队/网络层与任务槽
@@ -49,7 +49,7 @@ udp2cal/
 │  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
-├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp/ 媒体面 + jni.rs JNI 表面
+├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp/ 媒体面 + resampler.rs 重采样 + jni.rs JNI 表面
 ├─ docs/           # 项目文档（本目录）
 ├─ build.bat       # 统一构建入口（Windows / Android / ADB / 体检）
 ├─ scripts/        # 构建脚本实现（Python 3.8+）
@@ -71,9 +71,11 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | 位置 | 角色 |
 | --- | --- |
 | `protocol/protocol.rs`、`protocol/rtp/`（`header` / `jitter` / `step` / `drift` / `device_rate`） | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
+| `protocol/resampler.rs` | **唯一实现**：32 相 × 48 抽头多相 FIR 重采样。Windows 播放（`audio.rs`）、Windows 采集（`capture.rs`）直接调用；Android 经 JNI 调用同一段机器码 |
 | `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，全部 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
 | `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
 | `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
+| `android/.../StreamResampler.kt` | 重采样的 JNI 胶水：句柄 + 输出缓冲，不含 DSP 逻辑 |
 
 三个接线点：
 

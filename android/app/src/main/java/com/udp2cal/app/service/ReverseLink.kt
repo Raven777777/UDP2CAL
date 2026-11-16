@@ -681,6 +681,7 @@ internal class ReverseLink(
         } finally {
             // 播放循环退出，把原生句柄还回去（本循环每连接新建一个）
             step.close()
+            resampler.close()
         }
     }
 }

@@ -250,4 +250,34 @@ internal object ProtocolNative {
     external fun dcTargetMs(h: Long): Int
 
     external fun dcRatioUpdates(h: Long): Long
+
+    // ── 重采样器（protocol/resampler.rs：三端唯一实现） ──────────────────
+
+    /** `channels` 必须在 1..=32；失败返回 0 */
+    external fun rsCreate(channels: Int): Long
+
+    external fun rsDestroy(h: Long)
+
+    external fun rsReset(h: Long)
+
+    external fun rsSetSourceRate(h: Long, sourceRate: Int, deviceRate: Int)
+
+    external fun rsSetAdjust(h: Long, adjust: Double)
+
+    external fun rsRatio(h: Long): Double
+
+    /** 单次 `rsProcess` 允许的最大输入帧数 */
+    external fun rsMaxInputFrames(): Int
+
+    /** `process` 的输出数组一次必须能装下的 short 数 */
+    external fun rsMaxOutputShorts(h: Long): Int
+
+    /** 返回写入 `out` 的 short 数；参数越界/`out` 不够大返回 -1（状态不变） */
+    external fun rsProcess(
+        h: Long,
+        src: ShortArray,
+        offset: Int,
+        frames: Int,
+        out: ShortArray,
+    ): Int
 }

@@ -18,6 +18,7 @@ use crate::hires::HiResTimer;
 use crate::logf;
 use crate::power::MmcssGuard;
 use crate::protocol;
+use crate::protocol::resampler::Resampler;
 use crate::protocol::rtp;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
@@ -466,8 +467,9 @@ impl ReverseSender {
         // 音频服务重启、端点切换后，旧客户端可能永远返回错误。不能把它当成
         // “端点空闲”而一直发合成静音，否则重连前手机永远听不到声音。
         let mut capture: Option<LoopbackCapture> = None;
-        // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）
-        let mut resampler: Option<StereoResampler> = None;
+        // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）。
+        // 重采样器与播放侧、Android 共用 `protocol/resampler.rs`。
+        let mut resampler: Option<Resampler> = None;
         let mut last_capture_attempt: Option<Instant> = None;
         let mut last_capture_fail_log = Instant::now() - Duration::from_secs(10);
         let mut read_errors: u32 = 0;
@@ -515,7 +517,9 @@ impl ReverseSender {
                 match LoopbackCapture::new() {
                     Some(c) => {
                         let rate = c.sample_rate();
-                        resampler = Some(StereoResampler::new(rate, 48_000));
+                        let mut rs = Resampler::new(2);
+                        rs.set_source_rate(rate, 48_000);
+                        resampler = Some(rs);
                         capture = Some(c);
                         read_errors = 0;
                         logf!("[Reverse] 环回捕获已就绪（{} Hz）", rate);
@@ -618,7 +622,7 @@ impl ReverseSender {
                 let idle_ms = last_frame_at.elapsed().as_millis() as u64;
                 last_frame_at = Instant::now();
                 if let Some(rs) = resampler.as_mut() {
-                    rs.process(&loopback, &mut resampled);
+                    rs.process_into(&loopback, &mut resampled);
                 } else {
                     resampled.clear();
                 }
@@ -865,90 +869,6 @@ impl Drop for ComGuard {
             // SAFETY: 仅当本线程上一次 CoInitializeEx 返回成功时 active 为 true，
             // 因此这里恰好抵消那一次初始化；Drop 只执行一次。
             unsafe { CoUninitialize() };
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 立体声交错重采样（捕获侧）
-// ═══════════════════════════════════════════════════════════════════
-
-/// 线性插值 + 跨缓冲相位连续。
-///
-/// 只做"把端点混音率搬到 48 kHz"，不引入低通滤波：反向串流的目标是
-/// 语音/系统提示音，48 kHz 以上的镜像分量功率极低。
-struct StereoResampler {
-    /// 每个输出帧消耗的输入帧数（src/dst）
-    ratio: f64,
-    /// 输入帧坐标系中的当前位置，始终保留 1 帧余量供下次插值
-    phase: f64,
-    in_buf: Vec<f32>,
-}
-
-impl StereoResampler {
-    fn new(src_hz: u32, dst_hz: u32) -> Self {
-        let ratio = if dst_hz == 0 {
-            1.0
-        } else {
-            src_hz as f64 / dst_hz as f64
-        };
-        Self {
-            ratio,
-            phase: 0.0,
-            in_buf: Vec::with_capacity(4_096),
-        }
-    }
-
-    #[inline]
-    fn is_passthrough(&self) -> bool {
-        (self.ratio - 1.0).abs() < 1e-9
-    }
-
-    /// 处理一块交错立体声输入，结果写入 `out`（会先清空）
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        out.clear();
-        if input.is_empty() {
-            return;
-        }
-        if self.is_passthrough() {
-            out.extend_from_slice(input);
-            return;
-        }
-
-        self.in_buf.extend_from_slice(input);
-        let frames = self.in_buf.len() / 2;
-        if frames < 2 {
-            return;
-        }
-
-        loop {
-            let i = self.phase as usize;
-            if i + 1 >= frames {
-                break; // 需要下一帧才能插值
-            }
-            let frac = (self.phase - i as f64) as f32;
-            for ch in 0..2 {
-                let a = self.in_buf[i * 2 + ch];
-                let b = self.in_buf[(i + 1) * 2 + ch];
-                out.push(a + (b - a) * frac);
-            }
-            self.phase += self.ratio;
-        }
-
-        // 丢弃已经完全消费的整帧，保留 1 帧给下一块做插值。
-        //
-        // `consumed` 必须钳到 `frames - 1`：循环的退出条件是
-        // `floor(phase) >= frames - 1`，而最后一步
-        // `phase += ratio` 可以越过 `frames`。ratio > 2（44.1k 以上回环端点，
-        // 例如 176.4k / 192k / 384k）时 `consumed` 会等于 `frames + 1..`，
-        // `drain(0..consumed * 2)` 的末端下标越过 `in_buf.len()` → panic，
-        // 捕获线程直接死掉且反向音频永久静音。钳位同时也保证
-        // `phase - consumed >= 0`，不会出现负相位（`as usize` 饱和到 0 后
-        // 做负 frac 外插）。
-        let consumed = (self.phase as usize).min(frames - 1);
-        if consumed > 0 {
-            self.in_buf.drain(0..consumed * 2);
-            self.phase -= consumed as f64;
         }
     }
 }
@@ -1367,69 +1287,6 @@ mod tests {
         assert!(stall + Duration::from_millis(1) < s1);
         // 到了 s1 就正常前进一个 gap
         assert_eq!(advance_slot(s1, GAP, s1), s1 + GAP);
-    }
-
-    #[test]
-    fn resampler_passthrough_is_bit_exact() {
-        let mut rs = StereoResampler::new(48_000, 48_000);
-        let input: Vec<f32> = (0..960).map(|i| i as f32 * 1e-4).collect();
-        let mut out = Vec::new();
-        rs.process(&input, &mut out);
-        assert_eq!(out, input);
-    }
-
-    #[test]
-    fn resampler_44k1_to_48k_first_block() {
-        let mut rs = StereoResampler::new(44_100, 48_000);
-        let input = vec![0.5f32; 441 * 2];
-        let mut out = Vec::new();
-        rs.process(&input, &mut out);
-        let frames = out.len() / 2;
-        assert!((frames as i64 - 480).abs() <= 2, "frames={frames}");
-    }
-
-    #[test]
-    fn resampler_keeps_phase_across_blocks() {
-        let mut rs = StereoResampler::new(44_100, 48_000);
-        let input = vec![0.5f32; 441 * 2];
-        let mut out = Vec::new();
-        let mut total = 0usize;
-        for _ in 0..10 {
-            rs.process(&input, &mut out);
-            total += out.len() / 2;
-        }
-        assert!((total as i64 - 4_800).abs() <= 4, "total={total}");
-    }
-
-    /// 回归：高采样率回环端点（ratio > 2）下逐帧步进会越过 `frames`，
-    /// 曾经的 `drain(0..consumed * 2)` 直接 panic 掉整个捕获线程。
-    /// 覆盖 144k/176.4k/192k/384k 的典型 packet 帧数与相邻的 ±1 帧。
-    #[test]
-    fn resampler_high_ratio_never_overruns() {
-        for &src_hz in &[144_000u32, 176_400, 192_000, 384_000] {
-            for &(base, span) in &[(64usize, 32usize), (3_840, 4), (7_680, 4)] {
-                for frames in base.saturating_sub(span)..=base + span {
-                    let mut rs = StereoResampler::new(src_hz, 48_000);
-                    let input = vec![0.25f32; frames * 2];
-                    let mut out = Vec::new();
-                    rs.process(&input, &mut out);
-                    assert_eq!(out.len() % 2, 0, "输出必须是整帧");
-                    assert!(
-                        rs.phase >= 0.0,
-                        "相位不能为负（src={src_hz} frames={frames}）：{}",
-                        rs.phase
-                    );
-                    // 输出的帧数不得超过本次可用输入能支撑的量（多留 1 帧余量）
-                    let ratio = src_hz as f64 / 48_000.0;
-                    let max_out = (frames as f64 / ratio).ceil() as usize + 2;
-                    assert!(
-                        out.len() / 2 <= max_out,
-                        "src={src_hz} frames={frames} out={} max={max_out}",
-                        out.len() / 2
-                    );
-                }
-            }
-        }
     }
 
     #[test]

@@ -27,6 +27,11 @@
 
 pub mod rtp;
 
+/// 相位连续多相 FIR 重采样器：Windows 播放 / Windows 采集 / Android 共用这一份。
+pub mod resampler;
+
+pub use resampler::Resampler;
+
 /// JNI 绑定（Android 端复用本 crate 的唯一实现，见 `docs/PROTOCOL_V3_RTP.md` §12）。
 #[cfg(feature = "jni")]
 pub mod jni;

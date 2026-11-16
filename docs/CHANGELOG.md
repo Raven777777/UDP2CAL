@@ -4,6 +4,13 @@
 
 ---
 
+## 未发布 — 重采样器三端单源
+
+- 新增 `protocol/resampler.rs`：32 相 × 48 抽头 Kaiser sinc FIR（`CUTOFF=0.42`、`β=10`、每相 DC 归一），任意声道数、交错 f32、跨块相位连续。
+- `windows/src/audio.rs`（播放）删除内嵌 FIR 与系数表，改为调用共享核心；比率、历史段与调制语义不变。
+- `windows/src/capture.rs`（采集）删除两点线性插值 `StereoResampler`，改用同一 FIR：非 48 kHz 环回端点不再有 12 kHz −3 dB 的插值损失与随比率扫掠的颤动，代价是固定 ≈0.5 ms（24.5 样本）群延迟。
+- `StreamResampler.kt` 删除 Kotlin 算法副本，改为 `rs*` JNI 胶水；现有 Kotlin 单测原样在桌面 JVM 上跑同一份 Rust 机器码，三端行为由同一组 Rust 单测看守。
+
 ## v1.5.2 — 2026-11-13 · 稳定性优先与可靠性修复
 
 ### 发布前审查修复

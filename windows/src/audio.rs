@@ -8,13 +8,14 @@
 //      在 ±0.5% 内微调（漂移校正的**唯一手段**，见 `set_ratio_adjust`）；
 //   4. 把"还剩多少毫秒没播"如实报出来（`filled_frames`），供调度与控制器用。
 //
-// 重采样是多相 FIR（`RESAMPLE_PHASES` × `RESAMPLE_TAPS`）：两点线性插值的
-// 幅度响应是 |cos(ω/2)|，相位扫到半个样本时 12 kHz 掉 3 dB、24 kHz 全陷；
-// 而比率微调一启动相位就一直在扫。多相 FIR 的误差只取决于相位表密度，
-// 与比率无关，也不存在"比率恰好为 1 就直通"的特例。
+// 重采样是多相 FIR，算法与 Windows 采集端、Android 共用
+// `protocol/resampler.rs`：两点线性插值的幅度响应是 |cos(ω/2)|，相位扫到
+// 半个样本时 12 kHz 掉 3 dB、24 kHz 全陷；而比率微调一启动相位就一直在扫。
+// 多相 FIR 的误差只取决于相位表密度，与比率无关，也不存在"比率恰好为 1
+// 就直通"的特例。
 //
 // 本模块**不做**任何离散丢样/插样：水位只由比率这一条连续量控制。
-use crate::protocol::rtp;
+use crate::protocol::resampler::Resampler;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, FromSample, SampleFormat, SizedSample, StreamConfig};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -230,18 +231,10 @@ pub struct AudioWriter {
     stream_thread: Option<JoinHandle<()>>,
 
     // ── 相位连续多相 FIR 重采样器 ──
-    /// 当前输出点落在输入上的连续位置（源样本，可为负＝仍落在历史段）
-    pos: f64,
-    /// 固定比率 = 源采样率 / 设备采样率（不含微调）
-    base_ratio: f64,
-    /// 比率微调量（±0.005），由漂移控制器每 10 ms 写入一次
-    adjust: f64,
-    /// 当前输入采样率（0 = 尚未收到数据）
+    /// 当前输入采样率（0 = 尚未收到数据）；仅用于检测"换了一条输入时间线"
     source_rate: u32,
-    /// 上一块的尾段（`RESAMPLE_HIST` 个源样本），供跨块插值
-    hist: Vec<f32>,
-    /// `hist ++ pcm` 拼接缓冲，复用避免高频分配
-    work: Vec<f32>,
+    /// 重采样器：与 Android、Windows 采集端共用 `protocol/resampler.rs`
+    resampler: Resampler,
     /// 复用输出缓冲区，消除高频堆分配
     resample_buf: Vec<f32>,
 }
@@ -354,11 +347,7 @@ impl AudioWriter {
 
     /// 清空重采样器状态：相位归零、历史段置零（新数据从静音淡入）
     fn reset_filter(&mut self) {
-        self.pos = 0.0;
-        for s in self.hist.iter_mut() {
-            *s = 0.0;
-        }
-        self.work.clear();
+        self.resampler.reset();
     }
 
     /// 设置重采样比率微调量（±0.5%）。
@@ -370,18 +359,13 @@ impl AudioWriter {
     /// 语义：`实际比率 = 源/设备 × (1 + adjust)`；adjust > 0 → 每秒产出的
     /// 设备帧变少 → 缓冲水位回落。
     pub fn set_ratio_adjust(&mut self, adjust: f64) {
-        let a = if adjust.is_finite() {
-            adjust.clamp(-rtp::RESAMPLE_MAX_ADJUST, rtp::RESAMPLE_MAX_ADJUST)
-        } else {
-            0.0
-        };
-        self.adjust = a;
+        self.resampler.set_ratio_adjust(adjust);
     }
 
     /// 当前生效的重采样比率（含微调）
     #[inline]
     pub fn current_ratio(&self) -> f64 {
-        (self.base_ratio * (1.0 + self.adjust)).clamp(1e-6, 1e6)
+        self.resampler.ratio()
     }
 
     /// 写入 48 kHz 媒体 PCM（单声道），按设备采样率换算后入环。
@@ -397,60 +381,20 @@ impl AudioWriter {
 
         if source_rate > 0 && source_rate != self.source_rate {
             self.source_rate = source_rate;
-            let r = source_rate as f64 / self.device_rate as f64;
-            self.base_ratio = if (0.1..10.0).contains(&r) { r } else { 1.0 };
-            // 换源采样率＝换了一条输入时间线：清空历史段与相位
-            self.pos = 0.0;
-            self.hist.iter_mut().for_each(|v| *v = 0.0);
+            // 换源采样率＝换了一条输入时间线：比率重建、历史段与相位清空
+            self.resampler
+                .set_source_rate(source_rate, self.device_rate);
         }
-        let ratio = self.current_ratio();
 
-        if source_rate != self.device_rate || self.adjust.abs() > 1e-12 {
+        if source_rate != self.device_rate || self.resampler.adjust().abs() > 1e-12 {
             self.stats.resampled.fetch_add(1, Ordering::Relaxed);
         }
 
-        // ── 多相 FIR 插值 ──
+        // ── 多相 FIR 插值（唯一实现：protocol/resampler.rs）──
         //
-        // 输入先与上一块的尾段拼成 `work`；`pos` 是当前输出点落在输入上的连续
-        // 位置（可为负＝仍落在历史段）。只有当抽头窗口完全落在已知数据内时才
-        // 发出样本，因此不存在外插，也不需要"比率恰好为 1 就直通"的分支。
-        let n = pcm.len();
-        self.work.clear();
-        self.work.extend_from_slice(&self.hist);
-        self.work.extend_from_slice(pcm);
-
-        self.resample_buf.clear();
-        let mut pos = self.pos;
-        if n > RESAMPLE_HALF + 1 {
-            // 窗口右端不得越出本块：base <= n - HALF - 1
-            let limit = n as f64 - RESAMPLE_HALF as f64 - 1.0;
-            let table = coef_table();
-            while pos < limit {
-                let base = pos.floor();
-                // pcm[i] 在 work 中的下标是 i + RESAMPLE_HIST，
-                // 而抽头窗口从下标 base + 1 - HALF 开始
-                let w0 = base as isize + (RESAMPLE_HIST as isize + 1 - RESAMPLE_HALF as isize);
-                let frac = pos - base;
-                let phase = ((frac * RESAMPLE_PHASES as f64) as usize).min(RESAMPLE_PHASES - 1);
-                let coefs = &table[phase];
-                let w0 = w0 as usize;
-                let mut acc = 0.0f32;
-                for (j, &c) in coefs.iter().enumerate() {
-                    acc += c * self.work[w0 + j];
-                }
-                self.resample_buf.push(acc);
-                pos += ratio;
-            }
-        }
-        self.pos = pos - n as f64;
-        // 防御：连续收到极小输入块时 `pos` 会一路后退，钳在历史段范围内
-        let floor_pos = -((RESAMPLE_HALF + 1) as f64);
-        if self.pos < floor_pos {
-            self.pos = floor_pos;
-        }
-        // 保存尾段作为下一块的历史
-        let len = self.work.len();
-        self.hist.copy_from_slice(&self.work[len - RESAMPLE_HIST..]);
+        // 输入先与上一块的尾段拼接；相位连续、只在抽头窗口完全落在已知数据
+        // 内时发出样本，因此不存在外插，也不需要"比率恰好为 1 就直通"的分支。
+        self.resampler.process_into(pcm, &mut self.resample_buf);
 
         let mut written = 0usize;
         for &s in &self.resample_buf {
@@ -469,83 +413,8 @@ impl AudioWriter {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 多相 FIR 插值表
-//
-// 为什么不用两点线性插值：它的幅度响应是 |cos(ω/2)|，相位差半个样本时
-// 12 kHz 掉 3 dB、24 kHz 全陷。而比率微调让相位以 u×Fs 持续扫掠，于是
-// 那 3 dB 变成常年高频颤动（u=0.5% 时约 240 Hz）。多相 FIR 把插值误差
-// 变成纯相位表密度问题（1/(2×32) = 0.016 样本），与比率无关，
-// 12 kHz 的幅度误差约 0.003 dB。
+// 输出设备配置选择
 // ═══════════════════════════════════════════════════════════════════
-
-/// 相位分辨率
-const RESAMPLE_PHASES: usize = 32;
-/// 每相抽头数（偶数，对称）
-const RESAMPLE_TAPS: usize = 48;
-/// 半窗长
-const RESAMPLE_HALF: usize = RESAMPLE_TAPS / 2;
-/// 归一化截止频率（cycles/sample）：0.42 × 48 kHz = 20.2 kHz，
-/// 加上过渡带后阻带起点约 0.49，折返分量落在带外
-const RESAMPLE_CUTOFF: f64 = 0.42;
-/// Kaiser 窗 β（≈100 dB 阻带）
-const RESAMPLE_BETA: f64 = 10.0;
-/// 历史样本数：≥ HALF+1，保证相位滑到 −(HALF+1) 时仍有数据
-const RESAMPLE_HIST: usize = RESAMPLE_TAPS + 1;
-
-type CoefTable = [[f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
-
-/// 零阶修正贝塞尔函数（Kaiser 窗用）。级数展开即可，β ≤ 10 时收敛极快。
-fn bessel_i0(x: f64) -> f64 {
-    let y = x * x / 4.0;
-    let mut sum = 1.0f64;
-    let mut term = 1.0f64;
-    for k in 1..40 {
-        term *= y / (k as f64 * k as f64);
-        sum += term;
-        if term < sum * 1e-17 {
-            break;
-        }
-    }
-    sum
-}
-
-/// 生成/取用相位表（首次调用时计算，之后只读）
-fn coef_table() -> &'static CoefTable {
-    static TABLE: OnceLock<CoefTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let win_norm = bessel_i0(RESAMPLE_BETA);
-        let mut table = [[0.0f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
-        let w = 2.0 * RESAMPLE_CUTOFF;
-        for (p, coefs) in table.iter_mut().enumerate() {
-            let frac = p as f64 / RESAMPLE_PHASES as f64;
-            let mut sum = 0.0f64;
-            for (j, c) in coefs.iter_mut().enumerate() {
-                // 抽头 j 对应的输入样本与插值中心的距离（单位：样本）
-                let x = j as f64 - (RESAMPLE_HALF as f64 - 1.0) - frac;
-                let sinc = if x.abs() < 1e-9 {
-                    1.0
-                } else {
-                    (std::f64::consts::PI * w * x).sin() / (std::f64::consts::PI * w * x)
-                };
-                let u = x / RESAMPLE_HALF as f64;
-                let win = if u.abs() >= 1.0 {
-                    0.0
-                } else {
-                    bessel_i0(RESAMPLE_BETA * (1.0 - u * u).sqrt()) / win_norm
-                };
-                let h = w * sinc * win;
-                *c = h as f32;
-                sum += h;
-            }
-            // 每相单独归一：保证 DC 增益精确为 1，否则会留下低频起伏
-            let inv = 1.0 / sum;
-            for c in coefs.iter_mut() {
-                *c = (*c as f64 * inv) as f32;
-            }
-        }
-        table
-    })
-}
 
 /// 排序键：优先覆盖 48000 Hz 的采样率范围，其次格式（f32 > i16/u16/i32），
 /// 再次单声道（回调会复制到所有声道）。
@@ -839,12 +708,8 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             failed,
             cancel,
             stream_thread: Some(audio_thread),
-            pos: 0.0,
-            base_ratio: 1.0,
-            adjust: 0.0,
             source_rate: 0,
-            hist: vec![0.0; RESAMPLE_HIST],
-            work: Vec::with_capacity(RESAMPLE_HIST + 4096),
+            resampler: Resampler::new(1),
             resample_buf: Vec::with_capacity(4096),
         }),
         Ok(Err(e)) => Err(e),
@@ -898,6 +763,7 @@ fn find_vb_cable_device() -> Option<cpal::Device> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::rtp;
 
     #[test]
     fn pick_prefers_range_covering_48k_over_low_rate_f32() {
@@ -1080,12 +946,8 @@ mod tests {
                 failed: Arc::new(AtomicBool::new(false)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 stream_thread: None,
-                pos: 0.0,
-                base_ratio: 1.0,
-                adjust: 0.0,
                 source_rate: 0,
-                hist: vec![0.0; RESAMPLE_HIST],
-                work: Vec::new(),
+                resampler: Resampler::new(1),
                 resample_buf: Vec::new(),
             }
         }
@@ -1243,7 +1105,7 @@ mod tests {
         aw.set_ratio_adjust(9.0);
         assert!((aw.current_ratio() - (1.0 + rtp::RESAMPLE_MAX_ADJUST)).abs() < 1e-12);
         aw.set_ratio_adjust(f64::NAN);
-        assert_eq!(aw.adjust, 0.0);
+        assert_eq!(aw.current_ratio(), 1.0);
     }
 
     #[test]
@@ -1266,7 +1128,22 @@ mod tests {
         aw.write(&vec![0.1f32; 480], 48000);
         aw.flush();
         assert_eq!(aw.ring.len(), 0);
-        assert_eq!(aw.pos, 0.0);
-        assert!(aw.hist.iter().all(|&v| v == 0.0));
+        // 测试里没有音频回调：手动落地 flush 请求并清掉旧样本
+        aw.ring.apply_pending_flush();
+        while aw.ring.pop().is_some() {}
+        // 相位与历史已清零：同一块输入必须与"全新实例"逐样本一致
+        let mut fresh = AudioWriter::for_test(48000);
+        let pcm = tone_12k(480, 480);
+        aw.write(&pcm, 48000);
+        fresh.write(&pcm, 48000);
+        let mut a = Vec::new();
+        let mut f = Vec::new();
+        while let Some(v) = aw.ring.pop() {
+            a.push(v);
+        }
+        while let Some(v) = fresh.ring.pop() {
+            f.push(v);
+        }
+        assert_eq!(a, f);
     }
 }
