@@ -1,8 +1,7 @@
 //! iced 界面渲染。
 
 use crate::app::{AppState, Message, NoticeLevel};
-use crate::diag::{LATENCY_MS, audio_stats};
-use crate::session::{APP_RUNNING, p2p_snapshot};
+use crate::diag::LATENCY_MS;
 use iced::widget::{
     Space, button, column, container, opaque, progress_bar, row, stack, text, text_input,
 };
@@ -42,7 +41,7 @@ impl AppState {
 
         // P2P 状态: TYPE_CONNECT 独占绑定 / 空闲
         // 已占用后不再拼接 8 位设备识别码：对用户没有意义，还会把顶部一行挤满。
-        let p2p = p2p_snapshot();
+        let p2p = self.session.p2p();
         let (p2p_state, p2p_color) = if !self.is_running {
             (String::new(), dim)
         } else if p2p.is_busy() {
@@ -67,7 +66,7 @@ impl AppState {
         //   已启动未连上  → 广播地址 + 广播状态
         //   已连接        → 音频诊断 + 反向串流状态（地址与广播状态对用户已无意义）
         let footer_left = if self.connected {
-            let s = audio_stats().snapshot();
+            let s = self.session.audio_stats().snapshot();
             // 延迟放在最前：它是用户唯一能直接感知的指标，
             // 重采样计数已失去诊断价值（比率每帧都在动），只在日志里保留
             format!(
@@ -91,7 +90,7 @@ impl AppState {
                 ("○ 反向串流未启用".to_string(), dim)
             }
         } else {
-            let bc_on = APP_RUNNING.load(Ordering::Acquire) != 0 && !p2p.is_busy();
+            let bc_on = self.session.running() && !p2p.is_busy();
             if bc_on {
                 ("● 广播中".to_string(), accent)
             } else {

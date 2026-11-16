@@ -1,15 +1,16 @@
 //! 接收侧音频：抖动缓冲、解码/播放线程与音频初始化状态。
+//!
+//! 状态全部挂在 [`Session`] 上：本文件只实现解码线程的启动与运行循环。
 
+use super::Session;
 use crate::audio;
 use crate::decoder;
-use crate::diag::{
-    AUDIO_LEVEL_DB, DEVICE_LATENCY_MS, DRIFT_ADJUST_BITS, FEC_FRAMES, LATENCY_MS, audio_stats,
-};
+use crate::diag::{AUDIO_LEVEL_DB, DEVICE_LATENCY_MS, DRIFT_ADJUST_BITS, FEC_FRAMES, LATENCY_MS};
 use crate::logf;
 use crate::power;
 use crate::protocol;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
@@ -18,33 +19,6 @@ use windows::Win32::System::Threading::{
 // ══════════════════════════════════════════════
 // 接收侧：抖动缓冲 + 解码线程
 // ══════════════════════════════════════════════
-
-/// 正向媒体流的抖动缓冲。网络线程只插入，解码线程只按播放头拉取。
-static JITTER: OnceLock<Mutex<protocol::rtp::JitterBuffer>> = OnceLock::new();
-pub(crate) fn jitter() -> &'static Mutex<protocol::rtp::JitterBuffer> {
-    JITTER.get_or_init(|| Mutex::new(protocol::rtp::JitterBuffer::new()))
-}
-
-/// 解码线程句柄：网络线程与复位路径据此唤醒它（unpark 为原子置位，无分配）。
-///
-/// 必须**可替换**：音频初始化失败后重试会创建新的解码线程，而 `OnceLock`
-/// 只能写入一次——重试后 `wake_decoder()` 会一直唤醒已退出的旧线程，新线程
-/// 只能靠 4 ms 轮询兜底（表现为卡顿与延迟上升）。
-static DECODE_THREAD: Mutex<Option<std::thread::Thread>> = Mutex::new(None);
-
-fn set_decode_thread(t: std::thread::Thread) {
-    *DECODE_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
-}
-
-pub(crate) fn wake_decoder() {
-    if let Some(t) = DECODE_THREAD
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-    {
-        t.unpark();
-    }
-}
 
 /// 音频初始化状态。
 /// 历史实现用裸 u32 + 魔数 0/1/2/3 表达四态，读写点分散在三个函数里，
@@ -63,20 +37,15 @@ pub(crate) enum AudioInitState {
 }
 
 impl AudioInitState {
-    pub(crate) fn load() -> Self {
-        match AUDIO_INIT_STATE.load(Ordering::Acquire) {
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
             1 => Self::DecoderFailed,
             2 => Self::DeviceFailed,
             3 => Self::Ready,
             _ => Self::Pending,
         }
     }
-    fn store(self) {
-        AUDIO_INIT_STATE.store(self as u8, Ordering::Release);
-    }
 }
-
-static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8);
 
 /// 启动（或重启）音频解码/播放线程。
 ///
@@ -86,9 +55,10 @@ static AUDIO_INIT_STATE: AtomicU8 = AtomicU8::new(AudioInitState::Pending as u8)
 ///     不存在"超过 N 毫秒没收到包就补"的计时器；
 ///   * 等待用 `park`/`unpark`（网络线程与音频回调共同唤醒），
 ///     超时值只是兜底唤醒，不参与播放决策。
-pub(crate) fn init_audio_worker() {
-    AudioInitState::Pending.store();
-    let stats = audio_stats().clone();
+pub(crate) fn init_audio_worker(session: Arc<Session>) {
+    session.set_audio_state(AudioInitState::Pending);
+    let stats = session.audio_stats().clone();
+    let spawn_session = Arc::clone(&session);
 
     let spawn_result = std::thread::Builder::new()
         .name("udp2cal-decode".into())
@@ -106,13 +76,13 @@ pub(crate) fn init_audio_worker() {
                     }
                 }
             }
-            set_decode_thread(std::thread::current());
+            spawn_session.set_decode_thread(std::thread::current());
 
             let mut dec = match decoder::OpusDecoder::new() {
                 Ok(d) => d,
                 Err(e) => {
                     logf!("[Audio] Opus 解码器初始化失败: {e:?}");
-                    AudioInitState::DecoderFailed.store();
+                    spawn_session.set_audio_state(AudioInitState::DecoderFailed);
                     return;
                 }
             };
@@ -120,12 +90,12 @@ pub(crate) fn init_audio_worker() {
                 Ok(a) => a,
                 Err(e) => {
                     logf!("[Audio] 初始化失败: {e}");
-                    AudioInitState::DeviceFailed.store();
+                    spawn_session.set_audio_state(AudioInitState::DeviceFailed);
                     return;
                 }
             };
             aw.set_waker(std::thread::current());
-            AudioInitState::Ready.store();
+            spawn_session.set_audio_state(AudioInitState::Ready);
             logf!(
                 "[Audio] 就绪：输出设备 {} Hz（解码 48 kHz 单声道 / 10 ms），声卡缓冲 {} ms",
                 aw.device_rate,
@@ -153,9 +123,8 @@ pub(crate) fn init_audio_worker() {
             let water_target = protocol::rtp::water_target_ms();
             // 启动预缓冲：先攒够本方向目标再开播，之后靠 ASRC 慢慢收敛；
             // 不再出现“3 帧就开播、再用 24 s 爬坡”的隐性瞬态。
-            jitter()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            spawn_session
+                .jitter()
                 .set_start_prebuffer_ms(water_target);
             let mut payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
             let mut trim_payload = [0u8; protocol::rtp::OPUS_MAX_PAYLOAD];
@@ -174,10 +143,10 @@ pub(crate) fn init_audio_worker() {
             let mut adjust: f64;
 
             loop {
-                if super::APP_RUNNING.load(Ordering::Acquire) == 0 {
+                if !spawn_session.running() {
                     if !idle {
                         idle = true;
-                        jitter().lock().unwrap_or_else(|e| e.into_inner()).reset();
+                        spawn_session.jitter().reset();
                         drift.reset();
                         device_rate_est.reset();
                         step.reset();
@@ -221,12 +190,12 @@ pub(crate) fn init_audio_worker() {
                             device_rate_est =
                                 protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
                             step = protocol::rtp::StepAbsorber::new();
-                            AudioInitState::Ready.store();
+                            spawn_session.set_audio_state(AudioInitState::Ready);
                             logf!("[Audio] 输出流已重建（{} Hz）", aw.device_rate);
                         }
                         None => {
                             logf!("[Audio] 输出流重建失败；请检查音频设备/服务后重新开始");
-                            AudioInitState::DeviceFailed.store();
+                            spawn_session.set_audio_state(AudioInitState::DeviceFailed);
                             return;
                         }
                     }
@@ -234,7 +203,7 @@ pub(crate) fn init_audio_worker() {
 
                 // 新会话 / 重同步：epoch 变化 → 重建解码器与全部估计器。
                 // 速率估计器必须在这里一并复位：resync 会重建 highest_ts 基准。
-                let epoch = jitter().lock().unwrap_or_else(|e| e.into_inner()).epoch;
+                let epoch = spawn_session.jitter().epoch;
                 if epoch != last_epoch {
                     last_epoch = epoch;
                     dec.reset();
@@ -256,7 +225,7 @@ pub(crate) fn init_audio_worker() {
                 let queued_media = (pipe_frames as f64 * aw.current_ratio()) as u64;
 
                 let (pull, jb_water, newest_ts, arrival, trims, step_hit, playing) = {
-                    let mut jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                    let mut jb = spawn_session.jitter();
 
                     // ── 阶跃吸收（方案 C）：持续超额才裁，且逐帧解码后再丢 PCM ──
                     // 判据：总水位持续 STEP_TRIM_HOLD_MS 超过 target+STEP_TRIM_EXCESS_MS。
@@ -435,7 +404,7 @@ pub(crate) fn init_audio_worker() {
                         // 现实中这正好覆盖"包迟到/被 AP 攒批挤掉"的短洞：
                         // 过去每洞必 PLC（30 ms 听起来就是一下音量塌陷）。
                         let fec_n = {
-                            let jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+                            let jb = spawn_session.jitter();
                             match jb.peek_current(&mut payload) {
                                 Some(len) => dec.decode_fec(&payload[..len]),
                                 None => None,
@@ -509,6 +478,6 @@ pub(crate) fn init_audio_worker() {
     // 引擎照常启动 → UI 显示“运行中”但永远没有声音，日志一片空白。
     if let Err(e) = spawn_result {
         logf!("[Audio] 解码线程创建失败: {e}");
-        AudioInitState::DeviceFailed.store();
+        session.set_audio_state(AudioInitState::DeviceFailed);
     }
 }

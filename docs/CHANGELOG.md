@@ -10,6 +10,8 @@
 - `windows/src/audio.rs`（播放）删除内嵌 FIR 与系数表，改为调用共享核心；比率、历史段与调制语义不变。
 - `windows/src/capture.rs`（采集）删除两点线性插值 `StereoResampler`，改用同一 FIR：非 48 kHz 环回端点不再有 12 kHz −3 dB 的插值损失与随比率扫掠的颤动，代价是固定 ≈0.5 ms（24.5 样本）群延迟。
 - `StreamResampler.kt` 删除 Kotlin 算法副本，改为 `rs*` JNI 胶水；现有 Kotlin 单测原样在桌面 JVM 上跑同一份 Rust 机器码，三端行为由同一组 Rust 单测看守。
+- Windows 端会话级状态收敛为 `Arc<Session>`：`JITTER` / `P2P_STATE` / `REVERSE_SENDER` / 配对与音频初始化等进程静态改为 `Session` 字段，由 `app::run` 注入广播线程、接收流、解码线程与 UI；锁顺序记录在 `session/mod.rs` 头部，单测可创建独立实例。
+- `protocol/jni.rs` 的标量 getter 统一由 `handle_scalar!` 宏生成（`JitterBuffer` / `StepAbsorber` / `DriftController` / `DeviceRateEstimator` / `Resampler`），删除逐点手写的 JNI 入口。
 
 ## v1.5.2 — 2026-11-13 · 稳定性优先与可靠性修复
 

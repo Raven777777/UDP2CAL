@@ -13,7 +13,7 @@ use crate::tray;
 use crate::ui;
 use iced::{Subscription, Task, Theme};
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::Win32::System::Threading::CreateMutexW;
@@ -66,6 +66,8 @@ pub(crate) enum NoticeLevel {
 }
 
 pub(crate) struct AppState {
+    /// 会话级共享状态：绑定、抖动缓冲、反向发送、配对与音频统计。
+    pub(crate) session: Arc<session::Session>,
     pub(crate) config: config::Config,
     pub(crate) ip_input: String,
     pub(crate) port_input: String,
@@ -126,7 +128,7 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     let _power_guard = power::ProcessPowerGuard::acquire();
 
     let startup_cfg = config::Config::load();
-    net::LISTEN_PORT.store(startup_cfg.listen_port, Ordering::Release);
+    let session = session::Session::from_config(&startup_cfg);
 
     // 防火墙放行：限定到本程序 + 具体端口。失败必须可被用户看到，
     // 因此同步执行并把错误作为首条提示传入界面。
@@ -135,10 +137,10 @@ pub(crate) fn run() -> Result<(), iced::Error> {
         logf!("[Firewall] {err}");
     }
 
-    // P2P 系统初始化
-    net::start_broadcast_listener();
-    net::start_broadcast_state_machine();
-    session::init_audio_worker();
+    // P2P 系统初始化：广播线程与接收流共享同一个会话实例
+    net::start_broadcast_listener(Arc::clone(&session));
+    net::start_broadcast_state_machine(Arc::clone(&session));
+    session::init_audio_worker(Arc::clone(&session));
 
     // 初始化图标
     let (icon_rgba, w, h) = tray::load_icon_rgba();
@@ -159,16 +161,13 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     };
 
     // 主窗体
+    let ui_session = Arc::clone(&session);
     let result = iced::application(
         move || {
             let cfg = config::Config::load();
-            session::PAIRED_DEVICE.store(cfg.paired_device, Ordering::Release);
-            session::REVERSE_ENABLED.store(
-                if cfg.reverse_enabled != 0 { 1 } else { 0 },
-                Ordering::Release,
-            );
             let now = Instant::now();
             let state = AppState {
+                session: Arc::clone(&ui_session),
                 ip_input: cfg.listen_ip.clone(),
                 port_input: cfg.listen_port.to_string(),
                 port_valid: true,
@@ -272,7 +271,7 @@ impl AppState {
                     return Task::none();
                 }
                 self.reverse_enabled = enabled;
-                session::REVERSE_ENABLED.store(if enabled { 1 } else { 0 }, Ordering::Release);
+                self.session.set_reverse_enabled(enabled);
                 self.config.set_reverse_enabled(enabled);
                 self.persist_config();
                 Task::none()
@@ -284,13 +283,13 @@ impl AppState {
                 self.last_toggle_instant = Instant::now();
 
                 if self.is_running {
-                    session::APP_RUNNING.store(0, Ordering::Release);
-                    session::REVERSE_ENABLED.store(0, Ordering::Release);
-                    session::reset_to_ready();
+                    self.session.set_running(false);
+                    self.session.set_reverse_enabled(false);
+                    self.session.reset_to_ready();
                     self.is_running = false;
                     self.connected = false;
                     self.pending_pair = None;
-                    session::PAIRING_PROMPTED.store(0, Ordering::Release);
+                    self.session.clear_pairing_prompt();
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
                     self.status_text.clear();
@@ -353,19 +352,19 @@ impl AppState {
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;
                     let saved = self.persist_config();
-                    net::LISTEN_PORT.store(port as u32, Ordering::Release);
+                    self.session.set_listen_port(port as u32);
 
                     // 上次音频初始化失败过则重试一次（例如用户刚装好 VB-Cable）
                     if matches!(
-                        session::AudioInitState::load(),
+                        self.session.audio_state(),
                         session::AudioInitState::DecoderFailed
                             | session::AudioInitState::DeviceFailed
                     ) {
-                        session::init_audio_worker();
+                        session::init_audio_worker(Arc::clone(&self.session));
                     }
 
-                    session::APP_RUNNING.store(1, Ordering::Release);
-                    session::reset_to_ready();
+                    self.session.set_running(true);
+                    self.session.reset_to_ready();
                     self.is_running = true;
                     self.connected = false;
                     self.last_bitrate = 0.0;
@@ -376,8 +375,7 @@ impl AppState {
                     }
                     self.vb_cable_installed = audio::detect_vb_cable().is_some();
                     // 应用反向串流设置到全局
-                    session::REVERSE_ENABLED
-                        .store(if self.reverse_enabled { 1 } else { 0 }, Ordering::Release);
+                    self.session.set_reverse_enabled(self.reverse_enabled);
                 }
                 Task::none()
             }
@@ -385,7 +383,7 @@ impl AppState {
                 // 解码线程重建输出流失败会置 DeviceFailed；此时必须停表并提示，
                 // 不能维持“运行中”假象（played/设备时钟已冻结，永远无声）。
                 if self.is_running
-                    && session::AudioInitState::load() == session::AudioInitState::DeviceFailed
+                    && self.session.audio_state() == session::AudioInitState::DeviceFailed
                 {
                     return self.update(Message::EngineError(
                         "音频输出流失效，重建失败：请检查 VB-Cable/音频服务后重新开始".into(),
@@ -394,7 +392,7 @@ impl AppState {
                 // 「已连接」= 控制面绑定存在。规范 6.4 明确保活只看控制面，
                 // 不得用"是否收到 RTP"判断存活；历史实现只在 bitrate>0 时置真、
                 // 从不置假，导致 RTP 停止后码率归零而界面仍显示已连接。
-                let bound = session::p2p_snapshot().is_busy();
+                let bound = self.session.p2p().is_busy();
                 if bound != self.connected {
                     self.connected = bound;
                     if bound {
@@ -412,7 +410,7 @@ impl AppState {
                 // 诊断：每 30s 落一次盘（音频计数器 + RTP/抖动缓冲计数器）
                 if self.last_stats_log.elapsed() >= Duration::from_secs(30) {
                     self.last_stats_log = Instant::now();
-                    diag::log_periodic_stats();
+                    diag::log_periodic_stats(&self.session);
                 }
                 Task::none()
             }
@@ -428,12 +426,12 @@ impl AppState {
             }
             Message::EngineError(msg) => {
                 // 引擎级失败：必须回到停止态，否则界面会一直"假运行"
-                session::APP_RUNNING.store(0, Ordering::Release);
-                session::reset_to_ready();
+                self.session.set_running(false);
+                self.session.reset_to_ready();
                 self.is_running = false;
                 self.connected = false;
                 self.pending_pair = None;
-                session::PAIRING_PROMPTED.store(0, Ordering::Release);
+                self.session.clear_pairing_prompt();
                 self.last_bitrate = 0.0;
                 self.last_level_db = -60.0;
                 self.status_text.clear();
@@ -456,8 +454,8 @@ impl AppState {
             Message::AllowPairing => {
                 if let Some(req) = self.pending_pair.take() {
                     self.config.paired_device = req.device_id;
-                    session::PAIRED_DEVICE.store(req.device_id, Ordering::Release);
-                    session::PAIRING_PROMPTED.store(0, Ordering::Release);
+                    self.session.set_paired_device(req.device_id);
+                    self.session.clear_pairing_prompt();
                     // 保存失败时 persist_config 已写入错误提示，不能覆盖掉。
                     if self.persist_config() {
                         self.notice = format!(
@@ -477,14 +475,8 @@ impl AppState {
             }
             Message::DenyPairing => {
                 if let Some(req) = self.pending_pair.take() {
-                    let mut denied = session::PAIRING_DENIED
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if denied.len() < 16 {
-                        denied.push(req.device_id);
-                    }
-                    drop(denied);
-                    session::PAIRING_PROMPTED.store(0, Ordering::Release);
+                    self.session.deny_pairing(req.device_id);
+                    self.session.clear_pairing_prompt();
                     self.notice = format!(
                         "已拒绝 {}（{:016x}）的连接请求",
                         req.addr.ip(),
@@ -531,11 +523,12 @@ impl AppState {
         ];
 
         if self.is_running {
-            let ip = self.config.listen_ip.clone();
-            let port = self.config.listen_port;
-            subs.push(Subscription::run_with((ip, port), |data| {
-                net::udp_receiver_stream(data.0.clone(), data.1)
-            }));
+            let key = net::ReceiverKey {
+                session: Arc::clone(&self.session),
+                listen_ip: self.config.listen_ip.clone(),
+                listen_port: self.config.listen_port,
+            };
+            subs.push(Subscription::run_with(key, net::receiver_stream));
         }
 
         Subscription::batch(subs)

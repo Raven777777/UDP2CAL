@@ -4,13 +4,11 @@ use crate::app::{Message, StatusInfo};
 use crate::diag::{AUDIO_LEVEL_DB, RTP_RX_DROPPED, RTP_RX_PACKETS};
 use crate::logf;
 use crate::protocol;
-use crate::session::{self, APP_RUNNING, AudioInitState, RTP_IDLE_RESET_MS};
+use crate::session::{self, AudioInitState, RTP_IDLE_RESET_MS, Session};
 use iced::futures::SinkExt;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-
-/// 当前监听端口（缓存，避免广播线程每秒读注册表）
-pub(crate) static LISTEN_PORT: AtomicU32 = AtomicU32::new(protocol::DEFAULT_LISTEN_PORT as u32);
 
 // ══════════════════════════════════════════════
 // 广播状态机 (独立线程)
@@ -18,20 +16,20 @@ pub(crate) static LISTEN_PORT: AtomicU32 = AtomicU32::new(protocol::DEFAULT_LIST
 // Ready 模式: 每 1 秒广播 TYPE_DISCOVER_REPLY 到 LAN
 // Silent 模式: APP 停止 / DEVICE_BUSY / 反向不可用时停止广播
 
-pub(crate) fn start_broadcast_state_machine() {
+pub(crate) fn start_broadcast_state_machine(session: Arc<Session>) {
     std::thread::spawn(move || {
         let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(_) => return,
         };
         let _ = socket.set_broadcast(true);
-        let device_id = session::my_device_id();
+        let device_id = session.device_id();
         let mut buf = [0u8; protocol::CONTROL_HEADER_SIZE + protocol::CONTROL_MAX_PAYLOAD];
         loop {
-            if APP_RUNNING.load(Ordering::Acquire) != 0 && !session::p2p_snapshot().is_busy() {
+            if session.running() && !session.p2p().is_busy() {
                 let reply = protocol::DiscoverReply {
-                    listen_port: LISTEN_PORT.load(Ordering::Acquire) as u16,
-                    device_name: session::my_device_name().to_string(),
+                    listen_port: session.listen_port() as u16,
+                    device_name: session.device_name().to_string(),
                 };
                 let payload = reply.encode();
                 if let Some(total) = protocol::build_control_to(
@@ -53,7 +51,7 @@ pub(crate) fn start_broadcast_state_machine() {
 // ══════════════════════════════════════════════
 // 发现服务 (独立线程)
 // ══════════════════════════════════════════════
-pub(crate) fn start_broadcast_listener() {
+pub(crate) fn start_broadcast_listener(session: Arc<Session>) {
     std::thread::spawn(move || {
         let socket = match std::net::UdpSocket::bind(("0.0.0.0", protocol::DISCOVER_PORT)) {
             Ok(s) => s,
@@ -63,7 +61,7 @@ pub(crate) fn start_broadcast_listener() {
             }
         };
         let mut buf = [0u8; 1500];
-        let my_id = session::my_device_id();
+        let my_id = session.device_id();
         // 简单令牌桶：同一源 IP 每秒最多应答 MAX_PER_SEC 次。
         // 发现请求 15B、应答 ~15B+主机名，无限制时可被用于 UDP 反射放大。
         let mut bucket: std::collections::HashMap<std::net::IpAddr, (u32, Instant)> =
@@ -93,12 +91,12 @@ pub(crate) fn start_broadcast_listener() {
             {
                 continue;
             }
-            if APP_RUNNING.load(Ordering::Acquire) == 0 || session::p2p_snapshot().is_busy() {
+            if !session.running() || session.p2p().is_busy() {
                 continue;
             }
             let reply = protocol::DiscoverReply {
-                listen_port: LISTEN_PORT.load(Ordering::Acquire) as u16,
-                device_name: session::my_device_name().to_string(),
+                listen_port: session.listen_port() as u16,
+                device_name: session.device_name().to_string(),
             };
             let body = reply.encode();
             if let Some(total) = protocol::build_control_to(
@@ -114,7 +112,39 @@ pub(crate) fn start_broadcast_listener() {
     });
 }
 
+/// `iced::Subscription::run_with` 要求数据可 `Hash`，但 `Session` 本身不实现
+/// `Hash`（它含锁与线程句柄，也没有值语义）。这里用 `Arc` 的指针身份参与
+/// 哈希：同一会话 + 同一监听地址构成一个订阅标识，重启 iced 时不会误复用。
+pub(crate) struct ReceiverKey {
+    pub(crate) session: Arc<Session>,
+    pub(crate) listen_ip: String,
+    pub(crate) listen_port: u32,
+}
+
+impl std::hash::Hash for ReceiverKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.listen_ip.hash(state);
+        self.listen_port.hash(state);
+        (Arc::as_ptr(&self.session) as usize).hash(state);
+    }
+}
+
+/// `run_with` 只接受函数指针，因此从这里取回 `Session` 并启动接收流。
+///
+/// `+ use<>` 让返回的 opaque 类型不捕获入参生命周期——否则它无法强制转换成
+/// `for<'a> fn(&'a ReceiverKey) -> _`（流本身只持有 `Arc` 与 `String` 的所有权）。
+pub(crate) fn receiver_stream(
+    key: &ReceiverKey,
+) -> impl iced::futures::Stream<Item = Message> + use<> {
+    udp_receiver_stream(
+        Arc::clone(&key.session),
+        key.listen_ip.clone(),
+        key.listen_port,
+    )
+}
+
 pub(crate) fn udp_receiver_stream(
+    session: Arc<Session>,
     listen_ip: String,
     listen_port: u32,
 ) -> impl iced::futures::Stream<Item = Message> {
@@ -154,12 +184,12 @@ pub(crate) fn udp_receiver_stream(
 
             // 等待音频初始化完成（最多 3 秒；冷启动时音频服务可能较慢）
             let mut retries = 60;
-            while AudioInitState::load() == AudioInitState::Pending && retries > 0 {
+            while session.audio_state() == AudioInitState::Pending && retries > 0 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 retries -= 1;
             }
 
-            match AudioInitState::load() {
+            match session.audio_state() {
                 AudioInitState::DecoderFailed => {
                     let _ = output
                         .send(Message::EngineError("Opus 解码器初始化失败".into()))
@@ -187,8 +217,8 @@ pub(crate) fn udp_receiver_stream(
                 AudioInitState::Ready => {}
             }
 
-            session::reset_to_ready();
-            session::wake_decoder();
+            session.reset_to_ready();
+            session.wake_decoder();
 
             let mut buf = vec![0u8; 2048];
             let mut last_stats = Instant::now();
@@ -203,7 +233,7 @@ pub(crate) fn udp_receiver_stream(
                 // recv 超时分支里：只要 RTP 持续到达，检查就永不执行，绑定永不释放。
                 if last_liveness.elapsed() >= Duration::from_millis(100) {
                     last_liveness = Instant::now();
-                    if session::check_peer_timeout() {
+                    if session.check_peer_timeout() {
                         // Disconnected 每次断连只发一次（check_peer_timeout 触发
                         // reset_to_ready 后续 tick 直接 false），不能无脑丢：先试
                         // 非阻塞投递，通道真满（UI 落后 ≥64 条）才阻塞等待。
@@ -225,7 +255,7 @@ pub(crate) fn udp_receiver_stream(
                         // Windows 上 UDP socket 会把上一次 send_to 收到的 ICMP 端口不可达
                         // 回灌成一次 WSAECONNRESET。这类错误不是致命的，但绝对不能
                         // 立刻重试——那会变成 100% CPU 的忙等。睡 10 ms 退避。
-                        if session::should_log_control_reject() {
+                        if session.should_log_control_reject() {
                             logf!("[UDP] recv_from 失败：{e}");
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -238,12 +268,13 @@ pub(crate) fn udp_receiver_stream(
                 match protocol::demux(&buf[..len]) {
                     protocol::Datagram::Control(data) => {
                         if let Some((hdr, payload)) = protocol::parse_control(data) {
-                            session::handle_control(&hdr, payload, &src, &socket, &mut output)
+                            session
+                                .handle_control(&hdr, payload, &src, &socket, &mut output)
                                 .await;
                         }
                     }
                     protocol::Datagram::Rtp(data) => {
-                        let peer = session::p2p_snapshot();
+                        let peer = session.p2p();
                         // 未绑定 / 源地址不符：一律丢弃（含绑定前后的迟到包）
                         if !peer.is_busy() || peer.addr != Some(src) {
                             RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -264,8 +295,7 @@ pub(crate) fn udp_receiver_stream(
                             .map(|at| at.elapsed().as_millis() > RTP_IDLE_RESET_MS as u128)
                             .unwrap_or(false);
                         let accepted = {
-                            let mut jb =
-                                session::jitter().lock().unwrap_or_else(|e| e.into_inner());
+                            let mut jb = session.jitter();
                             if idle_too_long {
                                 jb.reset();
                             }
@@ -282,7 +312,7 @@ pub(crate) fn udp_receiver_stream(
                             byte_count += len as u64;
                             RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
                         }
-                        session::wake_decoder();
+                        session.wake_decoder();
                     }
                     protocol::Datagram::Drop => {
                         RTP_RX_DROPPED.fetch_add(1, Ordering::Relaxed);

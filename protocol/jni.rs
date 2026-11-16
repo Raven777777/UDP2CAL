@@ -1121,19 +1121,32 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPullT
     code
 }
 
-macro_rules! jb_scalar {
-    ($name:ident, $ret:ty, $body:expr) => {
+/// 为「句柄 → 内部状态」型标量 getter 生成 JNI 入口。
+///
+/// * `$handle_ref`：句柄解引用函数（[`jb_ref`] / [`step_ref`] / ...）；
+/// * `$default`：句柄无效（0 或已释放）时的返回值；
+/// * `$body`：接收 `&mut 内部状态` 的闭包。只读 getter 也统一拿 `&mut`，
+///   这样 `take_limited_log` 之类有状态 getter 不必再手写一份入口。
+macro_rules! handle_scalar {
+    ($name:ident, $handle_ref:path, $ret:ty, $default:expr, $body:expr) => {
         #[unsafe(no_mangle)]
         pub unsafe extern "system" fn $name(_env: Env, _this: jobject, h: Handle) -> $ret {
-            match jb_ref(h) {
+            match $handle_ref(h) {
                 Some(handle) => {
-                    let g = lock(&handle.inner);
+                    let mut g = lock(&handle.inner);
                     #[allow(clippy::redundant_closure_call)]
-                    ($body)(&g)
+                    ($body)(&mut g)
                 }
-                None => Default::default(),
+                None => $default,
             }
         }
+    };
+}
+
+/// `JitterBuffer` 句柄的标量 getter（句柄无效时返回 `Default::default()`）。
+macro_rules! jb_scalar {
+    ($name:ident, $ret:ty, $body:expr) => {
+        handle_scalar!($name, jb_ref, $ret, Default::default(), $body);
     };
 }
 
@@ -1377,41 +1390,29 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saDecid
     ((d.frames as jlong) << 32) | (d.limited as jlong)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saHits(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jlong {
-    match step_ref(h) {
-        Some(handle) => lock(&handle.inner).hits as jlong,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_saHits,
+    step_ref,
+    jlong,
+    0,
+    |g: &mut StepAbsorber| g.hits as jlong
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saTrimsInWindow(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jint {
-    match step_ref(h) {
-        Some(handle) => lock(&handle.inner).trims_in_window() as jint,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_saTrimsInWindow,
+    step_ref,
+    jint,
+    0,
+    |g: &mut StepAbsorber| g.trims_in_window() as jint
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_saTakeLimitedLog(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jboolean {
-    match step_ref(h) {
-        Some(handle) => lock(&handle.inner).take_limited_log(),
-        None => false,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_saTakeLimitedLog,
+    step_ref,
+    jboolean,
+    false,
+    |g: &mut StepAbsorber| g.take_limited_log()
+);
 
 // ═══════════════════ DeviceRateEstimator（设备时钟前馈） ═══════════════════
 
@@ -1464,42 +1465,30 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deObser
     }
 }
 
-/// 无估计时返回 NaN。正值表示设备时钟偏慢。
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deFeedforward(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match device_rate_ref(h) {
-        Some(handle) => lock(&handle.inner).feedforward().unwrap_or(f64::NAN),
-        None => f64::NAN,
-    }
-}
+// 无估计时返回 NaN。正值表示设备时钟偏慢。
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_deFeedforward,
+    device_rate_ref,
+    jdouble,
+    f64::NAN,
+    |g: &mut DeviceRateEstimator| g.feedforward().unwrap_or(f64::NAN)
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deSigmaPpm(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match device_rate_ref(h) {
-        Some(handle) => lock(&handle.inner).sigma_ppm(),
-        None => 0.0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_deSigmaPpm,
+    device_rate_ref,
+    jdouble,
+    0.0,
+    |g: &mut DeviceRateEstimator| g.sigma_ppm()
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_deBuckets(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jint {
-    match device_rate_ref(h) {
-        Some(handle) => lock(&handle.inner).buckets() as jint,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_deBuckets,
+    device_rate_ref,
+    jint,
+    0,
+    |g: &mut DeviceRateEstimator| g.buckets() as jint
+);
 
 // ═══════════════════════ DriftController ═══════════════════════
 
@@ -1562,65 +1551,45 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcUpdat
     lock(&handle.inner).update(water_ms.max(0) as u32, device_frames.max(0) as u64)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcAdjust(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match drift_ref(h) {
-        Some(handle) => lock(&handle.inner).adjust(),
-        None => 0.0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_dcAdjust,
+    drift_ref,
+    jdouble,
+    0.0,
+    |g: &mut DriftController| g.adjust()
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcWater(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match drift_ref(h) {
-        Some(handle) => lock(&handle.inner).water(),
-        None => 0.0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_dcWater,
+    drift_ref,
+    jdouble,
+    0.0,
+    |g: &mut DriftController| g.water()
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcIntegral(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match drift_ref(h) {
-        Some(handle) => lock(&handle.inner).integral(),
-        None => 0.0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_dcIntegral,
+    drift_ref,
+    jdouble,
+    0.0,
+    |g: &mut DriftController| g.integral()
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcTargetMs(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jint {
-    match drift_ref(h) {
-        Some(handle) => lock(&handle.inner).target_ms() as jint,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_dcTargetMs,
+    drift_ref,
+    jint,
+    0,
+    |g: &mut DriftController| g.target_ms() as jint
+);
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcRatioUpdates(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jlong {
-    match drift_ref(h) {
-        Some(handle) => lock(&handle.inner).ratio_updates as jlong,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_dcRatioUpdates,
+    drift_ref,
+    jlong,
+    0,
+    |g: &mut DriftController| g.ratio_updates as jlong
+);
 
 // ═══════════════════════ 重采样器（三端唯一实现） ═══════════════════════
 
@@ -1711,18 +1680,6 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_rsSetAd
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_rsRatio(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jdouble {
-    match rs_ref(h) {
-        Some(handle) => lock(&handle.inner).rs.ratio(),
-        None => 0.0,
-    }
-}
-
 /// 单次 `rsProcess` 允许的最大输入帧数（Kotlin `StreamResampler.CAPACITY_FRAMES`）。
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_rsMaxInputFrames(
@@ -1732,18 +1689,22 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_rsMaxIn
     MAX_INPUT_FRAMES as jint
 }
 
-/// 输出数组一次必须能装下的 `short` 数（最坏比率 + 最负相位 + 满块）。
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_rsMaxOutputShorts(
-    _env: Env,
-    _this: jobject,
-    h: Handle,
-) -> jint {
-    match rs_ref(h) {
-        Some(handle) => (MAX_OUTPUT_FRAMES * lock(&handle.inner).rs.channels()) as jint,
-        None => 0,
-    }
-}
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_rsRatio,
+    rs_ref,
+    jdouble,
+    0.0,
+    |g: &mut RsInner| g.rs.ratio()
+);
+
+// 输出数组一次必须能装下的 `short` 数（最坏比率 + 最负相位 + 满块）。
+handle_scalar!(
+    Java_com_udp2cal_app_native_ProtocolNative_rsMaxOutputShorts,
+    rs_ref,
+    jint,
+    0,
+    |g: &mut RsInner| (MAX_OUTPUT_FRAMES * g.rs.channels()) as jint
+);
 
 /// 重采样 `src[offset .. offset + frames*channels)`，结果写入 `out`。
 ///

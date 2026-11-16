@@ -9,7 +9,7 @@
 //   * 反向 Opus 配置来自 CONNECT，**只在变化时**应用（每秒重配会重置编码器状态）。
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audiopus::{Application, Bitrate, Channels, SampleRate};
@@ -121,7 +121,6 @@ impl From<&protocol::ConnectPayload> for OpusReverseConfig {
 // RTP 断流——实测表现为"每 30 s 一次"的破音：诊断日志本身把流打断了。
 // ═══════════════════════════════════════════════════════════════════
 
-#[derive(Default)]
 pub struct ReverseStats {
     pub packets: AtomicU64,
     pub bytes: AtomicU64,
@@ -157,26 +156,31 @@ pub struct ReverseStats {
     pub reanchors: AtomicU64,
 }
 
-static REVERSE_STATS: ReverseStats = ReverseStats {
-    packets: AtomicU64::new(0),
-    bytes: AtomicU64::new(0),
-    encode_errors: AtomicU64::new(0),
-    oversize: AtomicU64::new(0),
-    dropped_samples: AtomicU64::new(0),
-    send_errors: AtomicU64::new(0),
-    gaps: AtomicU64::new(0),
-    wait_us: AtomicU64::new(0),
-    read_us: AtomicU64::new(0),
-    encode_us: AtomicU64::new(0),
-    send_us: AtomicU64::new(0),
-    frames: AtomicU64::new(0),
-    max_backlog: AtomicU64::new(0),
-    late_us: AtomicU64::new(0),
-    late_min_us: AtomicU64::new(u64::MAX),
-    late_max_us: AtomicU64::new(0),
-    late_n: AtomicU64::new(0),
-    reanchors: AtomicU64::new(0),
-};
+impl Default for ReverseStats {
+    fn default() -> Self {
+        Self {
+            packets: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            encode_errors: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
+            dropped_samples: AtomicU64::new(0),
+            send_errors: AtomicU64::new(0),
+            gaps: AtomicU64::new(0),
+            wait_us: AtomicU64::new(0),
+            read_us: AtomicU64::new(0),
+            encode_us: AtomicU64::new(0),
+            send_us: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            max_backlog: AtomicU64::new(0),
+            late_us: AtomicU64::new(0),
+            // 哨兵：`fetch_min` 的初始值必须大于任何真实样本
+            late_min_us: AtomicU64::new(u64::MAX),
+            late_max_us: AtomicU64::new(0),
+            late_n: AtomicU64::new(0),
+            reanchors: AtomicU64::new(0),
+        }
+    }
+}
 
 /// 一个统计窗口的快照（读取即清零，调用方为 UI 线程）
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -218,67 +222,96 @@ impl ReverseSnapshot {
     }
 }
 
-/// 读取并清零（30 s 汇总用，调用方为 UI 线程）
-pub fn take_reverse_stats() -> ReverseSnapshot {
-    let s = ReverseSnapshot {
-        packets: REVERSE_STATS.packets.swap(0, Ordering::Relaxed),
-        bytes: REVERSE_STATS.bytes.swap(0, Ordering::Relaxed),
-        encode_errors: REVERSE_STATS.encode_errors.swap(0, Ordering::Relaxed),
-        oversize: REVERSE_STATS.oversize.swap(0, Ordering::Relaxed),
-        dropped_samples: REVERSE_STATS.dropped_samples.swap(0, Ordering::Relaxed),
-        send_errors: REVERSE_STATS.send_errors.swap(0, Ordering::Relaxed),
-        gaps: REVERSE_STATS.gaps.swap(0, Ordering::Relaxed),
-        wait_us: REVERSE_STATS.wait_us.swap(0, Ordering::Relaxed),
-        read_us: REVERSE_STATS.read_us.swap(0, Ordering::Relaxed),
-        encode_us: REVERSE_STATS.encode_us.swap(0, Ordering::Relaxed),
-        send_us: REVERSE_STATS.send_us.swap(0, Ordering::Relaxed),
-        frames: REVERSE_STATS.frames.swap(0, Ordering::Relaxed),
-        max_backlog: REVERSE_STATS.max_backlog.swap(0, Ordering::Relaxed),
-        late_us: REVERSE_STATS.late_us.swap(0, Ordering::Relaxed),
-        late_min_us: REVERSE_STATS.late_min_us.swap(u64::MAX, Ordering::Relaxed),
-        late_max_us: REVERSE_STATS.late_max_us.swap(0, Ordering::Relaxed),
-        late_n: REVERSE_STATS.late_n.swap(0, Ordering::Relaxed),
-        reanchors: REVERSE_STATS.reanchors.swap(0, Ordering::Relaxed),
-    };
-    // 窗口内没有任何发送时 min 仍是哨兵值，对外一律报 0
-    let late_min_us = if s.late_n == 0 { 0 } else { s.late_min_us };
-    ReverseSnapshot { late_min_us, ..s }
+impl ReverseStats {
+    /// 读取并清零（30 s 汇总用，调用方为 UI 线程）
+    fn take(&self) -> ReverseSnapshot {
+        let s = ReverseSnapshot {
+            packets: self.packets.swap(0, Ordering::Relaxed),
+            bytes: self.bytes.swap(0, Ordering::Relaxed),
+            encode_errors: self.encode_errors.swap(0, Ordering::Relaxed),
+            oversize: self.oversize.swap(0, Ordering::Relaxed),
+            dropped_samples: self.dropped_samples.swap(0, Ordering::Relaxed),
+            send_errors: self.send_errors.swap(0, Ordering::Relaxed),
+            gaps: self.gaps.swap(0, Ordering::Relaxed),
+            wait_us: self.wait_us.swap(0, Ordering::Relaxed),
+            read_us: self.read_us.swap(0, Ordering::Relaxed),
+            encode_us: self.encode_us.swap(0, Ordering::Relaxed),
+            send_us: self.send_us.swap(0, Ordering::Relaxed),
+            frames: self.frames.swap(0, Ordering::Relaxed),
+            max_backlog: self.max_backlog.swap(0, Ordering::Relaxed),
+            late_us: self.late_us.swap(0, Ordering::Relaxed),
+            late_min_us: self.late_min_us.swap(u64::MAX, Ordering::Relaxed),
+            late_max_us: self.late_max_us.swap(0, Ordering::Relaxed),
+            late_n: self.late_n.swap(0, Ordering::Relaxed),
+            reanchors: self.reanchors.swap(0, Ordering::Relaxed),
+        };
+        // 窗口内没有任何发送时 min 仍是哨兵值，对外一律报 0
+        let late_min_us = if s.late_n == 0 { 0 } else { s.late_min_us };
+        ReverseSnapshot { late_min_us, ..s }
+    }
 }
 
-static REVERSE_CFG: OnceLock<Mutex<OpusReverseConfig>> = OnceLock::new();
-
-fn reverse_config() -> &'static Mutex<OpusReverseConfig> {
-    REVERSE_CFG.get_or_init(|| Mutex::new(OpusReverseConfig::default()))
+/// 反向发送链路的会话级共享状态：控制面写配置，发送线程读配置、写统计。
+///
+/// 历史实现是两份进程静态（`REVERSE_CFG` / `REVERSE_STATS`），测试无法隔离、
+/// 也无法同时存在两个会话实例。现在由 [`Session`](crate::session::Session)
+/// 持有并传给 `ReverseSender`，锁序见 session 模块头部。
+pub struct ReverseShared {
+    config: Mutex<OpusReverseConfig>,
+    stats: ReverseStats,
 }
 
-/// 由 session 控制面调用；只有内容真正变化才落盘日志
-pub fn update_reverse_config(cfg: OpusReverseConfig) {
-    // 中毒恢复与其他 Mutex 一致：这里只是一份配置快照，没有跨字段不变量。
-    //
-    // 锁内只做比较 + 赋值：`logf!` 是同步文件 I/O，而反向发送线程每 500 ms
-    // 要抢同一把锁（capture.rs 的 run_loop）。在锁内落盘意味着磁盘慢时
-    // 会把发送线程一起拖住，反向 RTP 断流。
-    let changed = {
-        let mut c = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
-        if *c == cfg {
-            false
-        } else {
-            *c = cfg;
-            true
+impl ReverseShared {
+    pub fn new() -> Self {
+        Self {
+            config: Mutex::new(OpusReverseConfig::default()),
+            stats: ReverseStats::default(),
         }
-    };
-    if changed {
-        logf!(
-            "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
-            cfg.bitrate_kbps,
-            cfg.bandwidth,
-            cfg.complexity,
-            cfg.signal,
-            cfg.vbr,
-            cfg.dtx,
-            cfg.fec,
-            cfg.packet_loss
-        );
+    }
+
+    /// 由 session 控制面调用；只有内容真正变化才落盘日志
+    pub fn update_config(&self, cfg: OpusReverseConfig) {
+        // 中毒恢复与其他 Mutex 一致：这里只是一份配置快照，没有跨字段不变量。
+        //
+        // 锁内只做比较 + 赋值：`logf!` 是同步文件 I/O，而反向发送线程每 500 ms
+        // 要抢同一把锁（capture.rs 的 run_loop）。在锁内落盘意味着磁盘慢时
+        // 会把发送线程一起拖住，反向 RTP 断流。
+        let changed = {
+            let mut c = self.config.lock().unwrap_or_else(|e| e.into_inner());
+            if *c == cfg {
+                false
+            } else {
+                *c = cfg;
+                true
+            }
+        };
+        if changed {
+            logf!(
+                "[Reverse] Opus 配置更新: br={} bw={} cplx={} sig={} vbr={} dtx={} fec={} pl={}",
+                cfg.bitrate_kbps,
+                cfg.bandwidth,
+                cfg.complexity,
+                cfg.signal,
+                cfg.vbr,
+                cfg.dtx,
+                cfg.fec,
+                cfg.packet_loss
+            );
+        }
+    }
+
+    fn config(&self) -> OpusReverseConfig {
+        *self.config.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn take_stats(&self) -> ReverseSnapshot {
+        self.stats.take()
+    }
+}
+
+impl Default for ReverseShared {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -330,7 +363,7 @@ impl Drop for AliveGuard<'_> {
 
 impl ReverseSender {
     /// `ssrc` 由控制面生成并写入 CONNECT_ACK；本函数不自行生成。
-    pub fn start(target: SocketAddr, ssrc: u32) -> Self {
+    pub fn start(target: SocketAddr, ssrc: u32, shared: Arc<ReverseShared>) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
@@ -354,7 +387,7 @@ impl ReverseSender {
                         }
                     }
                 }
-                Self::run_loop(target, ssrc, &running_clone, &alive_clone);
+                Self::run_loop(target, ssrc, &running_clone, &alive_clone, &shared);
             })
             .ok();
         if handle.is_none() {
@@ -388,7 +421,14 @@ impl ReverseSender {
         self.alive.store(false, Ordering::Release);
     }
 
-    fn run_loop(target: SocketAddr, ssrc: u32, running: &AtomicBool, alive: &AtomicBool) {
+    fn run_loop(
+        target: SocketAddr,
+        ssrc: u32,
+        running: &AtomicBool,
+        alive: &AtomicBool,
+        shared: &ReverseShared,
+    ) {
+        let stats = &shared.stats;
         let _alive_guard = AliveGuard(alive);
         logf!("[Reverse] 启动反向音频 → {} (ssrc={:#010x})", target, ssrc);
 
@@ -410,7 +450,7 @@ impl ReverseSender {
         };
 
         // 启动时下发一次；之后仅在配置变化时下发
-        let mut applied = *reverse_config().lock().unwrap_or_else(|e| e.into_inner());
+        let mut applied = shared.config();
         apply_config(&mut encoder, &applied);
 
         // Opus 固有前瞻：它无法关掉，也不算在网络/抖动缓冲里，但会真实
@@ -536,10 +576,10 @@ impl ReverseSender {
             // ── 配置变化检测：500 ms 一次，避免每帧抢锁（发送线程不该有锁流量）──
             if cfg_check_at.elapsed() > Duration::from_millis(500) {
                 cfg_check_at = Instant::now();
-                let cfg = reverse_config().lock().unwrap_or_else(|e| e.into_inner());
-                if *cfg != applied {
+                let cfg = shared.config();
+                if cfg != applied {
                     apply_config(&mut encoder, &cfg);
-                    applied = *cfg;
+                    applied = cfg;
                 }
             }
 
@@ -575,7 +615,7 @@ impl ReverseSender {
                     };
                 }
             }
-            REVERSE_STATS
+            stats
                 .wait_us
                 .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
             let t_read = Instant::now();
@@ -584,7 +624,7 @@ impl ReverseSender {
             } else {
                 ReadOutcome::Empty
             };
-            REVERSE_STATS
+            stats
                 .read_us
                 .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
             let got_data = match outcome {
@@ -628,7 +668,7 @@ impl ReverseSender {
                 }
                 if resampled.len() > MAX_FRAME_BACKLOG {
                     let excess = resampled.len() - MAX_FRAME_BACKLOG;
-                    REVERSE_STATS
+                    stats
                         .dropped_samples
                         .fetch_add(excess as u64, Ordering::Relaxed);
                     resampled.drain(..excess);
@@ -647,14 +687,14 @@ impl ReverseSender {
             if pcm_buf.len() > MAX_FRAME_BACKLOG {
                 let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
                 pcm_buf.drain(..excess);
-                REVERSE_STATS
+                stats
                     .dropped_samples
                     .fetch_add(excess as u64, Ordering::Relaxed);
                 // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC
                 timestamp = timestamp.wrapping_add((excess / 2) as u32);
             }
             // 只保留最近 40 ms 的统计峰值；超限时旧数据已经丢掉
-            REVERSE_STATS
+            stats
                 .max_backlog
                 .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
 
@@ -667,18 +707,14 @@ impl ReverseSender {
                     // "迟到量"描述的是停顿多久，不是网格多准，混进迟到统计会把
                     // 均值带偏（实测一次 8 s 无声间隔 → 均值 0.3 ms 变 4.2 ms）。
                     // 只计数。真正的卡顿幅度看 `积压峰值` 与下面的重锚次数。
-                    REVERSE_STATS.reanchors.fetch_add(1, Ordering::Relaxed);
+                    stats.reanchors.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
                     let late_us = now.duration_since(next_send_at).as_micros() as u64;
-                    REVERSE_STATS.late_us.fetch_add(late_us, Ordering::Relaxed);
-                    REVERSE_STATS
-                        .late_min_us
-                        .fetch_min(late_us, Ordering::Relaxed);
-                    REVERSE_STATS
-                        .late_max_us
-                        .fetch_max(late_us, Ordering::Relaxed);
-                    REVERSE_STATS.late_n.fetch_add(1, Ordering::Relaxed);
+                    stats.late_us.fetch_add(late_us, Ordering::Relaxed);
+                    stats.late_min_us.fetch_min(late_us, Ordering::Relaxed);
+                    stats.late_max_us.fetch_max(late_us, Ordering::Relaxed);
+                    stats.late_n.fetch_add(1, Ordering::Relaxed);
                 }
                 next_send_at = advance_slot(next_send_at, frame_gap, now);
                 frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
@@ -686,10 +722,10 @@ impl ReverseSender {
 
                 let t_encode = Instant::now();
                 let encoded = encoder.encode(&frame, &mut payload);
-                REVERSE_STATS
+                stats
                     .encode_us
                     .fetch_add(t_encode.elapsed().as_micros() as u64, Ordering::Relaxed);
-                REVERSE_STATS.frames.fetch_add(1, Ordering::Relaxed);
+                stats.frames.fetch_add(1, Ordering::Relaxed);
                 // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限）。
                 // 时间戳仍按媒体时间前进，但**序列号不占号**：序号只属于真正
                 // 发到网络上的包。接收端 PLC/静音同样不推进序号，两边一致。
@@ -697,12 +733,12 @@ impl ReverseSender {
                     Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => n,
                     Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
                         // 超过 1275 字节：整帧丢弃，绝不截断
-                        REVERSE_STATS.oversize.fetch_add(1, Ordering::Relaxed);
+                        stats.oversize.fetch_add(1, Ordering::Relaxed);
                         0
                     }
                     Ok(_) => 0, // DTX 空帧：时间戳推进，不发包
                     Err(e) => {
-                        let n = REVERSE_STATS.encode_errors.fetch_add(1, Ordering::Relaxed);
+                        let n = stats.encode_errors.fetch_add(1, Ordering::Relaxed);
                         if n < 3 {
                             logf!("[Reverse] 编码失败: {e:?}");
                         }
@@ -728,22 +764,20 @@ impl ReverseSender {
                         || ts_gap_ms > rtp::RESYNC_GAP_MS as u64;
                     if !first_packet && marker {
                         // 发送中断会让接收端重同步（flush + 重建解码器），必须计数备查
-                        REVERSE_STATS.gaps.fetch_add(1, Ordering::Relaxed);
+                        stats.gaps.fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(total) =
                         rtp::write_packet(&mut packet, marker, seq, ts_start, ssrc, &payload[..len])
                     {
                         let t_send = Instant::now();
                         let sent = send_sock.send_to(&packet[..total], target);
-                        REVERSE_STATS
+                        stats
                             .send_us
                             .fetch_add(t_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         match sent {
                             Ok(_) => {
-                                REVERSE_STATS.packets.fetch_add(1, Ordering::Relaxed);
-                                REVERSE_STATS
-                                    .bytes
-                                    .fetch_add(total as u64, Ordering::Relaxed);
+                                stats.packets.fetch_add(1, Ordering::Relaxed);
+                                stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
                                 last_sent = Some(Instant::now());
                                 last_sent_ts = Some(ts_start);
                                 first_packet = false;
@@ -751,7 +785,7 @@ impl ReverseSender {
                                 seq = seq.wrapping_add(1);
                             }
                             Err(e) => {
-                                let n = REVERSE_STATS.send_errors.fetch_add(1, Ordering::Relaxed);
+                                let n = stats.send_errors.fetch_add(1, Ordering::Relaxed);
                                 if n == 0 {
                                     if matches!(
                                         e.kind(),
@@ -1372,5 +1406,27 @@ mod tests {
             64,
             "低档位原样透传"
         );
+    }
+
+    #[test]
+    fn reverse_stats_are_per_instance_and_use_a_min_sentinel() {
+        let a = ReverseShared::new();
+        let b = ReverseShared::new();
+
+        // 空窗口对外报 0，而不是 fetch_min 的哨兵值
+        let empty = a.take_stats();
+        assert_eq!(empty.late_min_us, 0);
+        assert_eq!(empty.packets, 0);
+
+        a.stats.packets.fetch_add(3, Ordering::Relaxed);
+        a.stats.late_min_us.fetch_min(120, Ordering::Relaxed);
+        a.stats.late_n.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(b.take_stats().packets, 0, "统计不再共享进程静态");
+        let snap = a.take_stats();
+        assert_eq!(snap.packets, 3);
+        assert_eq!(snap.late_min_us, 120);
+        // 读取即清零，下一窗口重新从哨兵开始
+        assert_eq!(a.take_stats().late_min_us, 0);
     }
 }

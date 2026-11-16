@@ -34,10 +34,10 @@ udp2cal/
 │  │  ├─ app.rs        # iced 应用状态、消息处理与启动编排
 │  │  ├─ ui.rs         # iced 界面渲染（view / 样式 / 窗口 Task）
 │  │  ├─ net.rs        # 发现/广播状态机与 UDP 接收流
-│  │  ├─ session/      # 控制面状态机 + 接收侧音频
-│  │  │  ├─ mod.rs     # P2P 独占绑定、配对、反向发送器、CONNECT 处理
+│  │  ├─ session/      # 控制面状态机 + 接收侧音频（状态收敛在 Arc<Session>）
+│  │  │  ├─ mod.rs     # Session 状态容器、P2P 绑定、配对、反向发送器、CONNECT 处理
 │  │  │  ├─ audio.rs   # 抖动缓冲、解码/播放线程（含两级漂移校正）
-│  │  │  └─ tests.rs   # 控制面纯逻辑单元测试
+│  │  │  └─ tests.rs   # 控制面纯逻辑与独立 Session 实例测试
 │  │  ├─ tray.rs       # 系统托盘、图标加载、原生窗口激活
 │  │  ├─ diag.rs       # 诊断计数器与周期统计日志
 │  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 可微调比率重采样
@@ -268,7 +268,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 - Windows 端常驻监听 UDP 端口 44043（独立线程 `start_broadcast_listener`）
 - **v3 控制包**：手机端 `TYPE_DISCOVER_REQ`（空负载）→ PC 回复 `TYPE_DISCOVER_REPLY`（`listen_port` + 设备名 ≤254 字节，UTF-8 不截断字符）
 - **广播状态机**（`start_broadcast_state_machine`）：READY 时每秒向 `255.255.255.255:44043` 广播 `TYPE_DISCOVER_REPLY`；BUSY 时自动静音
-- `listen_port` 取自当前监听端口（`LISTEN_PORT` 原子缓存，用户修改后立即生效）
+- `listen_port` 取自当前监听端口（`Session::listen_port`，用户修改后立即生效）
 - 发现请求按来源 IP 限速 5 次/秒；限流状态最多跟踪 1024 个源，防止伪造源地址在周期清理前无界占用内存
 
 ### 图标
@@ -294,7 +294,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 | 角色 | 行为 |
 |------|------|
-| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`P2P_STATE: Mutex<P2pState>` 记录的绑定关系（设备 ID / 源地址 / 双向 SSRC）**完全不变** |
+| **Windows 端** | `device_id` 不匹配 → 不回复 `CONNECT_ACK`，静默丢弃；`Session::p2p` 记录的绑定关系（设备 ID / 源地址 / 双向 SSRC）**完全不变** |
 | **第三方 Android 端** | 收不到新 `CONNECT_ACK` → `isAckFresh()` 恒为 false → **不编码不发送任何正向 RTP**；持续发 CONNECT 等待（由 Win 端静默丢弃，不影响已有连接） |
 | **已有 Android 端** | 正常收到 `CONNECT_ACK`（device_id + forward_ssrc 匹配保活分支），RTP 正常解码播放，**完全不受影响** |
 
@@ -309,7 +309,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 1. **Windows 端点击「停止」** → `reset_to_ready()`：清空绑定、停止反向发送、复位抖动缓冲
 2. **绑定设备 4.5 s 没有 CONNECT**（`PEER_TIMEOUT_MS`，比 Android 的 3 s ACK 窗口多一次重传余量）→ 接收流的超时分支自动释放，回到 Ready
 3. **`forward_ssrc` 变化** → 视为新会话：重置抖动缓冲/解码器/播放头，保留绑定但换反向 SSRC
-4. **重启 Windows 程序** → 全局状态初始化回到 Ready
+4. **重启 Windows 程序** → 新建 `Session`，初始化回到 Ready
 
 > 判活只看控制面：DTX 静音期间可能长时间没有 RTP，用"是否收到音频"判活会误杀连接。
 

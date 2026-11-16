@@ -1,14 +1,11 @@
 //! 诊断计数器与周期统计日志。
 //!
-//! 所有跨线程观测值（电平、延迟、比率、收包计数）集中在这里，
-//! UI 展示、音频线程写入与落盘日志共用同一组原子量。
+//! 纯遥测原子量（电平、延迟、收包计数）集中在这里；会话级计数器
+//! （音频 / 抖动缓冲 / 反向链路）随 `Session` 走，日志函数显式接收它。
 
-use crate::audio::AudioStats;
-use crate::capture;
 use crate::logf;
-use crate::session::{jitter, p2p_snapshot};
+use crate::session::Session;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
 /// 音频电平（dBFS），解码线程每 100 ms 更新一次
 pub(crate) static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
@@ -32,18 +29,12 @@ pub(crate) static FEC_FRAMES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RTP_RX_PACKETS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RTP_RX_DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// 音频诊断计数器（进程级单例，UI 展示 + 落盘日志共用）
-static AUDIO_STATS: OnceLock<Arc<AudioStats>> = OnceLock::new();
-pub(crate) fn audio_stats() -> &'static Arc<AudioStats> {
-    AUDIO_STATS.get_or_init(|| Arc::new(AudioStats::default()))
-}
-
 /// 每 30 s 落一次诊断日志：音频计数器 + RTP/抖动缓冲计数器 + 反向链路。
 /// 调用方负责计时（UI 线程，避免在实时线程里做文件 I/O）。
-pub(crate) fn log_periodic_stats() {
-    let s = audio_stats().snapshot();
+pub(crate) fn log_periodic_stats(session: &Session) {
+    let s = session.audio_stats().snapshot();
     let (j, water, lost, expected) = {
-        let jb = jitter().lock().unwrap_or_else(|e| e.into_inner());
+        let jb = session.jitter();
         (
             jb.stats,
             jb.water_ms(),
@@ -51,7 +42,7 @@ pub(crate) fn log_periodic_stats() {
             jb.expected_packets(),
         )
     };
-    let peer = p2p_snapshot();
+    let peer = session.p2p();
     logf!(
         "[Audio] 统计 块={} 重采样={} 丢样={} 满丢旧数据={} 欠载={}",
         s.writes,
@@ -100,7 +91,7 @@ pub(crate) fn log_periodic_stats() {
     );
     // 反向链路统计由 UI 线程汇总：发送线程内**不得**做文件 I/O，
     // 否则一次慢写盘就会打断 RTP（实测每 30 s 一次破音）
-    let r = capture::take_reverse_stats();
+    let r = session.take_reverse_stats();
     logf!(
         "[Reverse] 30s: 包={} 字节={} 编码错误={} 超限={} 丢样={} 发送错误={} 发送中断={} 帧={} 均值us(wait/read/encode/send)={:.0}/{:.0}/{:.0}/{:.0} 积压峰值={}ms",
         r.packets,
