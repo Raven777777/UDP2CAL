@@ -362,10 +362,11 @@ internal class ForwardLink(
      *   * 序列号只属于真正发出的包：编码失败/发送失败/DTX/无新鲜 ACK 都不 +1；
      *   * 未连接（无新鲜 ACK）时不编码不发送，时间戳照常推进。
      *
-     * **1 帧节拍整形**：AudioRecord 的阻塞读天然成簇返回（常见 20 ms 一次），
-     * 直接发就是"两包挨着、然后静默 20 ms"，接收端水位呈锯齿。这里把发送时刻
-     * 钉在 10 ms 网格上——不是攒队列，最多只压 1 帧；落后超过 4 帧就重置节拍，
-     * 绝不追赶式突发（突发会让接收端水位瞬间抬高，正是要消灭的东西）。
+     * **1 帧节拍整形（发送前对齐）**：AudioRecord 的阻塞读天然成簇返回
+     * （常见 20 ms 一次）。旧实现在 send 之后才等待，下一次阻塞读会把等待
+     * 直接吃掉，同簇的两个 10 ms 帧仍会背靠背发出。这里在 encode/send
+     * **之前**对齐 10 ms 网格：先等到本帧槽位再发；落后超过半帧就重锚，
+     * 绝不用连续突发追赶。这样一簇两帧会被拆到相邻两个 10 ms 槽位。
      */
     private suspend fun sendFrames(
         enc: OpusEncoder,
@@ -397,6 +398,10 @@ internal class ForwardLink(
         var sendNs = 0L
         var statFrames = 0L
         var maxFilled = 0
+        /** 30 s 窗口内最大的节拍迟到量（nanoTime 差；仅诊断） */
+        var paceLateMaxNs = 0L
+        /** 30 s 窗口内因落后半帧以上而重锚的次数（仅诊断） */
+        var paceRebases = 0L
 
         while (coroutineContext.isActive) {
             // AudioRecord.read 允许返回不足请求量的样本（缓冲区尚未填满）。
@@ -421,6 +426,24 @@ internal class ForwardLink(
                 lastCfgCheck = now
                 applyRuntimeConfig(enc)
             }
+            // ── 1 帧节拍整形（在 encode/send 之前）──
+            // AudioRecord 的阻塞读通常按 20 ms 成簇返回；旧实现在 send 之后
+            // 才等待，下一次 read 会把等待时间直接吃掉，同簇的两帧仍会
+            // 背靠背发出。这里先对齐到本帧的 10 ms 槽位再发送。
+            val paceNow = System.nanoTime()
+            val lateNs = paceNow - nextSendAt
+            if (!first && lateNs > paceLateMaxNs) paceLateMaxNs = lateNs
+            if (lateNs > frameNs / 2) {
+                // 采集/调度已落后超过半帧：重锚到当前时刻，不用突发补发
+                nextSendAt = paceNow
+                if (!first) paceRebases++
+            } else if (lateNs < 0L) {
+                val waitNs = -lateNs
+                if (waitNs >= 1_000_000L) delay(waitNs / 1_000_000L)
+                else yield() // 不足 1 ms：让出执行权，不忙等
+            }
+            nextSendAt += frameNs
+
             val nowMono = SystemClock.elapsedRealtime()
             if (sender.isAckFresh(nowMono)) {
                 val encStart = System.nanoTime()
@@ -463,7 +486,8 @@ internal class ForwardLink(
                     "tx30s frames=$statFrames read=${(readNs / 1e6 / ms * 1000).toInt()}us" +
                         " encode=${(encodeNs / 1e6 / ms * 1000).toInt()}us" +
                         " send=${(sendNs / 1e6 / ms * 1000).toInt()}us" +
-                        " assemble_peak=${maxFilled * 1000 / Udp2CalProtocol.OPUS_SAMPLE_RATE}ms"
+                        " assemble_peak=${maxFilled * 1000 / Udp2CalProtocol.OPUS_SAMPLE_RATE}ms" +
+                        " pace_late=${paceLateMaxNs / 1_000_000}ms rebase=$paceRebases"
                 )
                 statsAt = System.nanoTime()
                 readNs = 0
@@ -471,17 +495,8 @@ internal class ForwardLink(
                 sendNs = 0
                 statFrames = 0
                 maxFilled = 0
-            }
-
-            // ── 1 帧节拍整形 ──
-            nextSendAt += frameNs
-            val waitNs = nextSendAt - System.nanoTime()
-            when {
-                waitNs >= 1_000_000L -> delay(waitNs / 1_000_000L)
-                waitNs > 0L -> yield() // 不足 1 ms：让出执行权，不忙等
-                // 落后超过 4 帧（调度抖动/断连恢复）：重置节拍，
-                // 绝不用连续突发把落后的时间补回来
-                waitNs < -4 * frameNs -> nextSendAt = System.nanoTime()
+                paceLateMaxNs = 0
+                paceRebases = 0
             }
         }
     }
