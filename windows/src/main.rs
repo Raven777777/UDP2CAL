@@ -9,6 +9,7 @@ mod decoder;
 mod firewall;
 mod hires;
 mod logger;
+mod power;
 mod protocol;
 
 use iced::futures::SinkExt;
@@ -519,12 +520,15 @@ fn init_audio_worker() {
         .spawn(move || {
             // 解码线程的节拍由声卡播放头驱动：被后台线程抢占一次就是一个
             // 10 ms 块的迟写，负载高的机器上表现为周期性 underrun（规范 8.2）。
-            // 提到 HIGHEST 而不进 MMCSS：单次调用、不新增 crate feature，
-            // 失败（受限权限/组策略）只告警，继续用默认优先级。
-            // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
-            unsafe {
-                if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
-                    logf!("[Audio] 解码线程提权失败（{e}），继续用默认优先级");
+            // 优先注册 MMCSS "Pro Audio" 获取音频调度配额；失败（音频服务被
+            // 裁剪/组策略限制）才回退到 THREAD_PRIORITY_HIGHEST。
+            let mmcss = power::MmcssGuard::acquire("Audio");
+            if !mmcss.is_active() {
+                // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
+                unsafe {
+                    if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+                        logf!("[Audio] 解码线程提权失败（{e}），继续用默认优先级");
+                    }
                 }
             }
             set_decode_thread(std::thread::current());
@@ -1180,6 +1184,10 @@ fn main() -> Result<(), iced::Error> {
             return Ok(());
         }
     }
+
+    // 单实例检查通过后再接管电源：运行期保持系统唤醒、关闭 EcoQoS 降频，
+    // 守卫持有到 main 结束（iced 事件循环退出）才恢复。
+    let _power_guard = power::ProcessPowerGuard::acquire();
 
     let startup_cfg = config::Config::load();
     LISTEN_PORT.store(startup_cfg.listen_port, Ordering::Release);

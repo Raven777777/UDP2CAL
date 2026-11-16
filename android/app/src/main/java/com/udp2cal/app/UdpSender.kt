@@ -1,5 +1,6 @@
 package com.udp2cal.app
 
+import android.net.Network
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +80,12 @@ class UdpSender(
     @Volatile var reverseSock: DatagramSocket? = null; private set
     @Volatile var reversePort: Int = 0; private set
 
+    /**
+     * 本次会话绑定的 Wi-Fi 网络；null 表示走了系统默认路由。
+     * 服务层据此区分"我绑的 Wi-Fi 断了"与无关网络的回调。
+     */
+    @Volatile var boundNetwork: Network? = null; private set
+
     /** 会话锁：保证 forward_ssrc 换代与 ACK 提交原子化 */
     private val sessionLock = Any()
 
@@ -94,8 +101,37 @@ class UdpSender(
         try {
             // 只解析一次；之后每帧发送不再触碰 DNS / IP 解析
             val addr = InetSocketAddress(InetAddress.getByName(host), port)
+
+            // ── Wi-Fi 网络绑定（P1）──
+            // 手机同时有蜂窝/VPN 时，未绑定的 socket 走默认路由：Wi-Fi 一断，
+            // 发往局域网 IP 的包就会被交给外壳网络。优先把两个 socket 都钉在
+            // Wi-Fi 上；连 Wi-Fi 都没有、默认路由还是蜂窝时直接拒绝连接，
+            // 避免音频流悄悄跑在移动数据上。
+            val wifi = WifiNetworkBinder.currentNetwork()
+            if (wifi == null) {
+                if (WifiNetworkBinder.isCellularDefault()) {
+                    Log.w(TAG, "当前无 Wi-Fi 且默认路由为蜂窝，拒绝建立未绑定的 UDP 会话")
+                    return@withContext false
+                }
+                Log.w(TAG, "未找到 Wi-Fi 网络，使用系统默认路由")
+            }
+            var bound = false
+
             val sock = DatagramSocket()
             sockLocal = sock
+            if (wifi != null) {
+                bound = WifiNetworkBinder.bind(sock, wifi)
+                if (!bound) {
+                    if (WifiNetworkBinder.isCellularDefault()) {
+                        // 有 Wi-Fi 却绑不上（受限网络/厂商策略）：继续用默认
+                        // 路由就会把音频交给蜂窝，宁可失败也不偷偷耗流量。
+                        Log.w(TAG, "Wi-Fi 绑定失败且默认路由为蜂窝，拒绝连接")
+                        try { sock.close() } catch (_: Exception) {}
+                        return@withContext false
+                    }
+                    Log.w(TAG, "正向套接字绑定 Wi-Fi 失败，回退默认路由")
+                }
+            }
             // ── DSCP EF（A2）：正向 RTP 流标记最高优先级 ──
             // 让接入点把音频排在其他流量前，抑制排队抖动。设置可能被系统
             // 拒绝（权限/厂商策略），失败不影响功能，仅记录。
@@ -118,6 +154,13 @@ class UdpSender(
             }
             val revSock = DatagramSocket()
             revSockLocal = revSock
+            if (wifi != null && bound) {
+                if (!WifiNetworkBinder.bind(revSock, wifi)) {
+                    // 正向已绑定而反向失败：仍以 Wi-Fi 会话上报，断网时服务层
+                    // 会一并关闭两个 socket，不会留下走默认路由的接收口。
+                    Log.w(TAG, "反向套接字绑定 Wi-Fi 失败，回退默认路由")
+                }
+            }
             try {
                 revSock.receiveBufferSize = SOCKET_BUFFER_BYTES
             } catch (e: Exception) {
@@ -132,6 +175,7 @@ class UdpSender(
             }
             socket = sock
             remoteAddr = addr
+            boundNetwork = if (bound) wifi else null
             remoteIp = addr.address?.hostAddress
             expectedRemoteDeviceId = Prefs.targetDeviceId
                 .takeIf { it.length == Udp2CalProtocol.DEVICE_ID_SIZE * 2 }
@@ -151,17 +195,25 @@ class UdpSender(
             socket = null
             reverseSock = null
             remoteAddr = null
+            boundNetwork = null
             false
         }
     }
 
-    /** 发送任意数据报（控制包或 RTP 包）。音频线程直接调用，不切协程。 */
-    fun send(data: ByteArray, offset: Int, length: Int): Boolean {
-        if (length <= 0) return false
+    /**
+     * 发送任意数据报（控制包或 RTP 包）。音频线程直接调用，不切协程。
+     *
+     * 包对象由调用方持有并复用（目标地址每帧只写入两个字段），
+     * 避免 100 包/秒的热路径上每帧分配 `DatagramPacket`。
+     * 调用方不得在两次发送之间跨线程共享同一个包。
+     */
+    fun send(packet: DatagramPacket): Boolean {
+        if (packet.length <= 0) return false
         return try {
             val sock = socket ?: return false
             val addr = remoteAddr ?: return false
-            sock.send(DatagramPacket(data, offset, length, addr))
+            packet.socketAddress = addr
+            sock.send(packet)
             true
         } catch (_: Exception) {
             false
@@ -182,8 +234,11 @@ class UdpSender(
 
     fun getDeviceId(): ByteArray? = deviceId
 
-    /** 目标 IP（已解析），供反向流的来源校验 */
-    fun getRemoteIp(): String? = remoteIp
+    /**
+     * 目标 IP 的 [InetAddress] 对象。反向接收每包都要校验来源，
+     * 用对象比较可避免每包一次 `hostAddress` 字符串分配。
+     */
+    fun getRemoteAddress(): InetAddress? = remoteAddr?.address
 
     fun getRemotePort(): Int = port
 
@@ -277,6 +332,7 @@ class UdpSender(
         reverseSock = null
         socket = null
         remoteAddr = null
+        boundNetwork = null
         expectedRemoteDeviceId = null
         lastAckTime = 0L
         reverseSsrc = 0

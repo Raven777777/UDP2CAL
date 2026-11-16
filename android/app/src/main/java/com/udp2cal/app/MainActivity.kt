@@ -133,6 +133,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         Prefs.init(applicationContext)
+        // 发现广播/连接前就要能选 Wi-Fi 网络；监听本身由 CaptureService 起停
+        WifiNetworkBinder.init(applicationContext)
         refreshBatteryWhitelist()
         bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
 

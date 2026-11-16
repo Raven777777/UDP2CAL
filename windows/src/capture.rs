@@ -16,6 +16,7 @@ use audiopus::{Application, Bitrate, Channels, SampleRate};
 
 use crate::hires::HiResTimer;
 use crate::logf;
+use crate::power::MmcssGuard;
 use crate::protocol;
 use crate::protocol::rtp;
 
@@ -339,12 +340,17 @@ impl ReverseSender {
             .spawn(move || {
                 // 发送线程的节拍是 10 ms 网格：被后台线程抢占一次就表现为
                 // 一个 ≥10 ms 的发送空档，接收端对应一个 PLC 帧（可闻）。
-                // 提到 HIGHEST 而不进 MMCSS：单次调用、不新增 crate feature，
-                // 失败（受限权限/组策略）只告警，继续用默认优先级。
-                // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
-                unsafe {
-                    if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
-                        logf!("[Reverse] 发送线程提权失败（{e}），继续用默认优先级");
+                // 优先注册 MMCSS "Pro Audio" 获取音频调度配额；失败才回退到
+                // THREAD_PRIORITY_HIGHEST（受限权限/组策略只告警，继续运行）。
+                let mmcss = MmcssGuard::acquire("Reverse");
+                if !mmcss.is_active() {
+                    // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
+                    unsafe {
+                        if let Err(e) =
+                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
+                        {
+                            logf!("[Reverse] 发送线程提权失败（{e}），继续用默认优先级");
+                        }
                     }
                 }
                 Self::run_loop(target, ssrc, &running_clone, &alive_clone);

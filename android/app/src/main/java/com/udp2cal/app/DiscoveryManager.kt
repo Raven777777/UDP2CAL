@@ -35,6 +35,12 @@ object DiscoveryManager {
             socket.broadcast = true
             socket.soTimeout = 500
 
+            // 发现广播与后续 RTP 使用同一张 Wi-Fi 网络：默认路由是蜂窝/VPN 时，
+            // 未绑定的广播可能从错误接口发出，扫描结果为空或来源不可达。
+            WifiNetworkBinder.currentNetwork()?.let { wifi ->
+                WifiNetworkBinder.bind(socket, wifi)
+            }
+
             val deviceId = getOrCreateDeviceId()
             val reqPacket = Udp2CalProtocol.buildControl(
                 Udp2CalProtocol.TYPE_DISCOVER_REQ, deviceId, ByteArray(0)

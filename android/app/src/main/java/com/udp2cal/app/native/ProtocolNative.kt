@@ -85,6 +85,12 @@ internal object ProtocolNative {
     /** `[marker, seq, timestamp, ssrc, payloadOffset, payloadLength]` */
     external fun parseRtp(buf: ByteArray, len: Int): LongArray?
 
+    /**
+     * 同 [parseRtp]，但把字段写入调用方数组（长度 ≥6）并返回是否成功。
+     * 热路径（反向接收，每包一次）用它复用数组，避免每包分配。
+     */
+    external fun parseRtpInto(buf: ByteArray, len: Int, out: LongArray): Boolean
+
     external fun writeRtpHeader(
         dest: ByteArray,
         offset: Int,

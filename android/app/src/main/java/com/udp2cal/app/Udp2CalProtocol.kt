@@ -274,6 +274,19 @@ object Udp2CalProtocol {
         )
     }
 
+    /**
+     * [parseRtp] 的**无分配**版本：字段按
+     * `[marker, seq, timestamp, ssrc, payloadOffset, payloadLength]`
+     * 写入调用方数组（长度 ≥6）。反向接收热路径每 10 ms 调一次，
+     * 用它复用数组可省掉每包的 `LongArray` + `RtpPacket` 分配。
+     *
+     * 返回 false 时 `out` 内容未定义，调用方不得读取。
+     */
+    fun parseRtpInto(buf: ByteArray, len: Int, out: LongArray): Boolean {
+        require(out.size >= 6) { "out 至少需要 6 个槽位" }
+        return ProtocolNative.parseRtpInto(buf, len, out)
+    }
+
     fun extendSeq(highest: Long, seq: Int): Long = ProtocolNative.extendSeq(highest, seq)
 
     fun extendTs(highest: Long, ts: Long): Long = ProtocolNative.extendTs(highest, ts)

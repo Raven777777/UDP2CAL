@@ -12,6 +12,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
@@ -26,6 +27,7 @@ import com.udp2cal.app.Prefs
 import com.udp2cal.app.StreamResampler
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
+import com.udp2cal.app.WifiNetworkBinder
 import com.udp2cal.app.native.OpusDecoder as ReverseOpusDecoder
 import com.udp2cal.app.native.OpusEncoder
 import kotlinx.coroutines.CoroutineScope
@@ -40,6 +42,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -52,6 +56,7 @@ import java.util.concurrent.Executors
 import kotlinx.coroutines.yield
 import androidx.core.content.ContextCompat
 import java.security.SecureRandom
+import java.net.DatagramPacket
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.coroutines.coroutineContext
 
@@ -71,7 +76,7 @@ import kotlin.coroutines.coroutineContext
  * （micDispatcher / reverseRxDispatcher / reversePlayDispatcher）：协程在
  * delay/yield 后可能被 Dispatchers.IO 换池线程，优先级无法钉住。
  */
-class CaptureService : Service() {
+class CaptureService : Service(), WifiNetworkBinder.Listener {
     companion object {
         private const val TAG = "CaptureService"
 
@@ -114,6 +119,12 @@ class CaptureService : Service() {
 
     /** 主线程置位、IO 协程读取，必须 volatile */
     @Volatile private var hasNewCapture = false
+
+    /**
+     * Wi-Fi 丢失后等待恢复：置位期间不重建链路（当前无网络可绑），
+     * 等 NetworkCallback 报来新的 Wi-Fi 再走 restart 通道重建 socket。
+     */
+    @Volatile private var wifiReconnectPending = false
 
     private val _status = MutableStateFlow(CaptureStatus())
     val status: StateFlow<CaptureStatus> = _status.asStateFlow()
@@ -247,6 +258,44 @@ class CaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 整个服务生命周期监听 Wi-Fi：绑定网络与断网重连都以这里为准
+        WifiNetworkBinder.start(applicationContext, this)
+    }
+
+    /**
+     * Wi-Fi 恢复：只有"断网等待中"才重建。回调线程不是主线程，
+     * restartCapture 自带生命周期锁，可直接调用。
+     */
+    override fun onWifiAvailable(network: Network) {
+        if (!wifiReconnectPending) return
+        wifiReconnectPending = false
+        Log.i(TAG, "Wi-Fi 已恢复（$network），重建采集链路")
+        restartCapture()
+    }
+
+    /**
+     * 绑定的 Wi-Fi 丢失：立即关闭 socket，既不空转发送，也杜绝等待期间
+     * 未显式绑定的包被系统默认路由（蜂窝）接走；等 onAvailable 再重建。
+     */
+    override fun onWifiLost(network: Network) {
+        if (!hasNewCapture) return
+        val sender = udpSender
+        // 已建会话时只关心它实际绑定的网络；sender 为 null（connect 进行中）
+        // 时无法比对，按断网处理，避免错过重连时机。
+        if (sender != null && sender.boundNetwork != network) return
+        // onAvailable 可能先于 onLost 到达（快速重连/网络换代）：若已经有
+        // 新 Wi-Fi 在线就无需等待，直接重建。先置位再拆 socket，避免控制环
+        // 在这段窗口里用通用“已断开”覆盖 Wi-Fi 专属提示。
+        val hasWifiNow = WifiNetworkBinder.currentNetwork() != null
+        wifiReconnectPending = !hasWifiNow
+        Log.w(TAG, if (hasWifiNow) "Wi-Fi 网络已切换，重建采集链路" else "Wi-Fi 网络丢失，关闭 UDP 会话并等待恢复")
+        try { sender?.close() } catch (_: Exception) {}
+        _status.value = _status.value.copy(
+            connected = false,
+            reverseAudio = false,
+            errorMsg = if (hasWifiNow) "网络已切换（正在重连）" else "Wi-Fi 已断开（等待网络恢复）",
+        )
+        if (hasWifiNow) restartCapture()
     }
 
     // startForeground 必须在 startService→onStartCommand 时立即调用（5s 限制）
@@ -265,12 +314,18 @@ class CaptureService : Service() {
         }
         if (notificationJob?.isActive != true) {
             notificationJob = serviceScope.launch {
-                _status.collect {
-                    try {
-                        startForeground(1, buildNotification())
-                    } catch (_: Exception) {
+                // 通知只展示连接状态/模式/音源。码率与反向统计每秒都在变，
+                // 但通知文本不变——按内容去重，避免每次 _status 发射都
+                // 走一遍 startForeground（binder 调用 + SystemUI 唤醒）。
+                _status
+                    .map { notificationKey(it) }
+                    .distinctUntilChanged()
+                    .collect {
+                        try {
+                            startForeground(1, buildNotification())
+                        } catch (_: Exception) {
+                        }
                     }
-                }
             }
         }
         return START_NOT_STICKY
@@ -337,6 +392,7 @@ class CaptureService : Service() {
         val deviceId = DiscoveryManager.getOrCreateDeviceId()
         activeParams = CaptureParams(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
         restartPending = false
+        wifiReconnectPending = false
 
         // ATOMIC：launch 后立刻 stopCapture 也不会在“未启动”状态被取消，
         // 否则协程体（含 finally 拆除）永远不跑，captureJob 会永久占位。
@@ -501,6 +557,9 @@ class CaptureService : Service() {
     private suspend fun controlLoop() {
         var connected = false
         var sinceConnect = 0L
+        // CONNECT 每秒按当前 reversePort/forwardSsrc 重建负载；包对象复用，
+        // 只换数据与长度（发送时 send 会补上目标地址）。
+        val connectPacket = DatagramPacket(ByteArray(0), 0)
         while (coroutineContext.isActive) {
             val sender = udpSender ?: break
 
@@ -511,7 +570,9 @@ class CaptureService : Service() {
                     DiscoveryManager.getOrCreateDeviceId(),
                     payload
                 )
-                sender.send(packet, 0, packet.size)
+                connectPacket.data = packet
+                connectPacket.length = packet.size
+                sender.send(connectPacket)
                 sinceConnect = 1000
             }
             sinceConnect -= TICK_MS
@@ -523,7 +584,14 @@ class CaptureService : Service() {
                     _status.value = _status.value.copy(connected = true, errorMsg = "")
                 } else {
                     _status.value = _status.value.copy(
-                        connected = false, reverseAudio = false, errorMsg = "已断开（等待重连）"
+                        connected = false, reverseAudio = false,
+                        // Wi-Fi 断网等待恢复期间保留更具指导性的提示，
+                        // 不被控制环的通用“已断开”覆盖。
+                        errorMsg = if (wifiReconnectPending) {
+                            "Wi-Fi 已断开（等待网络恢复）"
+                        } else {
+                            "已断开（等待重连）"
+                        },
                     )
                     stopReverseAudioAndJoin()
                     activeReverseSsrc = 0
@@ -812,6 +880,8 @@ class CaptureService : Service() {
     ) {
         val pcm = ShortArray(FRAME)
         val packet = ByteArray(Udp2CalProtocol.RTP_MAX_PACKET)
+        // 复用同一 DatagramPacket（本函数只在采集线程执行，无跨线程共享）
+        val rtpPacket = DatagramPacket(packet, 0)
         val rnd = SecureRandom()
         var seq = rnd.nextInt() and 0xFFFF
         var timestamp = rnd.nextInt()
@@ -871,7 +941,8 @@ class CaptureService : Service() {
                         packet, 0, marker, seq, timestamp, sender.forwardSsrc
                     )
                     val sendStart = System.nanoTime()
-                    val sent = sender.send(packet, 0, Udp2CalProtocol.RTP_HEADER_SIZE + n)
+                    rtpPacket.length = Udp2CalProtocol.RTP_HEADER_SIZE + n
+                    val sent = sender.send(rtpPacket)
                     sendNs += System.nanoTime() - sendStart
                     if (sent) {
                         byteCount += n
@@ -1015,9 +1086,11 @@ class CaptureService : Service() {
     private suspend fun reverseRxLoop() {
         val sender = udpSender ?: return
         val sock = sender.reverseSock ?: return
-        val expectedIp = sender.getRemoteIp()
+        val expectedAddr = sender.getRemoteAddress()
         val buf = ByteArray(2048)
-        val pkt = java.net.DatagramPacket(buf, buf.size)
+        val pkt = DatagramPacket(buf, buf.size)
+        // 复用解析结果数组：本循环每 10 ms 一包，避免每包分配 LongArray/RtpPacket
+        val rtp = LongArray(6)
         var byteCount = 0L
         var lastReport = System.currentTimeMillis()
 
@@ -1037,10 +1110,16 @@ class CaptureService : Service() {
                     continue
                 }
                 val len = pkt.length
-                if (expectedIp != null && pkt.address?.hostAddress != expectedIp) continue
-                val rtp = Udp2CalProtocol.parseRtp(buf, len) ?: continue
+                if (expectedAddr != null && pkt.address != expectedAddr) continue
+                // 槽位顺序见 Udp2CalProtocol.parseRtpInto
+                if (!Udp2CalProtocol.parseRtpInto(buf, len, rtp)) continue
                 val ssrc = activeReverseSsrc
-                if (ssrc == 0 || rtp.ssrc != ssrc) continue
+                if (ssrc == 0 || rtp[3].toInt() != ssrc) continue
+                val marker = rtp[0] != 0L
+                val seq = rtp[1].toInt()
+                val timestamp = rtp[2]
+                val payloadOffset = rtp[4].toInt()
+                val payloadLength = rtp[5].toInt()
 
                 val nowMono = SystemClock.elapsedRealtime()
                 linkLock.lock()
@@ -1056,8 +1135,8 @@ class CaptureService : Service() {
                     }
                     lastReversePacketAt = nowMono
                     jitter.insert(
-                        rtp.seq, rtp.timestamp, rtp.marker,
-                        buf, rtp.payloadOffset, rtp.payloadLength
+                        seq, timestamp, marker,
+                        buf, payloadOffset, payloadLength
                     )
                     linkSignal.signalAll()
                 } finally {
@@ -1475,6 +1554,7 @@ class CaptureService : Service() {
             activeParams = null
             restartPending = false
             hasNewCapture = false
+            wifiReconnectPending = false
             try { wifiLock?.release() } catch (_: Exception) {}
             wifiLock = null
             // 不在这里把 captureJob 置空：旧任务的 finally 拆除完对象后才清空。
@@ -1503,18 +1583,29 @@ class CaptureService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification {
-        val status = _status.value
-        val modeLabel = if (status.opusMode.contains("语音")) "语音" else "音乐"
-        val audioLabel = when {
+    /** 通知栏实际展示的内容：只有这些字段变化才需要重建前台通知 */
+    private data class NotificationKey(
+        val connected: Boolean,
+        val modeLabel: String,
+        val audioLabel: String,
+    )
+
+    private fun notificationKey(status: CaptureStatus): NotificationKey = NotificationKey(
+        connected = status.connected,
+        modeLabel = if (status.opusMode.contains("语音")) "语音" else "音乐",
+        audioLabel = when {
             status.audioSource.contains("AEC已启用") -> "NS+AGC+AEC"
             status.audioSource.contains("硬件降噪") -> "NS+AGC"
             else -> "MIC-Direct"
-        }
-        val connStr = if (status.connected) "已连接" else "等待连接"
+        },
+    )
+
+    private fun buildNotification(): Notification {
+        val key = notificationKey(_status.value)
+        val connStr = if (key.connected) "已连接" else "等待连接"
         return NotificationCompat.Builder(this, "udp2cal_capture")
             .setContentTitle("UDP2CAL")
-            .setContentText("$connStr · $modeLabel $audioLabel")
+            .setContentText("$connStr · ${key.modeLabel} ${key.audioLabel}")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .build()
@@ -1529,6 +1620,7 @@ class CaptureService : Service() {
         val oldRx = reverseRxJob
         stopCapture()
         serviceScope.cancel()
+        WifiNetworkBinder.stop()
         // 顺序有意义：captureJob 的收尾会调用 udpSender.close() 关闭反向 socket，
         // 而 reverseRxLoop 阻塞在 sock.receive() 上、协程取消唤不醒它——所以先等
         // 采集协程退出（socket 被关掉），接收协程才会跟着退出。

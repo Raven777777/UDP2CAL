@@ -71,7 +71,7 @@ use jni_sys::{
 
 use crate::rtp::{
     ARRIVAL_TRACE, DeviceRateEstimator, DriftController, InsertResult, JitterBuffer,
-    OPUS_FRAME_SAMPLES, OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, Pull, RTP_HEADER_SIZE,
+    OPUS_FRAME_SAMPLES, OPUS_MAX_PAYLOAD, OPUS_SAMPLE_RATE, Pull, RTP_HEADER_SIZE, RTP_MAX_PACKET,
     RtpHeader, RtpPacket, StepAbsorber, extend_seq, extend_ts, water_target_ms,
 };
 use crate::{
@@ -125,6 +125,25 @@ unsafe fn read_bytes(
     out.resize(len as usize, 0);
     if len > 0 {
         (f.GetByteArrayRegion)(env, arr, offset, len, out.as_mut_ptr() as *mut jbyte);
+    }
+    true
+}
+
+/// 把 `arr[0 .. len)` 拷进调用方的定长缓冲；越界返回 false。
+///
+/// 与 [`read_bytes`] 的区别是不在原生堆上分配：RTP 解析只需要包长和
+/// 12 字节头，调用方给一块栈上数组即可，每包省掉一次 `Vec` 分配。
+unsafe fn read_bytes_head(env: Env, arr: jbyteArray, len: jint, out: &mut [u8]) -> bool {
+    if arr.is_null() || len < 0 || len as usize > out.len() {
+        return false;
+    }
+    let f = fns(env);
+    let total = (f.GetArrayLength)(env, arr);
+    if total < 0 || len as i64 > total as i64 {
+        return false;
+    }
+    if len > 0 {
+        (f.GetByteArrayRegion)(env, arr, 0, len, out.as_mut_ptr() as *mut jbyte);
     }
     true
 }
@@ -207,6 +226,22 @@ unsafe fn new_longs(env: Env, data: &[jlong]) -> jlongArray {
     }
     (f.SetLongArrayRegion)(env, arr, 0, data.len() as jsize, data.as_ptr());
     arr
+}
+
+/// 把 `data` 写进调用方数组 `arr[0 .. data.len())`；容量不足返回 false。
+unsafe fn write_longs(env: Env, arr: jlongArray, data: &[jlong]) -> bool {
+    if arr.is_null() {
+        return false;
+    }
+    let f = fns(env);
+    let total = (f.GetArrayLength)(env, arr);
+    if total < 0 || data.len() as jsize > total {
+        return false;
+    }
+    if !data.is_empty() {
+        (f.SetLongArrayRegion)(env, arr, 0, data.len() as jsize, data.as_ptr());
+    }
+    true
 }
 
 unsafe fn new_ints(env: Env, data: &[jint]) -> jintArray {
@@ -665,6 +700,41 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseRt
         p.payload.len() as jlong,
     ];
     new_longs(env, &out)
+}
+
+/// 同 [`Java_com_udp2cal_app_native_ProtocolNative_parseRtp`]，但把字段写入
+/// 调用方提供的数组（长度 ≥6），返回是否解析成功。
+///
+/// 反向接收线程每 10 ms 调一次。复用 Kotlin 侧 `LongArray` + 这里改用的
+/// 栈缓冲后，热路径上不再有 `LongArray` / `RtpPacket` / `Vec` 分配。
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseRtpInto(
+    env: Env,
+    _this: jobject,
+    buf: jbyteArray,
+    len: jint,
+    out: jlongArray,
+) -> jboolean {
+    if len < 0 || len as usize > RTP_MAX_PACKET {
+        return false;
+    }
+    let mut data = [0u8; RTP_MAX_PACKET];
+    if !read_bytes_head(env, buf, len, &mut data) {
+        return false;
+    }
+    let p = match crate::rtp::parse(&data[..len as usize]) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let fields: [jlong; 6] = [
+        p.marker as jlong,
+        p.seq as jlong,
+        p.timestamp as jlong,
+        p.ssrc as jlong,
+        RTP_HEADER_SIZE as jlong,
+        p.payload.len() as jlong,
+    ];
+    write_longs(env, out, &fields)
 }
 
 #[unsafe(no_mangle)]

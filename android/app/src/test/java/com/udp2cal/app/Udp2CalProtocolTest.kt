@@ -233,6 +233,27 @@ class Udp2CalProtocolTest {
     }
 
     @Test
+    fun rtpParseInto_matchesParseRtp_andLeavesOutUntouchedOnFailure() {
+        val buf = ByteArray(Udp2CalProtocol.RTP_MAX_PACKET)
+        Udp2CalProtocol.writeRtpHeader(buf, 0, true, 0x1234, 0x4B0, 0xDEADBEEF.toInt())
+        buf[12] = 0x01
+
+        val out = LongArray(6)
+        assertTrue(Udp2CalProtocol.parseRtpInto(buf, 13, out))
+        assertEquals(1L, out[0])
+        assertEquals(0x1234L, out[1])
+        assertEquals(0x4B0L, out[2])
+        assertEquals(0xDEADBEEFL, out[3])
+        assertEquals(12L, out[4])
+        assertEquals(1L, out[5])
+
+        // 解析失败不写输出：热路径失败后直接 continue，不读取脏数据
+        val before = out.copyOf()
+        assertFalse(Udp2CalProtocol.parseRtpInto(buf, 12, out))
+        assertArrayEquals(before, out)
+    }
+
+    @Test
     fun packetSizeLimits_matchSpec() {
         assertEquals(12, Udp2CalProtocol.RTP_HEADER_SIZE)
         assertEquals(1275, Udp2CalProtocol.OPUS_MAX_PAYLOAD)
