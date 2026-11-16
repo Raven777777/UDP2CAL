@@ -14,7 +14,7 @@ import android.util.Log
  * 时钟模型：**AudioTrack 播放头是唯一音频时钟**。
  *   * 不再维护应用层 PCM 队列，也不做"高水位裁剪"——那只是把延迟藏起来；
  *   * `write` 使用**阻塞写**，写入节奏由 AudioTrack 缓冲决定，不额外 delay；
- *   * 上层（CaptureService 的反向播放线程）依据 [playbackHeadFrames] 拉取/PLC。
+ *   * 上层（ReverseLink 的反向播放线程）依据 [playbackHeadFrames] 拉取/PLC。
  *
  * 固定 48 kHz 立体声：设备若需要其它采样率，由系统混音器重采样，
  * 媒体时间线仍然是 48 kHz，因此播放头换算保持 1:1。

@@ -8,7 +8,7 @@ import com.udp2cal.app.Udp2CalProtocol
  * Opus 编码器（v3：固定 48 kHz / 10 ms / 单声道）
  *
  * 与 v2 的差别：**不再写任何私有包头**。`encodeTo` 只把 Opus 负载写进
- * `dest[payloadOffset...]`，RTP 头由调用方（CaptureService）用
+ * `dest[payloadOffset...]`，RTP 头由调用方（ForwardLink）用
  * [Udp2CalProtocol.writeRtpHeader] 写在偏移 0..11。
  *
  * 负载上限 1275 字节（[Udp2CalProtocol.OPUS_MAX_PAYLOAD]）：

@@ -18,7 +18,12 @@ udp2cal/
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
 │     │  ├─ StreamResampler.kt       # 反向流的受控重采样（32 相 × 48 抽头多相 FIR）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
-│     │  ├─ service/CaptureService.kt# 前台采集服务（采集/控制/反向接收/反向播放 四路并发，无 PCM 队列）
+│     │  ├─ service/CaptureService.kt    # 前台服务外壳：Binder/通知/Wi-Fi 回调/停机 join
+│     │  ├─ service/CaptureLifecycle.kt  # 会话编排：链路启停/重启排队/网络层与任务槽
+│     │  ├─ service/ForwardLink.kt       # 正向：采集→Opus→RTP（热循环 + 参数热更新）
+│     │  ├─ service/ReverseLink.kt       # 反向：阻塞接收 + 按播放头解码/PLC→AudioTrack
+│     │  ├─ service/ControlLoop.kt       # 控制面：CONNECT 保活 + ACK 状态 + 反向开关
+│     │  ├─ service/CaptureStatus.kt     # CaptureStatus + StatusBus（StateFlow）
 │     │  └─ native/Opus*.kt          # Opus 编码器/解码器 JNI 封装
 │     │     native/ProtocolNative.kt # 协议层的 external fun 声明（加载 libudp2cal_protocol.so）
 │     └─ cpp/                        # opus_jni.c / opus_jni_decoder.c（JNI 封装）
@@ -99,7 +104,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 桌面 JVM 与 Android 真机跑的是同一份机器码，协议回归不再需要"两端各跑一遍再人工比对"。
 
 **边界：共享的是线格式与协议算法，不是连接状态机或身份安全。** Android 的 ACK 生命周期在
-`UdpSender.kt` / `CaptureService.kt`，Windows 的会话绑定在 `windows/src/session/mod.rs`；设备选择、重连、超时、
+`UdpSender.kt` / `ControlLoop.kt`，Windows 的会话绑定在 `windows/src/session/mod.rs`；设备选择、重连、超时、
 端点更新和安全决策仍可能出现平台差异。v3 的 `device_id` 是公开标识而非凭证；更详细的差异和整改状态见
 [控制面审查归档](archive/CONTROL_PLANE_REMEDIATION.md)。
 
