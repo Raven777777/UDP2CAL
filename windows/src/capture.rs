@@ -250,7 +250,7 @@ fn reverse_config() -> &'static Mutex<OpusReverseConfig> {
     REVERSE_CFG.get_or_init(|| Mutex::new(OpusReverseConfig::default()))
 }
 
-/// 由 main.rs 的控制面调用；只有内容真正变化才落盘日志
+/// 由 session 控制面调用；只有内容真正变化才落盘日志
 pub fn update_reverse_config(cfg: OpusReverseConfig) {
     // 中毒恢复与其他 Mutex 一致：这里只是一份配置快照，没有跨字段不变量。
     //

@@ -25,7 +25,16 @@ udp2cal/
 ├─ opus-src/       # libopus 1.6.1 源码树（Android 与 Windows 共用的唯一副本）
 ├─ windows/        # Windows 接收端（Rust + iced + cpal）
 │  ├─ src/
-│  │  ├─ main.rs       # iced UI、托盘、解复用、控制状态机、解码线程（含两级漂移校正）
+│  │  ├─ main.rs       # 入口：模块声明与 app::run()
+│  │  ├─ app.rs        # iced 应用状态、消息处理与启动编排
+│  │  ├─ ui.rs         # iced 界面渲染（view / 样式 / 窗口 Task）
+│  │  ├─ net.rs        # 发现/广播状态机与 UDP 接收流
+│  │  ├─ session/      # 控制面状态机 + 接收侧音频
+│  │  │  ├─ mod.rs     # P2P 独占绑定、配对、反向发送器、CONNECT 处理
+│  │  │  ├─ audio.rs   # 抖动缓冲、解码/播放线程（含两级漂移校正）
+│  │  │  └─ tests.rs   # 控制面纯逻辑单元测试
+│  │  ├─ tray.rs       # 系统托盘、图标加载、原生窗口激活
+│  │  ├─ diag.rs       # 诊断计数器与周期统计日志
 │  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 可微调比率重采样
 │  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
 │  │  ├─ config.rs     # 注册表配置读写
@@ -90,7 +99,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 桌面 JVM 与 Android 真机跑的是同一份机器码，协议回归不再需要"两端各跑一遍再人工比对"。
 
 **边界：共享的是线格式与协议算法，不是连接状态机或身份安全。** Android 的 ACK 生命周期在
-`UdpSender.kt` / `CaptureService.kt`，Windows 的会话绑定在 `windows/src/main.rs`；设备选择、重连、超时、
+`UdpSender.kt` / `CaptureService.kt`，Windows 的会话绑定在 `windows/src/session/mod.rs`；设备选择、重连、超时、
 端点更新和安全决策仍可能出现平台差异。v3 的 `device_id` 是公开标识而非凭证；更详细的差异和整改状态见
 [控制面审查归档](archive/CONTROL_PLANE_REMEDIATION.md)。
 
@@ -342,7 +351,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 
 | 机制 | 位置 | 为什么必须这样 |
 | --- | --- | --- |
-| 水位只用**一个口径** | `main.rs` 解码线程：`water = jb.water_ms() + ring_ms + device_latency_ms` | 抖动缓冲、解码环、声卡缓冲三段都是"可听点之前压着的媒体量"，加在一起才等于真实排队时长；分开算就会互相打架，需要偏移记账去补 |
+| 水位只用**一个口径** | `session/audio.rs` 解码线程：`water = jb.water_ms() + ring_ms + device_latency_ms` | 抖动缓冲、解码环、声卡缓冲三段都是"可听点之前压着的媒体量"，加在一起才等于真实排队时长；分开算就会互相打架，需要偏移记账去补 |
 | 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：cpal 0.15.3 把帧数换算成 `hnsBufferDuration` 时少乘 100 |
 | 预解码深度 ≤40 ms | `rtp::JitterBuffer::pull`：`ring_ms >= DECODE_LIMIT_MS` 就返回 `Wait` | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到可听点前面几百毫秒，恢复后真包全被判迟到 |
 | 回调唤醒解码线程 | `audio.rs`：`thread.unpark()` | 播放头前移本身就是"该拉下一帧"的信号，不需要定时器 |
@@ -354,9 +363,9 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 迟到半个帧就重锚 | `capture.rs::slot_is_late` + `advance_slot`（重锚值 `now + gap`） | 偏移一旦形成会被每帧复制、永远到不了"落后 4 帧"的旧阈值；重锚返回 `now` 又会让积压帧当轮连发 |
 | 重锚帧不计入迟到统计 | `capture.rs::ReverseStats.reanchors` | 迟到量描述"网格多准"，不是"停顿多久"：一次 8 s 无声间隔曾把窗口均值从 0.3 ms 拉到 4.2 ms |
 | PCM 环满丢最旧 | `audio.rs::Ring::push_latest` + 既有 flush 通道 | 只丢新样本等于把满载延迟永久保留；丢掉未播的旧数据才能把水位压回目标（`满丢旧数据=` 计数） |
-| 反馈只在出声时评估 | `main.rs` 解码线程 `feedback_on = !rtp_idle && playing` | 预缓冲阶段水位必然低于目标，PI 会把积分压到负饱和（实测 -1100 ppm），起播后要花 ~80 s 退饱和 |
+| 反馈只在出声时评估 | `session/audio.rs` 解码线程 `feedback_on = !rtp_idle && playing` | 预缓冲阶段水位必然低于目标，PI 会把积分压到负饱和（实测 -1100 ppm），起播后要花 ~80 s 退饱和 |
 | Opus 带内 FEC 重建 | `rtp::JitterBuffer::peek_current` → `decoder.rs::OpusDecoder::decode_fec`（Android 侧 `ProtocolNative.jbPeek` → `decoderDecodeFec`） | 丢帧的 LBRR 冗余在**下一个包**里，所以补洞前必须能前瞻而不消费；FEC 模式下 `opus_decode` 会填满调用方容量，只能给一帧 |
-| 收发缓冲放大到 1 MiB | `capture.rs` 反向 send、`main.rs` 正向 recv、`UdpSender.kt` 双向 | 突发补齐时让内核吸收峰峰差，用户态少一次丢包 |
+| 收发缓冲放大到 1 MiB | `capture.rs` 反向 send、`net.rs` 正向 recv、`UdpSender.kt` 双向 | 突发补齐时让内核吸收峰峰差，用户态少一次丢包 |
 
 ### 快速双击防抖
 

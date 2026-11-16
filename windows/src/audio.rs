@@ -204,7 +204,7 @@ impl Ring {
 pub struct AudioWriter {
     ring: Arc<Ring>,
     pub device_rate: u32,
-    /// 诊断计数器：由 UI 线程读取并展示/落盘（见 main.rs 的 AUDIO_STATS）
+    /// 诊断计数器：由 UI 线程读取并展示/落盘（见 diag.rs 的 AUDIO_STATS）
     pub stats: Arc<AudioStats>,
     /// 声卡已接手的帧数（含欠载时补的静音：它们同样占据媒体时间线）。
     ///
