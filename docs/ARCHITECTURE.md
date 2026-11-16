@@ -49,7 +49,7 @@ udp2cal/
 │  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
 │  │  └─ protocol.rs   # 协议重新导出
 │  └─ Cargo.toml
-├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp.rs 媒体面 + jni.rs JNI 表面
+├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp/ 媒体面 + jni.rs JNI 表面
 ├─ docs/           # 项目文档（本目录）
 ├─ build.bat       # 统一构建入口（Windows / Android / ADB / 体检）
 ├─ scripts/        # 构建脚本实现（Python 3.8+）
@@ -70,7 +70,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 
 | 位置 | 角色 |
 | --- | --- |
-| `protocol/protocol.rs`、`protocol/rtp.rs` | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
+| `protocol/protocol.rs`、`protocol/rtp/`（`header` / `jitter` / `step` / `drift` / `device_rate`） | **唯一实现**（控制面 / RTP / 抖动缓冲 / 水位与比率控制） |
 | `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，全部 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
 | `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
 | `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
