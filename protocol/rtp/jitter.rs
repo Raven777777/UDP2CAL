@@ -293,6 +293,23 @@ impl JitterBuffer {
         let ext_seq = extend_seq(self.highest_seq, pkt.seq);
         let ext_ts = extend_ts(self.highest_ts, pkt.timestamp);
 
+        // 发送端按墙钟补缺口/丢积压时，补出的时间戳未必是整帧（如缺 35 ms
+        // 补 1680 样本）。播放头只按 ±480 前进，一旦错开非零余数就永远
+        // 匹配不到任何包：PLC 到上限后无限静音、槽位堆满后每包记溢出。
+        // 非整帧跳变必然是时间线断裂，直接按新时间线重同步。
+        if ext_ts % FRAME_SAMPLES as u64 != self.next_ts % FRAME_SAMPLES as u64 {
+            self.last_rebase_reason = format!(
+                "时间戳非整帧跳变（偏移 {} 样本）",
+                ext_ts.abs_diff(self.next_ts) % FRAME_SAMPLES as u64
+            );
+            self.rebase(ext_seq, ext_ts);
+            self.store(pkt, ext_seq, ext_ts);
+            self.next_seq = ext_seq + 1;
+            self.stats.resyncs += 1;
+            self.stats.inserted += 1;
+            return InsertResult::Resync;
+        }
+
         // 迟到：播放头已越过该时间戳（时间戳是播放顺序的唯一权威）
         if ext_ts < self.next_ts {
             self.stats.late += 1;
@@ -882,6 +899,31 @@ mod tests {
         assert_eq!(r, InsertResult::Inserted);
         assert_eq!(jb.epoch, epoch);
         assert!(jb.is_playing());
+    }
+
+    #[test]
+    fn jb_unaligned_timestamp_jump_realigns_instead_of_stalling() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        // 播掉一帧进入 PLAYING（next_ts = 480，余数 0）
+        assert_eq!(pull_tags(&mut jb, 0, 1), vec![1]);
+        let epoch = jb.epoch;
+
+        // 发送端补 35 ms 缺口 = 1680 样本（非 480 倍数）：不重同步就会永久错开半帧
+        let jump_ts = 480 * 3 + 1680;
+        assert_eq!(insert(&mut jb, 4, jump_ts, false, 9), InsertResult::Resync);
+        assert!(jb.epoch > epoch);
+        assert_eq!(jb.next_ts(), jump_ts as u64);
+        assert!(!jb.is_playing(), "重同步后必须回到预缓冲");
+        assert!(jb.last_rebase_reason.contains("非整帧"));
+
+        // 新时间线整帧连续：必须能正常起播，而不是无限 PLC/静音
+        for i in 1..=3u16 {
+            insert(&mut jb, 4 + i, jump_ts + 480 * i as u32, false, 10 + i as u8);
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![9, 11, 12, 13]);
     }
 
     #[test]
