@@ -9,7 +9,8 @@ use super::{FRAME_MS, FRAME_SAMPLES, samples_to_ms};
 /// 重排槽位
 pub const MAX_REORDER_PACKETS: usize = 64;
 
-/// 起播的**硬下限**：至少 3 帧连续可解码音频。
+/// 起播的**硬下限**：至少 3 帧可解码音频（队首之后是终点已知的洞时，
+/// 洞由 PLC 补齐，不阻塞起播）。
 ///
 /// 真正的起播水位是 [`JitterBuffer::set_start_prebuffer_ms`] 设置的目标
 /// （默认与 [`WATER_TARGET_MS`](super::WATER_TARGET_MS) 相同）：先攒到目标再播，
@@ -78,6 +79,11 @@ pub fn plc_hold_frames() -> u32 {
 }
 /// 触发重同步的时间戳跳变阈值
 pub const RESYNC_GAP_MS: u32 = 200;
+/// 连续多少个“帧对齐、非 marker、远超重排窗口”的包才判定时间线断裂。
+///
+/// 单个远跳可能是伪造（只丢弃）；连续多个更可能是 marker 丢失的合法断流，
+/// 或接收端播放头因背压冻结。阈值 3 ≈ 30 ms，恢复延迟可忽略。
+const FAR_JUMP_REBASE_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertResult {
@@ -195,6 +201,8 @@ pub struct JitterBuffer {
     playing: bool,
     /// 中段洞的连续 PLC 帧数（推进时间线的那一类；尾部洞 hold 不计入）
     plc_run: u32,
+    /// 连续被丢弃的“M=0 且远超重排窗口”包数（见 [`FAR_JUMP_REBASE_AFTER`]）
+    far_jumps: u32,
     /// 尾部洞 hold 状态（见 [`HoldState`]）
     hold: HoldState,
     /// 每次重同步/复位自增，播放线程据此重建解码器状态
@@ -224,6 +232,7 @@ impl JitterBuffer {
             started: false,
             playing: false,
             plc_run: 0,
+            far_jumps: 0,
             hold: HoldState::Idle,
             epoch: 0,
             last_rebase_reason: String::new(),
@@ -413,6 +422,39 @@ impl JitterBuffer {
             return InsertResult::Resync;
         }
 
+        // 非 marker 的超前跳跃超过一个重排窗口：发送端任何 >640 ms 的断点都会
+        // 置 M=1，合法流不会走到这里。接纳它会把 `highest_ts`/水位钉在高位
+        // （最长约 640 ms），伪造包随后还会被当成真实音频播一次。
+        //
+        // 但接收端播放头可能因背压冻结（ring 满 / 未起播）超过 640 ms，此时
+        // 连续到达的 M=0 包也会全部越过窗口；只按单包丢弃会永久静音且 1 s
+        // 空闲 reset 永不触发（丢包仍刷新最后收包时间）。因此连续 N 个远跳
+        // 视为时间线断裂，按 M=1 的语义重同步。
+        //
+        // shortcut: 伪造者连发 N 个远跳包仍能触发重同步；非整帧远跳或 M=1
+        // 也会直接触发（与现有重同步同级 DoS），单个 M=0 帧对齐包不会。
+        // 要根治需要会话认证/包签名。
+        if !pkt.marker
+            && ext_ts.saturating_sub(self.next_ts)
+                > MAX_REORDER_PACKETS as u64 * FRAME_SAMPLES as u64
+        {
+            self.far_jumps += 1;
+            if self.far_jumps < FAR_JUMP_REBASE_AFTER {
+                self.stats.overflow += 1;
+                return InsertResult::Dropped;
+            }
+            self.last_rebase_reason =
+                format!("M=0 连续远跳 {} 次，重同步", self.far_jumps);
+            self.rebase(ext_seq, ext_ts);
+            self.store(pkt, ext_seq, ext_ts);
+            self.next_seq = ext_seq + 1;
+            self.stats.resyncs += 1;
+            self.stats.inserted += 1;
+            return InsertResult::Resync;
+        }
+        // 时间线正常（包在窗口内）：连续远跳计数归零。
+        self.far_jumps = 0;
+
         // 超出重排窗口（`next_seq .. next_seq+63`）：**只丢弃这一包**。
         //
         // 这里绝不能重同步：重同步会连同 64 帧已缓冲的音频一起丢掉（约 640 ms
@@ -468,9 +510,21 @@ impl JitterBuffer {
             return Pull::Wait;
         }
         if !self.playing {
+            // 队首是空洞（槽里没有可播媒体）：尚未播出，跳到最小时间戳无损。
+            // 否则基准包之后的第一个缺口会永远挡住 `contiguous_frames()`。
+            if self.find_ts(self.next_ts).is_none()
+                && self.highest_ts > self.next_ts
+                && let Some(ts) = self.slots.iter().filter(|s| s.valid).map(|s| s.ts).min()
+            {
+                self.next_ts = ts;
+            }
             let enough_frames = self.contiguous_frames() >= (JITTER_START_MS / FRAME_MS) as usize;
             let enough_water = self.water_ms() >= self.start_ms;
-            if enough_frames && enough_water {
+            // 队首有真包、后面是**终点已知**的中段洞时，洞可由 PLC 填满；
+            // 若仍要求 3 连帧，丢一帧就会永久停在预缓冲（后续包只会撑满槽位）。
+            let recoverable_hole = self.highest_ts > self.next_ts
+                && self.occupancy_frames() >= (JITTER_START_MS / FRAME_MS) as usize;
+            if (enough_frames || recoverable_hole) && enough_water {
                 self.playing = true;
             } else {
                 return Pull::Wait;
@@ -635,6 +689,7 @@ impl JitterBuffer {
         self.started = false;
         self.playing = false;
         self.plc_run = 0;
+        self.far_jumps = 0;
         self.hold = HoldState::Idle;
         // 注意：**不重置** `start_ms`。它是上层按本方向目标注入的配置，
         // 重连后仍应生效。
@@ -661,6 +716,7 @@ impl JitterBuffer {
         self.started = true;
         self.playing = false;
         self.plc_run = 0;
+        self.far_jumps = 0;
         self.hold = HoldState::Idle;
         if bump_epoch {
             self.epoch += 1;
@@ -716,20 +772,18 @@ impl JitterBuffer {
 
     /// 查"时间戳 `ts` 那一帧是什么时候到达的"。
     ///
-    /// 取的是最新一条 `entry.ts <= ts` 的记录：帧是按时间戳单调到达的，
-    /// 该记录就是这一帧（或它最近的同刻邻居）。查不到（例如刚重同步、
-    /// 记录已被覆盖）返回 `None`，调用方应跳过本次延迟估算。
+    /// 取的是 `entry.ts <= ts` 且时间戳最大的记录：帧可能乱序到达，按到达
+    /// 顺序倒查会把后到的旧包当成这一帧（少报一个重排窗口的延迟）。查不到
+    /// （例如刚重同步、记录已被覆盖）返回 `None`，调用方应跳过本次延迟估算。
     pub fn arrival_of(&self, ts: u64) -> Option<Instant> {
-        for i in 0..ARRIVAL_TRACE {
-            let idx = (self.arrival_pos + ARRIVAL_TRACE - 1 - i) % ARRIVAL_TRACE;
-            let a = self.arrivals[idx];
-            if let Some(at) = a.at {
-                if a.ts <= ts {
-                    return Some(at);
-                }
+        let mut best: Option<(u64, Instant)> = None;
+        for a in self.arrivals.iter() {
+            let Some(at) = a.at else { continue };
+            if a.ts <= ts && best.is_none_or(|(best_ts, _)| a.ts >= best_ts) {
+                best = Some((a.ts, at));
             }
         }
-        None
+        best.map(|(_, at)| at)
     }
 
     /// 丢弃扩展序号最小的非 `next` 包（缓冲满时的准入策略）
@@ -1273,6 +1327,121 @@ mod tests {
     }
 
     #[test]
+    fn jb_starts_despite_a_known_mid_hole_after_the_base_packet() {
+        // 基准包之后丢 1 帧、后续全部到达：连续量永远停在 1。
+        // 起播条件必须允许“终点已知的中段洞”，否则永久静音。
+        let mut jb = JitterBuffer::new();
+        assert_eq!(insert(&mut jb, 0, 0, true, 1), InsertResult::Started);
+        assert_eq!(insert(&mut jb, 2, 960, false, 3), InsertResult::Inserted);
+        for i in 3..20u16 {
+            insert(&mut jb, i, 480 * i as u32, false, i as u8 + 1);
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 3), vec![1, 0xFE, 3]);
+        assert!(jb.is_playing(), "已知终点的中段洞不得阻塞起播");
+        assert_eq!(pull_tags(&mut jb, 0, 5), vec![4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn jb_skips_a_leading_hole_before_starting() {
+        // 队首没有可播媒体时（重同步/复位后的罕见状态），跳到最小时间戳：
+        // 尚未播出，不丢任何真实音频。
+        let mut jb = JitterBuffer::new();
+        insert(&mut jb, 0, 0, true, 1);
+        for i in 4..10u16 {
+            insert(&mut jb, i, 480 * i as u32, false, i as u8 + 1);
+        }
+        // 手动模拟“队首槽位缺失”的边界状态：next_ts 指向空洞，槽里只有更晚的包
+        let head = jb.find_ts(0).unwrap();
+        jb.slots[head].valid = false;
+        jb.next_ts = 480;
+        assert_eq!(pull_tags(&mut jb, 0, 3), vec![5, 6, 7]);
+        assert!(jb.is_playing());
+    }
+
+    #[test]
+    fn jb_drops_unmarked_far_future_timestamp() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        let highest = jb.highest_ts();
+        let water = jb.water_ms();
+        // seq 在窗口内、时间戳 +10 s、M=0：伪造包不得拉高 highest_ts/水位
+        assert_eq!(
+            insert(&mut jb, 5, 480 * 3 + 480_000, false, 99),
+            InsertResult::Dropped
+        );
+        assert_eq!(jb.stats.overflow, 1);
+        assert_eq!(jb.highest_ts(), highest, "highest_ts 不得被伪造包拉高");
+        assert_eq!(jb.water_ms(), water, "水位不得饱和到 640 ms");
+        // 真实音频顺序播放，伪造包不会被当成音频
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn jb_recovers_from_consecutive_unmarked_far_jumps() {
+        // 接收端播放头冻结（如 PCM 环满）超过 640 ms 后，发送端仍以 M=0、
+        // 连续序号发新时间线：单包丢弃，连续第 3 个必须重同步自愈。
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        let base = 480 * 3 + 38_400; // next_ts + 800 ms
+        // seq = next_seq + 1：断流期间还丢了一个包
+        assert_eq!(insert(&mut jb, 5, base, false, 5), InsertResult::Dropped);
+        assert_eq!(
+            insert(&mut jb, 6, base + 480, false, 6),
+            InsertResult::Dropped
+        );
+        assert_eq!(
+            insert(&mut jb, 7, base + 960, false, 7),
+            InsertResult::Resync,
+            "连续远跳必须重同步，不能永久丢弃"
+        );
+        for i in 8..12u16 {
+            insert(
+                &mut jb,
+                i,
+                base + 480 * (i as u32 - 5),
+                false,
+                i as u8,
+            );
+        }
+        // 新时间线按序起播，后续真包能播出
+        assert_eq!(pull_tags(&mut jb, 0, 3), vec![7, 8, 9]);
+        assert!(jb.is_playing());
+    }
+
+    #[test]
+    fn jb_three_unmarked_far_jumps_rebase_instead_of_saturating_water() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        let epoch = jb.epoch;
+        let far = 480 * 3 + 480_000; // next_ts + 10 s
+        assert_eq!(insert(&mut jb, 4, far, false, 5), InsertResult::Dropped);
+        assert_eq!(
+            insert(&mut jb, 5, far + 480, false, 6),
+            InsertResult::Dropped
+        );
+        // 前两个伪造包不得拉高最高时间戳/水位
+        assert_eq!(jb.highest_ts(), 480 * 3);
+        assert_eq!(jb.water_ms(), 40);
+        // 第三个触发重同步：缓冲被重置到新基准，水位不得饱和到 640 ms
+        assert_eq!(
+            insert(&mut jb, 6, far + 960, false, 7),
+            InsertResult::Resync
+        );
+        assert!(jb.epoch > epoch);
+        assert!(!jb.is_playing());
+        assert_eq!(jb.next_ts(), far as u64 + 960);
+        assert_eq!(jb.highest_ts(), far as u64 + 960);
+        assert_eq!(jb.water_ms(), FRAME_MS, "重同步后水位必须归到单帧");
+        assert_eq!(jb.stats.overflow, 2);
+    }
+
+    #[test]
     fn jb_accepts_lagging_seq_without_rebuild() {
         // DTX 期间发送端只推进时间戳、不推进序号；接收端 PLC/静音也**不**推进
         // next_seq。恢复包序号可能落后，但时间戳合法：按时间戳接纳，绝不重建。
@@ -1460,6 +1629,18 @@ mod tests {
     }
 
     // ── 到达时刻追踪（总延迟估算）──
+
+    #[test]
+    fn arrival_of_out_of_order_uses_the_matching_timestamp() {
+        let mut jb = JitterBuffer::new();
+        insert(&mut jb, 0, 0, true, 1);
+        insert(&mut jb, 2, 960, false, 2); // 乱序先到
+        let at_960 = jb.arrival_of(960).expect("960 已到达");
+        insert(&mut jb, 1, 480, false, 3); // 旧包后到
+        // 查询 960 不得返回后到的 480 的到达时刻（按到达顺序倒查会返回它）
+        assert_eq!(jb.arrival_of(960), Some(at_960));
+        assert!(jb.arrival_of(480).is_some());
+    }
 
     #[test]
     fn arrival_trace_reports_when_frame_landed() {

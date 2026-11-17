@@ -53,11 +53,16 @@ pub(crate) fn start_broadcast_state_machine(session: Arc<Session>) {
 // ══════════════════════════════════════════════
 pub(crate) fn start_broadcast_listener(session: Arc<Session>) {
     std::thread::spawn(move || {
-        let socket = match std::net::UdpSocket::bind(("0.0.0.0", protocol::DISCOVER_PORT)) {
-            Ok(s) => s,
-            Err(e) => {
-                logf!("[Discovery] 绑定广播端口失败: {}", e);
-                return;
+        // 发现端口可能被短暂占用（旧实例退出、系统服务重启）。绑定失败
+        // 就返回会让 Android 永远发现不了本机，而 UI 只会显示“等待连接”。
+        // 每 5 s 重试，直到成功；原有限流逻辑不变。
+        let socket = loop {
+            match std::net::UdpSocket::bind(("0.0.0.0", protocol::DISCOVER_PORT)) {
+                Ok(s) => break s,
+                Err(e) => {
+                    logf!("[Discovery] 绑定广播端口失败: {}（5 s 后重试）", e);
+                    std::thread::sleep(Duration::from_secs(5));
+                }
             }
         };
         let mut buf = [0u8; 1500];

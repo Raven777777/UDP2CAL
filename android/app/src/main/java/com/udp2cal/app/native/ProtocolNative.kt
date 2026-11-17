@@ -36,10 +36,7 @@ internal object ProtocolNative {
 
     // ── 控制面 ────────────────────────────────────────────────────────────
 
-    /** `[msgType, payloadLen, id0..id7]`，解析失败为 null */
-    external fun decodeControlHeader(buf: ByteArray, len: Int): LongArray?
-
-    /** 同 [decodeControlHeader]，但要求数据报长度精确匹配 */
+    /** 控制头解析，要求数据报长度精确匹配 */
     external fun parseControl(buf: ByteArray, len: Int): LongArray?
 
     external fun buildControl(msgType: Int, deviceId: ByteArray, payload: ByteArray): ByteArray?
@@ -143,8 +140,6 @@ internal object ProtocolNative {
 
     external fun jbHighestTs(h: Long): Long
 
-    external fun jbStarted(h: Long): Boolean
-
     external fun jbPlaying(h: Long): Boolean
 
     external fun jbPlcRun(h: Long): Int
@@ -155,21 +150,11 @@ internal object ProtocolNative {
 
     external fun jbPulledLength(h: Long): Int
 
-    external fun jbPulledTs(h: Long): Long
-
     external fun jbWaterMs(h: Long): Int
-
-    external fun jbContiguousFrames(h: Long): Int
-
-    external fun jbContiguousMs(h: Long): Int
-
-    external fun jbOccupancyFrames(h: Long): Int
 
     external fun jbOccupancyMs(h: Long): Int
 
     external fun jbArrivalNanosAt(h: Long, ts: Long): Long
-
-    external fun jbReceived(h: Long): Long
 
     external fun jbLate(h: Long): Long
 

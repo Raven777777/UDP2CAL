@@ -47,6 +47,9 @@ const OPUS_SAMPLE_RATE_PER_MS: u32 = 48;
 const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
 /// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
 const MAX_FRAME_BACKLOG: usize = FRAME_INTERLEAVED * 4;
+/// 发送侧允许的流水线深度（帧）：当前时隙 1 帧 + 下一时隙 1 帧。
+/// 超过它的帧是迟到积压，10 ms 节拍永远追不上，必须在入队时丢弃。
+const PCM_MAX_QUEUED_FRAMES: usize = 2;
 // 端点空闲时**不再**由发送端合成静音：接收端在本机用静音维持
 // AudioTrack，RTP 只在有真实媒体时发送。这样端点失效不会被静音掩盖。
 /// 帧长（毫秒）：发送节拍与空闲时间戳补偿的基准
@@ -698,6 +701,18 @@ impl ReverseSender {
                 .max_backlog
                 .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
 
+            // 高精度定时器路径不消费 WASAPI 事件：一次读到 2 个周期或线程被
+            // 抢占后，组帧缓冲会多出整帧。发送严格 1 帧/10 ms，超过流水线
+            // 深度的积压永远等不到节拍，只会永久抬高发送端延迟（40 ms 上限
+            // 只截不断）。丢弃最旧的超额帧，保留最新 1-2 帧；时间戳/序号不动。
+            let excess = backlog_trim(pcm_buf.len(), PCM_MAX_QUEUED_FRAMES);
+            if excess > 0 {
+                pcm_buf.drain(..excess);
+                stats
+                    .dropped_samples
+                    .fetch_add(excess as u64, Ordering::Relaxed);
+            }
+
             // 只发到点的帧：节拍整形。槽位落后超过半个帧就重锚（见 `advance_slot`），
             // 绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
             while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
@@ -849,6 +864,13 @@ fn advance_slot(slot: Instant, gap: Duration, now: Instant) -> Instant {
     } else {
         slot + gap
     }
+}
+
+/// 返回 `pcm_buf` 需要从队首丢弃的交错样本数，使队列不超过 `max_frames` 帧。
+///
+/// 只做数量决策，不碰时间戳/序号：调用方负责 drain 并计入丢样统计。
+fn backlog_trim(len: usize, max_frames: usize) -> usize {
+    len.saturating_sub(max_frames * FRAME_INTERLEAVED)
 }
 
 /// 槽位是否已经"过期到该重锚"：迟到超过半个帧就算。
@@ -1321,6 +1343,37 @@ mod tests {
         assert!(stall + Duration::from_millis(1) < s1);
         // 到了 s1 就正常前进一个 gap
         assert_eq!(advance_slot(s1, GAP, s1), s1 + GAP);
+    }
+
+    #[test]
+    fn backlog_trim_bounds_queue_and_actually_drains_it() {
+        // 2 帧是流水线深度（当前时隙 + 下一时隙），不丢
+        assert_eq!(backlog_trim(FRAME_INTERLEAVED, 2), 0);
+        assert_eq!(backlog_trim(FRAME_INTERLEAVED * 2, 2), 0);
+        // 卡顿后攒到 3/4 帧：最旧的超额帧被丢弃，队列真的下降
+        assert_eq!(backlog_trim(FRAME_INTERLEAVED * 3, 2), FRAME_INTERLEAVED);
+        assert_eq!(
+            backlog_trim(FRAME_INTERLEAVED * 4, 2),
+            FRAME_INTERLEAVED * 2
+        );
+
+        // 模拟连续发送时隙：每轮先到 1 帧，裁剪到流水线深度，再发出 1 帧。
+        // 卡顿攒下的积压必须收敛到 1 帧流水线，而不是停在 40 ms 上限。
+        let mut queued = FRAME_INTERLEAVED * 4;
+        for _ in 0..4 {
+            queued += FRAME_INTERLEAVED;
+            queued -= backlog_trim(queued, PCM_MAX_QUEUED_FRAMES);
+            assert!(
+                queued <= PCM_MAX_QUEUED_FRAMES * FRAME_INTERLEAVED,
+                "裁剪后不得超过流水线深度"
+            );
+            queued = queued.saturating_sub(FRAME_INTERLEAVED);
+            assert!(
+                queued <= FRAME_INTERLEAVED,
+                "每轮发出 1 帧后只允许剩 1 帧流水线"
+            );
+        }
+        assert_eq!(queued, FRAME_INTERLEAVED, "积压必须收敛到流水线深度");
     }
 
     #[test]

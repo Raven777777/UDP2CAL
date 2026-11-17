@@ -79,7 +79,7 @@ use crate::rtp::{
 use crate::{
     BITRATE_AUTO_KBPS, BITRATE_MAX_KBPS, BITRATE_STEPS_KBPS, CONNECT_ACK_PAYLOAD_SIZE,
     CONNECT_PAYLOAD_SIZE, CONTROL_HEADER_SIZE, CONTROL_MAX_PAYLOAD, CONTROL_VERSION,
-    ConnectAckPayload, ConnectPayload, ControlHeader, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE,
+    ConnectAckPayload, ConnectPayload, DEFAULT_LISTEN_PORT, DEVICE_ID_SIZE,
     DEVICE_NAME_MAX, DISCOVER_PORT, DiscoverReply, OPUS_FRAME_MS, OPUS_PAYLOAD_TYPE, TYPE_CONNECT,
     TYPE_CONNECT_ACK, TYPE_DATA, TYPE_DISCOVER_REPLY, TYPE_DISCOVER_REQ, TYPE_MAX_KNOWN,
     build_control, clamp_bitrate_kbps, parse_control, snap_bitrate_kbps,
@@ -383,7 +383,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
     env: Env,
     _this: jobject,
 ) -> jlongArray {
-    let v: [jlong; 46] = [
+    let v: [jlong; 52] = [
         CONTROL_VERSION as jlong,
         CONTROL_HEADER_SIZE as jlong,
         CONTROL_MAX_PAYLOAD as jlong,
@@ -430,6 +430,13 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
         crate::rtp::STEP_TRIM_EXCESS_MS as jlong,
         crate::rtp::STEP_TRIM_HOLD_MS as jlong,
         crate::rtp::STEP_TRIM_MAX_PER_MIN as jlong,
+        // CONNECT 线上语义：Kotlin 复刻一份，必须逐项比对，防两端漂移。
+        crate::OPUS_FLAG_VBR as jlong,
+        crate::OPUS_FLAG_DTX as jlong,
+        crate::OPUS_FLAG_VBR_CONSTRAINT as jlong,
+        crate::OPUS_FLAG_FEC as jlong,
+        crate::OPUS_FLAGS_RESERVED_MASK as jlong,
+        crate::OPUS_COMPLEXITY_MAX as jlong,
     ];
     new_longs(env, &v)
 }
@@ -455,31 +462,8 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
 // ═══════════════════════ 控制面（纯函数） ═══════════════════════
 
 /// `[msg_type, payload_len, id0..id7]`，解析失败返回 null。
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_decodeControlHeader(
-    env: Env,
-    _this: jobject,
-    buf: jbyteArray,
-    len: jint,
-) -> jlongArray {
-    let mut data = Vec::new();
-    if !read_bytes(env, buf, 0, len, &mut data) {
-        return null();
-    }
-    let hdr = match ControlHeader::decode(&data) {
-        Some(h) => h,
-        None => return null(),
-    };
-    let mut out: Vec<jlong> = Vec::with_capacity(2 + DEVICE_ID_SIZE);
-    out.push(hdr.msg_type as jlong);
-    out.push(hdr.payload_len as jlong);
-    for b in hdr.device_id {
-        out.push(b as jlong);
-    }
-    new_longs(env, &out)
-}
-
-/// 与 `decodeControlHeader` 相同，但要求数据报长度精确等于 `15 + payload_len`。
+///
+/// 要求数据报长度精确等于 `15 + payload_len`（只校验头部的入口已删除）。
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseControl(
     env: Env,
@@ -519,6 +503,16 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_parseCo
 fn build_control_args_ok(msg_type: jint, payload_len: jint) -> bool {
     (0..=u8::MAX as jint).contains(&msg_type)
         && (0..=CONTROL_MAX_PAYLOAD as jint).contains(&payload_len)
+}
+
+/// `jint → u8` 必须无损；越界返回 `None`（导出函数据此返回 `null`）。
+fn u8_arg(v: jint) -> Option<u8> {
+    (0..=u8::MAX as jint).contains(&v).then_some(v as u8)
+}
+
+/// `jint → u16` 必须无损；越界返回 `None`。
+fn u16_arg(v: jint) -> Option<u16> {
+    (0..=u16::MAX as jint).contains(&v).then_some(v as u16)
 }
 
 #[unsafe(no_mangle)]
@@ -597,17 +591,42 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_connect
     bitrate_kbps: jint,
     packet_loss: jint,
 ) -> jbyteArray {
+    let (
+        Some(reverse_port),
+        Some(payload_type),
+        Some(frame_ms),
+        Some(complexity),
+        Some(signal),
+        Some(bandwidth),
+        Some(opus_flags),
+        Some(bitrate_kbps),
+        Some(packet_loss),
+    ) = (
+        u16_arg(reverse_port),
+        u8_arg(payload_type),
+        u8_arg(frame_ms),
+        u8_arg(complexity),
+        u8_arg(signal),
+        u8_arg(bandwidth),
+        u8_arg(opus_flags),
+        u16_arg(bitrate_kbps),
+        u8_arg(packet_loss),
+    )
+    else {
+        return null();
+    };
     let p = ConnectPayload {
-        reverse_port: reverse_port as u16,
+        reverse_port,
+        // jint → u32 是位模式保留的（Kotlin 用 Int 承载 SSRC），无需范围校验
         forward_ssrc: forward_ssrc as u32,
-        payload_type: payload_type as u8,
-        frame_ms: frame_ms as u8,
-        complexity: complexity as u8,
-        signal: signal as u8,
-        bandwidth: bandwidth as u8,
-        opus_flags: opus_flags as u8,
-        bitrate_kbps: bitrate_kbps as u16,
-        packet_loss: packet_loss as u8,
+        payload_type,
+        frame_ms,
+        complexity,
+        signal,
+        bandwidth,
+        opus_flags,
+        bitrate_kbps,
+        packet_loss,
     };
     new_bytes(env, &p.encode())
 }
@@ -647,10 +666,14 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_ackEnco
     frame_ms: jint,
     forward_ssrc: jint,
 ) -> jbyteArray {
+    let (Some(payload_type), Some(frame_ms)) = (u8_arg(payload_type), u8_arg(frame_ms)) else {
+        return null();
+    };
     let p = ConnectAckPayload {
+        // jint → u32 是位模式保留的（Kotlin 用 Int 承载 SSRC），无需范围校验
         reverse_ssrc: reverse_ssrc as u32,
-        payload_type: payload_type as u8,
-        frame_ms: frame_ms as u8,
+        payload_type,
+        frame_ms,
         forward_ssrc: forward_ssrc as u32,
     };
     new_bytes(env, &p.encode())
@@ -828,8 +851,6 @@ struct JbInner {
     scratch: Vec<u8>,
     /// 上一次 `pull` 写出的字节数（对应 Kotlin 的 `pulledLength`）
     pulled_len: jint,
-    /// 上一次 `pull` 涉及的时间戳（对应 Kotlin 的 `pulledTs`；WAIT 时保持不变）
-    pulled_ts: u64,
 }
 
 struct JbHandle {
@@ -921,7 +942,6 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbCreat
             jb: JitterBuffer::new(),
             scratch: vec![0u8; OPUS_MAX_PAYLOAD],
             pulled_len: 0,
-            pulled_ts: 0,
         }),
     });
     // SAFETY: `Box::into_raw` 把所有权交给 Kotlin 侧（见模块头部 unsafe
@@ -952,7 +972,6 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbReset
         let mut g = lock(&handle.inner);
         g.jb.reset();
         g.pulled_len = 0;
-        g.pulled_ts = 0;
     }
 }
 
@@ -1033,14 +1052,13 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
         pipe_ms.max(0) as u32,
         &mut scratch[..],
     );
-    let (code, ts, len) = match result {
-        Pull::Packet { len, ts } => (1, ts, len),
-        Pull::Plc { ts } => (2, ts, 0),
-        Pull::Silence { ts } => (3, ts, 0),
-        Pull::Wait => (0, 0, 0),
+    let (code, len) = match result {
+        Pull::Packet { len, .. } => (1, len),
+        Pull::Plc { .. } => (2, 0),
+        Pull::Silence { .. } => (3, 0),
+        Pull::Wait => (0, 0),
     };
     if code != 0 {
-        g.pulled_ts = ts;
         g.pulled_len = len as jint;
         if len > 0 && !write_bytes(env, out, 0, &scratch[..len]) {
             // 帧已经从缓冲里取走了（游标已前进）：不能对外报 Wait（那会让上层
@@ -1059,7 +1077,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPull(
 ///
 /// 返回负载长度；`0` 表示播放位的包还没到（或句柄无效），调用方退回 PLC。
 /// 与 `jbPull` 的 `WAIT`(0) 同值但语义不同：本函数**不推进**任何游标，
-/// 也不会改变 `pulledLen`/`pulledTs`（那两个描述的是上一次 `jbPull` 的结果）。
+/// 也不会改变 `pulledLen`（它描述的是上一次 `jbPull` 的结果）。
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPeek(
     env: Env,
@@ -1104,14 +1122,13 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_jbPullT
     let mut scratch = std::mem::take(&mut g.scratch);
     ensure_payload_capacity(&mut scratch);
     let result = g.jb.pull_trim(&mut scratch[..]);
-    let (code, ts, len) = match result {
-        Pull::Packet { len, ts } => (1, ts, len),
-        Pull::Plc { ts } => (2, ts, 0),
-        Pull::Silence { ts } => (3, ts, 0),
-        Pull::Wait => (0, 0, 0),
+    let (code, len) = match result {
+        Pull::Packet { len, .. } => (1, len),
+        Pull::Plc { .. } => (2, 0),
+        Pull::Silence { .. } => (3, 0),
+        Pull::Wait => (0, 0),
     };
     if code != 0 {
-        g.pulled_ts = ts;
         g.pulled_len = len as jint;
         if len > 0 && !write_bytes(env, out, 0, &scratch[..len]) {
             g.pulled_len = 0;
@@ -1168,11 +1185,6 @@ jb_scalar!(
     |g: &JbInner| g.jb.highest_ts() as jlong
 );
 jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbStarted,
-    jboolean,
-    |g: &JbInner| g.jb.is_started()
-);
-jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbPlaying,
     jboolean,
     |g: &JbInner| g.jb.is_playing()
@@ -1193,39 +1205,14 @@ jb_scalar!(
     |g: &JbInner| g.pulled_len
 );
 jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbPulledTs,
-    jlong,
-    |g: &JbInner| g.pulled_ts as jlong
-);
-jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbWaterMs,
     jint,
     |g: &JbInner| g.jb.water_ms() as jint
 );
 jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbOccupancyFrames,
-    jint,
-    |g: &JbInner| g.jb.occupancy_frames() as jint
-);
-jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbOccupancyMs,
     jint,
     |g: &JbInner| g.jb.occupancy_ms() as jint
-);
-jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbContiguousMs,
-    jint,
-    |g: &JbInner| g.jb.contiguous_ms() as jint
-);
-jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbContiguousFrames,
-    jint,
-    |g: &JbInner| g.jb.contiguous_frames() as jint
-);
-jb_scalar!(
-    Java_com_udp2cal_app_native_ProtocolNative_jbReceived,
-    jlong,
-    |g: &JbInner| g.jb.stats.received as jlong
 );
 jb_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_jbLate,
@@ -1798,6 +1785,45 @@ mod tests {
         assert!(!build_control_args_ok(TYPE_CONNECT as jint, jint::MAX));
         // 负长度（GetArrayLength 正常不会给，但 JNI 边界不当假设）
         assert!(!build_control_args_ok(TYPE_CONNECT as jint, -1));
+    }
+
+    /// 越界字段必须在 `new_bytes` 之前返回 null，而不是静默截断（356 → 100）。
+    /// 只走拒绝路径，故可用空 `Env`：这些分支不碰 JNI 函数表。
+    #[test]
+    fn connect_and_ack_encode_reject_out_of_range_fields() {
+        let env: Env = std::ptr::null_mut();
+        let this: jobject = std::ptr::null_mut();
+        let connect = |payload_type: jint, frame_ms: jint, packet_loss: jint| unsafe {
+            Java_com_udp2cal_app_native_ProtocolNative_connectEncode(
+                env,
+                this,
+                0,
+                1,
+                payload_type,
+                frame_ms,
+                0,
+                0,
+                4,
+                crate::OPUS_FLAG_VBR as jint,
+                0,
+                packet_loss,
+            )
+        };
+        assert!(connect(OPUS_PAYLOAD_TYPE as jint, OPUS_FRAME_MS as jint, 356).is_null());
+        assert!(connect(256, OPUS_FRAME_MS as jint, 0).is_null());
+        assert!(connect(OPUS_PAYLOAD_TYPE as jint, 300, 0).is_null());
+
+        let ack = |frame_ms: jint| unsafe {
+            Java_com_udp2cal_app_native_ProtocolNative_ackEncode(
+                env,
+                this,
+                0,
+                OPUS_PAYLOAD_TYPE as jint,
+                frame_ms,
+                0,
+            )
+        };
+        assert!(ack(300).is_null());
     }
 
     /// 复用缓冲的尺寸必须与 `OPUS_MAX_PAYLOAD` 恰好一致：偏小会把可播帧当

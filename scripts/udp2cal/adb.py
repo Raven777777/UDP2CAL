@@ -47,8 +47,12 @@ def _ensure_device(adb: Path, logger) -> bool:
         logger.error("未检测到 Android 设备")
         logger.hint("确认 1) USB 调试已开启  2) adb 驱动已安装  3) 已在设备上授权本机")
         return False
-    for serial in serials:
-        logger.ok("设备已连接: {}".format(serial))
+    if len(serials) > 1:
+        # adb 不会自动挑设备，带 -s 才是正确做法；本工具只支持单设备
+        logger.error("检测到多台设备: {}".format(", ".join(serials)))
+        logger.hint("请断开其他设备，只保留一台后重试")
+        return False
+    logger.ok("设备已连接: {}".format(serials[0]))
     return True
 
 
@@ -159,7 +163,10 @@ def run_adb(ctx, logger) -> int:
         index += 1
         logger.step(index, total, "清空 Logcat 缓冲")
         assert adb is not None
-        runner.run([str(adb), "logcat", "-c"], logger=logger, tail_lines=10)
+        result = runner.run([str(adb), "logcat", "-c"], logger=logger, tail_lines=10)
+        if not result.ok:
+            logger.error("清空 Logcat 失败（退出码 {}）".format(result.code))
+            return 1
         logger.ok("缓冲已清空")
 
     if actions["winlog"]:
@@ -171,18 +178,19 @@ def run_adb(ctx, logger) -> int:
         index += 1
         logger.step(index, total, "Logcat 监控")
         assert adb is not None
-        _monitor(adb, logger)
+        if not _monitor(adb, logger):
+            return 1
 
     return 0
 
 
-def _monitor(adb: Path, logger) -> None:
+def _monitor(adb: Path, logger) -> bool:
     logger.blank()
     logger.info("请在手机上：打开 udp2cal → 点击「开始采集」")
     logger.info("按 Ctrl+C 退出监控")
     logger.blank()
     try:
-        runner.run(
+        result = runner.run(
             [str(adb), "logcat", "-v", "time", "-s"] + LOGCAT_TAGS.split(),
             logger=logger,
             tail_lines=10,
@@ -190,6 +198,10 @@ def _monitor(adb: Path, logger) -> None:
     except KeyboardInterrupt:
         logger.blank()
         logger.ok("已停止 Logcat 监控")
+        return True
+    if not result.ok:
+        logger.error("Logcat 监控异常退出（退出码 {}）".format(result.code))
+    return result.ok
 
 
 def _open_winlog(logger) -> None:

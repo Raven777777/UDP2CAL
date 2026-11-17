@@ -124,7 +124,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | UI（Windows） | iced 0.14（tiny-skia 软件渲染，禁用 wgpu） | 固定窗口、深色卡片、实时电平；单行状态栏按连接状态切换 |
 | 网络 | Kotlin Coroutines / Rust tokio | 控制包与正向 RTP **共用一个 socket**，靠首字节解复用；Windows 防火墙覆盖专用/公用网络，仅对本地子网放行 |
 | 采集（Android） | `AudioRecord` 48 kHz 单声道 | `READ_BLOCKING` 累积到整帧再编码；语音模式决定音源与 AEC（创建时定型） |
-| 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
+| 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形；发送队列上限 2 帧，超额丢最旧，不做无界积压 |
 | 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | Deep PLC；DRED 不启用（接收端无解析/恢复路径）；负载上限 1275 字节，超限丢帧不截断 |
 | 时钟 | 三个时间参考 | RTP 媒体时间、接收端 QPC/`Instant`、声卡设备进度（Windows `IAudioClock::GetPosition`，Android 播放头）；映射规则见协议 7.9/7.10 |
 | 输出（Windows） | cpal 0.18 / WASAPI | 无锁 SPSC 环（341 ms）+ 显式 10 ms 设备缓冲 + 事件驱动回调 |
@@ -237,8 +237,8 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 - 单文件上限 2 MiB，超限后轮转为 `udp2cal.1.log`（只保留一轮）
 - 记录：启动版本、防火墙结果、托盘降级、音频初始化、P2P 绑定/SSRC/反向端口变化、
   反向编码配置变更、发送错误计数、每 30 s 一次的音频统计（块数/重采样/丢样/欠载、
-  总延迟与比率微调）与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）、
-  每 10 s 一行的水位分解（抖动缓冲 + 解码环 + 声卡）、比率与反馈/前馈量
+  总延迟与比率微调、水位分解（抖动缓冲 + 解码环 + 声卡）、比率与反馈/前馈量）
+  与 RTP 统计（收包/迟到/重复/溢出/重同步/PLC/水位/SSRC）
 - UI 底部为**单行**状态行，按连接状态切换内容（三种状态互斥，永远只占一行）：
   - 未启动：`广播地址: 255.255.255.255:44043`
   - 已启动未连上：`广播地址…` + `● 广播中`（被占用静默时显示 `● 已静音`）
@@ -351,7 +351,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | tokio 接收流（iced subscription） | `recv_from`、解复用、校验、插抖动缓冲、回 ACK | 解码、阻塞等待播放 |
 | `udp2cal-decode` | 按播放头拉取、解码/PLC、两级漂移校正、重采样、写环 | 网络 IO、用定时器当节拍 |
 | `udp2cal-audio`（cpal 回调） | pop PCM、补静音、发布 `played_frames` 与声卡延迟、unpark | 加锁、分配、调用 Opus、写日志 |
-| `reverse-capture` | WASAPI 环回 → 10 ms 组帧 → 1 帧节拍整形 → Opus → RTP | 应用层积压、等待 ACK |
+| `reverse-capture` | WASAPI 环回 → 10 ms 组帧 → 1 帧节拍整形（队列上限 2 帧，超额丢最旧） → Opus → RTP | 无界应用层积压、等待 ACK |
 | 广播 / 发现线程 | 每秒 `DISCOVER_REPLY`、应答 `DISCOVER_REQ` | 触碰音频路径 |
 
 ### 关键实现点（规则本身见协议第七章）
@@ -369,7 +369,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 前馈管设备钟差 + 反馈管长期残差 | `rtp::DeviceRateEstimator` / `rtp::DriftController` | 前馈观测 `(设备帧, QPC)`，测的是媒体时钟相对**声卡设备时钟**的频差；反馈对 4 s 低通后的水位做慢 PI，只修长期残差。网络攒批不进入前馈，因此不会变成变调 |
 | 没有播放头，也没有偏移记账 | 旧 `PlayheadClock`（base/余数/offset/`note_*`）已删除 | 一旦存在"设备帧↔媒体时间戳"换算，就必须记住偏移；改为纯水位口径后，`played_frames` 不参与任何播放判定，换算链与三处补丁一起消失 |
 | flush 只投递请求 | `audio.rs::Ring::request_flush` | `tail` 归消费者所有；生产者直接写会让 `len()` 回绕成 `usize::MAX`，解码线程永久停产（静默死锁） |
-| 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后不补发（补发就是突发） |
+| 1 帧节拍整形 | `capture.rs`：发送时刻钉在 10 ms 网格；队列上限 2 帧，超额丢最旧 | 环回事件成簇交货，直接发会让接收端水位呈锯齿；落后不补发（补发就是突发），卡顿积压丢最旧而不是永久抬高延迟 |
 | 节拍等待用高精度定时器 | `hires.rs::HiResTimer`（`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`） | Windows 默认定时器分辨率 15.6 ms，会把 10 ms 网格量化成 15.6 ms 的稳定偏移（实测 avg 迟到 15.8 ms）。不调 `timeBeginPeriod`：那是进程级全局状态 |
 | 迟到半个帧就重锚 | `capture.rs::slot_is_late` + `advance_slot`（重锚值 `now + gap`） | 偏移一旦形成会被每帧复制、永远到不了"落后 4 帧"的旧阈值；重锚返回 `now` 又会让积压帧当轮连发 |
 | 重锚帧不计入迟到统计 | `capture.rs::ReverseStats.reanchors` | 迟到量描述"网格多准"，不是"停顿多久"：一次 8 s 无声间隔曾把窗口均值从 0.3 ms 拉到 4.2 ms |

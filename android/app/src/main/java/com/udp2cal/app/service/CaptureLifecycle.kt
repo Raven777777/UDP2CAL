@@ -154,7 +154,6 @@ internal class CaptureLifecycle(
         }
 
         hasNewCapture = true
-        val voiceMode = isVoiceMode()
         val deviceId = DiscoveryManager.getOrCreateDeviceId()
         activeParams = params
         restartPending = false
@@ -187,6 +186,9 @@ internal class CaptureLifecycle(
 
                 // ── 正向编码器（固定 48 kHz / 10 ms / 单声道）──
                 val cfg = forward.prepare(params.testTone) ?: return@launch
+                // 音源/路由/AEC 都用 prepare() 的同一快照，避免连接期间切
+                // 音乐↔语音时 AudioRecord 与 voiceMode 来自两个不同时刻。
+                val voiceMode = cfg.voiceMode()
 
                 // ── 反向链路：解码器 + 接收协程（PC→Phone，立体声）──
                 reverse.startSession(sender)
@@ -216,7 +218,7 @@ internal class CaptureLifecycle(
                 }
 
                 // 采集热循环钉到专用线程（见 micDispatcher）
-                forward.run(sender, voiceMode, params.testTone)
+                forward.run(sender, cfg, params.testTone)
             } catch (_: CancellationException) {
             } catch (e: Exception) {
                 Log.e(TAG, "采集异常", e)
@@ -398,9 +400,6 @@ internal class CaptureLifecycle(
     override fun ensurePlayer(voiceMode: Boolean, sessionId: Int) {
         reverse.ensurePlayer(voiceMode, sessionId)
     }
-
-    /** 语音模式：VOICE_COMMUNICATION + 硬件降噪 + AEC */
-    private fun isVoiceMode(): Boolean = Prefs.opusSignal == 3001
 }
 
 /** 单线程执行器 → 协程调度器（热循环专用） */

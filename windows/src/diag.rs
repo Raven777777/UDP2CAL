@@ -4,8 +4,9 @@
 //! （音频 / 抖动缓冲 / 反向链路）随 `Session` 走，日志函数显式接收它。
 
 use crate::logf;
+use crate::protocol;
 use crate::session::Session;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// 音频电平（dBFS），解码线程每 100 ms 更新一次
 pub(crate) static AUDIO_LEVEL_DB: AtomicU32 = AtomicU32::new((-60.0f32).to_bits());
@@ -24,6 +25,33 @@ pub(crate) static DRIFT_ADJUST_BITS: AtomicU32 = AtomicU32::new(0);
 
 /// 用 Opus 带内 FEC 重建成功的帧数（每个统计窗口清零，诊断用）
 pub(crate) static FEC_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+// ── 解码线程水位/比率快照 ──
+//
+// 解码线程只写原子量，日志统一由 UI 线程在 `log_periodic_stats` 里输出：
+// 实时线程每 10 s 同步写盘，在慢盘/日志轮转时会阻塞超过 PCM 环的 40 ms，
+// 造成周期性的可闻欠载（capture.rs 同样禁止发送线程写日志）。
+pub(crate) static DECODE_JB_WATER_MS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static DECODE_PIPE_MS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static DECODE_WATER_TARGET_MS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static DECODE_DEVICE_MS: AtomicU32 = AtomicU32::new(0);
+/// 反馈 Δu / 前馈 r̂ / σ（ppm，f64 位模式）
+pub(crate) static DECODE_DU_PPM_BITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DECODE_FF_PPM_BITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DECODE_SIGMA_PPM_BITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DECODE_BUCKETS: AtomicU32 = AtomicU32::new(0);
+
+/// 阶跃吸收事件快照：`STEP_EVENT` 是类型，其余字段是一次事件的内容。
+pub(crate) const STEP_EVENT_NONE: u8 = 0;
+pub(crate) const STEP_EVENT_TRIMMED: u8 = 1;
+pub(crate) const STEP_EVENT_LIMITED: u8 = 2;
+pub(crate) static STEP_EVENT: AtomicU8 = AtomicU8::new(STEP_EVENT_NONE);
+pub(crate) static STEP_BEFORE_MS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static STEP_WANT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static STEP_SKIPPED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static STEP_WATER_MS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static STEP_TRIMS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STEP_WINDOW_TRIMS: AtomicU32 = AtomicU32::new(0);
 
 /// RTP 接收计数（诊断用）
 pub(crate) static RTP_RX_PACKETS: AtomicU64 = AtomicU64::new(0);
@@ -57,6 +85,50 @@ pub(crate) fn log_periodic_stats(session: &Session) {
         DEVICE_LATENCY_MS.load(Ordering::Relaxed),
         f32::from_bits(DRIFT_ADJUST_BITS.load(Ordering::Relaxed)) * 100.0
     );
+    // 解码线程快照（原每 10 s 的 [Latency] 行，搬到 UI 线程输出）
+    let jb_water = DECODE_JB_WATER_MS.load(Ordering::Relaxed);
+    let pipe_ms = DECODE_PIPE_MS.load(Ordering::Relaxed);
+    let total_water = jb_water.saturating_add(pipe_ms);
+    logf!(
+        "[Latency] 总延迟≈{}ms（水位 {}ms = 抖动 {} + 解码 {}，目标 {}）声卡 {}ms 比率 {:+.3}%（反馈 {:+.0}ppm / 前馈 {:+.1}ppm，σ {:.1}ppm，{} 桶，阶跃裁剪 {} 帧）",
+        LATENCY_MS.load(Ordering::Relaxed),
+        total_water,
+        jb_water,
+        pipe_ms,
+        DECODE_WATER_TARGET_MS.load(Ordering::Relaxed),
+        DECODE_DEVICE_MS.load(Ordering::Relaxed),
+        f32::from_bits(DRIFT_ADJUST_BITS.load(Ordering::Relaxed)) * 100.0,
+        f64::from_bits(DECODE_DU_PPM_BITS.load(Ordering::Relaxed)) * 1e6,
+        f64::from_bits(DECODE_FF_PPM_BITS.load(Ordering::Relaxed)) * 1e6,
+        f64::from_bits(DECODE_SIGMA_PPM_BITS.load(Ordering::Relaxed)),
+        DECODE_BUCKETS.load(Ordering::Relaxed),
+        j.step_trims,
+    );
+    // 阶跃吸收事件（原解码线程内联日志，同样搬到 UI 线程）
+    match STEP_EVENT.swap(STEP_EVENT_NONE, Ordering::Acquire) {
+        STEP_EVENT_TRIMMED => {
+            let skipped = STEP_SKIPPED.load(Ordering::Relaxed);
+            logf!(
+                "[Step] 阶跃吸收：整帧跳 {} / {} 帧（{}ms），水位 {}→{}ms，累计 {} 帧",
+                skipped,
+                STEP_WANT.load(Ordering::Relaxed),
+                skipped * protocol::rtp::FRAME_MS,
+                STEP_BEFORE_MS.load(Ordering::Relaxed),
+                STEP_WATER_MS.load(Ordering::Relaxed),
+                STEP_TRIMS.load(Ordering::Relaxed)
+            );
+        }
+        STEP_EVENT_LIMITED => {
+            logf!(
+                "[Step] 水位 {}ms（目标 {}）命中阶跃吸收，但每分钟 {} 次限额已满（本窗口已用 {} 次）：本次只记录不裁剪",
+                STEP_BEFORE_MS.load(Ordering::Relaxed),
+                DECODE_WATER_TARGET_MS.load(Ordering::Relaxed),
+                protocol::rtp::STEP_TRIM_MAX_PER_MIN,
+                STEP_WINDOW_TRIMS.load(Ordering::Relaxed)
+            );
+        }
+        _ => {}
+    }
     logf!(
         "[RTP] 收={} 字节={} 迟到={} 重复={} 溢出={} 重同步={} PLC={}(hold {}) 峰值={} FEC={} 水位={}ms SSRC={:#010x}",
         j.received,

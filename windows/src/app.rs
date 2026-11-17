@@ -8,6 +8,7 @@ use crate::logf;
 use crate::logger;
 use crate::net;
 use crate::power;
+use crate::protocol;
 use crate::session;
 use crate::tray;
 use crate::ui;
@@ -308,6 +309,15 @@ impl AppState {
                         self.notice_level = NoticeLevel::Error;
                         return Task::none();
                     }
+                    // 44043 是常驻发现服务的绑定端口：监听它必定冲突，
+                    // 而且坏端口一旦落盘，之后每次启动都会失败。
+                    if port == protocol::DISCOVER_PORT {
+                        self.notice = format!(
+                            "端口 {port} 保留给局域网发现服务，请改用其它端口"
+                        );
+                        self.notice_level = NoticeLevel::Error;
+                        return Task::none();
+                    }
                     // 监听地址必须是本机地址；空/非法值会让 bind 直接失败
                     let ip = self.ip_input.trim().to_string();
                     if ip.is_empty() {
@@ -396,8 +406,12 @@ impl AppState {
                 if bound != self.connected {
                     self.connected = bound;
                     if bound {
-                        // 音频真正流动起来后清掉历史错误与断开标记
-                        self.notice.clear();
+                        // 音频真正流动起来后清掉历史错误与断开标记。
+                        // 只清 Info：配置保存失败等 Error 提示必须保留，
+                        // 否则用户重启后发现端口/开关静默回退且无线索。
+                        if self.notice_level == NoticeLevel::Info {
+                            self.notice.clear();
+                        }
                         self.status_text.clear();
                     } else if self.is_running {
                         self.last_bitrate = 0.0;
@@ -448,6 +462,10 @@ impl AppState {
                         req.addr.ip()
                     );
                     self.pending_pair = Some(req);
+                } else {
+                    // UI 已有待确认弹窗时丢弃新请求，但必须释放控制面的提示槽：
+                    // 该槽已属于这个被丢弃的请求，不清会让后续设备永远 Ignore。
+                    self.session.clear_pairing_prompt();
                 }
                 Task::none()
             }

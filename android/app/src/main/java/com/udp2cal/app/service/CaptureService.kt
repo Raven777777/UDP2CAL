@@ -106,7 +106,14 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
         testTone: Boolean = false,
     ) = lifecycle.startCapture(sampleRateHz, bitrateKbps, targetIp, targetPort, testTone)
 
-    fun stopCapture() = lifecycle.stopCapture()
+    fun stopCapture() {
+        // 先停通知收集器：否则 IO 侧收到 connected=false 后会在
+        // CaptureLifecycle 的 stopForeground 之后再次 startForeground，
+        // 停止后仍显示"等待连接"的通知。
+        notificationJob?.cancel()
+        notificationJob = null
+        lifecycle.stopCapture()
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

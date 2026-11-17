@@ -29,8 +29,9 @@ const DEFAULT_LISTEN_PORT: u32 = 44044;
 /// 超出 1..=65535 的值必须在加载时归一，因为下游有多处 `as u16` 截断
 /// （DISCOVER_REPLY 广播、防火墙规则），截断后的回绕端口与实际 bind 用值
 /// 不一致：广播出去的是错端口、防火墙放行的是错端口，而 bind 反而失败。
+/// 发现端口（44043）由常驻发现服务占用，监听它必定 bind 失败，同样归一。
 fn sanitize_port(v: u32) -> u32 {
-    if (1..=65535).contains(&v) {
+    if (1..=65535).contains(&v) && v != u32::from(udp2cal_protocol::DISCOVER_PORT) {
         v
     } else {
         DEFAULT_LISTEN_PORT
@@ -182,6 +183,12 @@ mod tests {
                 "非法端口 {p} 必须归一为默认值"
             );
         }
+        // 发现端口被常驻发现服务占用，监听它必定失败：加载时必须归一，
+        // 否则坏端口会一直留在注册表里，每次启动都 bind 失败。
+        assert_eq!(
+            sanitize_port(u32::from(udp2cal_protocol::DISCOVER_PORT)),
+            DEFAULT_LISTEN_PORT
+        );
         // 归一后的值必须能安全地截断成 u16
         assert_eq!(sanitize_port(u32::MAX) as u16, DEFAULT_LISTEN_PORT as u16);
     }

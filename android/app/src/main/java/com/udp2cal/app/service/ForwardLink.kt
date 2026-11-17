@@ -67,6 +67,9 @@ internal data class EncoderCfg(
     }
 }
 
+/** 语音模式：由编码器快照（而非再次读 Prefs）决定音源与 AEC 路由。 */
+internal fun EncoderCfg.voiceMode(): Boolean = signal == 3001
+
 /** 音源描述枚举 */
 private object AudioSourceLabel {
     const val MIC_RAW = "MIC直出"
@@ -147,7 +150,7 @@ internal class ForwardLink(
         )
         encoder = enc
         appliedCfg = cfg0
-        appliedSignal = Prefs.opusSignal
+        appliedSignal = cfg0.signal
         appliedTestTone = testTone
         if (!enc.start()) {
             host.fail("编码器初始化失败")
@@ -161,11 +164,12 @@ internal class ForwardLink(
     }
 
     /** 采集热循环；运行在 [dispatcher] 这条专用单线程上（见 CaptureLifecycle 注释） */
-    suspend fun run(sender: UdpSender, voiceMode: Boolean, testTone: Boolean) {
+    suspend fun run(sender: UdpSender, cfg: EncoderCfg, testTone: Boolean) {
         val enc = encoder ?: return
+        val voiceMode = cfg.voiceMode()
         withContext(dispatcher) {
             if (testTone) runTestToneLoop(enc, sender, voiceMode)
-            else runMicCaptureLoop(enc, sender, voiceMode)
+            else runMicCaptureLoop(enc, sender, cfg)
         }
     }
 
@@ -185,7 +189,8 @@ internal class ForwardLink(
         aecInstance = null
     }
 
-    private suspend fun runMicCaptureLoop(enc: OpusEncoder, sender: UdpSender, voiceMode: Boolean) {
+    private suspend fun runMicCaptureLoop(enc: OpusEncoder, sender: UdpSender, cfg: EncoderCfg) {
+        val voiceMode = cfg.voiceMode()
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
@@ -208,7 +213,7 @@ internal class ForwardLink(
         // 音源候选（按优先级）：首选音源初始化失败时回退 MIC 直出。
         // 3003=UNPROCESSED / 3004=VOICE_RECOGNITION 都不做系统降噪处理，
         // 用于绕过系统级 AI 降噪对高频的削切。
-        val attempts: List<Pair<Int, String>> = when (Prefs.opusSignal) {
+        val attempts: List<Pair<Int, String>> = when (cfg.signal) {
             3001 -> listOf(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION to AudioSourceLabel.SYSTEM_NS,
                 MediaRecorder.AudioSource.MIC to AudioSourceLabel.SYSTEM_NS_FALLBACK,

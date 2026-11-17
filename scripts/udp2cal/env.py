@@ -195,14 +195,20 @@ def select_java(
 
     if pool:
         highest = pool[0]
+        if highest.major > config.JDK_MAX_MAJOR:
+            logger.error(
+                "当前最高版本为 JDK {}，超出 Gradle 8.9 支持上限 {}，已拒绝使用".format(
+                    highest.major, config.JDK_MAX_MAJOR
+                )
+            )
+            logger.hint("建议安装 JDK 17 或 21：winget install Microsoft.OpenJDK.21")
+            return None
         logger.warn(
             "未找到 JDK {}-{}；当前最高版本为 JDK {}，Gradle 8.9 存在启动失败风险".format(
                 config.JDK_MIN_MAJOR, config.JDK_MAX_MAJOR, highest.major
             )
         )
         logger.hint("建议安装 JDK 17 或 21：winget install Microsoft.OpenJDK.21")
-        if highest.major >= config.JDK_MIN_MAJOR:
-            return highest
     return None
 
 

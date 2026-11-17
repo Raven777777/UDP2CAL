@@ -85,13 +85,23 @@ object DiscoveryManager {
     }
 
     fun getOrCreateDeviceId(): ByteArray {
-        val storedId = Prefs.deviceId
-        if (storedId.isNotEmpty() && storedId.length == Udp2CalProtocol.DEVICE_ID_SIZE * 2) {
-            try { return hexStringToByteArray(storedId) } catch (_: Exception) {}
-        }
+        parseStoredDeviceId(Prefs.deviceId)?.let { return it }
         val newId = Udp2CalProtocol.generateDeviceId()
         Prefs.deviceId = Udp2CalProtocol.deviceIdToString(newId)
         return newId
+    }
+
+    /**
+     * 解析已保存的 device_id；长度不符或全零（prefs 损坏/旧版写坏）都返回 null，
+     * 由调用方重新生成。全零 ID 会被 Windows 静默丢弃，表现为永久重连。
+     */
+    internal fun parseStoredDeviceId(hex: String): ByteArray? {
+        if (hex.length != Udp2CalProtocol.DEVICE_ID_SIZE * 2) return null
+        return try {
+            hexStringToByteArray(hex).takeIf { id -> id.any { it != 0.toByte() } }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     internal fun hexStringToByteArray(s: String): ByteArray {

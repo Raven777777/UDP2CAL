@@ -40,7 +40,7 @@ Android 没有独立的 PCM 环：`ring_ms` 取 `written − playbackHead`，`de
 
 ## 2. 打印基线（不需要任何外部设备）
 
-启动后（debug 构建）每 10 s 会有一行日志：
+启动后（debug 构建）每 30 s 会有一行日志：
 
 ```
 [Latency] 总延迟≈200ms（水位 190ms = 抖动 100 + 解码 90，目标 200）声卡 10ms 比率 -0.004%（反馈 -46ppm / 设备前馈 +4ppm，σ 13.0ppm，24 桶，阶跃裁剪 0 帧）
@@ -145,7 +145,7 @@ WASAPI 的 `IAudioClock` 是驱动自己的采样计数，`playback − callback
 
 ## 5. 高频诊断（P0 基线，实机微调用）
 
-每 10 s 的 `[Latency]` 日志行（debug 构建）给出核心量：总延迟、水位分解
+每 30 s 的 `[Latency]` 日志行（debug 构建）给出核心量：总延迟、水位分解
 （抖动/解码）、目标、声卡延迟、比率、反馈/前馈、σ/桶与阶跃裁剪帧数。旧版
 `UDP2CAL_ASRC_DIAG` CSV 打点已移除。
 
@@ -274,7 +274,7 @@ UDP 筛选器（对端 IP 10.10.10.5）抓 605 s（923k 行 → 五元组去重 
 4. 分析脚本：`C:\Users\21248\AppData\Local\Temp\udp2cal_gap\analyze_udp2cal.py`
    （tshark 字段 CSV → 去重 → 到达间隔/事件/簇/残差；`--min-gap-ms` 调事件阈值）。
 
-换环境后仍要重跑本节的开环采样（看每 10 s 的 `[Latency]` 日志），目标取「实测最大空档 ×1.5–1.6」。
+换环境后仍要重跑本节的开环采样（看每 30 s 的 `[Latency]` 日志），目标取「实测最大空档 ×1.5–1.6」。
 Windows 正向接收可直接用 `UDP2CAL_WATER_TARGET_MS`（允许 80–600 ms，越界钳位，首次读取后
 缓存）现场试；Android 反向接收改 Android 常量。**每个方向独立定值，不要求两端同值。**
 **不要靠压低目标去赢延迟。**

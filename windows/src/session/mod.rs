@@ -409,17 +409,21 @@ impl Session {
             .pairing_denied
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if denied.len() < 16 {
-            denied.push(id);
+        // 表满时淘汰最早的一条：静默丢弃会让 UI 已提示“已拒绝”的设备
+        // 下次 CONNECT 再次弹窗，拒绝等于没生效。淘汰后仍有界。
+        if denied.len() >= 16 {
+            denied.remove(0);
         }
+        denied.push(id);
     }
 
-    fn pairing_action_for(&self, id: u64) -> PairingAction {
+    fn pairing_action_for(&self, id: u64, bound: bool) -> PairingAction {
         pairing_action(
             self.paired_device(),
             id,
             self.is_denied(id),
             self.pairing_prompted.load(Ordering::Acquire),
+            bound,
         )
     }
 
@@ -470,6 +474,11 @@ impl Session {
     }
 
     /// 启动/重启反向发送器：先停旧的，保证同一时刻只有一个线程持有环回端点。
+    ///
+    /// 本函数在 `spawn_blocking` 里排队执行，从入队到真正拿锁之间，会话可能
+    /// 已被停止 / 超时释放 / 被新的 CONNECT 改写参数。因此拿锁后必须重新
+    /// 校验当前绑定：不匹配就只停旧、绝不安装，否则会出现“UI 已停止但仍在
+    /// 采集环回并发送”，或旧参数覆盖新参数。
     fn restart_reverse_sender(&self, addr: SocketAddr, ssrc: u32) {
         // 中毒恢复：槽里只有 Option<ReverseSender>，取回内部值继续操作；
         // 若因中毒直接跳过，旧发送线程会继续跑而日志一无所知。
@@ -479,7 +488,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.stop_reverse_sender_under(&serial);
-        if ssrc != 0 {
+        if should_start_reverse(self.running(), &self.p2p(), addr, ssrc) {
             let sender =
                 capture::ReverseSender::start(addr, ssrc, Arc::clone(&self.reverse_shared));
             *self
@@ -570,7 +579,10 @@ impl Session {
         output: &mut iced::futures::channel::mpsc::Sender<Message>,
     ) {
         // 0（已废弃）与 5..=255（保留）都不是本端要处理的消息
-        if !is_valid_control_header(header) || header.msg_type != protocol::TYPE_CONNECT {
+        if !self.running()
+            || !is_valid_control_header(header)
+            || header.msg_type != protocol::TYPE_CONNECT
+        {
             return;
         }
 
@@ -612,7 +624,7 @@ impl Session {
         // 绑定、不回调反向编码器，只弹一次确认。用户允许后手机的下一次 1 Hz
         // CONNECT 才真正建立会话。
         let device_id = u64::from_be_bytes(header.device_id);
-        match self.pairing_action_for(device_id) {
+        match self.pairing_action_for(device_id, same_device) {
             PairingAction::Allow => {}
             PairingAction::Ignore => return,
             PairingAction::Prompt => {
@@ -650,10 +662,13 @@ impl Session {
             // 新会话：抖动缓冲与解码器状态全部重建
             self.jitter().reset();
             self.wake_decoder();
+            // 绑定成功说明该设备已获准：释放可能属于旧弹窗的提示槽，
+            // 否则后续设备的 CONNECT 会因 prompted != 0 永远被 Ignore。
+            self.clear_pairing_prompt();
             // restart 里的 stop 是同步 join，旧线程卡在启动段时可达几百 ms；
             // 移出接收任务（spawn_blocking），避免顶住 RTP/CONNECT 入栈。
             // ACK 不等线程起来：反向包晚 ~百 ms 到达只多喂几帧 PLC。
-            let addr = SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1));
+            let addr = reverse_target(src_addr, cfg.reverse_port.max(1));
             let this = Arc::clone(self);
             tokio::task::spawn_blocking(move || this.restart_reverse_sender(addr, reverse_ssrc));
             if self.should_log_control_event() {
@@ -716,7 +731,7 @@ impl Session {
             }
             // 同上：restart 含同步 join，移出接收任务；串行锁保证与后续 restart
             // 互斥，限流清除（依赖 restart 完成）也一并移入。
-            let addr = SocketAddr::new(src_addr.ip(), cfg.reverse_port.max(1));
+            let addr = reverse_target(src_addr, cfg.reverse_port.max(1));
             let dead = sender_dead;
             let stale = reverse_stale;
             let port = cfg.reverse_port;
@@ -790,15 +805,48 @@ enum PairingAction {
     Ignore,
 }
 
-/// 纯决策：已批准 → 放行；已拒绝/已有弹窗 → 忽略；否则请求本机确认。
-fn pairing_action(paired: u64, id: u64, denied: bool, prompted: u64) -> PairingAction {
-    if paired == id {
+/// 反向目标地址：IPv6 link-local 必须保留 scope_id，否则 `send_to` 直接失败
+/// （表现为正向有声、反向无声）。`SocketAddr::new` 会丢掉 scope_id。
+fn reverse_target(src: &SocketAddr, port: u16) -> SocketAddr {
+    match src {
+        SocketAddr::V4(_) => SocketAddr::new(src.ip(), port),
+        SocketAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            *v6.ip(),
+            port,
+            v6.flowinfo(),
+            v6.scope_id(),
+        )),
+    }
+}
+
+/// 纯决策：已绑定（`bound`）/ 已批准 → 放行；已拒绝/已有弹窗 → 忽略；否则请求本机确认。
+fn pairing_action(paired: u64, id: u64, denied: bool, prompted: u64, bound: bool) -> PairingAction {
+    if bound || paired == id {
         PairingAction::Allow
     } else if denied || prompted != 0 {
         PairingAction::Ignore
     } else {
         PairingAction::Prompt
     }
+}
+
+/// 重启任务在拿锁后是否仍可安装新发送器。
+///
+/// 任务在 `spawn_blocking` 里排队期间，会话可能被停止 / 超时释放，
+/// 或者绑定已被更晚的 CONNECT 改成另一组地址/端口/SSRC。只有请求参数
+/// 与当前绑定完全一致且仍在运行，安装才是安全的。
+fn should_start_reverse(
+    running: bool,
+    peer: &P2pState,
+    addr: SocketAddr,
+    ssrc: u32,
+) -> bool {
+    ssrc != 0
+        && running
+        && peer.is_busy()
+        && peer.addr.map(|a| a.ip()) == Some(addr.ip())
+        && peer.reverse_port == addr.port()
+        && peer.reverse_ssrc == ssrc
 }
 
 /// 死发送线程的最小重试间隔。

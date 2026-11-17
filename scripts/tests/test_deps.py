@@ -3,9 +3,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import support
-from udp2cal import deps, env as envmod
+from udp2cal import config, deps, env as envmod
 
 FakeLogger = support.FakeLogger
 
@@ -100,6 +101,27 @@ class SdkResolutionTest(unittest.TestCase):
         self.assertEqual(sdk.root, sdk_root)
         self.assertTrue(deps.ensure_local_properties(self.project, sdk, self.logger))
         self.assertEqual(deps.read_sdk_dir(self.project), str(sdk_root))
+
+    def test_write_error_returns_false(self):
+        with patch.object(Path, "write_text", side_effect=OSError("denied")):
+            self.assertFalse(deps.ensure_local_properties(self.project, self.detected, self.logger))
+        self.assertTrue(self.logger.texts("error"))
+
+
+class RustTargetWithoutRustupTest(unittest.TestCase):
+    def setUp(self):
+        self.rust = envmod.RustInfo(Path("cargo"), Path("rustc"), None)
+        self.logger = FakeLogger()
+
+    def test_host_target_is_deferred_to_cargo(self):
+        triple = config.WINDOWS_TARGETS["x64"]
+        self.assertTrue(deps.ensure_rust_target(self.rust, triple, self.logger))
+        self.assertTrue(self.logger.texts("warn"))
+
+    def test_cross_target_without_rustup_fails(self):
+        triple = config.WINDOWS_TARGETS["x86"]
+        self.assertFalse(deps.ensure_rust_target(self.rust, triple, self.logger))
+        self.assertTrue(self.logger.texts("error"))
 
 
 if __name__ == "__main__":

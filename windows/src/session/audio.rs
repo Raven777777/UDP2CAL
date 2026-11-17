@@ -5,7 +5,13 @@
 use super::Session;
 use crate::audio;
 use crate::decoder;
-use crate::diag::{AUDIO_LEVEL_DB, DEVICE_LATENCY_MS, DRIFT_ADJUST_BITS, FEC_FRAMES, LATENCY_MS};
+use crate::diag::{
+    AUDIO_LEVEL_DB, DECODE_BUCKETS, DECODE_DEVICE_MS, DECODE_DU_PPM_BITS, DECODE_FF_PPM_BITS,
+    DECODE_JB_WATER_MS, DECODE_PIPE_MS, DECODE_SIGMA_PPM_BITS, DECODE_WATER_TARGET_MS,
+    DEVICE_LATENCY_MS, DRIFT_ADJUST_BITS, FEC_FRAMES, LATENCY_MS, STEP_BEFORE_MS, STEP_EVENT,
+    STEP_EVENT_LIMITED, STEP_EVENT_TRIMMED, STEP_SKIPPED, STEP_TRIMS, STEP_WANT, STEP_WATER_MS,
+    STEP_WINDOW_TRIMS,
+};
 use crate::logf;
 use crate::power;
 use crate::protocol;
@@ -134,7 +140,6 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             let mut rms_sum = 0.0f64;
             let mut rms_count = 0u64;
             let mut last_stats = Instant::now();
-            let mut last_latency_log = Instant::now();
             let mut last_packet_at = Instant::now();
             let mut last_newest_ts = 0u64;
             let mut idle_feedback = false;
@@ -188,6 +193,11 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     match rebuilt {
                         Some(a) => {
                             aw = a;
+                            // 重建期间解码线程停止 pull，但网络线程仍在持续入包：
+                            // 不清空会留下一个“旧播放头 … 最新包”之间永不闭合的空洞，
+                            // 恢复后只能靠 ASRC + PLC 慢慢排水。epoch 变化会让下一轮
+                            // 顺带重建解码器与全部估计器。
+                            spawn_session.jitter().reset();
                             device_rate = aw.device_rate.max(1);
                             // 新流的设备时钟/播放头从 0 重新开始，旧估计器历史必须作废。
                             drift = protocol::rtp::DriftController::new(device_rate);
@@ -232,6 +242,9 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
 
                 let (pull, jb_water, newest_ts, arrival, trims, step_hit, playing) = {
                     let mut jb = spawn_session.jitter();
+                    // 播放头在 pull / 裁剪之前取值：它们都会推进 next_ts，
+                    // 用推进后的值扣 queued_media 会把可听点算新一帧。
+                    let play_ts = jb.next_ts();
 
                     // ── 阶跃吸收（方案 C）：持续超额才裁，且逐帧解码后再丢 PCM ──
                     // 判据：总水位持续 STEP_TRIM_HOLD_MS 超过 target+STEP_TRIM_EXCESS_MS。
@@ -267,9 +280,8 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     }
 
                     let r = jb.pull(ring_ms, pipe_ms, &mut payload);
-                    let next_ts = jb.next_ts();
                     let highest = jb.highest_ts();
-                    let audible_ts = next_ts.saturating_sub(queued_media);
+                    let audible_ts = play_ts.saturating_sub(queued_media);
                     (
                         r,
                         jb.water_ms(),
@@ -286,44 +298,42 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     last_packet_at = Instant::now();
                 }
 
-                // 阶跃吸收的日志（锁外：logf 会写盘）。水位一律用**总水位**
+                // 阶跃吸收的统计只写原子量，由 UI 线程在 `diag::log_periodic_stats`
+                // 里落盘：解码线程每 10 s 同步写日志，在慢盘/轮转时会阻塞超过
+                // PCM 环的 40 ms，造成周期性的可闻欠载。水位一律用**总水位**
                 // （jb + pipe）口径，与判据一致；否则“跳了 120 ms 只掉 76 ms”
-                // 会把人带坑里。限额分支每 60 s 窗口只放行一条：被压制时水位
-                // 不会自己降下来，不节流就是 ≈250 条/秒。
+                // 会把人带坑里。限额分支每 60 s 窗口只放行一条。
                 if let Some((before, want, skipped, limited)) = step_hit {
                     if limited {
                         if step.take_limited_log() {
-                            logf!(
-                                "[Step] 水位 {}ms（目标 {}）命中阶跃吸收，但每分钟 {} 次限额已满（本窗口已用 {} 次）：本次只记录不裁剪",
-                                before,
-                                water_target,
-                                protocol::rtp::STEP_TRIM_MAX_PER_MIN,
-                                step.trims_in_window()
-                            );
+                            STEP_BEFORE_MS.store(before, Ordering::Relaxed);
+                            STEP_WINDOW_TRIMS.store(step.trims_in_window(), Ordering::Relaxed);
+                            STEP_EVENT.store(STEP_EVENT_LIMITED, Ordering::Release);
                         }
-                    } else if skipped > 0 {
-                        logf!(
-                            "[Step] 阶跃吸收：整帧跳 {} / {} 帧（{}ms），水位 {}→{}ms，累计 {} 帧",
-                            skipped,
-                            want,
-                            skipped * protocol::rtp::FRAME_MS,
-                            before,
-                            water,
-                            trims
-                        );
+                    } else if skipped > 0
+                        // 限额事件每个窗口只出现一次，不能被随后的裁剪事件覆盖
+                        && STEP_EVENT.load(Ordering::Relaxed) != STEP_EVENT_LIMITED
+                    {
+                        STEP_BEFORE_MS.store(before, Ordering::Relaxed);
+                        STEP_WANT.store(want, Ordering::Relaxed);
+                        STEP_SKIPPED.store(skipped, Ordering::Relaxed);
+                        STEP_WATER_MS.store(water, Ordering::Relaxed);
+                        STEP_TRIMS.store(trims, Ordering::Relaxed);
+                        STEP_EVENT.store(STEP_EVENT_TRIMMED, Ordering::Release);
                     }
                 }
 
                 // ── 前馈：只管“声卡设备时钟 vs QPC” ──
                 // 设备进度与时刻都取自音频回调里的 IAudioClock 采样：设备帧数
                 // 与 `timestamp().playback` 对应的 QPC 时刻绑定，而不是解码线程
-                // 被唤醒时的 `Instant::now()`。网络到达节奏不进入这里，90 ms
-                // 攒批因此不会调制音高。
-                let (played, played_at) = aw
-                    .device_clock_sample()
-                    .unwrap_or_else(|| (aw.played_frames(), Instant::now()));
-                if played > 0 {
-                    device_rate_est.observe(played, played_at);
+                // 被唤醒时的 `Instant::now()`。没有采样就不喂：设备重建后新流的
+                // 首个采样时刻与后续样本同轴，混入 `Instant::now()` 会让 t0 落在
+                // 真实时间轴而样本落在旧轴，`duration_since` 恒 0、桶数永不增长。
+                let played = aw.played_frames();
+                if let Some((clock_frames, played_at)) = aw.device_clock_sample()
+                    && clock_frames > 0
+                {
+                    device_rate_est.observe(clock_frames, played_at);
                 }
                 let ff = device_rate_est.feedforward().unwrap_or(0.0);
 
@@ -360,6 +370,17 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                 );
                 aw.set_ratio_adjust(adjust);
                 DRIFT_ADJUST_BITS.store((adjust as f32).to_bits(), Ordering::Relaxed);
+
+                // 周期日志所需的快照一律落原子量，由 UI 线程输出（见 diag.rs）。
+                DECODE_JB_WATER_MS.store(jb_water, Ordering::Relaxed);
+                DECODE_PIPE_MS.store(pipe_ms, Ordering::Relaxed);
+                DECODE_WATER_TARGET_MS.store(water_target, Ordering::Relaxed);
+                DECODE_DEVICE_MS.store(aw.device_latency_ms(), Ordering::Relaxed);
+                DECODE_DU_PPM_BITS.store(du.to_bits(), Ordering::Relaxed);
+                DECODE_FF_PPM_BITS.store(ff.to_bits(), Ordering::Relaxed);
+                DECODE_SIGMA_PPM_BITS
+                    .store(device_rate_est.sigma_ppm().to_bits(), Ordering::Relaxed);
+                DECODE_BUCKETS.store(device_rate_est.buckets() as u32, Ordering::Relaxed);
 
                 // ── 总延迟估算 ──
                 // `audible_ts` 已经扣掉了“PCM 环 + 声卡排队”对应的媒体量，
@@ -476,27 +497,6 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     rms_sum = 0.0;
                     rms_count = 0;
                     last_stats = Instant::now();
-                }
-
-                // 延迟构成每 10 s 落一次盘：水位分解、比率、前馈与估计质量
-                // 一目了然，出现"延迟越来越大"时可直接判断是哪一段在涨。
-                if last_latency_log.elapsed() >= Duration::from_secs(10) {
-                    last_latency_log = Instant::now();
-                    logf!(
-                        "[Latency] 总延迟≈{}ms（水位 {}ms = 抖动 {} + 解码 {}，目标 {}）声卡 {}ms 比率 {:+.3}%（反馈 {:+.0}ppm / 前馈 {:+.1}ppm，σ {:.1}ppm，{} 桶，阶跃裁剪 {} 帧）",
-                        LATENCY_MS.load(Ordering::Relaxed),
-                        water,
-                        jb_water,
-                        pipe_ms,
-                        water_target,
-                        aw.device_latency_ms(),
-                        adjust * 100.0,
-                        du * 1e6,
-                        ff * 1e6,
-                        device_rate_est.sigma_ppm(),
-                        device_rate_est.buckets(),
-                        trims,
-                    );
                 }
             }
         });

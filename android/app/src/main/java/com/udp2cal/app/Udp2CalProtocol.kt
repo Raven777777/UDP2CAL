@@ -131,9 +131,6 @@ object Udp2CalProtocol {
         return ControlHeader(arr[0].toInt(), arr[1].toInt(), id)
     }
 
-    fun decodeControlHeader(buf: ByteArray, len: Int): ControlHeader? =
-        ProtocolNative.decodeControlHeader(buf, len)?.let { headerFrom(it) }
-
     fun parseControl(buf: ByteArray, len: Int): ControlHeader? =
         ProtocolNative.parseControl(buf, len)?.let { headerFrom(it) }
 
@@ -494,8 +491,6 @@ object Udp2CalProtocol {
         fun feedforward(): Double? =
             ProtocolNative.deFeedforward(handle).let { if (it.isNaN()) null else it }
 
-        fun feedforwardPpm(): Double? = feedforward()?.times(1e6)
-
         fun sigmaPpm(): Double = ProtocolNative.deSigmaPpm(handle)
 
         fun buckets(): Int = ProtocolNative.deBuckets(handle)
@@ -536,8 +531,6 @@ object Udp2CalProtocol {
         fun adjust(): Double = ProtocolNative.dcAdjust(handle)
 
         fun targetMs(): Int = ProtocolNative.dcTargetMs(handle)
-
-        fun water(): Double = ProtocolNative.dcWater(handle)
 
         fun integral(): Double = ProtocolNative.dcIntegral(handle)
 

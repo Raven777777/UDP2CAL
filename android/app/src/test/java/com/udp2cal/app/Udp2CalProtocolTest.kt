@@ -1086,7 +1086,13 @@ class Udp2CalProtocolTest {
             Udp2CalProtocol.STEP_TRIM_GROWTH_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_EXCESS_MS.toLong(),
             Udp2CalProtocol.STEP_TRIM_HOLD_MS.toLong(),
-            Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN.toLong()
+            Udp2CalProtocol.STEP_TRIM_MAX_PER_MIN.toLong(),
+            Udp2CalProtocol.OPUS_FLAG_VBR.toLong(),
+            Udp2CalProtocol.OPUS_FLAG_DTX.toLong(),
+            Udp2CalProtocol.OPUS_FLAG_VBR_CONSTRAINT.toLong(),
+            Udp2CalProtocol.OPUS_FLAG_FEC.toLong(),
+            Udp2CalProtocol.OPUS_FLAGS_RESERVED_MASK.toLong(),
+            Udp2CalProtocol.OPUS_COMPLEXITY_MAX.toLong()
         )
         val actual = ProtocolNative.constants()
         assertEquals("常量个数", expected.size, actual.size)

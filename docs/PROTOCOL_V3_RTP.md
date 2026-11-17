@@ -494,7 +494,7 @@ Android                                   Windows
 - Windows 绑定成功后，才可以接受正向 RTP；未绑定状态下收到 RTP 一律丢弃。
 - Android 收到 `reverse_ssrc != 0` 的 ACK 后，才可以启动反向接收。
 - Windows 只有在 CONNECT 的 `reverse_port != 0` 且反向功能开启时，才启动反向发送。
-- 接收端在收到第一个 RTP 包后进入预缓冲；连续 3 帧（30 ms）只是硬下限，实际还要等媒体跨度水位达到 `start_ms`（§7.7，两端取 `WATER_TARGET_MS` = 200 ms）才开始播放。
+- 接收端在收到第一个 RTP 包后进入预缓冲；至少 3 帧可解码（30 ms）只是硬下限（基准包之后若出现终点已知的中段洞，可由 PLC 补齐，不阻塞起播），实际还要等媒体跨度水位达到 `start_ms`（§7.7，两端取 `WATER_TARGET_MS` = 200 ms）才开始播放。
 
 ### 6.4 保活与超时
 
@@ -570,7 +570,7 @@ Reconnecting ──(ACK)──> Connected
 |------|----|------|
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
-| `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧连续）；实际启动还要求水位达到本方向的启动目标 |
+| `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧可解码；基准包后已知终点的中段洞由 PLC 补齐）；实际启动还要求水位达到本方向的启动目标 |
 | `WATER_TARGET_MS` | PC 正向 200 ms / Android 反向 200 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
 | `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
 | `STEP_TRIM_GROWTH_MS` | 80 ms | 仅诊断：记录“单次 tick 增长超过该值”的次数，**不再作为裁剪判据** |
@@ -644,7 +644,7 @@ JitterBuffer {
          或断流跨过了 i16 差值边界（>32767 个包 ≈ 5.4 分钟）。
          此时**不重建缓冲**：时间戳合法且未重复就照常入槽，计入 seq_realign，
          并保持 next_seq 不动；恢复包按时间戳播放。只有 M=1 且时间戳跳变
-         超过 RESYNC_GAP_MS 才走下一步的显式重建。
+         超过 RESYNC_GAP_MS，或连续 3 个 M=0 的 640 ms 远跳，才走显式重建。
 6. 若 M=1 且 (ext_ts - next_ts) > RESYNC_GAP_MS：
      清空 slots；重置 next_seq/next_ts/highest_*；
      重置解码器/PLC 状态；进入 PREBUFFER；
@@ -657,7 +657,8 @@ JitterBuffer {
 
 注意：
 
-- 扩展序号超出重排窗口（`ext_seq ≥ next_seq + 64`）的包若相位正常只丢弃并计 `overflow`，**不得重同步**（会连带丢掉已缓冲的约 640 ms 音频）；相位不符的包已在步 0 按 §7.7 处理。本步内，只有 `M=1` 且跳变超过 `RESYNC_GAP_MS` 的包才重建。
+- 扩展序号超出重排窗口（`ext_seq ≥ next_seq + 64`）的包若相位正常只丢弃并计 `overflow`，**不得重同步**（会连带丢掉已缓冲的约 640 ms 音频）；相位不符的包已在步 0 按 §7.7 处理。本步内，只有 `M=1` 且跳变超过 `RESYNC_GAP_MS` 的包，或连续 3 个 `M=0` 的 640 ms 远跳包，才重建。
+- 非 `M=1`、帧对齐、`ext_ts - next_ts > 64 × 480`（640 ms）的包：单包丢弃并计 `overflow`（防止伪造包把水位钉在高位）；连续第 3 个视为 marker 丢失的合法断流或播放头冻结，按 §7.7 以该包重同步。该启发式允许伪造者连发 3 个远跳触发一次重同步（与 `M=1` 重同步同级）；单个 `M=0` 帧对齐包不会拉高 `highest_ts`/水位，也不会被当成音频播放。
 - 时间戳是播放顺序的权威；序列号用于重复检测与断点识别。**序号落后于
   `next_seq` 而时间戳合法且未重复时，结论是"发生了断点"，不是"包迟到"**——
   真正迟到的包在第 4 步已由 `ext_ts < next_ts` 拦下。旧实现的顺序（先判序号
@@ -676,7 +677,8 @@ pipe_ms = ring_ms + 声卡已接手但尚未播完的毫秒数    // = 可听点
 if (!started) return 等待;
 
 if (!playing):
-    if 连续可解码帧数 >= JITTER_START_MS / 10 且 jb.water_ms >= start_ms:
+    if 可解码帧数 >= JITTER_START_MS / 10 且 jb.water_ms >= start_ms:
+        # 队首空洞可跳过；基准包后已知终点的中段洞由 PLC 补齐，不要求 3 帧连续
         playing = true
     else:
         return 等待;
@@ -744,7 +746,7 @@ return silence_10ms()                   # 消费侧接 10 ms 淡出
 IDLE
   │ 收到第一个合法 RTP
   ▼
-PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
+PREBUFFER ──(可解码 >= 3 帧且水位 >= start_ms；已知终点洞由 PLC 补齐)──> PLAYING
   ▲                              │
   │                              ├─ 下一帧缺失，但 ring_ms > PLC_LEAD_MS
   │                              │     └─> GAP（等待，不消耗媒体时间）
@@ -792,6 +794,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 触发条件：
 
 - `M=1` 且 `ext_ts - next_ts > 200 ms`；
+- 或连续 3 个 `M=0`、帧对齐、`ext_ts - next_ts > 640 ms` 的远跳（§7.4 注意）；
 - 或时间戳非整帧：`ext_ts % 480 ≠ next_ts % 480`（发送端按墙钟补缺口会出现 35 ms 这类跳变，播放头只按 ±480 前进，必然永久失配）；
 - 或发送端 SSRC 变化（由控制面触发）。
 
@@ -802,7 +805,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 3. 重置 Opus 解码器和 PLC 状态；
 4. 清空 PCM 环（`flush`）、重采样器相位与历史、解码器 PLC 状态；
 5. 复位漂移控制器与速率估计器（`highest_ts` 重建基准，旧观测不再有意义）；
-6. 回到 `PREBUFFER`，满足起播条件（3 帧且水位达到 `start_ms`）后恢复 PLAYING。
+6. 回到 `PREBUFFER`，满足起播条件（至少 3 帧可解码且水位达到 `start_ms`；已知终点的中段洞由 PLC 补齐）后恢复 PLAYING。
 
 ### 7.8 PLC 规则
 
@@ -1080,7 +1083,7 @@ PLC/解码器状态自然覆盖，听感成本低于在实时路径引入 WSOLA 
 
 **接入点**（两端都在拉取之前判定，日志前缀 `[Step]`）：
 
-- Windows：`windows/src/session/audio.rs` 解码循环，`jb.pull` 之前；`[Latency]` 行的 `阶跃裁剪 N 帧` 是累计消费帧数（每 10 s 一条）。
+- Windows：`windows/src/session/audio.rs` 解码循环，`jb.pull` 之前；`[Latency]` 行的 `阶跃裁剪 N 帧` 是累计消费帧数（每 30 s 一条）。
 - Android：`android/.../service/ReverseLink.kt` 的 `reversePlayLoop`，`jitter.pull` 之前，
   在 `linkLock` 内。
 
@@ -1176,7 +1179,7 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 ```
 
 - `arrival_time` 由抖动缓冲在**接纳**每个包时记录（128 条环形记录，≈1.28 s 历史）；
-  查询时取"最新一条 `entry_ts ≤ audible_ts` 的记录"（`audible_ts` 见 7.10）；
+  查询时取 `entry_ts ≤ audible_ts` 且 `entry_ts` 最大的一条记录（乱序到达时不能按到达顺序倒查，否则会少报一个重排窗口的延迟；`audible_ts` 见 7.10）；
 - `audible_ts` 已经减去了 PCM 环与声卡缓冲（见 7.10），因此这里**不再加** `device_latency_ms`；
   再加一次就是重复计算；
 - 它**不包含**发送端采集→发包以及单程网络时延：这两个量在没有跨设备时钟的情况下
@@ -1185,7 +1188,7 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 
 要求：
 
-- 实时显示（UI 每次状态刷新读一次原子变量），并每 10 s 落一行日志，
+- 实时显示（UI 每次状态刷新读一次原子变量），并每 30 s 落一行日志，
   同时打印水位与比率微调量——出现"延迟越来越大"时可直接判断是水位涨还是声卡缓冲涨；
 - 不得在音频回调里计算（回调只做一次 `Instant` 差值，写在原子变量里）。
 
@@ -1208,8 +1211,8 @@ total_latency_ms = now − arrival_time(audible_ts 那一帧)
 8. 超过 1275 字节的 Opus 负载不得发送。
 9. `M=1` 按 4.6 设置。
 10. **1 帧节拍整形**：发送时刻钉在 10 ms 网格上，把采集设备成簇交出的帧摊平。
-    它不是队列——最多只压 1 帧；迟到超过半个帧就重锚网格（见下方实现要点），
-    绝不用连续突发把落后的时间补回来。
+    发送队列只保留当前时隙 + 下一时隙的 2 帧流水线；超过 2 帧的迟到积压丢弃最旧帧
+    （计丢样），迟到超过半个帧就重锚网格（见下方实现要点），绝不用连续突发把落后的时间补回来。
 
 发送端节拍整形为什么必要：采集硬件的读接口按"周期"交货（WASAPI 环回常见
 10/20 ms，`AudioRecord` 视缓冲而定），成簇输出的直接后果是接收端水位呈锯齿。
@@ -1258,6 +1261,8 @@ wait ≥ 1 ms   → sleep/delay(wait)
 
 - WASAPI loopback，事件驱动；端点混音率不是 48 kHz 时先重采样到 48 kHz。
 - 累积 480 个立体声帧（10 ms）后编码；不得用 20 ms 或更大帧。
+- 发送队列上限 2 帧（当前时隙 + 下一时隙）；卡顿造成的超额积压丢弃最旧帧并计
+  `dropped_samples`，不推进时间戳/序号，也不连发。
 - RTP 头发送目标为 CONNECT 的 `reverse_port`；源 socket 为临时端口。
 - SSRC 使用控制面生成并写入 ACK 的 `reverse_ssrc`。
 - 反向 Opus 配置来自 CONNECT；只在配置变化时应用，避免每秒重置编码器。

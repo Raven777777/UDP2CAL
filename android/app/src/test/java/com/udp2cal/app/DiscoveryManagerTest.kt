@@ -1,6 +1,7 @@
 package com.udp2cal.app
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
@@ -25,5 +26,17 @@ class DiscoveryManagerTest {
         assertThrows(StringIndexOutOfBoundsException::class.java) {
             DiscoveryManager.hexStringToByteArray("abc")
         }
+    }
+
+    @Test
+    fun parseStoredDeviceId_rejectsAllZeroAndWrongLength() {
+        // 全零 ID 会被 Windows 静默丢弃：必须当成"未保存"重新生成
+        assertNull(DiscoveryManager.parseStoredDeviceId("0000000000000000"))
+        assertNull(DiscoveryManager.parseStoredDeviceId("00112233445566"))
+        assertNull(DiscoveryManager.parseStoredDeviceId("001122334455667788"))
+        assertArrayEquals(
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 1),
+            DiscoveryManager.parseStoredDeviceId("0000000000000001")
+        )
     }
 }

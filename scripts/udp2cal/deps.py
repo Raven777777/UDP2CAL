@@ -20,13 +20,18 @@ from typing import List, Optional
 from . import config, env as envmod, runner
 
 
-def _backup(path: Path) -> Optional[Path]:
+def _backup(path: Path, logger=None) -> Optional[Path]:
     """生成带时间戳的备份，避免覆盖上一次备份。"""
     if not path.exists():
         return None
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     target = path.with_name("{}.{}.bak".format(path.name, stamp))
-    shutil.copy2(str(path), str(target))
+    try:
+        shutil.copy2(str(path), str(target))
+    except OSError as exc:
+        if logger:
+            logger.error("备份 {} 失败: {}".format(path.name, exc))
+        return None
     return target
 
 
@@ -35,37 +40,21 @@ def _backup(path: Path) -> Optional[Path]:
 
 def wrapper_ready(project_dir: Path) -> bool:
     wrapper = project_dir / "gradle" / "wrapper"
-    return (wrapper / "gradle-wrapper.jar").exists() and (wrapper / "gradle-wrapper.properties").exists()
+    return (
+        (project_dir / "gradlew.bat").exists()
+        and (wrapper / "gradle-wrapper.jar").exists()
+        and (wrapper / "gradle-wrapper.properties").exists()
+    )
 
 
 def ensure_gradle_wrapper(project_dir: Path, logger) -> bool:
-    """补齐缺失的 gradle wrapper，来源优先取仓库内其他项目的同名文件。"""
     if wrapper_ready(project_dir):
         logger.detail("gradle wrapper: 完整")
         return True
 
-    sources: List[Path] = []
-    for key, target in config.ANDROID_TARGETS.items():
-        other = Path(target["dir"])
-        if other.resolve() == project_dir.resolve():
-            continue
-        if wrapper_ready(other):
-            sources.append(other / "gradle" / "wrapper")
-
-    if not sources:
-        logger.error("{} 缺少 gradle/wrapper，且仓库内无可复制的来源".format(project_dir.name))
-        logger.hint("请在 {} 下执行一次 `gradle wrapper --gradle-version 8.9`".format(project_dir.name))
-        return False
-
-    src = sources[0]
-    dst = project_dir / "gradle" / "wrapper"
-    dst.mkdir(parents=True, exist_ok=True)
-    for name in ("gradle-wrapper.jar", "gradle-wrapper.properties"):
-        source_file = src / name
-        if source_file.exists():
-            shutil.copy2(str(source_file), str(dst / name))
-    logger.warn("已从 {} 复制 gradle wrapper 到 {}".format(src.parent.parent.name, project_dir.name))
-    return wrapper_ready(project_dir)
+    logger.error("{} 缺少 gradlew.bat 或 gradle/wrapper".format(project_dir.name))
+    logger.hint("请在 {} 下执行一次 `gradle wrapper --gradle-version 8.9`".format(project_dir.name))
+    return False
 
 
 # ---------------------------------------------------------------- local.properties
@@ -212,9 +201,11 @@ def ensure_local_properties(project_dir: Path, sdk: envmod.SdkInfo, logger) -> b
         logger.detail("local.properties: 未设置 sdk.dir，将补写")
 
     if props.exists():
-        backup = _backup(props)
-        if backup:
-            logger.hint("已备份至 {}".format(backup.name))
+        backup = _backup(props, logger)
+        if backup is None:
+            logger.error("无法备份 local.properties，已中止写入")
+            return False
+        logger.hint("已备份至 {}".format(backup.name))
 
     lines = []
     if props.exists():
@@ -237,7 +228,11 @@ def ensure_local_properties(project_dir: Path, sdk: envmod.SdkInfo, logger) -> b
     if not replaced:
         lines.append(entry)
 
-    props.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    try:
+        props.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.error("写入 local.properties 失败: {}".format(exc))
+        return False
     logger.ok("已写入 sdk.dir={}".format(sdk.root))
     return True
 
@@ -388,6 +383,10 @@ def ensure_rust_target(rust: envmod.RustInfo, triple: str, logger, env: Optional
         logger.detail("Rust target {}: 已安装".format(triple))
         return True
     if rust.rustup is None:
+        # 非 rustup 安装无法列出 target；宿主 target 交给 cargo 判定
+        if triple == config.WINDOWS_TARGETS["x64"]:
+            logger.warn("未找到 rustup，跳过 {} 的 target 检查（由 cargo 判定）".format(triple))
+            return True
         logger.error("未找到 rustup，无法自动添加 target {}".format(triple))
         return False
 

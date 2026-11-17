@@ -58,6 +58,10 @@ pub const ACK_TIMEOUT_MS: u64 = 3000;
 /// 造成本可避免的断音。
 pub const PEER_TIMEOUT_MS: u64 = 4500;
 
+// 不变量：保活间隔 < ACK 超时 < 对端超时。改错顺序会让一侧先拆链。
+const _: () = assert!(KEEPALIVE_INTERVAL_MS < ACK_TIMEOUT_MS);
+const _: () = assert!(ACK_TIMEOUT_MS < PEER_TIMEOUT_MS);
+
 // ── 消息类型 ──
 /// v3 废弃：媒体走 RTP，控制包中出现该类型一律丢弃
 pub const TYPE_DATA: u8 = 0;
@@ -96,6 +100,9 @@ pub const BITRATE_AUTO_KBPS: u16 = 512;
 /// 留足 VBR 冲高与 FEC 冗余空间）。两端必须用同一个值：接收端会用它钳制
 /// 对端下发的值，跨端不一致会导致"设置显示 512、实际跑 1000"。
 pub const BITRATE_MAX_KBPS: u16 = 512;
+
+// 线上 `0` 恒映射到上限：两个常量一旦分叉，旧客户端的“自动”就会失真。
+const _: () = assert!(BITRATE_AUTO_KBPS == BITRATE_MAX_KBPS);
 
 /// 手动档位（UI 滑块的五档）。
 ///

@@ -53,7 +53,7 @@ def _write_init_script(logger) -> Optional[Path]:
     return path
 
 
-def _gradle_env(java: envmod.JavaInfo, sdk: envmod.SdkInfo, proxy, mirror_script: Optional[Path]) -> dict:
+def _gradle_env(java: envmod.JavaInfo, sdk: envmod.SdkInfo, proxy) -> dict:
     jvm_args = proxymod.jvm_args(proxy)
     gradle_opts = ["-Dfile.encoding=UTF-8"] + jvm_args
     env = runner.clean_env(
@@ -67,8 +67,6 @@ def _gradle_env(java: envmod.JavaInfo, sdk: envmod.SdkInfo, proxy, mirror_script
         unset=("_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS"),
     )
     proxymod.apply_env(env, proxy)
-    if mirror_script is not None:
-        env["UDP2CAL_MIRROR_INIT"] = str(mirror_script)
     return runner.prepend_path(env, java.home / "bin", sdk.root / "platform-tools", sdk.root / "cmake" / config.ANDROID_CMAKE_VERSION / "bin")
 
 
@@ -98,8 +96,6 @@ def find_apk(project_dir: Path, build_type: str) -> Optional[Path]:
         name = path.name.lower()
         if lowered in parent or lowered in name:
             candidates.append(path)
-    if not candidates:
-        candidates = sorted(apk_root.rglob("*.apk"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -156,10 +152,11 @@ def build(ctx, logger) -> int:
 
     if not deps.ensure_gradle_wrapper(project_dir, logger):
         return 1
-    deps.ensure_local_properties(project_dir, sdk, logger)
+    if not deps.ensure_local_properties(project_dir, sdk, logger):
+        return 1
 
     if getattr(ctx, "install_deps", True):
-        tool_env = _tool_env(_gradle_env(java, sdk, proxy, None), proxy)
+        tool_env = _tool_env(_gradle_env(java, sdk, proxy), proxy)
         if not deps.ensure_sdk_components(sdk, ctx.target, logger, env=tool_env):
             logger.warn("组件校验未通过，仍尝试构建（Gradle 可能自行下载）")
     else:
@@ -174,12 +171,14 @@ def build(ctx, logger) -> int:
         return 1
     logger.ok("Rust: {}".format(rust.version or rust.cargo))
     rust_triple = config.ANDROID_RUST_TARGETS.get(ctx.abi, "aarch64-linux-android")
-    if not deps.ensure_rust_target(rust, rust_triple, logger, env=None):
-        logger.hint("也可手动执行: rustup target add {}".format(rust_triple))
-        return 1
+    if getattr(ctx, "install_deps", True):
+        if not deps.ensure_rust_target(rust, rust_triple, logger, env=tool_env):
+            logger.hint("也可手动执行: rustup target add {}".format(rust_triple))
+            return 1
     logger.step(2, 3, "Gradle assemble{} ({})".format(build_type, ctx.abi))
     task = "assemble{}".format(build_type)
-    base_cmd = ["gradlew.bat", task, "-PtargetAbi={}".format(ctx.abi), "--console=plain"]
+    # 绝对路径：设置 NoDefaultCurrentDirectoryInExePath 时 cmd 不会搜索 cwd
+    base_cmd = [str(project_dir / "gradlew.bat"), task, "-PtargetAbi={}".format(ctx.abi), "--console=plain"]
 
     init_script: Optional[Path] = None
     if mirror_mode == "force":
@@ -194,7 +193,7 @@ def build(ctx, logger) -> int:
     # 注册表只是缓存，构建前先清掉指向失效 JDK 的条目。
     deps.heal_daemon_registry(_gradle_home(), logger)
 
-    env = _gradle_env(java, sdk, proxy, init_script)
+    env = _gradle_env(java, sdk, proxy)
     result = runner.run(base_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
 
     if not result.ok and mirror_mode == "auto" and result.network_failed:
@@ -203,7 +202,7 @@ def build(ctx, logger) -> int:
         init_script = _write_init_script(logger)
         if init_script:
             retry_cmd = base_cmd + ["-I", str(init_script)]
-            env = _gradle_env(java, sdk, proxy, init_script)
+            env = _gradle_env(java, sdk, proxy)
             result = runner.run(retry_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
 
     if not result.ok:

@@ -14,6 +14,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -163,8 +164,8 @@ internal class ReverseLink(
     fun stop() {
         // 只停播放协程；接收协程继续保持阻塞 receive，等会话结束关闭 socket。
         // 非 suspend 版本用于服务停止路径，协程退出由服务作用域取消兜底。
+        // 不置 null：留给 stopAndJoin 拿到同一个 Job 去 join（置空会 join 不到）。
         playJob?.cancel()
-        playJob = null
         linkLock.lock()
         try {
             jitter.reset()
@@ -173,7 +174,8 @@ internal class ReverseLink(
         } finally {
             linkLock.unlock()
         }
-        player?.flush()
+        // 不在这里 flush：本方法在主线程调用，AudioTrack/HAL 卡住时会 ANR。
+        // 播放协程取消后由 teardownSession 的 player.stop()（IO 线程）释放。
         status.update {
             it.copy(reverseAudio = false, reverseBitrateKbps = 0f, reverseJitter = "")
         }
@@ -182,8 +184,18 @@ internal class ReverseLink(
     /** 需要保证旧循环已退出时使用（会话切换/ACK 超时/播放循环退出）。 */
     suspend fun stopAndJoin() = withContext(NonCancellable) {
         val old = playJob
-        playJob = null
-        old?.cancelAndJoin()
+        // 与控制循环的 1 s 上限一致：HAL 卡在 write 时不能无限拖住会话收尾。
+        val joined = withTimeoutOrNull(1000) {
+            old?.cancelAndJoin()
+            true
+        } ?: false
+        if (joined) {
+            playJob = null
+        } else {
+            // 超时后保留引用：service 停机路径还要 join 它；只要它没退出，
+            // CaptureService.onDestroy 就不会 closeNative（避免 use-after-free）。
+            Log.w(TAG, "反向播放协程 1 s 内未退出，继续收尾")
+        }
         linkLock.lock()
         try {
             jitter.reset()
@@ -192,7 +204,9 @@ internal class ReverseLink(
         } finally {
             linkLock.unlock()
         }
-        player?.flush()
+        // 播放协程没退出时不要再抢 trackLock：它可能正卡在 AudioTrack.write，
+        // flush 会跟着一起卡住；teardownSession 的 player.stop() 负责最终释放。
+        if (joined) player?.flush()
         status.update {
             it.copy(reverseAudio = false, reverseBitrateKbps = 0f, reverseJitter = "")
         }
@@ -326,6 +340,9 @@ internal class ReverseLink(
                 Log.e(TAG, "反向 AudioTrack 连续重建失败，交由播放协程监督者重启")
                 return false
             }
+            // 取消后不能再重建：否则 teardown 的 player.stop() 与新 track
+            // 的创建/路由切换交错，新建的 track 无人释放、MODE_IN_COMMUNICATION 不恢复。
+            coroutineContext.ensureActive()
             if (!player.recover()) delay(100) else delay(20)
         }
         return false
@@ -614,17 +631,28 @@ internal class ReverseLink(
 
             when (code) {
                 Udp2CalProtocol.Pull.PACKET -> {
-                    val n = dec.decode(payload, 0, pulledLen, pcm)
-                    if (n <= 0) continue // 解码失败按丢包处理，水位见底后 PLC
-                    // PLC 帧和真实帧走同一条时间线，所以都过同一个重采样器
-                    if (n >= 2) {
-                        lastL = pcm[n - 2].toInt()
-                        lastR = pcm[n - 1].toInt()
-                        hasLast = true
-                    }
-                    val produced = resampler.process(pcm, 0, n / 2)
-                    if (produced > 0) {
-                        if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                    var n = dec.decode(payload, 0, pulledLen, pcm)
+                    // 解码失败按丢包处理：本帧必须补上 PCM，否则 pull 已推进的
+                    // 10 ms 与 AudioTrack 时间线会持续错位（Windows 同路径用 PLC）。
+                    if (n <= 0) n = dec.plc(pcm)
+                    if (n > 0) {
+                        // PLC 帧和真实帧走同一条时间线，所以都过同一个重采样器
+                        if (n >= 2) {
+                            lastL = pcm[n - 2].toInt()
+                            lastR = pcm[n - 1].toInt()
+                            hasLast = true
+                        }
+                        val produced = resampler.process(pcm, 0, n / 2)
+                        if (produced > 0) {
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                        }
+                    } else {
+                        // 连 PLC 都失败：补静音，保持时间线连续
+                        hasLast = false
+                        val produced = resampler.process(silence, 0, silence.size / 2)
+                        if (produced > 0) {
+                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
+                        }
                     }
                 }
 

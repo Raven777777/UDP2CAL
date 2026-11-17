@@ -110,12 +110,35 @@ fn reverse_restart_is_immediate_when_stale_but_dead_retries_are_limited() {
 
 #[test]
 fn pairing_prompts_only_until_approved_or_denied() {
-    assert_eq!(pairing_action(0, 0xAA, false, 0), PairingAction::Prompt);
-    assert_eq!(pairing_action(0xAA, 0xAA, false, 0), PairingAction::Allow);
-    assert_eq!(pairing_action(0xAA, 0xBB, false, 0), PairingAction::Prompt);
-    assert_eq!(pairing_action(0, 0xAA, true, 0), PairingAction::Ignore);
-    assert_eq!(pairing_action(0, 0xAA, false, 0xAA), PairingAction::Ignore);
-    assert_eq!(pairing_action(0, 0xAA, false, 0xBB), PairingAction::Ignore);
+    assert_eq!(
+        pairing_action(0, 0xAA, false, 0, false),
+        PairingAction::Prompt
+    );
+    assert_eq!(
+        pairing_action(0xAA, 0xAA, false, 0, false),
+        PairingAction::Allow
+    );
+    assert_eq!(
+        pairing_action(0xAA, 0xBB, false, 0, false),
+        PairingAction::Prompt
+    );
+    assert_eq!(
+        pairing_action(0, 0xAA, true, 0, false),
+        PairingAction::Ignore
+    );
+    assert_eq!(
+        pairing_action(0, 0xAA, false, 0xAA, false),
+        PairingAction::Ignore
+    );
+    assert_eq!(
+        pairing_action(0, 0xAA, false, 0xBB, false),
+        PairingAction::Ignore
+    );
+    // 已绑定的设备本身就已获准：即便拒绝表/旧弹窗还在，也不能被踢回 Prompt
+    assert_eq!(
+        pairing_action(0xAA, 0xBB, true, 0xCC, true),
+        PairingAction::Allow
+    );
 }
 
 #[test]
@@ -155,17 +178,30 @@ fn session_pairing_state_is_instance_scoped_and_bounded() {
 
     a.set_paired_device(0xAA);
     assert_eq!(a.paired_device(), 0xAA);
-    assert_eq!(a.pairing_action_for(0xAA), PairingAction::Allow);
+    assert_eq!(
+        a.pairing_action_for(0xAA, false),
+        PairingAction::Allow
+    );
     // 同一 ID 在另一个会话里仍是未配对状态：不再有进程级串扰
-    assert_eq!(b.pairing_action_for(0xAA), PairingAction::Prompt);
+    assert_eq!(
+        b.pairing_action_for(0xAA, false),
+        PairingAction::Prompt
+    );
 
     assert!(a.claim_pairing_prompt(0xBB));
     assert!(!a.claim_pairing_prompt(0xCC), "单槽只允许一个待确认设备");
-    assert_eq!(a.pairing_action_for(0xCC), PairingAction::Ignore);
+    assert_eq!(
+        a.pairing_action_for(0xCC, false),
+        PairingAction::Ignore
+    );
     a.clear_pairing_prompt();
-    assert_eq!(a.pairing_action_for(0xCC), PairingAction::Prompt);
+    assert_eq!(
+        a.pairing_action_for(0xCC, false),
+        PairingAction::Prompt
+    );
 
-    // 拒绝表有上限，避免故障设备反复重连把内存撑大
+    // 拒绝表有上限，避免故障设备反复重连把内存撑大；满时淘汰最早一条，
+    // 否则 UI 已提示“已拒绝”的第 17 个设备下次 CONNECT 会再次弹窗。
     for id in 0..20u64 {
         a.deny_pairing(id);
     }
@@ -175,7 +211,22 @@ fn session_pairing_state_is_instance_scoped_and_bounded() {
         .unwrap_or_else(|e| e.into_inner())
         .len();
     assert_eq!(denied_len, 16);
-    assert_eq!(b.pairing_action_for(3), PairingAction::Prompt);
+    assert!(!a.is_denied(0), "最早的拒绝记录必须被淘汰");
+    assert!(a.is_denied(19), "最新的拒绝记录必须保留");
+    assert_eq!(
+        a.pairing_action_for(3, false),
+        PairingAction::Prompt,
+        "已被淘汰的 ID 应重新允许弹窗"
+    );
+    assert_eq!(
+        a.pairing_action_for(19, false),
+        PairingAction::Ignore,
+        "仍在拒绝表中的 ID 必须被忽略"
+    );
+    assert_eq!(
+        b.pairing_action_for(3, false),
+        PairingAction::Prompt
+    );
 }
 
 #[test]
@@ -206,4 +257,65 @@ fn reverse_retry_gate_is_stored_per_session() {
     a.set_reverse_retry_at(Some(now));
     assert_eq!(a.reverse_retry_at(), Some(now));
     assert_eq!(b.reverse_retry_at(), None);
+}
+
+#[test]
+fn reverse_restart_is_rejected_after_stop_or_parameter_change() {
+    // 回归：restart 在 spawn_blocking 里排队，期间可能已停止/释放绑定/换参数。
+    // 旧任务拿到 restart 锁后不得再安装 ReverseSender。
+    let addr: SocketAddr = "192.0.2.10:50001".parse().unwrap();
+    let mut peer = P2pState::new();
+    peer.state = DEVICE_BUSY;
+    peer.addr = Some("192.0.2.10:50000".parse().unwrap());
+    peer.reverse_port = 50001;
+    peer.reverse_ssrc = 0x5678;
+
+    assert!(should_start_reverse(true, &peer, addr, 0x5678));
+    // 已停止（reset_to_ready 后 running=false）：参数一致也不能启动
+    assert!(!should_start_reverse(false, &peer, addr, 0x5678));
+    // 旧任务：SSRC / 端口 / IP 任一不匹配都不得覆盖当前绑定
+    assert!(!should_start_reverse(true, &peer, addr, 0x9999));
+    assert!(!should_start_reverse(
+        true,
+        &peer,
+        "192.0.2.10:50002".parse().unwrap(),
+        0x5678
+    ));
+    assert!(!should_start_reverse(
+        true,
+        &peer,
+        "192.0.2.11:50001".parse().unwrap(),
+        0x5678
+    ));
+    // 反向关闭（ssrc=0）不启动
+    assert!(!should_start_reverse(true, &peer, addr, 0));
+    // 未绑定
+    let idle: SocketAddr = "192.0.2.10:50000".parse().unwrap();
+    let mut unbound = P2pState::new();
+    unbound.addr = Some(idle);
+    unbound.reverse_port = 50001;
+    unbound.reverse_ssrc = 0x5678;
+    assert!(!should_start_reverse(true, &unbound, addr, 0x5678));
+}
+
+#[test]
+fn reverse_target_preserves_ipv6_scope_id() {
+    let src = SocketAddr::V6(std::net::SocketAddrV6::new(
+        "fe80::1".parse().unwrap(),
+        50000,
+        0,
+        7,
+    ));
+    match reverse_target(&src, 50001) {
+        SocketAddr::V6(v6) => {
+            assert_eq!(v6.port(), 50001);
+            assert_eq!(v6.scope_id(), 7, "link-local 目标必须保留 scope_id");
+        }
+        SocketAddr::V4(_) => panic!("IPv6 源必须生成 IPv6 目标"),
+    }
+    let v4: SocketAddr = "192.0.2.10:50000".parse().unwrap();
+    assert_eq!(
+        reverse_target(&v4, 50001),
+        "192.0.2.10:50001".parse().unwrap()
+    );
 }

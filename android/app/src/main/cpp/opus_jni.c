@@ -36,6 +36,9 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
 
     int err = 0;
     int frame_size = (sampleRate * FRAME_MS) / 1000;  // v3 固定 10 ms 帧（48 kHz → 480）
+    // Prefs 传 3001..3004；OPUS_SET_SIGNAL 只接受 VOICE(3001)/MUSIC(3002)，
+    // 3003/3004 必须映射成 MUSIC，否则 ctl 失败被静默忽略。
+    int opusSignal = (signalType == OPUS_SIGNAL_VOICE) ? OPUS_SIGNAL_VOICE : OPUS_SIGNAL_MUSIC;
 
     OpusEncoder* enc = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_AUDIO, &err);
     if (err != OPUS_OK || enc == NULL) return 0;
@@ -51,7 +54,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     // 发送端单方面打开只会白占码率。
     opus_encoder_ctl(enc, OPUS_SET_DRED_DURATION(0));
     opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
-    opus_encoder_ctl(enc, OPUS_SET_SIGNAL(signalType));
+    opus_encoder_ctl(enc, OPUS_SET_SIGNAL(opusSignal));
     opus_encoder_ctl(enc, OPUS_SET_BANDWIDTH(bandwidth));
     opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate * 1000));
 
@@ -62,7 +65,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderCreate(
     state->frame_size  = frame_size;
     state->bitrate_bps = bitrate * 1000;
     state->complexity  = complexity;
-    state->signal_type = signalType;
+    state->signal_type = opusSignal;
     state->bandwidth   = bandwidth;
     state->fec         = fec;
     state->packet_loss = packetLoss;
@@ -148,9 +151,15 @@ Java_com_udp2cal_app_native_OpusNative_encoderUpdate(
     jint fec, jint packetLoss, jint vbrConstraint) {
     if (handle == 0) return JNI_FALSE;
     EncoderState* state = (EncoderState*)(uintptr_t)handle;
+    // Prefs 传 3001..3004；映射到 Opus 只接受的 VOICE/MUSIC。
+    int opusSignal = (signalType == OPUS_SIGNAL_VOICE) ? OPUS_SIGNAL_VOICE : OPUS_SIGNAL_MUSIC;
     // BITRATE 必须放在 BANDWIDTH 之后，因为 OPUS_SET_BANDWIDTH 会重置内部码率
     opus_encoder_ctl(state->encoder, OPUS_SET_COMPLEXITY(complexity));
-    opus_encoder_ctl(state->encoder, OPUS_SET_SIGNAL(signalType));
+    if (opus_encoder_ctl(state->encoder, OPUS_SET_SIGNAL(opusSignal)) != OPUS_OK) {
+        // ctl 失败必须上报，否则 Kotlin 会把状态记成"已生效"。
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Update: OPUS_SET_SIGNAL(%d) failed", opusSignal);
+        return JNI_FALSE;
+    }
     opus_encoder_ctl(state->encoder, OPUS_SET_BANDWIDTH(bandwidth));
     opus_encoder_ctl(state->encoder, OPUS_SET_DTX(dtx));
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR(vbr));
@@ -162,7 +171,7 @@ Java_com_udp2cal_app_native_OpusNative_encoderUpdate(
     opus_encoder_ctl(state->encoder, OPUS_SET_VBR_CONSTRAINT(vbr ? vbrConstraint : 0));
     opus_encoder_ctl(state->encoder, OPUS_SET_BITRATE(bitrate * 1000));
     state->complexity  = complexity;
-    state->signal_type = signalType;
+    state->signal_type = opusSignal;
     state->bandwidth   = bandwidth;
     state->bitrate_bps = bitrate * 1000;
     state->fec         = fec;

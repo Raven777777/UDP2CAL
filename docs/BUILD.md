@@ -21,7 +21,7 @@
 | JDK | 17~22 |
 | Android SDK | API 35 |
 | NDK | 27.0.12077973 |
-| Rust 工具链 | `cargo` 在 `PATH`（`build.bat` 的预检只认 `PATH`；`CARGO` 仅对直接调用 gradlew 生效），且已装交叉 target：`rustup target add aarch64-linux-android` |
+| Rust 工具链 | `cargo` 在 `PATH`（`build.bat` 的预检只认 `PATH`；`CARGO` 仅对直接调用 gradlew 生效），且已装交叉 target：`rustup target add aarch64-linux-android`；非 rustup 安装时脚本只警告宿主构建，交叉 target 仍须可用 |
 
 > 构建脚本会自动检查 JDK / SDK、校验 gradle wrapper 文件是否存在，并修正 `local.properties`；产物复制到项目根目录。
 
@@ -196,7 +196,7 @@ scripts/
 | CMake 报 `Compatibility with CMake < 3.5 has been removed` | CMake ≥ 4.0 的兼容性策略变更 | 脚本已自动设置 `CMAKE_POLICY_VERSION_MINIMUM=3.5`；手动构建时需自行设置 |
 | `icon.png` 缺失导致构建失败 | 图标被移动或重命名 | 恢复 `windows/icon.png`（EXE 资源图标）与项目根 `icon.png`（窗口/托盘，缺失即编译失败） |
 | Android 构建找不到 SDK / NDK | `local.properties` 路径错误 | 执行 `build.bat doctor --fix` 自动修正 |
-| Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本只校验 wrapper 文件是否存在；缺失且无可复制来源时报错，需在 `android/` 下执行 `gradle wrapper --gradle-version 8.9`；版本异常时删除 `~/.gradle/caches` 后重试 |
+| Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本只校验 wrapper 文件是否存在；缺失时直接报错，需在 `android/` 下执行 `gradle wrapper --gradle-version 8.9`；版本异常时删除 `~/.gradle/caches` 后重试 |
 | `lintVitalAnalyzeRelease` 报 `IncompatibleClassChangeError: KaCallableMemberCall` | AGP 8.7 的 lint 与 Kotlin 2.0 分析 API 不兼容（Google issue 374783344），崩溃点为 `NullSafeMutableLiveData` 检查 | 已在 `app/build.gradle.kts` 禁用该检查；升级到 AGP 8.8.2+ 后可删除该行恢复 |
 | `--proxy` 构建报 `'127.0.0.1' 不是内部或外部命令` | `-Dhttp.nonProxyHosts` 中的 `\|` 被 cmd 当作管道符 | 已修复（`scripts/udp2cal/proxy.py` 为该参数加引号）；旧脚本可改用 `--proxy direct` 绕过 |
 | `A problem occurred starting process 'command 'cargo''` | Gradle 继承了 Git Bash 的 POSIX `PATH`，Java 解析不了；或 `PATH` 里根本没有 cargo | 用 cmd 构建（`build.bat android`）并把 `cargo` 放进 `PATH`；`CARGO=<绝对路径>` 与 `~/.cargo/bin/cargo.exe` 回退只在直接调用 gradlew 时生效（Gradle 的 `cargoExe()`） |

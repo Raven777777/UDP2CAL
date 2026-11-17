@@ -19,7 +19,6 @@ CACHE_DIR = SCRIPTS_DIR / ".cache"
 
 ANDROID_TARGETS = {
     "modern": {
-        "key": "modern",
         "dir": ROOT / "android",
         "prefix": "udp2cal",
         "label": "Modern (minSdk 29 / Android 10+)",
@@ -35,7 +34,6 @@ ANDROID_RUST_TARGETS = {
     "arm64-v8a": "aarch64-linux-android",
     "armeabi-v7a": "armv7-linux-androideabi",
 }
-ANDROID_BUILD_TYPES = ("Release", "Debug")
 ANDROID_BUILD_TOOLS = "35.0.0"
 ANDROID_CMAKE_VERSION = "3.22.1"
 
@@ -46,7 +44,6 @@ WINDOWS_TARGETS = {
     "x64": "x86_64-pc-windows-msvc",
     "x86": "i686-pc-windows-msvc",
 }
-WINDOWS_BUILD_TYPES = ("Release", "Debug")
 
 # ---------------------------------------------------------------- JDK 约束
 #
@@ -125,17 +122,6 @@ NETWORK_FAILURE_MARKERS = (
     "unknownhostexception",
     "unable to access",
     "timeout was reached",
-)
-
-# 判定构建失败的辅助特征（用于错误摘要）
-BUILD_FAILURE_MARKERS = (
-    "build failed",
-    "error:",
-    "cannot find symbol",
-    "caused by:",
-    "cmake error",
-    "what went wrong",
-    "execution failed for task",
 )
 
 

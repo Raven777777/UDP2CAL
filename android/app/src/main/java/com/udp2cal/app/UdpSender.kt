@@ -4,6 +4,7 @@ import android.net.Network
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -67,7 +68,6 @@ class UdpSender(
     // 跨线程访问：connect()/close() 在 IO 线程，send() 在采集线程，
     // ACK 线程回调 lastAckTime。全部 @Volatile 保证可见性。
     @Volatile private var socket: DatagramSocket? = null
-    @Volatile private var deviceId: ByteArray? = null
     @Volatile private var remoteAddr: InetSocketAddress? = null
     @Volatile private var remoteIp: String? = null
     @Volatile private var expectedRemoteDeviceId: ByteArray? = null
@@ -81,8 +81,9 @@ class UdpSender(
     @Volatile var reversePort: Int = 0; private set
 
     /**
-     * 本次会话绑定的 Wi-Fi 网络；null 表示走了系统默认路由。
-     * 服务层据此区分"我绑的 Wi-Fi 断了"与无关网络的回调。
+     * 本次会话选定的 Wi-Fi 网络（即使绑定失败、回退默认路由也记录）；
+     * null 表示连接时没有 Wi-Fi。服务层据此区分"我选的 Wi-Fi 断了"
+     * 与无关网络的回调。
      */
     @Volatile var boundNetwork: Network? = null; private set
 
@@ -175,7 +176,9 @@ class UdpSender(
             }
             socket = sock
             remoteAddr = addr
-            boundNetwork = if (bound) wifi else null
+            // 记录选定的 Wi-Fi 而不是"绑定成功"：绑定失败回退默认路由时，
+            // 这张 Wi-Fi 断开仍必须触发会话重建（否则永远停在"等待重连"）。
+            boundNetwork = wifi
             remoteIp = addr.address?.hostAddress
             expectedRemoteDeviceId = Prefs.targetDeviceId
                 .takeIf { it.length == Udp2CalProtocol.DEVICE_ID_SIZE * 2 }
@@ -183,9 +186,14 @@ class UdpSender(
                 ?.mapNotNull { it.toIntOrNull(16)?.toByte() }
                 ?.takeIf { it.size == Udp2CalProtocol.DEVICE_ID_SIZE }
                 ?.toByteArray()
-            deviceId = DiscoveryManager.getOrCreateDeviceId()
             startAckLoop()
             Log.i(TAG, "已连接 $addr，正向 SSRC=${"%08x".format(forwardSsrc)}，反向端口=$reversePort")
+            // 连接期间被 Stop/重启/Wi-Fi 切换取消：withContext 随后会抛
+            // CancellationException，调用方拿不到 sender 引用，必须在此回收。
+            if (!coroutineContext.isActive) {
+                close()
+                return@withContext false
+            }
             true
         } catch (e: Exception) {
             // 失败路径必须回收已创建的 socket（第二个 DatagramSocket 抛错时第一个会泄漏）
@@ -230,17 +238,11 @@ class UdpSender(
         return t > 0L && nowMs - t <= windowMs
     }
 
-    fun getLastAckTime(): Long = lastAckTime
-
-    fun getDeviceId(): ByteArray? = deviceId
-
     /**
      * 目标 IP 的 [InetAddress] 对象。反向接收每包都要校验来源，
      * 用对象比较可避免每包一次 `hostAddress` 字符串分配。
      */
     fun getRemoteAddress(): InetAddress? = remoteAddr?.address
-
-    fun getRemotePort(): Int = port
 
     /**
      * 断连后主动更换正向 SSRC：下一次 CONNECT 会让接收端把它识别为

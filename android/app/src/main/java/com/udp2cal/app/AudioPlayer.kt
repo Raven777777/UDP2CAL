@@ -70,6 +70,10 @@ class AudioPlayer(private val context: Context) {
     private var routeChanged: Boolean = false
 
     fun start(audioSessionId: Int = 0, voiceMode: Boolean = true): Boolean {
+        // 与 writeBlocking/flush/stop 互斥：recover() 的重建不能被并发的
+        // stop() 交错，否则新 track 会失去引用且路由不复位。
+        // 锁序恒为 linkLock → trackLock（本方法内不获取 linkLock）。
+        synchronized(trackLock) {
         startedVoiceMode = voiceMode
         startedSessionId = audioSessionId
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -146,6 +150,7 @@ class AudioPlayer(private val context: Context) {
 
         Log.i(TAG, "AudioPlayer 已启动（${if (voiceMode) "语音模式" else "音乐模式"}·${if (isVoiceCommActive) "VOICE_COMMUNICATION" else "MEDIA"}·缓冲 ${finalBufSize / 4} 帧·low-latency)")
         return true
+        }
     }
 
     /**
@@ -216,21 +221,6 @@ class AudioPlayer(private val context: Context) {
     /** 已写入但尚未播放的帧数（AudioTrack 缓冲深度） */
     fun pendingFrames(playedFrames: Long): Long = synchronized(trackLock) {
         (writtenFrames - playedFrames).coerceAtLeast(0)
-    }
-
-    /**
-     * 实际协商到的缓冲深度（帧），用于启动日志。
-     *
-     * 注意：Android **没有**公开 `AudioTrack.getLatency()`（该 API 是 system-api，
-     * 不在公开 SDK 里）。本端不做"声卡自报延迟"的单独测量——
-     * [playbackHeadFrames] 返回的已经是混音器消费到的位置，
-     * 由此算出的"播放头那一帧的到达年龄"天然包含 AudioTrack 缓冲，
-     * 只少一个混音周期（典型 5–20 ms）。
-     */
-    fun bufferFrames(): Int = try {
-        audioTrack?.getBufferSizeInFrames() ?: 0
-    } catch (_: Exception) {
-        0
     }
 
     /**
@@ -326,8 +316,10 @@ class AudioPlayer(private val context: Context) {
             headRaw = 0
             headFrames = 0
             writtenFrames = 0
+            // 与 start() 同一把锁：否则 teardown 的 stop() 会在 recover() 的
+            // start() 之后才恢复旧路由，把刚建立的语音路由覆盖掉。
+            restoreAudioRoute()
         }
-        restoreAudioRoute()
     }
 
     /**
