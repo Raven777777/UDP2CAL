@@ -140,11 +140,10 @@ pub fn init() {
     let path = base.join("udp2cal.log");
 
     // 启动时文件已超限：直接轮转，避免把上一轮日志和新会话混在一个文件里
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_BYTES {
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() > MAX_BYTES {
             let _ = std::fs::rename(&path, base.join(ROTATED_NAME));
         }
-    }
 
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         let banner = format!(

@@ -351,8 +351,8 @@ impl AppState {
                     // 旧实现异步执行并丢弃错误：非管理员时新端口被永久静默阻断，
                     // 而界面显示启动成功。失败则保留旧端口并明确提示。
                     let old_port = self.config.listen_port;
-                    if port as u32 != old_port {
-                        if let Err(err) = firewall::add_firewall_rule(port) {
+                    if port as u32 != old_port
+                        && let Err(err) = firewall::add_firewall_rule(port) {
                             logf!("[Firewall] 端口 {port} 规则添加失败: {err}");
                             // add 会先删旧规则；失败时尽量把旧端口的规则补回去。
                             let restore = u16::try_from(old_port)
@@ -373,7 +373,6 @@ impl AppState {
                             self.port_input = old_port.to_string();
                             return Task::none();
                         }
-                    }
 
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;

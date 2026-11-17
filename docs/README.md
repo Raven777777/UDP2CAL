@@ -31,6 +31,7 @@
 | [FEATURES.md](FEATURES.md) | 两端功能清单、Opus 参数说明、界面截图 | 使用者、调参用户 |
 | [BUILD.md](BUILD.md) | 环境要求、`build.bat` 全部命令、产物清单、构建排障 | 首次构建者、发布者 |
 | [LATENCY_CALIBRATION.md](LATENCY_CALIBRATION.md) | 延迟口径（`water_ms`/`pipe_ms`/`audible_ts`）、DMA 缓冲、实测校准、P0 高频诊断与**本环境实测基线** | 排障者、调优 |
+| [PERF_PROFILE.md](PERF_PROFILE.md) | 性能剖析工具链（samply/hyperfine 本机踩坑）、CPU 剖析基线、PLC/缓冲基准 | 调优、性能回归 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本历史与重大变更（按版本倒序） | 全部 |
 | [BUGFIX.md](BUGFIX.md) | **现行代码**的 bug 根因档案 | 全部 |
 | [archive/CONTROL_PLANE_REMEDIATION.md](archive/CONTROL_PLANE_REMEDIATION.md) | 私有控制面 / 网络架构审查快照、首批整改记录与未完成风险 | 追溯 |

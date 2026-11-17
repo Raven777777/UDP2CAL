@@ -1023,13 +1023,12 @@ impl LoopbackCapture {
 
             // 环回端点在某些驱动上不接受事件回调：失败就退回超时轮询（10 ms 粒度）
             let mut event = event;
-            if let Some(h) = event {
-                if client.SetEventHandle(h).is_err() {
+            if let Some(h) = event
+                && client.SetEventHandle(h).is_err() {
                     logf!("[Reverse] 环回端点不支持事件回调，改用 10 ms 超时轮询");
                     let _ = CloseHandle(h);
                     event = None;
                 }
-            }
 
             // 从这里往后不能再提前返回：`event` 是内核句柄，`Self` 没建好就没有
             // Drop 去关它。run_loop 每 500 ms 重试一次，用 `?` 提前返回就是 2 个

@@ -1,71 +1,70 @@
-# UDP2CAL — 局域网双向音频串流
+# UDP2CAL
+***Bidirectional Audio Streaming over LAN***
 
-把 Android 手机当作电脑的麦克风与扬声器：手机麦克风音频经 Opus 编码通过局域网送达 PC 的虚拟声卡，PC 扬声器音频反向回传到手机听筒。
+**[中文](README.zh.md) | English**
 
-接收端稳态水位目标默认：PC 正向 200 ms / Android 反向 200 ms（抖动缓冲 + 解码/PCM 环 + 声卡缓冲，两个方向各自独立定值，可在两端“预期延迟”里调整）；端到端延迟还包含采集、编码、发送与网络传输，实际值随设备/网络变化。界面显示的是**接收端可测部分**，不包含发送端与网络。
-
-**稳定性优先（2026-11-13 起）**：同链路 pktmon 抓包复测确认，Wi-Fi/AP 会按 ~100 ms 周期把 10 个 10 ms 包攒批交付；目标 80 ms 时这正好打成 7–10 帧 PLC。目标 200 ms 可覆盖 99–109 ms 的实测空档并留余量；代价是接收端总延迟约 200 ms。目标可现场调整：Windows 托盘右键“预期延迟”控制 **PC 正向**（写注册表 `water_target_ms`；未设置时仍可用 `$env:UDP2CAL_WATER_TARGET_MS` 覆盖），Android 高级设置“预期延迟”控制**反向接收**；两端均为 80/120/160/200/300 五档，底层 80–600 ms 越界钳位。链路空档更深的设备/环境须按「实测最大空档 ×1.5–1.6」定值，**不要靠压低目标去赢延迟**——水位就是断供时的全部缓冲（见 [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) §5.2）。
+Use an Android phone as your PC's microphone and speaker: the phone's mic audio is Opus-encoded and sent over the LAN to the PC's virtual sound card, while the PC's speaker audio is streamed back to the phone's earpiece.
 
 ```
-Android 手机 ↔ 双向音频 ↔ Windows PC
-  正向: 手机麦克风 → Opus 编码 → UDP → PC → WASAPI → VB-Cable → 任意应用
-  反向: PC 扬声器 → WASAPI Loopback → Opus 编码 → UDP → 手机听筒/扬声器
+Android phone ↔ bidirectional audio ↔ Windows PC
+  Forward:  phone mic → Opus encode → UDP → PC → WASAPI → VB-Cable → any application
+  Reverse:  PC speakers → WASAPI Loopback → Opus encode → UDP → phone earpiece/speaker
 ```
 
 ---
 
-> ### 旧手机支持
+> ### Legacy phone support
 >
-> 本仓库仅维护 Android 10+ 的 `android/` 客户端与配套的 `windows/`、`protocol/`。
+> This repository only maintains the Android 10+ `android/` client together with its matching `windows/` and `protocol/` code.
 >
-> **Android 6~8 旧手机**所需的 App 与 Windows 端软件，请前往 **[Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)** 下载；两者需成对使用，旧版 App 无法连接当前版本的 PC 端。
+> For **Android 6–8 legacy phones**, download the app and Windows software from **[Release v1.1.1](https://github.com/Raven777777/UDP2CAL/releases/tag/v1.1.1)**; the two must be used as a pair — the old app cannot connect to the current PC side.
 
 ---
 
-## 组件
+## Components
 
-| 目录                 | 说明                                                                                | 系统要求                        |
-| ------------------ | --------------------------------------------------------------------------------- | --------------------------- |
-| `windows/`         | Windows 接收端（Rust + iced），WASAPI 播放 / Loopback 回传，系统托盘常驻                           | Windows 10+，需 VB-Cable 虚拟声卡 |
-| `android/`         | Android 客户端（Kotlin + Jetpack Compose），全参数 Opus 面板                                 | Android 10 (API 29)+        |
-| `opus-src/`        | libopus 1.6.1 源码树（Android JNI 与 Windows 共用的唯一副本，勿在其内部另存副本）                            | —                           |
-| `vendor/`          | `audiopus` / `audiopus_sys` 本地副本（含本地扩展，经 `[patch.crates-io]` 引用，勿用上游覆盖）                | —                           |
-| `protocol/`        | 协议 v3 crate：控制面 + RTP 媒体面（协议唯一真源；Android 端经 JNI 复用同一份实现）                          | —                           |
+| Directory          | Description                                                                                                     | Requirements                                   |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `windows/`         | Windows receiver (Rust + iced), WASAPI playback / loopback capture, lives in the system tray                  | Windows 10+, VB-Cable virtual audio device     |
+| `android/`         | Android client (Kotlin + Jetpack Compose), full Opus parameter panel                                           | Android 10 (API 29)+                           |
+| `opus-src/`        | libopus 1.6.1 source tree (single copy shared by Android JNI and Windows — do not keep another copy inside it)  | —                                              |
+| `vendor/`          | Local copies of `audiopus` / `audiopus_sys` (with local patches, referenced via `[patch.crates-io]` — do not overwrite with upstream) | —                                              |
+| `protocol/`        | Protocol v3 crate: control plane + RTP media plane (single source of truth; Android reuses the same implementation via JNI) | —                                              |
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bat
-build.bat win --release                              :: 编译 Windows 接收端
-build.bat android --abi arm64-v8a --release          :: 编译 Android 客户端
-build.bat doctor --fix                               :: 环境体检与自动修复
+build.bat win --release                              :: build the Windows receiver
+build.bat android --abi arm64-v8a --release          :: build the Android client
+build.bat doctor --fix                               :: environment check with auto-fix
 ```
 
-不带参数运行 `build.bat` 可进入交互式菜单。
+Run `build.bat` without arguments for the interactive menu.
 
-**开发**：Windows Rust 1.96+、VS Build Tools 2022、CMake 3.22+；Android JDK 17~22、Android SDK 35、NDK 27.0.12077973，外加 Rust `aarch64-linux-android` target（协议层交叉编译成 `libudp2cal_protocol.so`，见 [docs/BUILD.md](docs/BUILD.md)）
-
----
-
-## 文档
-
-全部技术文档位于 [`docs/`](docs/README.md)。
-
-| 文档                                           | 内容                              |
-| -------------------------------------------- | ------------------------------- |
-| [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 常用构建命令与选项、编译产物、常见问题 |
-| [docs/FEATURES.md](docs/FEATURES.md)         | 两端功能特性、Opus 参数详解、界面截图           |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 项目结构、技术栈、运行时行为、代码落点、命名约定      |
-| [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **协议规范（现行）**：RTP 媒体面、控制面、时钟模型 |
-| [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) | 延迟口径、`playhead_ts` 与 DMA 缓冲、实测校准流程 |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md)       | 版本历史                            |
-| [docs/BUGFIX.md](docs/BUGFIX.md)             | 现行代码的 Bug 根因档案                  |
-| [docs/LEGAL.md](docs/LEGAL.md)               | 版权声明、GPL-3.0 授权、第三方组件许可         |
-| [docs/archive/](docs/archive/)               | 历史存档：v2 协议、迁移计划、历次审查报告、旧修复记录   |
+**Development**: Windows Rust 1.96+, VS Build Tools 2022, CMake 3.22+; Android JDK 17–22, Android SDK 35, NDK 27.0.12077973, plus the Rust `aarch64-linux-android` target (the protocol layer is cross-compiled into `libudp2cal_protocol.so`, see [docs/BUILD.md](docs/BUILD.md))
 
 ---
 
-## 许可证
+## Documentation
 
-© 2026 UDP2CAL Contributors. 本程序为自由软件，以 **GNU General Public License v3.0** 发布，详见 [`LICENSE`](LICENSE)；第三方开源组件许可见 [docs/LEGAL.md](docs/LEGAL.md)。
+All technical documentation lives in [`docs/`](docs/README.md). (Documents are in Chinese.)
+
+| Document                                       | Contents                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------- |
+| [docs/BUILD.md](docs/BUILD.md)                 | Requirements, common `build.bat` commands and options, build artifacts, FAQ |
+| [docs/FEATURES.md](docs/FEATURES.md)           | Features of both sides, Opus parameters in detail, screenshots        |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Project layout, tech stack, runtime behavior, code map, naming conventions |
+| [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **Protocol spec (current)**: RTP media plane, control plane, clock model |
+| [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) | Latency definitions, `playhead_ts` and DMA buffers, measurement/calibration procedure |
+| [docs/CHANGELOG.md](docs/CHANGELOG.md)         | Version history                                                       |
+| [docs/BUGFIX.md](docs/BUGFIX.md)               | Root-cause archive of bugs in the current code                        |
+| [docs/LEGAL.md](docs/LEGAL.md)                 | Copyright, GPL-3.0 licensing, third-party component licenses          |
+| [docs/archive/](docs/archive/)                 | Historical archive: v2 protocol, migration plans, past review reports, old fix notes |
+
+---
+
+## License
+
+© 2026 UDP2CAL Contributors. This program is free software released under the **GNU General Public License v3.0**, see [`LICENSE`](LICENSE); third-party open-source licenses are listed in [docs/LEGAL.md](docs/LEGAL.md).

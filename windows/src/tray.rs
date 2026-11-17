@@ -225,11 +225,10 @@ pub(crate) fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> 
                 };
                 // 托盘事件是可重复的用户点击：UI 卡住时丢一次点击比阻塞托盘
                 // 线程好；仅接收端已退出才退出转发循环。
-                if let Err(e) = output.try_send(message) {
-                    if e.is_disconnected() {
+                if let Err(e) = output.try_send(message)
+                    && e.is_disconnected() {
                         break;
                     }
-                }
             }
         },
     )

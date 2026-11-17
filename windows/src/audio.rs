@@ -660,7 +660,7 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
             let mut last_err = String::new();
             let mut chosen = None;
             for bs in [BufferSize::Fixed(buffer_frames), BufferSize::Default] {
-                let mut cfg = stream_config.clone();
+                let mut cfg = stream_config;
                 cfg.buffer_size = bs;
                 let built = match sample_format {
                     SampleFormat::F32 => build_stream::<f32>(&device, &cfg, &shared),
@@ -749,11 +749,10 @@ pub fn detect_vb_cable() -> Option<String> {
 fn find_vb_cable_device() -> Option<cpal::Device> {
     let host = cpal::default_host();
     for d in host.output_devices().ok()? {
-        if let Ok(desc) = d.description() {
-            if desc.name().contains(VB_CABLE_RENDER_NAME) {
+        if let Ok(desc) = d.description()
+            && desc.name().contains(VB_CABLE_RENDER_NAME) {
                 return Some(d);
             }
-        }
     }
     None
 }

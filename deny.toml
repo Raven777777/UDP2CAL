@@ -1,0 +1,43 @@
+# cargo-deny 配置：cargo deny check
+# 放行常见宽松许可证；忽略无修复的间接 unmaintained 依赖。
+# 运行：cargo deny check（在 windows/ 下）
+
+[licenses]
+# GPL/AGPL 兼容符号位均未启用，按需追加
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "BSL-1.0",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "GPL-3.0-or-later",
+  "NCSA",
+]
+confidence-threshold = 0.8
+
+[advisories]
+version = 2
+ignore = [
+  # RUSTSEC-2026-0441: pin-utils 已归档，仅经 iced → wasmtimer 间接引入，上游无升级可用
+  "RUSTSEC-2026-0441",
+  # RUSTSEC-2024-0370: proc-macro-error 已停维，仅作 iced 依赖树的宏构建期依赖
+  "RUSTSEC-2024-0370",
+  # RUSTSEC-2024-0436: paste 已停维，仅作 iced 依赖树的宏构建期依赖
+  "RUSTSEC-2024-0436",
+  # RUSTSEC-2026-0192: ttf-parser 停维，经 iced/tiny-skia 字体排版路径间接引入
+  "RUSTSEC-2026-0192",
+]
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

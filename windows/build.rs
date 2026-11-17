@@ -11,12 +11,11 @@ fn main() {
     let png_path = std::path::Path::new("icon.png");
 
     // PNG -> ICO (256x256)
-    if png_path.exists() {
-        if let Ok(img) = image::open(png_path) {
+    if png_path.exists()
+        && let Ok(img) = image::open(png_path) {
             let resized = img.resize_exact(256, 256, image::imageops::FilterType::Lanczos3);
             let _ = resized.save(&ico_path);
         }
-    }
 
     // 嵌入 ICO 到 EXE 资源
     if ico_path.exists() {
