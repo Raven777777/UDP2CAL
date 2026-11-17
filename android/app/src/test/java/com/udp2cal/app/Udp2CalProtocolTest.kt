@@ -664,6 +664,18 @@ class Udp2CalProtocolTest {
     }
 
     @Test
+    fun drift_setTargetAppliesAndClamps() {
+        val d = Udp2CalProtocol.DriftController()
+        d.setTargetMs(120)
+        assertEquals(120, d.targetMs())
+        d.setTargetMs(1)
+        assertEquals(Udp2CalProtocol.WATER_TARGET_MIN_MS, d.targetMs())
+        d.setTargetMs(Int.MAX_VALUE)
+        assertEquals(Udp2CalProtocol.WATER_TARGET_MAX_MS, d.targetMs())
+        d.close()
+    }
+
+    @Test
     fun drift_onTargetDoesNothing() {
         // 水位稳定在目标上：比率一动不动
         val d = Udp2CalProtocol.DriftController()

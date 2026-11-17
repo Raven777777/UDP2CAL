@@ -5,6 +5,21 @@
 
 ---
 
+## 未发布 — 预期延迟运行时可调
+
+- 接收目标水位（`WATER_TARGET_MS`）不再只能靠编译常量/环境变量：
+  - Windows 托盘右键新增“预期延迟”子菜单（80/120/160/200/300 ms），选择后写注册表
+    `HKCU\Software\UDP2CAL\water_target_ms` 并实时作用于正向接收；值为 0（未设置）时仍回退
+    `UDP2CAL_WATER_TARGET_MS` / 默认 200。
+  - Android 高级设置新增“预期延迟”五档滑块，控制反向（PC→手机）接收；值存 SharedPreferences，
+    运行中立即生效，每次起流也按当前值预缓冲。
+- 协议层：`DriftController::set_target()` + JNI `dcSetTargetMs`；Windows 解码线程每轮检测目标变化，
+  Android 播放循环每轮读取控制器目标；设备重建与重同步不再回落到默认 200。
+- 测试：新增 `set_target_applies_and_clamps`（含“改目标后 PI 按新目标算误差”）与 Android
+  `drift_setTargetAppliesAndClamps`；Windows 新增注册表脏值归一测试。
+- 文档：README、PROTOCOL_V3_RTP.md（§6.3 / §7.2 / §7.7 / §7.10.1 / §12）、LATENCY_CALIBRATION.md、
+  FEATURES.md 同步更新。
+
 ## 未发布 — 重采样器三端单源
 
 - 新增 `protocol/resampler.rs`：32 相 × 48 抽头 Kaiser sinc FIR（`CUTOFF=0.42`、`β=10`、每相 DC 归一），任意声道数、交错 f32、跨块相位连续。

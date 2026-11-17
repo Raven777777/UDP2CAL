@@ -1,5 +1,6 @@
 // 配置管理 - 注册表读写
 use std::sync::OnceLock;
+use udp2cal_protocol::rtp::{WATER_TARGET_MAX_MS, WATER_TARGET_MIN_MS};
 use winreg::RegKey;
 use winreg::enums::*;
 
@@ -15,6 +16,8 @@ pub struct Config {
     /// 已批准的手机设备 ID；0 = 尚未配对。首次连接必须由本机用户确认。
     pub paired_device: u64,
     pub reverse_enabled: u32,
+    /// 正向接收目标水位（ms）；0 = 未显式设置，回退环境变量/默认值
+    pub water_target_ms: u32,
 }
 
 /// 进程级设备 ID 缓存。
@@ -38,6 +41,15 @@ fn sanitize_port(v: u32) -> u32 {
     }
 }
 
+/// 注册表的 water_target_ms 同样是外部输入：0 表示未设置，其余钳到允许区间。
+fn sanitize_water_target(v: u32) -> u32 {
+    if v == 0 {
+        0
+    } else {
+        v.clamp(WATER_TARGET_MIN_MS, WATER_TARGET_MAX_MS)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -47,6 +59,7 @@ impl Default for Config {
             device_id: 0,
             paired_device: 0,
             reverse_enabled: 0,
+            water_target_ms: 0,
         }
     }
 }
@@ -107,6 +120,7 @@ impl Config {
             device_id: resolve_device_id(stored_id),
             paired_device: get_qword(&path, "paired_device", 0),
             reverse_enabled: get_dword(&path, "reverse_enabled", 0),
+            water_target_ms: sanitize_water_target(get_dword(&path, "water_target_ms", 0)),
         }
     }
 
@@ -120,7 +134,17 @@ impl Config {
         key.set_value("device_id", &self.get_device_id())?;
         key.set_value("paired_device", &self.paired_device)?;
         key.set_value("reverse_enabled", &self.reverse_enabled)?;
+        key.set_value("water_target_ms", &self.water_target_ms)?;
         Ok(())
+    }
+
+    /// 生效的接收目标水位：显式设置优先，否则沿用环境变量/编译默认值。
+    pub fn resolved_water_target_ms(&self) -> u32 {
+        if self.water_target_ms == 0 {
+            udp2cal_protocol::rtp::water_target_ms()
+        } else {
+            self.water_target_ms
+        }
     }
 
     /// 写入/删除开机自启项。
@@ -191,5 +215,17 @@ mod tests {
         );
         // 归一后的值必须能安全地截断成 u16
         assert_eq!(sanitize_port(u32::MAX) as u16, DEFAULT_LISTEN_PORT as u16);
+    }
+
+    #[test]
+    fn sanitize_water_target_keeps_zero_and_clamps_range() {
+        // 0 是“未设置”哨兵，必须保留，否则环境变量覆盖失效
+        assert_eq!(sanitize_water_target(0), 0);
+        for v in [WATER_TARGET_MIN_MS, 120, 200, 300, WATER_TARGET_MAX_MS] {
+            assert_eq!(sanitize_water_target(v), v);
+        }
+        assert_eq!(sanitize_water_target(WATER_TARGET_MIN_MS - 1), WATER_TARGET_MIN_MS);
+        assert_eq!(sanitize_water_target(WATER_TARGET_MAX_MS + 1), WATER_TARGET_MAX_MS);
+        assert_eq!(sanitize_water_target(u32::MAX), WATER_TARGET_MAX_MS);
     }
 }

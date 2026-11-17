@@ -143,6 +143,11 @@ impl DriftController {
         self.target_ms
     }
 
+    /// 运行时重定目标（托盘 / 设置界面），保持积分与水位状态连续。
+    pub fn set_target(&mut self, target_ms: u32) {
+        self.target_ms = target_ms.clamp(WATER_TARGET_MIN_MS, WATER_TARGET_MAX_MS);
+    }
+
     pub fn reset(&mut self) {
         self.water = 0.0;
         self.adjust = 0.0;
@@ -249,6 +254,26 @@ mod tests {
         const { assert!(WATER_TARGET_MS < WATER_TARGET_MAX_MS) };
         // 环境变量缓存后的值必须落在允许区间内（未设置时等于常数）
         assert!((WATER_TARGET_MIN_MS..=WATER_TARGET_MAX_MS).contains(&water_target_ms()));
+    }
+
+    #[test]
+    fn set_target_applies_and_clamps() {
+        let mut d = DriftController::with_target(48_000, WATER_TARGET_MS);
+        d.set_target(120);
+        assert_eq!(d.target_ms(), 120);
+        d.set_target(1);
+        assert_eq!(d.target_ms(), WATER_TARGET_MIN_MS);
+        d.set_target(u32::MAX);
+        assert_eq!(d.target_ms(), WATER_TARGET_MAX_MS);
+
+        // 重定目标后 PI 必须按新目标算误差：水位仍停在旧目标 200 时，
+        // 目标降到 80 应判“水位偏高”并加速播放排掉缓冲。
+        let mut d = DriftController::with_target(48_000, WATER_TARGET_MS);
+        let mut dev = 0u64;
+        run_pi(&mut d, WATER_TARGET_MS, 100, &mut dev);
+        d.set_target(WATER_TARGET_MIN_MS);
+        let a = run_pi(&mut d, WATER_TARGET_MS, 1000, &mut dev);
+        assert!(a > 0.0, "目标降低后旧水位应判偏高: {a}");
     }
 
     #[test]

@@ -46,6 +46,17 @@ pub(crate) fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
 enum TrayCommand {
     Restore,
     Quit,
+    SetWaterTarget(u32),
+}
+
+/// 预期延迟档位（ms），与 Android 高级设置保持一致。
+const WATER_TARGET_STEPS_MS: [u32; 5] = [80, 120, 160, 200, 300];
+
+// 勾选态需要菜单项句柄；muda 的 CheckMenuItem 内部是 Rc（非 Send/Sync），
+// 不能放进 static。菜单事件在创建菜单的线程消息泵里派发，因此按线程保存。
+thread_local! {
+    static WATER_TARGET_ITEMS: std::cell::RefCell<Vec<(u32, tray_icon::menu::CheckMenuItem)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 static TRAY_COMMANDS: OnceLock<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<TrayCommand>>> =
@@ -58,6 +69,7 @@ pub(crate) fn install_tray(
     icon_rgba: Vec<u8>,
     width: u32,
     height: u32,
+    water_target_ms: u32,
 ) -> Option<tray_icon::TrayIcon> {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     let _ = TRAY_COMMANDS.set(tokio::sync::Mutex::new(receiver));
@@ -72,11 +84,40 @@ pub(crate) fn install_tray(
         move |event: tray_icon::menu::MenuEvent| {
             if event.id == "quit" {
                 let _ = sender.try_send(TrayCommand::Quit);
+            } else if let Some(ms) = event
+                .id
+                .0
+                .strip_prefix("water-")
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                WATER_TARGET_ITEMS.with(|slot| {
+                    for (value, item) in slot.borrow().iter() {
+                        item.set_checked(*value == ms);
+                    }
+                });
+                let _ = sender.try_send(TrayCommand::SetWaterTarget(ms));
             }
         },
     ));
 
     let tray_menu = tray_icon::menu::Menu::new();
+    let delay_menu =
+        tray_icon::menu::Submenu::with_id("water-target-menu", "预期延迟", true);
+    let mut delay_items = Vec::new();
+    for ms in WATER_TARGET_STEPS_MS {
+        let item = tray_icon::menu::CheckMenuItem::with_id(
+            format!("water-{ms}"),
+            format!("{ms}ms"),
+            true,
+            ms == water_target_ms,
+            None,
+        );
+        let _ = delay_menu.append(&item);
+        delay_items.push((ms, item));
+    }
+    // 二次安装（理论上不会发生）时覆盖旧句柄，保持勾选态更新指向当前菜单
+    WATER_TARGET_ITEMS.with(|slot| *slot.borrow_mut() = delay_items);
+    let _ = tray_menu.append(&delay_menu);
     let quit_item = tray_icon::menu::MenuItemBuilder::new()
         .id("quit".into())
         .text("退出")
@@ -180,6 +221,7 @@ pub(crate) fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> 
                         Message::ShowWindow
                     }
                     TrayCommand::Quit => Message::Quit,
+                    TrayCommand::SetWaterTarget(ms) => Message::SetWaterTarget(ms),
                 };
                 // 托盘事件是可重复的用户点击：UI 卡住时丢一次点击比阻塞托盘
                 // 线程好；仅接收端已退出才退出转发循环。

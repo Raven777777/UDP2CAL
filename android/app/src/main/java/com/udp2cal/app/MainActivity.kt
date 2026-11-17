@@ -620,6 +620,9 @@ private val BW_LABELS = arrayOf(
 )
 private val BW_SHORT = arrayOf("NB", "MB", "WB", "SWB", "FB")
 
+/** 反向接收目标水位五档（ms） */
+private val WATER_TARGET_STEPS_MS = intArrayOf(80, 120, 160, 200, 300)
+
 @Composable
 fun OpusSettingsScreen(
     onBack: () -> Unit,
@@ -642,6 +645,7 @@ fun OpusSettingsScreen(
     var fec by remember { mutableStateOf(Prefs.opusFec != 0) }
     var packetLoss by remember { mutableStateOf(Prefs.opusPacketLoss.toFloat()) }
     var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint != 0) }
+    var waterTarget by remember { mutableStateOf(Prefs.waterTargetMs) }
 
     // ── 运行时状态 ──
     var isRunning by remember { mutableStateOf(false) }
@@ -980,6 +984,41 @@ fun OpusSettingsScreen(
             onValueChange = { packetLoss = it; Prefs.opusPacketLoss = it.toInt() },
             valueRange = 0f..30f, steps = 29, modifier = Modifier.fillMaxWidth()
         )
+
+        Text("预期延迟: ${waterTarget}ms", fontSize = 14.sp, color = Color.White)
+        run {
+            val lastIdx = WATER_TARGET_STEPS_MS.lastIndex
+            val idx = WATER_TARGET_STEPS_MS.indexOf(waterTarget).takeIf { it >= 0 }
+                ?: WATER_TARGET_STEPS_MS.indexOf(Udp2CalProtocol.WATER_TARGET_MS).coerceAtLeast(0)
+            Slider(
+                value = idx.toFloat(),
+                onValueChange = { v ->
+                    val i = v.roundToInt().coerceIn(0, lastIdx)
+                    val ms = WATER_TARGET_STEPS_MS[i]
+                    if (ms != waterTarget) {
+                        waterTarget = ms
+                        Prefs.waterTargetMs = ms
+                        service?.setReverseWaterTargetMs(ms)
+                    }
+                },
+                valueRange = 0f..lastIdx.toFloat(),
+                steps = WATER_TARGET_STEPS_MS.size - 2,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                WATER_TARGET_STEPS_MS.forEach { ms ->
+                    Text(
+                        "$ms",
+                        fontSize = 10.sp,
+                        color = if (ms == waterTarget) Color(0xFF00E676) else Color(0xFF888888)
+                    )
+                }
+            }
+            Text(
+                "PC→手机反向串流的目标缓冲；越低延迟越小，网络抖动大时更容易断音",
+                fontSize = 11.sp, color = Color(0xFF888888)
+            )
+        }
 
         // ═══ 关于页面 ═══
         Spacer(Modifier.height(12.dp))

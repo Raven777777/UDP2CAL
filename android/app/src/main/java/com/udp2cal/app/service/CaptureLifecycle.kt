@@ -315,6 +315,9 @@ internal class CaptureLifecycle(
     /** 服务停机：归还反向链路的原生句柄（见 ReverseLink.closeNative） */
     fun closeNative() = reverse.closeNative()
 
+    /** 高级设置：反向（PC→手机）目标水位，运行时立即生效 */
+    fun setReverseWaterTargetMs(ms: Int) = reverse.setWaterTarget(ms)
+
     // ══════════════════════════════════════════════════════════
     // Wi-Fi 网络回调（由 CaptureService 转发）
     // ══════════════════════════════════════════════════════════

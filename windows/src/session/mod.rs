@@ -189,6 +189,8 @@ pub(crate) struct Session {
     reverse_enabled: AtomicBool,
     /// 当前监听端口（广播线程与接收流读取）
     listen_port: AtomicU32,
+    /// 正向接收目标水位（ms）：托盘可运行时修改，解码线程每轮读取
+    water_target_ms: AtomicU32,
 
     // ── 身份 ──
     /// 本机设备 ID（启动时从配置解析一次，避免每包读注册表）
@@ -222,6 +224,7 @@ impl Session {
             cfg.listen_port,
             cfg.paired_device,
             cfg.reverse_enabled != 0,
+            cfg.resolved_water_target_ms(),
         ))
     }
 
@@ -231,6 +234,7 @@ impl Session {
         listen_port: u32,
         paired_device: u64,
         reverse_enabled: bool,
+        water_target_ms: u32,
     ) -> Self {
         Self {
             p2p: Mutex::new(P2pState::new()),
@@ -252,6 +256,7 @@ impl Session {
             running: AtomicBool::new(false),
             reverse_enabled: AtomicBool::new(reverse_enabled),
             listen_port: AtomicU32::new(listen_port),
+            water_target_ms: AtomicU32::new(water_target_ms),
             device_id,
             device_name,
         }
@@ -266,6 +271,7 @@ impl Session {
             protocol::DEFAULT_LISTEN_PORT as u32,
             0,
             false,
+            protocol::rtp::WATER_TARGET_MS,
         ))
     }
 
@@ -301,6 +307,14 @@ impl Session {
 
     pub(crate) fn set_listen_port(&self, port: u32) {
         self.listen_port.store(port, Ordering::Release);
+    }
+
+    pub(crate) fn water_target_ms(&self) -> u32 {
+        self.water_target_ms.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_water_target_ms(&self, ms: u32) {
+        self.water_target_ms.store(ms, Ordering::Release);
     }
 
     // ── 音频初始化状态 ──

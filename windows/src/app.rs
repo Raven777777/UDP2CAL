@@ -28,6 +28,8 @@ pub(crate) enum Message {
     ToggleRunning,
     ToggleReverse(bool),
     ToggleAutoStart(bool),
+    /// 托盘切换接收目标水位（ms）
+    SetWaterTarget(u32),
     StatusUpdate(StatusInfo),
     Disconnected,
     /// 引擎级失败（监听失败 / 音频初始化失败）：必须回到停止态并把原因显示出来
@@ -147,7 +149,12 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     let (icon_rgba, w, h) = tray::load_icon_rgba();
 
     // 系统托盘（失败不致命：降级为"关窗即退出"）
-    let tray_icon = tray::install_tray(icon_rgba.clone(), w, h);
+    let tray_icon = tray::install_tray(
+        icon_rgba.clone(),
+        w,
+        h,
+        startup_cfg.resolved_water_target_ms(),
+    );
     let tray_ok = tray_icon.is_some();
     if !tray_ok {
         logf!("[Tray] 托盘不可用，降级为关闭窗口即退出");
@@ -275,6 +282,15 @@ impl AppState {
                 self.session.set_reverse_enabled(enabled);
                 self.config.set_reverse_enabled(enabled);
                 self.persist_config();
+                Task::none()
+            }
+            Message::SetWaterTarget(ms) => {
+                self.config.water_target_ms = ms;
+                if self.persist_config() {
+                    self.notice.clear();
+                }
+                // 解码线程每轮读取该原子值，运行中也能立即换目标
+                self.session.set_water_target_ms(ms);
                 Task::none()
             }
             Message::ToggleRunning => {

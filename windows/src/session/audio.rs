@@ -118,15 +118,18 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             // 但这里是解码线程顶层，除零 = 线程 panic = 整条音频链死亡，
             // 必须栅位而不是赌。
             let mut device_rate = aw.device_rate.max(1);
-            let mut drift = protocol::rtp::DriftController::new(device_rate);
+            let mut drift = protocol::rtp::DriftController::with_target(
+                device_rate,
+                spawn_session.water_target_ms(),
+            );
             // 前馈只看**声卡设备进度 vs QPC**：网络攒批/重排不进入比率。
             // 发送端媒体时间线 vs Instant 的旧 RateEstimator 已从比率路径移除。
             let mut device_rate_est =
                 protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
             // 阶跃吸收（方案 C）：判据与限额与 Android 端同构
             let mut step = protocol::rtp::StepAbsorber::new();
-            // 实际生效的目标水位（环境变量可覆盖，两端各自读各自的）
-            let water_target = protocol::rtp::water_target_ms();
+            // 实际生效的目标水位（托盘可运行时修改）
+            let mut water_target = spawn_session.water_target_ms();
             // 启动预缓冲：先攒够本方向目标再开播，之后靠 ASRC 慢慢收敛；
             // 不再出现“3 帧就开播、再用 24 s 爬坡”的隐性瞬态。
             spawn_session
@@ -151,6 +154,13 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             let mut adjust: f64;
 
             loop {
+                // 托盘可能随时改目标：与会话原子值对比，变化时实时重定控制器
+                let target = spawn_session.water_target_ms();
+                if target != water_target {
+                    water_target = target;
+                    drift.set_target(target);
+                    spawn_session.jitter().set_start_prebuffer_ms(target);
+                }
                 if !spawn_session.running() {
                     if !idle {
                         idle = true;
@@ -200,7 +210,10 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                             spawn_session.jitter().reset();
                             device_rate = aw.device_rate.max(1);
                             // 新流的设备时钟/播放头从 0 重新开始，旧估计器历史必须作废。
-                            drift = protocol::rtp::DriftController::new(device_rate);
+                            drift = protocol::rtp::DriftController::with_target(
+                                device_rate,
+                                spawn_session.water_target_ms(),
+                            );
                             device_rate_est =
                                 protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
                             step = protocol::rtp::StepAbsorber::new();

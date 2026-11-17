@@ -82,6 +82,18 @@ object Prefs {
         get() = prefs.getInt("opus_vbr_constraint", 0) // 0=无约束, 1=约束（不超码率）
         set(v) = prefs.edit().putInt("opus_vbr_constraint", v.coerceIn(0, 1)).apply()
 
+    // ═══ 接收侧调参 ═══
+    /** 反向串流（PC→手机）目标总水位（ms），由高级设置五档滑块写入。 */
+    var waterTargetMs: Int
+        get() = prefs.getInt("water_target_ms", Udp2CalProtocol.WATER_TARGET_MS)
+            .coerceIn(Udp2CalProtocol.WATER_TARGET_MIN_MS, Udp2CalProtocol.WATER_TARGET_MAX_MS)
+        set(v) = prefs.edit()
+            .putInt(
+                "water_target_ms",
+                v.coerceIn(Udp2CalProtocol.WATER_TARGET_MIN_MS, Udp2CalProtocol.WATER_TARGET_MAX_MS)
+            )
+            .apply()
+
     // ═══ P2P 独占通信配置 ═══
     var deviceId: String
         get() = prefs.getString("device_id", "") ?: ""

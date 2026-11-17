@@ -1577,6 +1577,18 @@ handle_scalar!(
     |g: &mut DriftController| g.target_ms() as jint
 );
 
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_dcSetTargetMs(
+    _env: Env,
+    _this: jobject,
+    h: Handle,
+    target_ms: jint,
+) {
+    if let Some(handle) = drift_ref(h) {
+        lock(&handle.inner).set_target(target_ms.max(0) as u32);
+    }
+}
+
 handle_scalar!(
     Java_com_udp2cal_app_native_ProtocolNative_dcRatioUpdates,
     drift_ref,

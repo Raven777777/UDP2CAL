@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.udp2cal.app.AudioPlayer
+import com.udp2cal.app.Prefs
 import com.udp2cal.app.StreamResampler
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
@@ -68,11 +69,19 @@ internal class ReverseLink(
 
     /** 新采集会话：建解码器并起接收协程 */
     fun startSession(sender: UdpSender) {
+        // 服务常驻、句柄跨会话复用：每次起流都按用户当前设置为准
+        setWaterTarget(Prefs.waterTargetMs)
         activeSsrc = 0
         decoder = ReverseOpusDecoder(Udp2CalProtocol.OPUS_SAMPLE_RATE, channels = 2).also {
             if (!it.start()) Log.w(TAG, "反向解码器初始化失败，继续运行")
         }
         launchReverseReceiver(sender)
+    }
+
+    /** 运行时切换目标水位：漂移控制器立即生效，起播预缓冲供下次起流使用。 */
+    fun setWaterTarget(ms: Int) {
+        drift.setTargetMs(ms)
+        jitter.setStartPrebufferMs(ms)
     }
 
     /**

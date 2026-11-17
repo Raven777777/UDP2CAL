@@ -115,6 +115,9 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
         lifecycle.stopCapture()
     }
 
+    /** 高级设置：反向（PC→手机）目标水位，运行时立即生效 */
+    fun setReverseWaterTargetMs(ms: Int) = lifecycle.setReverseWaterTargetMs(ms)
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(

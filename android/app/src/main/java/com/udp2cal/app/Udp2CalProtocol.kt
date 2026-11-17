@@ -532,6 +532,11 @@ object Udp2CalProtocol {
 
         fun targetMs(): Int = ProtocolNative.dcTargetMs(handle)
 
+        /** 运行时重定目标（高级设置滑块），不影响已积累的积分/水位。 */
+        fun setTargetMs(ms: Int) {
+            ProtocolNative.dcSetTargetMs(handle, ms)
+        }
+
         fun integral(): Double = ProtocolNative.dcIntegral(handle)
 
         fun update(waterMs: Int, deviceFrames: Long): Double =

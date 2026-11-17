@@ -236,6 +236,8 @@ internal object ProtocolNative {
 
     external fun dcTargetMs(h: Long): Int
 
+    external fun dcSetTargetMs(h: Long, targetMs: Int)
+
     external fun dcRatioUpdates(h: Long): Long
 
     // ── 重采样器（protocol/resampler.rs：三端唯一实现） ──────────────────

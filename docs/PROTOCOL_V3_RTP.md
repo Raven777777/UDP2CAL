@@ -494,7 +494,7 @@ Android                                   Windows
 - Windows 绑定成功后，才可以接受正向 RTP；未绑定状态下收到 RTP 一律丢弃。
 - Android 收到 `reverse_ssrc != 0` 的 ACK 后，才可以启动反向接收。
 - Windows 只有在 CONNECT 的 `reverse_port != 0` 且反向功能开启时，才启动反向发送。
-- 接收端在收到第一个 RTP 包后进入预缓冲；至少 3 帧可解码（30 ms）只是硬下限（基准包之后若出现终点已知的中段洞，可由 PLC 补齐，不阻塞起播），实际还要等媒体跨度水位达到 `start_ms`（§7.7，两端取 `WATER_TARGET_MS` = 200 ms）才开始播放。
+- 接收端在收到第一个 RTP 包后进入预缓冲；至少 3 帧可解码（30 ms）只是硬下限（基准包之后若出现终点已知的中段洞，可由 PLC 补齐，不阻塞起播），实际还要等媒体跨度水位达到 `start_ms`（§7.7，默认为本方向 `WATER_TARGET_MS` = 200 ms，可在两端 UI 现场调整）才开始播放。
 
 ### 6.4 保活与超时
 
@@ -571,8 +571,8 @@ Reconnecting ──(ACK)──> Connected
 | `FRAME_MS` | 10 ms | 固定 |
 | `FRAME_SAMPLES` | 480 | 48 kHz |
 | `JITTER_START_MS` | 30 ms | 预缓冲硬下限（3 帧可解码；基准包后已知终点的中段洞由 PLC 补齐）；实际启动还要求水位达到本方向的启动目标 |
-| `WATER_TARGET_MS` | PC 正向 200 ms / Android 反向 200 ms | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；取值见 §7.10.1 |
-| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 环境变量覆盖值的允许区间，越界钳位（Android 侧仅作常量文档化） |
+| `WATER_TARGET_MS` | 默认 200 ms（两方向各自） | 目标**总**水位（抖动缓冲 + PCM 环 + 声卡缓冲）。每个方向独立定值，**不要求两端同值**；运行时可在 Windows 托盘 / Android 高级设置调整，见 §7.10.1 |
+| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | 80 / 600 ms | 运行时设置与环境变量覆盖值的允许区间，越界钳位 |
 | `STEP_TRIM_GROWTH_MS` | 80 ms | 仅诊断：记录“单次 tick 增长超过该值”的次数，**不再作为裁剪判据** |
 | `STEP_TRIM_EXCESS_MS` | 100 ms | 阶跃判据：总水位 > `target + 100` ms 且持续 `STEP_TRIM_HOLD_MS` |
 | `STEP_TRIM_HOLD_MS` | 1500 ms | 必须持续超预算这么久才裁剪；90 ms 攒批/一次补齐不算积压 |
@@ -783,8 +783,8 @@ PREBUFFER ──(可解码 >= 3 帧且水位 >= start_ms；已知终点洞由 PL
 **启动**
 
 - 首包建立基准；不要求首包序列号是某个固定值。
-- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的 `WATER_TARGET_MS`（PC 正向 200 / Android 反向 200），所以不存在“30 ms 先播、再用 24 秒慢慢爬到目标值”的过程；`JITTER_START_MS` 只是硬下限。
-- `start_ms` 每个方向独立，可取 [30, WATER_TARGET_MS]；当前实现取目标值，以一次可闻的启动等待换取稳态不欠载。
+- 启动必须同时满足：连续可解码 ≥ 3 帧（30 ms）**且**媒体跨度水位 ≥ `start_ms`。两端都在会话开始时把 `start_ms` 设为本方向的当前目标（默认 200 ms，可现场调整），所以不存在“30 ms 先播、再用 24 秒慢慢爬到目标值”的过程；`JITTER_START_MS` 只是硬下限。
+- `start_ms` 每个方向独立，可取 [30, 当前目标]；当前实现取目标值，以一次可闻的启动等待换取稳态不欠载。运行中调整目标时，`start_ms` 同步更新，供下次起流/重同步使用。
 - 若首包丢失，以第一个收到的包为基准；不得无限等待“第 0 帧”。
 - Windows cpal 回调在预缓冲完成前输出静音；播放进度由回调侧的 `played_frames` 表达，并通过 `OutputCallbackInfo::timestamp().playback`（WASAPI `IAudioClock::GetPosition` + QPC）建立设备进度映射。
 - Android 的 AudioTrack 只需 2 帧（20 ms）硬件缓冲并启用 low-latency 通路；这 2 帧是输出缓冲，不是应用层无限队列。
@@ -1016,22 +1016,30 @@ NACK/WSOLA/双流同样受“数据必须在播放头前到”的约束，均不
 目标统一改为 **200 ms**，把“不断音”放在“低延迟”之前；100 ms 总延迟只在没有 100 ms 级
 扣包的干净链路上才可能。
 
-**运行时覆盖（仅 Windows）**：默认取常量 `WATER_TARGET_MS = 200`（PC 正向；Android 反向用
-Kotlin 常量 200）；环境变量
-`UDP2CAL_WATER_TARGET_MS` 可覆盖，允许区间
-`WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位，进程内首次读取后缓存
-（`protocol::rtp::water_target_ms()`）。取值经 `DriftController::with_target()` 注入，PI 的
-`err` 仍只对比这一个量。
+**运行时调整（两端都有 UI，互不影响）**：默认取 `WATER_TARGET_MS = 200`（每个方向独立）。
+两端都提供 80 / 120 / 160 / 200 / 300 ms 五档，允许区间仍为
+`WATER_TARGET_MIN_MS = 80` ～ `WATER_TARGET_MAX_MS = 600`，越界钳位：
+
+- **Windows（PC 正向）**：托盘右键“预期延迟”子菜单，写入注册表
+  `HKCU\Software\UDP2CAL\water_target_ms` 并立即生效（`Session` 原子值 → 解码线程
+  `DriftController::set_target()`）。注册表值为 0（未设置）时回退环境变量
+  `UDP2CAL_WATER_TARGET_MS` / 默认 200；该环境变量仍保留作现场调试入口。
+- **Android（反向接收）**：高级设置“预期延迟”滑块，写入 SharedPreferences 并经
+  `ProtocolNative.dcSetTargetMs` 立即生效；服务常驻时每次起流也会重新读取当前设置。
+- 目标经 `DriftController::with_target()` / `set_target()` 注入，PI 的 `err` 仍只对比这一个量；
+  起播预缓冲 `start_ms` 同步取当前目标。
+- 运行中调高目标不会瞬间加缓冲：受控重采样只有 ±0.5%，80→300 ms 约需 44 s 收敛；
+  调低时由阶跃吸收（§7.10.2）先裁掉持续超额。需要立即生效时应重新起流。
 
 **两个方向的目标各自独立**：正向（Android 发 → Windows 收）与反向（Windows 发 → Android 收）
 各有自己的网络路径、设备时钟与到达统计，`WATER_TARGET_MS` 不是跨端协议常量。Windows 的
-环境变量只改正向接收；Android 的常量只改反向接收。只有存在共享瓶颈/耦合时才需要联动定值，
-当前实现没有这种耦合。相应地，`JITTER_START_MS` 只是每方向的启动下限，实际启动目标取本方向
-的 `WATER_TARGET_MS`。
+托盘/环境变量只改正向接收；Android 的滑块只改反向接收。只有存在共享瓶颈/耦合时才需要联动定值，
+当前实现没有这种耦合。相应地，`JITTER_START_MS` 只是每方向的启动下限，实际启动目标取本方向的
+当前目标值。
 
-这个参数仍是**唯一**跟环境相关的常数：换路由器、换手机、对方装新 App 都可能重新引入扫描源
-或改变空档幅度，此时应重跑 P0 打点按实测最大空档 ×1.5–1.6 重新定值；现场调参优先用
-`UDP2CAL_WATER_TARGET_MS`（不必重编译），确定后回写常量（Android 反向同步改 Kotlin 常量）。
+这个参数仍是**唯一**跟环境相关的调参量：换路由器、换手机、对方装新 App 都可能重新引入扫描源
+或改变空档幅度，此时应重跑 P0 打点按实测最大空档 ×1.5–1.6 重新定值；现场调参直接改对应端的
+“预期延迟”即可（不必重编译），确定长期值后再回写默认常量（`drift.rs` / `Udp2CalProtocol.kt`）。
 
 ### 7.10.2 阶跃吸收（step trim）
 
@@ -1376,9 +1384,9 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | `DISCOVER_PORT` | `44043` | 发现广播端口 |
 | `DEFAULT_LISTEN_PORT` | `44044` | Windows 默认监听端口 |
 | `JITTER_START_MS` | `30` | 预缓冲（3 帧） |
-| `WATER_TARGET_MS` | `200` | PC 正向目标总水位（抖动缓冲 + PCM 环 + 声卡）；Android 反向独立取 200 |
-| `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 端运行时覆盖目标水位的环境变量 |
-| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 覆盖值允许区间，越界钳位 |
+| `WATER_TARGET_MS` | `200` | 每方向默认可听总水位（抖动缓冲 + PCM 环 + 声卡）；运行时可在 Windows 托盘 / Android 高级设置调整 |
+| `WATER_TARGET_ENV` | `"UDP2CAL_WATER_TARGET_MS"` | Windows 注册表未设置目标水位时的回退覆盖（现场调试） |
+| `WATER_TARGET_MIN_MS` / `WATER_TARGET_MAX_MS` | `80` / `600` | 运行时设置与环境变量覆盖值的允许区间，越界钳位 |
 | `STEP_TRIM_GROWTH_MS` | `80` | 仅诊断：不再单独触发裁剪 |
 | `STEP_TRIM_EXCESS_MS` | `100` | 总水位 > `target + 100` 且持续 `STEP_TRIM_HOLD_MS` 才裁剪 |
 | `STEP_TRIM_HOLD_MS` | `1500` | 持续超预算的确认时间 |
@@ -1539,7 +1547,7 @@ v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.m
    漂移；稳态比率残差 <20 ppm。端到端延迟还包含采集/编码/发送/网络，不能用单一 ≤190 ms
    一刀切，必须另做发送端打点与录音对齐。强抖动网络下水位数标准差做不到 <10 ms（实测
    31–64 ms）——那是网络交付节奏的函数，不是控制器的函数，所以验收取 25 ms；超出上述目标
-   时应先按 §7.10.1 重定 `WATER_TARGET_MS`，而不是放宽验收。
+   时应先按 §7.10.1 重定目标，而不是放宽验收。
 4. 设备钟差与网络抖动分离：
    - 仅设备时钟误差（±200/±300 ppm、无网络抖动）时，前馈收敛、`adjust_ppm` 稳定、
      音高稳定、阶跃裁剪不增长；
@@ -1570,11 +1578,12 @@ FEC 的超限保护（码率上限 512 kbps，最坏情况 640 + 冗余仍远低
    本版不为此提高目标水位（那会让有线用户白白多等），需要时由上层应用自行补偿。
 2. **AudioTrack 播放头精度**：不同厂商 `getPlaybackHeadPosition()` 的粒度不同（典型 5–20 ms，
    低延迟模式下更细）。协议侧只要求播放头单调，不假设其精度。
-3. **Wi-Fi 抖动**：正向 200 ms / 反向 200 ms 的目标水位覆盖关闭扫描后的常见家用/办公
+3. **Wi-Fi 抖动**：正向 / 反向默认 200 ms 的目标水位覆盖关闭扫描后的常见家用/办公
    环境（稳态空档 68–90 ms），偶发台阶由阶跃吸收（§7.10.2）兜住。若环境重新出现
    数百毫秒级断供，
    表现会转向 PLC 与阶跃裁剪，而不是自动抬水位——抬水位会把延迟永久留在链路上；
-   此时应用 `UDP2CAL_WATER_TARGET_MS` 现场重定目标（§7.10.1）。
+   此时在对应端的“预期延迟”里重定目标（§7.10.1）；Windows 也可用
+   `UDP2CAL_WATER_TARGET_MS`（仅注册表未设置时生效）。
 4. **干净断代**：v2/v3 不能互通，发布时必须同时升级两端（见第二章）。
 
 ---
