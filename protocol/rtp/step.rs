@@ -42,8 +42,8 @@ impl StepDecision {
 
 /// 阶跃吸收的判据 + 限额（方案 C）。
 ///
-/// 单独成形是为了让 Windows（`main.rs` 解码循环）与 Android
-/// （`CaptureService.reversePlayLoop`）用**同一套**阈值与限额，两端不必各写一份。
+/// 单独成形是为了让 Windows（`session/audio.rs` 解码循环）与 Android
+/// （`ReverseLink.reversePlayLoop`）用**同一套**阈值与限额，两端不必各写一份。
 /// 本结构只看数字、不碰缓冲：调用方拿到 `frames` 后自己调
 /// [`JitterBuffer::pull_trim`](super::JitterBuffer::pull_trim)，
 /// 因此可以在同一把锁里完成决定、在外面记录日志。

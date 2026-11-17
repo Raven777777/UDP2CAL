@@ -1,6 +1,7 @@
 # 版本历史
 
 > 按版本倒序排列。单个 Bug 的根因分析与修复细节见 [BUGFIX.md](BUGFIX.md)。
+> 各版本条目记录发布当时的代码树；后续模块拆分可能移动了路径（如 `protocol/rtp.rs` 已拆分），当前映射见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ---
 
@@ -12,6 +13,7 @@
 - `StreamResampler.kt` 删除 Kotlin 算法副本，改为 `rs*` JNI 胶水；现有 Kotlin 单测原样在桌面 JVM 上跑同一份 Rust 机器码，三端行为由同一组 Rust 单测看守。
 - Windows 端会话级状态收敛为 `Arc<Session>`：`JITTER` / `P2P_STATE` / `REVERSE_SENDER` / 配对与音频初始化等进程静态改为 `Session` 字段，由 `app::run` 注入广播线程、接收流、解码线程与 UI；锁顺序记录在 `session/mod.rs` 头部，单测可创建独立实例。
 - `protocol/jni.rs` 的标量 getter 统一由 `handle_scalar!` 宏生成（`JitterBuffer` / `StepAbsorber` / `DriftController` / `DeviceRateEstimator` / `Resampler`），删除逐点手写的 JNI 入口。
+- 其他修复：缺口 PLC 区分中段洞与尾部洞（c3f1034）；时间戳非整帧跳变立即重同步（9e94639）；Android 发送节拍改为发送前对齐（4138ba8）；结构上 Windows main.rs / Android CaptureService / protocol rtp.rs 拆分为模块（e61e05e / 1f2af77 / 6728100）。
 
 ## v1.5.2 — 2026-11-13 · 稳定性优先与可靠性修复
 
@@ -587,8 +589,8 @@
   与新整形叠加会导致半速，已删除
 - `JITTER_START_MS` 40 → 30 ms（3 帧）：前提是水位由比率闭环维持，不再需要旧模型的安全垫
 - Windows 输出显式请求 10 ms 缓冲（`BufferSize::Fixed`），驱动拒绝时回落默认值；
-  cpal 0.15.3 的 `buffer_size_to_duration` 有 100× 换算误差，请求值不可信，
-  因此延迟一律以时间戳实测为准
+  cpal 0.15.3 的 `buffer_size_to_duration` 只是请求值：帧数→hns 换算会截断，
+  共享模式下 WASAPI 还会把过小的周期向上取整到引擎最小周期，因此延迟一律以时间戳实测为准
 - Android AudioTrack 缓冲 80 ms → 2 帧（20 ms），`PERFORMANCE_MODE_LOW_LATENCY` 常态化
   （minSdk 29），反向路径接入重采样
 
@@ -746,7 +748,7 @@
 
 ## 未发布 — 第二轮质量审查修复（24 项）
 
-> 详细根因与修复方式见 [BUGFIX.md](BUGFIX.md#2026-10-23--第二轮质量审查24-项)，完整报告见 [CODE_REVIEW_ROUND2_2026-10-23.md](archive/CODE_REVIEW_ROUND2_2026-10-23.md)。
+> 详细根因与修复方式见 [BUGFIX_V2_ERA.md](archive/BUGFIX_V2_ERA.md)，完整报告见 [CODE_REVIEW_ROUND2_2026-10-23.md](archive/CODE_REVIEW_ROUND2_2026-10-23.md)。
 
 **windows（`udp2cal`）**
 - 反向捕获：解析端点混音采样率，非 48 kHz（如 44.1 kHz）在编码前重采样，修复音高偏差 8.8%

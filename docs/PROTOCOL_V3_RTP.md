@@ -7,7 +7,7 @@
 > - 控制协议版本：**3**
 > - 媒体承载：**标准 RTP/AVP，RTP version 2**
 > - 适用范围：Android ↔ Windows，局域网 / 点对点，单向或双向实时音频
-> - 协议真源：`protocol/protocol.rs`（控制面） + `protocol/rtp.rs`（媒体面 / 抖动缓冲 / 播放头）
+> - 协议真源：`protocol/protocol.rs`（控制面） + `protocol/rtp/`（媒体面：jitter/drift/step/header 等）
 >   —— Android 不再有 Kotlin 副本，它通过 JNI 调用同一份 Rust 实现（见 [ARCHITECTURE.md](ARCHITECTURE.md)）
 > - 相关文档：[v2 协议（历史）](archive/PROTOCOL_V2.md) · [架构说明](ARCHITECTURE.md)
 >
@@ -377,7 +377,7 @@ ACK 负载固定 10 字节：
 
 规则：
 
-- Windows 收到每个合法 CONNECT 后立即回复 ACK。
+- Windows 收到每个合法 CONNECT 后立即回复 ACK（未配对设备的首个 CONNECT 除外，须本机确认后才 ACK，见 §6.4）。
 - ACK 必须回显 CONNECT 的 `forward_ssrc`；Android 只接受与当前会话一致的 ACK。
   旧会话/重复 ACK 不得刷新 `lastAckTime`，也不得覆盖 `reverse_ssrc`。
   这是一次不兼容的负载扩展：Android 与 Windows 必须同步升级到本版。
@@ -494,14 +494,14 @@ Android                                   Windows
 - Windows 绑定成功后，才可以接受正向 RTP；未绑定状态下收到 RTP 一律丢弃。
 - Android 收到 `reverse_ssrc != 0` 的 ACK 后，才可以启动反向接收。
 - Windows 只有在 CONNECT 的 `reverse_port != 0` 且反向功能开启时，才启动反向发送。
-- 接收端在收到第一个 RTP 包后进入预缓冲；预缓冲满足 30 ms（3 帧）才开始播放。
+- 接收端在收到第一个 RTP 包后进入预缓冲；连续 3 帧（30 ms）只是硬下限，实际还要等媒体跨度水位达到 `start_ms`（§7.7，两端取 `WATER_TARGET_MS` = 200 ms）才开始播放。
 
 ### 6.4 保活与超时
 
 | 项目 | 值 |
 |------|----|
 | Android CONNECT 间隔 | 1 s |
-| Windows ACK 延迟 | 立即回复 |
+| Windows ACK 延迟 | 立即回复（未配对设备的首个 CONNECT 除外，待本机确认后才 ACK，见本节下述规则） |
 | Android ACK 超时 | 3 s |
 | Windows CONNECT 超时 | 4.5 s（给 Android 3 s ACK 窗口留一次重传余量） |
 
@@ -510,6 +510,7 @@ Android                                   Windows
 - 保活只看控制面，**不得**用“是否收到 RTP”判断连接存活；DTX 静音期间可能长时间没有 RTP。
 - Android 3 s 未收到新 ACK：标记断连，停止正向 RTP，保留 CONNECT 重试。
 - Windows 4.5 s 未收到绑定设备的 CONNECT：释放绑定，停止反向发送，回到 Ready。
+- Windows 首次收到**未配对**设备的合法 CONNECT 时先请本机用户确认：确认前不回 ACK、不绑定、不启动反向发送；用户拒绝或已有待确认弹窗时静默忽略。
 - ACK 丢失但 CONNECT 正常时，以最近一次 ACK 时间为准；下一次 CONNECT 会重新触发 ACK。
 - 重连必须使用新 SSRC；旧 SSRC 包丢弃，抖动缓冲清空。
 
@@ -526,14 +527,14 @@ Android                                   Windows
 **Windows 绑定状态**
 
 ```
-Ready ──(合法 CONNECT)──> Busy
+Ready ──(合法 CONNECT，未配对需本机确认)──> Busy
 Busy  ──(4.5s 无 CONNECT)──> Ready
 Busy  ──(异设备 CONNECT)──> Busy（静默忽略，不回 ACK）
 ```
 
 | 状态 | 行为 |
 |------|------|
-| Ready | 每秒广播 DISCOVER_REPLY；接受 CONNECT；丢弃所有 RTP |
+| Ready | 每秒广播 DISCOVER_REPLY；接受 CONNECT（未配对设备的 CONNECT 需本机确认后才 ACK）；丢弃所有 RTP |
 | Busy | 停止广播；只接受绑定设备的 CONNECT；只接受绑定源地址 + SSRC 的 RTP；异设备 CONNECT 静默丢弃 |
 
 **Android 连接状态**
@@ -590,7 +591,7 @@ Reconnecting ──(ACK)──> Connected
 | `PI_INTEGRAL_MAX` | 0.001 | 积分项权限（±1000 ppm），限住长饱和后的余振 |
 | `PI_MIN_UPDATE_MS` | 5 ms | 单次评估的最小时间跨度；更密的调用只累计时间 |
 | `WATER_SMOOTH_TAU_MS` | 4000 ms | 水位一阶低通时间常数：90 ms 攒批衰减约 20 倍，只留长期均值 |
-| `RATE_WINDOW_S` / `RATE_BUCKETS` | 30 s / 30 | 设备时钟估计窗与桶数（每桶 1 s，桶内取设备进度/QPC 的最小二乘点） |
+| `RATE_WINDOW_S` / `RATE_BUCKETS` | 30 s / 30 | 设备时钟估计窗与桶数（每桶 1 s；每桶只取该桶**首个**设备进度/QPC 观测点，再对最近 ≤30 个点整体做最小二乘） |
 | `RATE_MIN_BUCKETS` | 6 | 起算所需最少桶数（没攒够宁可不出估计） |
 | `RATE_JUMP_MAX_SAMPLES` | 96000（2 s） | 设备帧单次跳变上限：超过即判时间线被重建，整窗作废 |
 | `RATE_FEEDFORWARD_MAX` | ±0.02 | 设备时钟前馈钳位（±2%：超出说明不是钟差） |
@@ -625,6 +626,7 @@ JitterBuffer {
 网络线程收到 RTP 后：
 
 ```text
+0. 每包先做相位检查：ext_ts % 480 ≠ next_ts % 480 立即重同步（§7.7），先于迟到/重复/溢出判定。
 1. 校验 RTP 版本、P/X/CC、PT、长度、SSRC、源地址。
 2. 用 16 位/32 位有符号差值扩展 seq/ts：
      ext_seq = highest_seq + (seq - (u16)highest_seq)   // 以 i16 解释差值
@@ -655,7 +657,7 @@ JitterBuffer {
 
 注意：
 
-- 扩展差值超出重排窗口的包按“跳变”处理，不得让 `u16/u32` 回绕误判为巨大的未来包。
+- 扩展序号超出重排窗口（`ext_seq ≥ next_seq + 64`）的包若相位正常只丢弃并计 `overflow`，**不得重同步**（会连带丢掉已缓冲的约 640 ms 音频）；相位不符的包已在步 0 按 §7.7 处理。本步内，只有 `M=1` 且跳变超过 `RESYNC_GAP_MS` 的包才重建。
 - 时间戳是播放顺序的权威；序列号用于重复检测与断点识别。**序号落后于
   `next_seq` 而时间戳合法且未重复时，结论是"发生了断点"，不是"包迟到"**——
   真正迟到的包在第 4 步已由 `ext_ts < next_ts` 拦下。旧实现的顺序（先判序号
@@ -753,7 +755,10 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
   │                              │     └─ 否则（尾部洞，终点未知）
   │                              │           └─> hold（PLC 不推进，最多 12 帧）→ 静音
   │                              │
-  │                              └─ M=1 且跳变 > 200ms
+  │                              ├─ M=1 且跳变 > 200ms
+  │                              │     └─> RESYNC
+  │                              │
+  │                              └─ 时间戳非整帧（§7.7）
   │                                    └─> RESYNC
   │
   └────────────────────────────── RESYNC（清空、重置、重新预缓冲）
@@ -766,7 +771,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
   尾部洞（`highest_ts <= next_ts`）先 hold：PLC 帧照常输出但播放头不动，最多 H 帧
   （默认 12 帧 / 120 ms），迟到的包仍可无损接回；倒计时耗尽才推进一帧并转静音。
   两种路径都保持 `PLAYING`，直到真实包恢复。
-- 真实包恢复且时间戳跳变大于 200 ms：进入 `RESYNC`；否则直接继续 `PLAYING`，`plc_run=0`、
+- 真实包恢复且满足 §7.7 的任一触发条件：进入 `RESYNC`；否则直接继续 `PLAYING`，`plc_run=0`、
   hold 状态复位。
 - `stats.hold_frames` 记录尾部洞 hold 的填充帧（是 `stats.plc_frames` 的子集）；
   诊断日志据此区分“hold”与“普通 PLC”。
@@ -787,7 +792,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 触发条件：
 
 - `M=1` 且 `ext_ts - next_ts > 200 ms`；
-- 或连续 PLC 达到上限后收到时间戳跳变大于 200 ms 的包；
+- 或时间戳非整帧：`ext_ts % 480 ≠ next_ts % 480`（发送端按墙钟补缺口会出现 35 ms 这类跳变，播放头只按 ±480 前进，必然永久失配）；
 - 或发送端 SSRC 变化（由控制面触发）。
 
 动作：
@@ -797,7 +802,7 @@ PREBUFFER ──(连续 >= 3 帧且水位 >= start_ms)──> PLAYING
 3. 重置 Opus 解码器和 PLC 状态；
 4. 清空 PCM 环（`flush`）、重采样器相位与历史、解码器 PLC 状态；
 5. 复位漂移控制器与速率估计器（`highest_ts` 重建基准，旧观测不再有意义）；
-6. 回到 `PREBUFFER`，重新满足 3 帧后播放。
+6. 回到 `PREBUFFER`，满足起播条件（3 帧且水位达到 `start_ms`）后恢复 PLAYING。
 
 ### 7.8 PLC 规则
 
@@ -853,8 +858,8 @@ i_next     = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MA
   只能按 `ki·|err|`（err=-110 ms 时约 12 ppm/s）慢慢退，稳态水位因此被顶在目标
   之上 10–30 ms 长达数分钟。现场日志指纹：开播瞬间 `反馈 -1100ppm`，之后
   -457 → -294 → +21 → +65 缓慢爬升。门控后积分从 0 起算，开播即收敛。
-  两端实现一致：Windows `windows/src/main.rs` 解码线程、Android
-  `CaptureService.kt` 反向播放循环都用 `!rtpIdle && jitter.is_playing()`。
+  两端实现一致：Windows `windows/src/session/audio.rs` 解码线程、Android
+  `ReverseLink.kt` 反向播放循环都用 `!rtpIdle && jitter.is_playing()`。
 - `dt < PI_MIN_UPDATE_MS`（5 ms）的调用只累计时间，不评估。
 - 反馈输出仍要经过最终钳位 `±RESAMPLE_MAX_ADJUST`（±0.5%），见下面的合成式。
 
@@ -864,7 +869,7 @@ i_next     = clamp(i + (PI_KP_PER_MS / PI_TI_S) × err × dt_s, ±PI_INTEGRAL_MA
   Windows 由音频回调在读取 `IAudioClock` 时间戳的同一刻写入；Android 用播放头与
   `System.nanoTime()`。这样测到的是“声卡设备时钟相对本机单调钟”的频差。
 - 每 1 s 取一个点，最近 30 个点做最小二乘，得到设备帧/秒斜率。
-- `ratio_err = slope / 48000 − 1`；`ff = clamp(−ratio_err, ±RATE_FEEDFORWARD_MAX)`。
+- `ratio_err = slope / device_rate − 1`（`device_rate` = 设备标称采样率（优先 48 kHz；不支持时取设备最大率，常见 44.1 kHz）；用 48000 会把 44.1 kHz 设备误判成 −8.125%（随后被 ±2% 前馈钳位吃掉）的钟差）；`ff = clamp(−ratio_err, ±RATE_FEEDFORWARD_MAX)`。
   设备时钟偏快 → `ff` 为负 → 重采样比率变小 → 每输入帧产出更多设备帧。
 - 桶数不足 `RATE_MIN_BUCKETS`（6）时**不发布**估计（宁可用 0，也不用噪声）；
   设备帧跳变超过 `RATE_JUMP_MAX_SAMPLES`（2 s）时整窗作废。
@@ -1075,12 +1080,12 @@ PLC/解码器状态自然覆盖，听感成本低于在实时路径引入 WSOLA 
 
 **接入点**（两端都在拉取之前判定，日志前缀 `[Step]`）：
 
-- Windows：`windows/src/main.rs` 解码循环，`jb.pull` 之前；诊断 CSV 末列 `trims` 是累计消费帧数。
-- Android：`android/.../service/CaptureService.kt` 的 `reversePlayLoop`，`jitter.pull` 之前，
+- Windows：`windows/src/session/audio.rs` 解码循环，`jb.pull` 之前；`[Latency]` 行的 `阶跃裁剪 N 帧` 是累计消费帧数（每 10 s 一条）。
+- Android：`android/.../service/ReverseLink.kt` 的 `reversePlayLoop`，`jitter.pull` 之前，
   在 `linkLock` 内。
 
 **已知代价**：每次裁剪仍是一次 10–120 ms 的时间跳，但因为逐帧解码，接缝是 PLC 而不是
-解码器状态断裂。若 `trims` 持续增长，说明目标水位相对该环境偏低，应先重定目标。
+解码器状态断裂。若阶跃裁剪持续增长，说明目标水位相对该环境偏低，应先重定目标。
 
 ### 7.11 Windows 接收管线
 
@@ -1107,6 +1112,7 @@ cpal 输出回调（只 pop PCM、填静音、更新 played_frames）
 - 解码线程等待用条件变量/事件；不得用 `recv_timeout`、`sleep(10ms)` 或“60 ms PLC 定时器”驱动播放。
 - PCM 环容量至少 200 ms；建议 16384 帧（约 341 ms）或按设备缓冲调整。
 - 解码线程只在环有空间且水位未超过目标时解码；不得无限预解码。
+- **空闲恢复**：RTP 连续空闲超过 1 s（`RTP_IDLE_RESET_MS`）后，下个通过校验的包到达时先 `JitterBuffer.reset()` 再按首包重新起播，否则恢复包会被判 late。
 - `played_frames`、设备时钟采样与 `device_latency_us` 用原子变量发布；解码线程据此算
   `ring_ms`/`pipe_ms` 与可听点，但不用它们反算“播放头媒体时间戳”去驱动播放判定。
 - 网络线程、解码线程、音频回调之间的唯一共享是抖动缓冲（锁/无锁队列）和 PCM 环；不得共享可变 Opus 实例。
@@ -1141,8 +1147,7 @@ AudioTrack / 声卡
   本地写静音，保持 AudioTrack 不断流。这种“起播/无包可拉”的本地静音不是媒体时间线
   的一部分，不推进 `next_ts`；缺口期的 PLC 与随后的 `Silence` 仍按 §7.5 推进媒体时间线
   （尾部洞 hold 期例外：PLC 不推进，超时后的 `Silence` 才推进）。
-- **空闲恢复**：RTP 连续空闲超过 1 s 后，下个通过校验的包到达时先 `JitterBuffer.reset()`，
-  再按首包重新起播，避免本地静音把 `next_ts` 推过新包时间戳后把恢复包判成 late。
+- **空闲恢复**：同 §7.11（Windows `RTP_IDLE_RESET_MS` / Android `REVERSE_IDLE_RESET_MS`，均 1 s），否则空闲期的 PLC/Silence 会把 `next_ts` 推过新包时间戳，恢复包被判成 late。
   发送端在恢复时按墙钟缺口补偿 RTP 时间戳并置 marker。
 
 ### 7.13 统计
@@ -1323,11 +1328,11 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | 机制 | 位置 | 做法 | 为什么 |
 |------|------|------|--------|
 | 高精度发送节拍 | `windows/src/hires.rs` + `windows/src/capture.rs` | 用 `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` 的定时器等 `next_send_at` | Windows 的 `Sleep`/`WaitForSingleObject` 超时受系统定时器分辨率限制（默认 15.6 ms），“睡 10 ms”常变成 15.6 ms，10 ms 网格被打成“两包挨着 + 一段空”。只用高精度**单个句柄**，不调 `timeBeginPeriod`（那是进程级全局状态且影响整机功耗）。创建失败自动退回毫秒级等待 |
-| 套接字缓冲 1 MiB | `windows/src/capture.rs`（反向发送）、`windows/src/main.rs`（主接收）、`android/.../UdpSender.kt`（两端） | `SO_SNDBUF`/`SO_RCVBUF` 请求 1 MiB，失败只告警 | Windows 默认发送缓冲仅 8 KiB 量级；一次 Wi-Fi 漫游/重传退避就会丢掉突发，丢一包就是一个可闻的 PLC。放大的是**内核队列**，两端每 10 ms 立刻 send/recv，不构成应用层积压。Android/Linux 会按 `net.core.rmem_max`（通常 ~208 KiB）截断，属预期 |
+| 套接字缓冲 1 MiB | `windows/src/capture.rs`（反向发送）、`windows/src/net.rs`（主接收）、`android/.../UdpSender.kt`（两端） | `SO_SNDBUF`/`SO_RCVBUF` 请求 1 MiB，失败只告警 | Windows 默认发送缓冲仅 8 KiB 量级；一次 Wi-Fi 漫游/重传退避就会丢掉突发，丢一包就是一个可闻的 PLC。放大的是**内核队列**，两端每 10 ms 立刻 send/recv，不构成应用层积压。Android/Linux 会按 `net.core.rmem_max`（通常 ~208 KiB）截断，属预期 |
 | PCM 环满“最新优先” | `windows/src/audio.rs` `Ring::push_latest` | 环满时丢弃**未播旧数据**（生产者只投递 `request_flush`，`tail` 仍归消费者） | 历史实现只丢新样本 → 环永久满载 → 可听位置永远落后一个环容量，多出的延迟再也散不掉。丢旧数据只需一次 ≤10 ms 缺口，水位立即回正。计数见 `[Audio] 统计` 的 `满丢旧数据` |
 | 节拍迟到统计 | `windows/src/capture.rs` 的 `ReverseStats.late_*` 与 `reanchors`，30 s 汇总 | 实际发送时刻 − 计划时刻的 min/avg/max，**不做 EWMA**；迟到超过半个帧（该重锚）的帧不计入，只累加 `重锚=` 计数 | 只报 min/max/avg 才能看见偶发的百毫秒级卡顿；EWMA 会把卡顿抹平。反过来，一次 8 s 的无声间隔也不该被当成"迟到"——它描述的是停顿多久，不是网格多准，混进来会把均值从 0.3 ms 拉到 4.2 ms（实测）。日志行 `[Pacer] 30s` |
-| 抖动缓冲满即覆盖最旧槽 | `protocol/rtp.rs` `JitterBuffer::store` | 槽位满时覆盖序号最小的槽 | 等价于 Sunshine 的 `drop_oldest`：宁可少一段历史，也不让播放头被旧包拖住 |
-| Opus 带内 FEC 重建（两个方向） | Windows 接收：`windows/src/main.rs`（`Pull::Plc` 分支）、`protocol/rtp.rs` `JitterBuffer::peek_current`、`windows/src/decoder.rs` `OpusDecoder::decode_fec`；Android 接收：`CaptureService.kt` 的 `Pull.PLC` 分支、`ProtocolNative.jbPeek`、`cpp/opus_jni_decoder.c` `decoderDecodeFec` | 丢帧时先用**下一个包**里的 LBRR 冗余重建该帧（`opus_decode(..., fec = 1)`），下一个包也还没到才退回 PLC；`peek_current` 只读不消费，同一个包随后照常解码 | 实测一次 >100 ms 的到达停顿会连丢 3 帧 = 30 ms PLC，听感就是“音量塌一下”。同一测试音源实测：FEC 重建与原始帧的平均绝对误差 0.0064，PLC 外推是 0.297（约 1/46）。前提是发送端开了 in-band FEC；没开时 libopus 自动退化成 PLC，所以接收端不需要先知道对端配置。`opus_decode(fec = 1)` 会把调用方给的输出缓冲填满（传 5760 就返回 5760），因此必须只交 480 采样，否则多出的帧会被当成“这一帧”写进播放环。计数见 Windows 的 `[RTP]` 行 `FEC=` 与 Android 的 `反向延迟` 行 `FEC=n` |
+| 抖动缓冲满即覆盖最旧槽 | `protocol/rtp/jitter.rs` `JitterBuffer::store` | 槽位满时覆盖序号最小的槽 | 等价于 Sunshine 的 `drop_oldest`：宁可少一段历史，也不让播放头被旧包拖住 |
+| Opus 带内 FEC 重建（两个方向） | Windows 接收：`windows/src/session/audio.rs`（`Pull::Plc` 分支）、`protocol/rtp/jitter.rs` `JitterBuffer::peek_current`、`windows/src/decoder.rs` `OpusDecoder::decode_fec`；Android 接收：`ReverseLink.kt` 的 `Pull.PLC` 分支、`ProtocolNative.jbPeek`、`cpp/opus_jni_decoder.c` `decoderDecodeFec` | 丢帧时先用**下一个包**里的 LBRR 冗余重建该帧（`opus_decode(..., fec = 1)`），下一个包也还没到才退回 PLC；`peek_current` 只读不消费，同一个包随后照常解码 | 实测一次 >100 ms 的到达停顿会连丢 3 帧 = 30 ms PLC，听感就是“音量塌一下”。同一测试音源实测：FEC 重建与原始帧的平均绝对误差 0.0064，PLC 外推是 0.297（约 1/46）。前提是发送端开了 in-band FEC；没开时 libopus 自动退化成 PLC，所以接收端不需要先知道对端配置。`opus_decode(fec = 1)` 会把调用方给的输出缓冲填满（传 5760 就返回 5760），因此必须只交 480 采样，否则多出的帧会被当成“这一帧”写进播放环。计数见 Windows 的 `[RTP]` 行 `FEC=` 与 Android 的 `反向延迟` 行 `FEC=n` |
 
 **实测（v1.5.1，同一条 Wi-Fi 链路、同一台机器）**：加高精度定时器之前 `[Pacer]` 迟到
 `min/avg/max=11204/15788/17927 µs`（稳定 15.8 ms ≈ 一个系统 tick，且槽位偏移一旦形成就逐帧复制）；
@@ -1423,7 +1428,7 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 | 抖动缓冲满 | 丢弃扩展序号最小的非 `next` 包，计数 |
 | 迟到/重复包 | 丢弃，计数 |
 | 时间戳合法但序号落后（断流/DTX 恢复） | 按时间戳重新对齐并计数，**不得丢弃** |
-| PLC 超过 120 ms | 输出静音，等待真实包/重同步 |
+| PLC 达到上限（中段洞 `PLC_HOLE_MAX_MS` = 300 ms / 尾部洞 hold `PLC_HOLD_MS` = 120 ms） | 输出静音，等待真实包/重同步 |
 | 声卡/解码器致命错误 | 停止播放，报告错误；不得忙等 |
 
 所有错误处理都不得引入无界队列、无界重试或音频路径定时器。
@@ -1494,10 +1499,10 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v DisableUser
 v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.md)「协议单一实现」）：Kotlin 通过 JNI
 调用同一份代码，不再存在"两份实现跑偏"。一致性由三道闸门看守：
 
-- `Udp2CalProtocolTest`（63 例）在桌面 JVM 上加载 `udp2cal_protocol.dll`，与 Android 真机跑的是
+- `Udp2CalProtocolTest`（57 例）在桌面 JVM 上加载 `udp2cal_protocol.dll`，与 Android 真机跑的是
   **同一份机器码**：字节向量、回绕、边界全部照旧；
 - `nativeConstantsMatchKotlinConstants` / `nativeRealConstantsMatchKotlinConstants`：Rust 导出的
-  44 个整数常量与 9 个浮点常量必须与 Kotlin 的 `const val` 逐项相等（Kotlin 常量仅为编译期需要）；
+  46 个整数常量与 7 个浮点常量必须与 Kotlin 的 `const val` 逐项相等（Kotlin 常量仅为编译期需要）；
 - 附录 B 的十六进制向量仍是跨版本（v3 各实现）的互通基准：换实现、换语言时以它为准。
 
 ### 11.3 集成测试
@@ -1532,10 +1537,10 @@ v1.5.0 起协议只有一份实现（Rust，见 [ARCHITECTURE.md](ARCHITECTURE.m
    时应先按 §7.10.1 重定 `WATER_TARGET_MS`，而不是放宽验收。
 4. 设备钟差与网络抖动分离：
    - 仅设备时钟误差（±200/±300 ppm、无网络抖动）时，前馈收敛、`adjust_ppm` 稳定、
-     音高稳定、`trims` 不增长；
+     音高稳定、阶跃裁剪不增长；
    - 仅网络攒批（90 ms 一次补齐）时，单次增长不触发裁剪，`adjust_ppm` 不被单次到达
      推走，无周期性变调；
-   - 阶跃积压持续 >1.5 s 时，`trims` 增长而 `plc` 不增长，接缝无爆音；
+   - 阶跃积压持续 >1.5 s 时，阶跃裁剪增长而 `plc` 不增长，接缝无爆音；
    - 单包丢失/200 ms–2 s 断流：PLC 上限、静音、恢复与 resync 行为符合 §7.5/§7.6。
 5. 丢包时只在 PCM 环见底（`ring_ms <= PLC_LEAD_MS`）后 PLC；设备缓冲为 10/20/30/50 ms
    时都必须在欠载前补 PLC；真实包恢复后 PLC 停止。

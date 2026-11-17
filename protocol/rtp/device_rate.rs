@@ -63,7 +63,7 @@ impl DeviceRateEstimator {
     }
 
     /// 指定设备标称速率。Windows 输出设备可能是 44.1 kHz，此时不能拿 48 kHz
-    /// 当基准，否则会把“设备本来就是 44.1k”误判成 −8.16% 的巨大钟差。
+    /// 当基准，否则会把“设备本来就是 44.1k”误判成 −8.125%（随后被 ±2% 前馈钳位吃掉）的巨大钟差。
     pub fn with_rate(nominal_rate: u32) -> Self {
         Self {
             nominal_rate: nominal_rate.max(1) as f64,

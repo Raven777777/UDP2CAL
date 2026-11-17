@@ -73,6 +73,7 @@ docs/
 ├─ BUGFIX.md                  # 现行代码的根因档案
 ├─ LEGAL.md                   # 许可证与合规
 ├─ archive/                   # 历史存档（不维护，不作为规范引用；见 archive/README.md）
+│  ├─ README.md                        # 存档索引
 │  ├─ CONTROL_PLANE_REMEDIATION.md     # 控制面审查快照（首批整改；认证等未完成）
 │  ├─ PROTOCOL_V2.md                   # v2 协议（与 v3 不互通）
 │  ├─ PROPOSAL_LATENCY_V1.4.md        # 延迟优化提案：DSCP EF + 水位 150 + 阶跃吸收（v1.4.0 已落地）
@@ -82,6 +83,9 @@ docs/
 │  ├─ CODE_REVIEW_2026-10-23.md        # 第一轮审查（43 项）
 │  ├─ CODE_REVIEW_ROUND2_2026-10-23.md # 第二轮审查（24 项）
 │  ├─ CODE_REVIEW_2026-10-25.md        # 第三轮审查（22 项）
+│  ├─ CODE_REVIEW_2026-10-27.md        # 全流程审查（v1.5.1 基线）
+│  ├─ CODE_REVIEW_2026-10-27_ROUND3.md # 全流程审查第三轮（2026-10-27）
+│  ├─ PLAN_RECEIVE_CLOCK_2026-10-27.md # 接收端时钟/播放控制梳理方案（整改已落地）
 │  ├─ CODE_REVIEW_2026-10-28_ROUND2.md  # 全流程审查二审（4 处修复、保留风险清单）
 │  ├─ RESEARCH_SUNSHINE_LOW_LATENCY.md  # 外部调研：Sunshine 源码级拆解（仅供借鉴）
 │  ├─ PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md # Sunshine 对照：已实现项、候选改进 S1–S20

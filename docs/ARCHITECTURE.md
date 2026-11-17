@@ -18,6 +18,7 @@ udp2cal/
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
 │     │  ├─ StreamResampler.kt       # 反向流重采样的 JNI 胶水（实现见 protocol/resampler.rs）
 │     │  ├─ Prefs.kt                 # SharedPreferences 配置
+│     │  ├─ WifiNetworkBinder.kt     # Wi-Fi Network 选择 / socket 绑定与回调
 │     │  ├─ service/CaptureService.kt    # 前台服务外壳：Binder/通知/Wi-Fi 回调/停机 join
 │     │  ├─ service/CaptureLifecycle.kt  # 会话编排：链路启停/重启排队/网络层与任务槽
 │     │  ├─ service/ForwardLink.kt       # 正向：采集→Opus→RTP（热循环 + 参数热更新）
@@ -45,11 +46,14 @@ udp2cal/
 │  │  ├─ config.rs     # 注册表配置读写
 │  │  ├─ decoder.rs    # Opus 解码器封装（48 kHz 单声道，480 采样/帧；含带内 FEC 重建）
 │  │  ├─ firewall.rs   # 防火墙规则
+│  │  ├─ power.rs      # 电源守卫（SetThreadExecutionState/EcoQoS）+ MMCSS 线程注册
 │  │  ├─ hires.rs      # 高精度可等待定时器（反向发送节拍）
 │  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
 │  │  └─ protocol.rs   # 协议重新导出
-│  └─ Cargo.toml
+│  ├─ Cargo.toml
+│  └─ build.rs      # 构建脚本：icon.png → ICO，嵌入 PE 资源
 ├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp/ 媒体面 + resampler.rs 重采样 + jni.rs JNI 表面
+├─ vendor/         # audiopus / audiopus_sys 本地补丁副本（Cargo [patch.crates-io]）
 ├─ docs/           # 项目文档（本目录）
 ├─ build.bat       # 统一构建入口（Windows / Android / ADB / 体检）
 ├─ scripts/        # 构建脚本实现（Python 3.8+）
@@ -74,7 +78,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | `protocol/resampler.rs` | **唯一实现**：32 相 × 48 抽头多相 FIR 重采样。Windows 播放（`audio.rs`）、Windows 采集（`capture.rs`）直接调用；Android 经 JNI 调用同一段机器码 |
 | `protocol/jni.rs` | `#[cfg(feature = "jni")]` 的 JNI 表面，全部 `Java_com_udp2cal_app_native_ProtocolNative_*` 符号 |
 | `android/.../native/ProtocolNative.kt` | `external fun` 声明 + `System.loadLibrary("udp2cal_protocol")` |
-| `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（492 行） |
+| `android/.../Udp2CalProtocol.kt` | 只剩常量、DTO 打包/解包与 `get()` 转发（559 行） |
 | `android/.../StreamResampler.kt` | 重采样的 JNI 胶水：句柄 + 输出缓冲，不含 DSP 逻辑 |
 
 三个接线点：
@@ -94,9 +98,9 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 
 - `cargoBuildAndroidProtocol`（Exec）：用 NDK 的 `clang.exe` 交叉编译
   `protocol/ --features jni --target aarch64-linux-android`，链接器经
-  `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` + `CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS`
-  （`-C link-arg=--target=aarch64-linux-android29 -C link-arg=--sysroot=…`）指定；用 per-target 变量
-  是为了不覆盖用户自己的 `RUSTFLAGS`；
+  `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` 指定，`-Clink-arg=--target=aarch64-linux-android29
+  -Clink-arg=--sysroot=…` 走 `CARGO_ENCODED_RUSTFLAGS`（0x1f 分隔）传入，避免路径空格被切分，
+  同时保留用户已有的 `RUSTFLAGS`；
 - `syncRustJniLibs`（Sync）：把 `libudp2cal_protocol.so` 放到 `build/rustJniLibs/<abi>/`，`preBuild` 依赖它；
 - `cargoBuildHostProtocol`（Exec）：宿主 `cargo build --release --features jni` 产出
   `udp2cal_protocol.dll`，单元测试用 `java.library.path` 指向 `protocol/target/release`——
@@ -123,7 +127,7 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 | 采集（Windows） | WASAPI Loopback，事件驱动 | 10 ms 组帧 + 1 帧节拍整形，不做应用层积压 |
 | 编码 | libopus 1.6.1（JNI / audiopus，双端同一份 `opus-src`） | Deep PLC；DRED 不启用（接收端无解析/恢复路径）；负载上限 1275 字节，超限丢帧不截断 |
 | 时钟 | 三个时间参考 | RTP 媒体时间、接收端 QPC/`Instant`、声卡设备进度（Windows `IAudioClock::GetPosition`，Android 播放头）；映射规则见协议 7.9/7.10 |
-| 输出（Windows） | cpal 0.15 / WASAPI | 无锁 SPSC 环（341 ms）+ 显式 10 ms 设备缓冲 + 事件驱动回调 |
+| 输出（Windows） | cpal 0.18 / WASAPI | 无锁 SPSC 环（341 ms）+ 显式 10 ms 设备缓冲 + 事件驱动回调 |
 
 > 这里刻意不列"版本号矩阵"之外的运行时策略：那些属于会随实现漂移的细节，
 > 写在这里必然过时。行为以代码与协议规范为准。
@@ -147,30 +151,30 @@ v1.4.0 及之前的 `Udp2CalProtocol.kt` 是 `protocol/rtp.rs` + `protocol/proto
 |-------|------|------|
 | `udp2cal-protocol` | local | 局域网 UDP 协议（包头编解码、重排序缓冲区） |
 | `iced` | 0.14 | GUI 框架（tiny-skia 软件渲染，tokio 运行时） |
-| `tokio` | 1.40 | 异步 UDP 收发、超时控制、事件流 |
-| `cpal` | 0.15 | WASAPI 音频播放 |
+| `tokio` | 1.54 | 异步 UDP 收发、超时控制、事件流 |
+| `cpal` | 0.18 | WASAPI 音频播放 |
+| `socket2` | 0.6 | 收发缓冲 / DSCP(EF) / SO_SNDBUF 调优 |
 | `audiopus` | 0.3.0-rc.0 | Opus 音频编解码 |
-| `windows` | 0.58 | Win32 API（单实例互斥、窗口控制、COM/WASAPI） |
-| `winreg` | 0.52 | 注册表配置持久化 |
-| `tray-icon` | 0.24 | 系统托盘图标、右键菜单、双击恢复 |
-| `image` | 0.24 | 运行时解码内嵌 `icon.png` 为 RGBA |
+| `windows` | 0.62 | Win32 API（单实例互斥、窗口控制、COM/WASAPI） |
+| `winreg` | 0.56 | 注册表配置持久化 |
+| `tray-icon` | 0.26 | 系统托盘图标、右键菜单、双击恢复 |
+| `image` | 0.25 | 运行时解码内嵌 `icon.png` 为 RGBA |
 
 ### 关键依赖配置
 
 ```toml
 [profile.release]
-opt-level = 3         # 实时音频路径优先速度，体积换性能不划算
-lto = true            # 链接时优化
+opt-level = 2         # 实时音频路径优先速度，体积换性能不划算
+lto = "fat"           # 链接时优化
 codegen-units = 1     # 单代码生成单元
 panic = "unwind"      # Panic 展开
-strip = "symbols"     # 剥离调试符号
 
 [dependencies]
 iced = { version = "0.14", default-features = false, features = ["tokio", "tiny-skia", "image"] }
-tokio = { version = "1.40", features = ["net", "sync", "rt", "macros", "time"] }
-windows = { version = "0.58", features = [
+tokio = { version = "1.54", features = ["net", "sync", "rt", "macros", "time"] }
+windows = { version = "0.62", features = [
     "Win32_Security", "Win32_System_Com", "Win32_System_LibraryLoader",
-    "Win32_System_Threading", "Win32_System_Registry",
+    "Win32_System_Threading", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi",
     "Win32_Foundation", "Win32_Media_Audio", "Win32_Media_KernelStreaming",
@@ -359,7 +363,7 @@ v3 大幅削减了可协商项：**帧长、采样率、声道数、payload type
 | 机制 | 位置 | 为什么必须这样 |
 | --- | --- | --- |
 | 水位只用**一个口径** | `session/audio.rs` 解码线程：`water = jb.water_ms() + ring_ms + device_latency_ms` | 抖动缓冲、解码环、声卡缓冲三段都是"可听点之前压着的媒体量"，加在一起才等于真实排队时长；分开算就会互相打架，需要偏移记账去补 |
-| 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：cpal 0.15.3 把帧数换算成 `hnsBufferDuration` 时少乘 100 |
+| 设备延迟实测 | `audio.rs` 回调：`timestamp().playback − .callback` | 声卡自报，是唯一可信来源。请求的缓冲值不可信：`BufferSize::Fixed` 只是请求值：帧数→hns 换算有 ±1 帧以内的舍入误差，共享模式下 WASAPI 还会把过小的周期向上取整到引擎最小周期 |
 | 预解码深度 ≤40 ms | `rtp::JitterBuffer::pull`：`ring_ms >= DECODE_LIMIT_MS` 就返回 `Wait` | 不设上限时，断流期解码线程会以 CPU 速度灌 PLC，`next_ts` 跑到可听点前面几百毫秒，恢复后真包全被判迟到 |
 | 回调唤醒解码线程 | `audio.rs`：`thread.unpark()` | 播放头前移本身就是"该拉下一帧"的信号，不需要定时器 |
 | 前馈管设备钟差 + 反馈管长期残差 | `rtp::DeviceRateEstimator` / `rtp::DriftController` | 前馈观测 `(设备帧, QPC)`，测的是媒体时钟相对**声卡设备时钟**的频差；反馈对 4 s 低通后的水位做慢 PI，只修长期残差。网络攒批不进入前馈，因此不会变成变调 |
@@ -390,12 +394,12 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 | 项目 | 值 |
 | --- | --- |
-| 项目/EXE/APK | `UDP2CAL` / `udp2cal.exe` / `udp2cal.apk` |
+| 项目/EXE/APK | `UDP2CAL` / `udp2cal.exe` / `udp2cal_<abi>_<build_type>.apk`（如 `udp2cal_arm64-v8a_Release.apk`） |
 | Rust crate | `udp2cal` / `udp2cal-protocol` |
 | 协议 lib 名 | `udp2cal_protocol` |
 | 注册表 | `HKCU\Software\UDP2CAL` |
 | 开机自启 Run 键 | `UDP2CAL` |
-| 防火墙规则 | `UDP2CAL 局域网音频串流` |
+| 防火墙规则 | `UDP2CAL-In-UDP` |
 | 单实例互斥锁 | `UDP2CAL_SingleInstance_Mutex` |
 | 发现服务端口 | `44043` |
 | Android 包名 | `com.udp2cal.app` |

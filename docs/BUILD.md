@@ -21,9 +21,9 @@
 | JDK | 17~22 |
 | Android SDK | API 35 |
 | NDK | 27.0.12077973 |
-| Rust 工具链 | `cargo` 在 `PATH`（或 `CARGO` 环境变量），且已装交叉 target：`rustup target add aarch64-linux-android` |
+| Rust 工具链 | `cargo` 在 `PATH`（`build.bat` 的预检只认 `PATH`；`CARGO` 仅对直接调用 gradlew 生效），且已装交叉 target：`rustup target add aarch64-linux-android` |
 
-> 构建脚本会自动检查 JDK / SDK / gradle wrapper，并修正 `local.properties`；产物复制到项目根目录。
+> 构建脚本会自动检查 JDK / SDK、校验 gradle wrapper 文件是否存在，并修正 `local.properties`；产物复制到项目根目录。
 
 ---
 
@@ -38,7 +38,9 @@
 
 ## 三、统一构建入口
 
-所有构建均通过项目根目录的 `build.bat` 完成；不带参数运行可进入交互式菜单。
+常规构建入口是项目根目录的 `build.bat`；下列手工命令用于单步排障。不带参数运行可进入交互式菜单。
+
+> 其余通用选项（`--proxy` / `--mirror` / `--java-home` / `--sdk-dir` / `--no-install-deps` / `-v`）见 `build.bat --help`（或 `python scripts/build.py --help`）。
 
 ### Windows 接收端
 
@@ -93,8 +95,8 @@ cd protocol && cargo build --release --features jni
 cargo test --offline
 ```
 
-> cargo 默认联网（首次构建需下载 `jni-sys`）；缓存已暖的机器可加 `-PcargoOffline` 完全离线：
-> `gradlew :app:assembleRelease -PcargoOffline`。
+> cargo 默认联网（首次构建需下载 `jni-sys`）；缓存已暖的机器可加 `-PcargoOffline=true` 完全离线：
+> `cd android && gradlew.bat :app:assembleRelease -PcargoOffline=true`。
 
 > 交叉编译不用 NDK 的 `aarch64-linux-android29-clang` 包装脚本（在 Windows 上是 `.sh`/`.cmd`，Rust
 > 启动不了），而是直接用 `clang.exe` + `--target` + `--sysroot`。注意 sysroot 在
@@ -107,7 +109,7 @@ cargo test --offline
 | 特性 | 生效位置 | 运行时条件 | 说明 |
 |------|---------|-----------|------|
 | 经典 PLC | 解码端 | PCM 环见底 | 缺口在 `ring_ms <= PLC_LEAD_MS`（下一次提交只剩 20 ms 余量）时补一帧 480 采样。缺口后已有真包（终点已知）时最多补 30 帧（300 ms）；尾部洞终点未知时先 hold，用 PLC 填 12 帧且不推进播放头，迟到包可无损接回，超时后转静音但仍留在 PLAYING。PLC→静音接缝做 10 ms 线性淡出。**没有**丢包计时器、没有兜底定时器 —— 触发点由声卡消费节奏决定（协议 7.5/7.8） |
-| 抖动缓冲 | `protocol/rtp.rs` | 自动 | 固定 64 槽、按扩展时间戳索引；序号只用于重复检测。v3 **不再**动态扩缩重排窗口 |
+| 抖动缓冲 | `protocol/rtp/jitter.rs` | 自动 | 固定 64 槽、按扩展时间戳索引；序号只用于重复检测。v3 **不再**动态扩缩重排窗口 |
 | **Wi-Fi 省电锁（Android）** | CaptureService | 采集期间 | 采集期间持有 `WIFI_MODE_FULL_LOW_LATENCY` WifiLock，阻止网卡进入省电聚合（周期性 100~500ms 延迟簇的根源），停止采集释放 |
 | Deep PLC | 解码端 | 解码复杂度 ≥ 5 | 两端在解码器创建时设置（Windows `OpusDecoder::new()`、Android `opus_jni_decoder.c`）；v3 固定单解码器 48 kHz 单声道 |
 | DRED | 不启用 | — | 接收端没有 DRED 解析/恢复路径；发送端单方面开启只会白占码率。编码器显式 `OPUS_SET_DRED_DURATION(0)`，构建也关闭 `OPUS_DRED` |
@@ -143,7 +145,8 @@ build.bat adb --all         :: 编译 + 安装 + 清缓冲 + 监控 + 打开 Win
 
 ```properties
 # android/local.properties（不入库）
-RELEASE_STORE_FILE=lanmic-debug.keystore   # 相对 android/ 目录
+# 相对 android/ 目录
+RELEASE_STORE_FILE=lanmic-debug.keystore
 RELEASE_STORE_PASSWORD=******
 RELEASE_KEY_ALIAS=lanmic
 RELEASE_KEY_PASSWORD=******
@@ -161,15 +164,15 @@ RELEASE_KEY_PASSWORD=******
 
 ```
 udp2cal_x64.exe               # Windows 接收端 64-bit
-udp2cal_x64.upx.exe           # UPX 压缩版（额外产物）
+udp2cal_x64.upx.exe           # UPX 压缩版（用 --upx 构建时替代未压缩文件，二者不并存）
 udp2cal_x86.exe               # Windows 接收端 32-bit
-udp2cal_x86.upx.exe           # UPX 压缩版（额外产物）
-udp2cal_arm64-v8a.apk         # Android 发送端 64-bit（已签名，ProGuard 缩减）
-udp2cal_armeabi-v7a.apk       # Android 发送端 32-bit（已签名，ProGuard 缩减）
-icon.png                      # 图标源文件（已内嵌到 exe，分发时可选附带）
+udp2cal_x86.upx.exe           # UPX 压缩版（用 --upx 构建时替代未压缩文件，二者不并存）
+udp2cal_arm64-v8a_Release.apk      # Android 发送端 64-bit（已签名，ProGuard 缩减）
+udp2cal_armeabi-v7a_Release.apk    # Android 发送端 32-bit（已签名，ProGuard 缩减）
+icon.png                      # 图标源文件（根目录副本内嵌窗口/托盘，windows/icon.png 作 EXE 资源；分发时可选附带）
 ```
 
-> `icon.png` 必须保留在项目根目录：`windows/build.rs` 在构建期将其转换为 256×256 ICO 嵌入 PE 资源，`windows/src/main.rs` 通过 `include_bytes!("../../icon.png")` 编译期嵌入窗口/托盘图标。移动该文件会导致 Windows 端构建失败。
+> `icon.png` 必须保留在项目根目录：`windows/build.rs` 读 **`windows/icon.png`** 生成 256×256 ICO 嵌入 PE 资源，`windows/src/tray.rs` 通过 `include_bytes!("../../icon.png")` 编译期嵌入窗口/托盘图标（两个副本需同时替换）。移动根目录副本会导致 Windows 端构建失败。
 
 ---
 
@@ -182,7 +185,7 @@ scripts/
 └─ udp2cal/             # 环境探测、依赖补装、Gradle/Cargo 封装
 ```
 
-> Python 3.8+ 运行 `scripts/build.py`；`build.bat` 仅负责定位 Python 解释器并转发参数。
+> Python 3.8+ 运行 `scripts/build.py`；`build.bat` 仅负责定位 Python 解释器并转发参数。解释器不在 `PATH` 时可用环境变量 `UDP2CAL_PYTHON=<python.exe 绝对路径>` 指定；`build.bat` 另设 `UDP2CAL_ROOT` 指向仓库根。
 
 ---
 
@@ -191,12 +194,12 @@ scripts/
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | CMake 报 `Compatibility with CMake < 3.5 has been removed` | CMake ≥ 4.0 的兼容性策略变更 | 脚本已自动设置 `CMAKE_POLICY_VERSION_MINIMUM=3.5`；手动构建时需自行设置 |
-| `icon.png` 缺失导致构建失败 | 图标被移动或重命名 | 恢复 `icon.png` 到项目根目录 |
+| `icon.png` 缺失导致构建失败 | 图标被移动或重命名 | 恢复 `windows/icon.png`（EXE 资源图标）与项目根 `icon.png`（窗口/托盘，缺失即编译失败） |
 | Android 构建找不到 SDK / NDK | `local.properties` 路径错误 | 执行 `build.bat doctor --fix` 自动修正 |
-| Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本会检查 wrapper；必要时删除 `~/.gradle/caches` 后重试 |
+| Gradle wrapper 版本不匹配 | 本地 gradle 缓存异常 | 脚本只校验 wrapper 文件是否存在；缺失且无可复制来源时报错，需在 `android/` 下执行 `gradle wrapper --gradle-version 8.9`；版本异常时删除 `~/.gradle/caches` 后重试 |
 | `lintVitalAnalyzeRelease` 报 `IncompatibleClassChangeError: KaCallableMemberCall` | AGP 8.7 的 lint 与 Kotlin 2.0 分析 API 不兼容（Google issue 374783344），崩溃点为 `NullSafeMutableLiveData` 检查 | 已在 `app/build.gradle.kts` 禁用该检查；升级到 AGP 8.8.2+ 后可删除该行恢复 |
 | `--proxy` 构建报 `'127.0.0.1' 不是内部或外部命令` | `-Dhttp.nonProxyHosts` 中的 `\|` 被 cmd 当作管道符 | 已修复（`scripts/udp2cal/proxy.py` 为该参数加引号）；旧脚本可改用 `--proxy direct` 绕过 |
-| `A problem occurred starting process 'command 'cargo''` | Gradle 继承了 Git Bash 的 POSIX `PATH`，Java 解析不了；或 `PATH` 里根本没有 cargo | 用 cmd 构建（`build.bat android`），或设 `CARGO=<绝对路径>`；脚本已自动按 `~/.cargo/bin/cargo.exe` 定位 |
+| `A problem occurred starting process 'command 'cargo''` | Gradle 继承了 Git Bash 的 POSIX `PATH`，Java 解析不了；或 `PATH` 里根本没有 cargo | 用 cmd 构建（`build.bat android`）并把 `cargo` 放进 `PATH`；`CARGO=<绝对路径>` 与 `~/.cargo/bin/cargo.exe` 回退只在直接调用 gradlew 时生效（Gradle 的 `cargoExe()`） |
 | `ld.lld: error: cannot open crtbegin_so.o` / `unable to find library -lc` | `RUSTFLAGS` 里的 `--sysroot` 指到了 `ndk/<ver>/sysroot`（不存在） | 改为 `ndk/<ver>/toolchains/llvm/prebuilt/windows-x86_64/sysroot`；`build.gradle.kts` 已修正 |
 | Android 单元测试报 `UnsatisfiedLinkError: no udp2cal_protocol in java.library.path` | 宿主 `.dll` 未编或路径未传入 | `./gradlew :app:cargoBuildHostProtocol` 后重跑；测试任务已自动 `dependsOn` 并设 `java.library.path` |
 | Release 包运行时报 `UnsatisfiedLinkError: native method not found` | R8 把 `ProtocolNative` 类/方法改名了（JNI 符号名含类名与方法名） | `android/app/proguard-rules.pro` 里保留 `-keep class com.udp2cal.app.native.ProtocolNative { *; }`，勿删 |

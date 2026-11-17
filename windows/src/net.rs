@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 // 广播状态机 (独立线程)
 // ══════════════════════════════════════════════
 // Ready 模式: 每 1 秒广播 TYPE_DISCOVER_REPLY 到 LAN
-// Silent 模式: APP 停止 / DEVICE_BUSY / 反向不可用时停止广播
+// Silent 模式: APP 停止 / DEVICE_BUSY 时停止广播
 
 pub(crate) fn start_broadcast_state_machine(session: Arc<Session>) {
     std::thread::spawn(move || {

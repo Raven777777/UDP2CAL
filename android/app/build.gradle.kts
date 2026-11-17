@@ -62,7 +62,7 @@ fun cargoExe(): String {
 /** NDK 根目录：sdk.dir / ANDROID_HOME / LOCALAPPDATA 逐个回退 */
 fun cargoBuildArgs(vararg extra: String): List<String> {
     val args = mutableListOf(cargoExe(), "build", "--release", "--features", "jni")
-    // 首次构建要拉 jni-sys，默认联网；离线环境（缓存已暖）加 `-PcargoOffline`
+    // 首次构建要拉 jni-sys，默认联网；离线环境（缓存已暖）加 `-PcargoOffline=true`
     if (project.providers.gradleProperty("cargoOffline").map { it.toBoolean() }.getOrElse(false)) {
         args += "--offline"
     }

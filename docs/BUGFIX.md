@@ -25,7 +25,7 @@
 |---|---|
 | **模块** | Windows 播放路径（`windows/src/audio.rs`） |
 | **现象** | 手机升级安卓系统后（时间上巧合），链路声音“发闷”：高频全部消失；改任何手机端/应用设置均无效 |
-| **根因** | 依赖升级 `c1524db`（11月4日）把 cpal 从 0.15.3 升到 0.18.2。0.18 的 WASAPI 后端对**输出**设备不再探测格式（`usable = is_output || …`），于是枚举出 8000–384000 全部“可用”采样率范围；而 `pick_output_config` 的排序键（格式 → 单声道 → 声道数）**不含采样率**，选中列表第一个 f32 范围 = **8000 Hz**；`start_audio` 发现 48000 不在该范围内，退到 `with_max_sample_rate()` 兑底，以 **8 kHz** 开流。48 kHz 解码源被 FIR 重采样到 8 kHz（通带 ≈0.42×8k ≈ 3.4 kHz），高音被整体切除 |
+| **根因** | 依赖升级 `c1524db`（11月4日）把 cpal 从 0.15.3 升到 0.18.2。0.18 的 WASAPI 后端对**输出**设备不再探测格式（`usable = is_output \|\| …`），于是枚举出 8000–384000 全部“可用”采样率范围；而 `pick_output_config` 的排序键（格式 → 单声道 → 声道数）**不含采样率**，选中列表第一个 f32 范围 = **8000 Hz**；`start_audio` 发现 48000 不在该范围内，退到 `with_max_sample_rate()` 兑底，以 **8 kHz** 开流。48 kHz 解码源被 FIR 重采样到 8 kHz（通带 ≈0.42×8k ≈ 3.4 kHz），高音被整体切除 |
 | **误诊过程** | 日志曾显示“输出设备 8000 Hz”，但时间上与手机系统更新重合，先查了安卓端（HAL 48 kHz 四麦克风直采、无效果链，均正常），后用 1.5.1 旧版 win 源码 A/B（声音正常）才锁定 win 端；对拍 cpal 0.15.3（探测式枚举，同设备只有 48000 范围）与 0.18.2（不探测，枚举全部率）双向闭环 |
 | **修复** | `pick_output_config` 排序键最前新增“覆盖 48000 Hz 的范围优先”（`output_config_sort_key`，含回归测试）；无法覆盖 48 k 的设备仍走原兑底逻辑不变 |
 | **验证** | 真机（VB-Cable，0.18.2）枚举不变，修复后 pick 选中 min=max=48000 f32 范围；`cargo test` 49+2 全过。诊断方法：播放端日志 `就绪：输出设备 XXXX Hz` 直接显示实际开流采样率 |
@@ -68,14 +68,14 @@
 | 6 | 双端接收 | FEC 重建会把 5760 采样写进 480 采样的时间线（延迟棘轮） | `opus_decode(fec = 1)` 会用调用方的输出容量决定返回长度（传多少填多少） | 只交一帧（480/声道）容量，并要求返回恰好一帧，否则按失败退回 PLC |
 | 7 | Windows 捕获 | 环回初始化失败时事件句柄泄漏，每 500 ms 重试泄漏 2 个句柄 | `client.GetService().ok()?` / `client.Start().ok()?` 在 `Self` 构造前提前返回，`CreateEventW` 的句柄没人 `CloseHandle` | 两个失败分支显式 `CloseHandle` 并记 Win32 错误码 |
 | 8 | Windows 捕获 | 混音格式 `nBlockAlign` 偏小时按 `frame_count * channels` 造切片会越界读 | `parse_mix_format` 校验了 tag/bits/channels/rate/subformat，唯独没校验 `nBlockAlign` | `nBlockAlign != channels * bytes_per_sample` 直接拒绝；另补 `frames == 0` 分支的 `ReleaseBuffer` |
-| 9 | Windows 反向 | ≥144 kHz 环回端点下捕获线程 panic（反向永久静音） | 重采样循环退出条件是 `floor(phase) >= frames-1`，但最后一步 `phase += ratio` 可越过 `frames`，`consumed` 未夹 `frames - 1` | `consumed = (self.phase as usize).min(frames - 1)` + 高比率回归测试 |
-| 10 | Windows / Android | 停止时偶发 SIGSEGV（原生 use-after-free） | `onDestroy` 只 join 采集/播放协程就 `jitter.close()`，而唯一调 `jbInsert` 的反向接收协程不在 join 集合 | 先 `join(reverseRxJob)`（依赖 `udpSender.close()` 唤醒阻塞的 `receive()`），1 s 未退出则**保留**原生句柄并记日志 |
+| 9 | Windows 反向 | ≥144 kHz 环回端点下捕获线程 panic（反向永久静音） | 重采样循环退出条件是 `floor(phase) >= frames-1`，但最后一步 `phase += ratio` 可越过 `frames`，`consumed` 未夹 `frames - 1`（该实现已被重构删除） | 采集重采样改用 `protocol/resampler.rs` 多相 FIR（无 phase 循环），原两点插值已删除，回归测试随实现迁移至 `protocol/resampler.rs` |
+| 10 | Windows / Android | 停止时偶发 SIGSEGV（原生 use-after-free） | `onDestroy` 只 join 采集/播放协程就 `jitter.close()`，而唯一调 `jbInsert` 的反向接收协程不在 join 集合 | 先 `join(rxJob)`（`ReverseLink.jobs()`，依赖 `udpSender.close()` 唤醒阻塞的 `receive()`），1 s 未退出则**保留**原生句柄并记日志 |
 
 ### 验证
 
 - 反向节拍：`[Pacer]` 迟到 `11204/15788/17927 µs` → `21/300/1000 µs`（现场日志，同一台机器）。
 - FEC 重建质量：单测对比同一测试音源，平均绝对误差 0.0064（FEC）vs 0.297（PLC）。
-- 门控：`rtp.rs` 回归测试 `prebuffer_phase_winds_up_the_integral_to_the_negative_stop` 断言 120 s 低水位喂入后积分到负饱和。
+- 门控：`rtp/drift.rs` 回归测试 `prebuffer_phase_winds_up_the_integral_to_the_negative_stop` 断言 120 s 低水位喂入后积分到负饱和。
 - 门禁：protocol 80 tests / windows 42 单测 + 2 集成 / android `assembleDebug`（含 CMake）全绿，两 crate clippy 0 警告。
 
 ---
@@ -87,7 +87,7 @@
 | 1 | 三端 | 旧会话 ACK 可刷新连接、覆盖反向 SSRC | ACK 只带 reverse_ssrc/PT/frame，不绑定 forward_ssrc | ACK 扩为 10 字节并回显 forward_ssrc；Android 只接受当前会话 |
 | 2 | Windows | 单次控制包丢失时 Windows 先超时拆链 | ACK 窗口与绑定超时同为 3 s，无重传余量 | `PEER_TIMEOUT_MS=4500`，比 ACK 窗口长 1.5 s |
 | 3 | Windows | 停止播放后恢复，手机永久无声 | WASAPI 端点失效/服务重启后旧采集客户端只返回错误，线程把错误当空闲，永久发合成静音；发送线程死亡后槽位仍为 `Some` | `GetBuffer` 错误区分并连续 3 次重建客户端；`ReverseSender` 存活标志 + 保活自动重启；`stop` 同步 join |
-| 4 | Android | 播放协程退出后无人重启 | 只有 `activeReverseSsrc` 变化才启动播放；协程异常/写入连续失败会永久退出 | 控制面监督 `reversePlayJob`，2 s 退避后重启；切换会话时 `cancelAndJoin` 旧循环 |
+| 4 | Android | 播放协程退出后无人重启 | 只有 `activeReverseSsrc` 变化才启动播放；协程异常/写入连续失败会永久退出 | 控制面监督 `playJob`，2 s 退避后重启；切换会话时 `cancelAndJoin` 旧循环 |
 | 5 | Android | ACK 新鲜度受系统墙钟跳变影响；换 SSRC 与 ACK 提交有竞态 | `System.currentTimeMillis` + 无会话锁 | 改用 `elapsedRealtime`，ACK 提交与 `regenerateForwardSsrc` 同锁 |
 
 > 未修复（设计限制）：首次 CONNECT 仍只凭公开 `device_id` 绑定，未认证的局域网主机
@@ -127,7 +127,7 @@
 
 | # | 模块 | 问题 | 根因 | 修复 |
 |---|------|------|------|------|
-| 1 | 三端 | ACK 中断 0.2–3 s 后正向音频永久静音 | `CaptureService.sendFrames` 在 `!isAckFresh` 时同时跳过 `seq`，但 `timestamp` 无条件推进；接收端断流期间用 PLC/静音推进 `next_seq`，恢复包 `ext_seq` 永久落后 → 被"迟到"判定丢弃，且该判定位于 M=1 重同步之前，重同步分支不可达 | 序列号与时间戳同频推进（每帧无条件 +1）；接收端把"序号落后但时间戳合法"改判为断点并重新对齐 |
+| 1 | 三端 | ACK 中断 0.2–3 s 后正向音频永久静音 | `ForwardLink.sendFrames` 在 `!isAckFresh` 时同时跳过 `seq`，但 `timestamp` 无条件推进；接收端断流期间用 PLC/静音推进 `next_seq`，恢复包 `ext_seq` 永久落后 → 被"迟到"判定丢弃，且该判定位于 M=1 重同步之前，重同步分支不可达 | 序列号与时间戳同频推进（每帧无条件 +1）；接收端把"序号落后但时间戳合法"改判为断点并重新对齐 |
 | 2 | 三端 | DTX 结束 / 长断流后双向静音 | 规范 4.4 要求"DTX 不递增序列号"，与接收端的迟到判据不自洽：恢复包 `gap=0` 不满足重同步条件，随后被序号判定丢弃。Windows 反向链路严格按规范实现，开 DTX 即中招；Android 正向"错误地"递增序列号恰好掩盖了该缺陷 | 同 #1；同步修订规范 4.4（序列号每帧递增）与 7.4（判定顺序） |
 
 ### P1（严重）
@@ -135,7 +135,7 @@
 | # | 模块 | 问题 | 根因 | 修复 |
 |---|------|------|------|------|
 | 3 | Windows | 解码线程可能永久停产（静音、无日志） | `Ring::clear()` 由生产者写消费者索引 `tail`，破坏 SPSC 不变量；`len()` 的 head/tail 两次读取之间若插入 flush，相减回绕成 `usize::MAX` → `filled_frames() >= max_depth` 恒真 | 生产者改为投递 `flush_to` 请求、由音频回调落地；`len()` 增加"读 tail→读 head→再读 tail"快照校验 + `saturating_sub` 兜底；新增并发回归测试 |
-| 4 | Windows | 手机换 IP 后反向音频静音 | `reverse_stale` 未纳入源 IP，只有 `DeviceID/SSRC/reverse_port` 变化才重启反向发送器 | 增加 `peer.addr.ip() != src.ip()` 条件 |
+| 4 | Windows | 手机换 IP 后反向音频静音 | `reverse_stale` 未纳入源 IP，只有 `DeviceID/SSRC/reverse_port` 变化才重启反向发送器（该实现已被端点钉住校验取代，见 `windows/src/session/mod.rs:94-100`） | 改为校验完整源端点 `is_bound_peer_source()`：已绑定设备换 IP/端口直接拒绝，超时后由新 CONNECT 重建会话 |
 
 ### P2（中等）
 
@@ -157,12 +157,12 @@
 | 13 | Android | `sendFrames` 注释与实现（DTX 时递增、失败时不递增）三方矛盾 | 统一为"每帧递增"，重写注释 |
 | 14 | Android | `JitterBuffer.reset()` 未清 `lastRebaseReason`，新会话日志打印旧原因 | `reset()` 中清空 |
 | 15 | Android | 麦克风权限被拒无任何提示 | 新增说明弹窗 + "去设置"跳转 + `onResume` 复检 |
-| 16 | Windows | 音频初始化重试后 `wake_decoder()` 唤醒已退出线程 | `DECODE_THREAD` 由 `OnceLock` 改为可替换的 `Mutex<Option<Thread>>` |
+| 16 | Windows | 音频初始化重试后 `wake_decoder()` 唤醒已退出线程 | `decode_thread`（原 `DECODE_THREAD` 静态）改为 Session 内可替换的 `Mutex<Option<Thread>>` |
 | 17 | Android | `UdpSender.connect()` 失败路径不回收 socket | 失败分支关闭已创建的 socket 并清空字段 |
 | 18 | Windows | 日志 2 MiB 上限只在启动时检查 | 运行期按已写字节计数触发轮转，失败时延后重试 |
 | 19 | 构建 | `doctor --fix` 后不重算问题数，摘要恒为"待处理" | 抽出 `_check_projects()`，修复后复检 |
 | 20 | Windows | `StatusUpdate` 只置真不置假，码率 0 仍显示"已连接" | 由控制面绑定状态驱动 |
-| 21 | Windows | 报告曾判定"重采样相位为负导致外插" | **复核为误报**：相位恒在 `[0, ratio)`，不存在负相位。已在代码中补充推导注释，不做改动 |
+| 21 | Windows | 报告曾判定"重采样相位为负导致外插" | **随重采样器重写失效**：现实现 `pos` 可为负（历史段），但抽头窗口不完全落在已知数据内就不出样本，仍不外插 |
 | 22 | 协议 | `DRIFT_MIN_SAMPLES` 为未使用常量 | 删除 |
 
 ### 验证

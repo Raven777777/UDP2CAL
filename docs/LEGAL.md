@@ -28,11 +28,13 @@
 |---------|--------|------|
 | [**libopus**](https://opus-codec.org/) (1.6.1) | BSD-3-Clause | Opus 音频编解码核心（仓库根 `opus-src/` 共享源码树） |
 | [**iced**](https://iced.rs/) (0.14) | MIT | Windows 端 GUI 框架 |
-| [**tokio**](https://tokio.rs/) (1.40) | MIT | 异步 UDP 收发与超时控制 |
-| [**cpal**](https://github.com/RustAudio/cpal) (0.15) | MIT/Apache-2.0 | WASAPI 音频播放 |
+| [**tokio**](https://tokio.rs/) (1.54) | MIT | 异步 UDP 收发与超时控制 |
+| [**cpal**](https://github.com/RustAudio/cpal) (0.18) | Apache-2.0 | WASAPI 音频播放 |
 | [**audiopus**](https://github.com/djg/audiopus-rs) (0.3.0-rc.0) | ISC | Rust Opus 编解码封装（`vendor/audiopus` 副本含本地扩展，见其 README） |
 | [**audiopus_sys**](https://github.com/serenity-rs/audiopus_sys) (0.2.2) | ISC | Opus 构建与 FFI 绑定（`vendor/audiopus_sys` 副本改读共享 `opus-src/`，见其 README） |
-| [**windows-rs**](https://github.com/microsoft/windows-rs) (0.58) | MIT | Windows Win32/COM API |
+| [**windows-rs**](https://github.com/microsoft/windows-rs) (0.62) | MIT OR Apache-2.0 | Windows Win32/COM API |
+| [**socket2**](https://crates.io/crates/socket2) / [**tray-icon**](https://crates.io/crates/tray-icon) / [**winreg**](https://crates.io/crates/winreg) / [**image**](https://crates.io/crates/image) / [**jni-sys**](https://crates.io/crates/jni-sys) | MIT OR Apache-2.0（winreg 为 MIT） | 套接字选项、托盘、注册表、图像解码、JNI 边界 |
+| **AndroidX**（activity-compose / lifecycle-runtime-compose / core-ktx） | Apache-2.0 | Android 生命周期与 Compose 运行时 |
 | [**Jetpack Compose**](https://developer.android.com/jetpack/compose) + **Material 3** | Apache-2.0 | Android 端现代 UI |
 | [**Kotlin Coroutines**](https://kotlinlang.org/docs/coroutines-overview.html) | Apache-2.0 | Android 异步编程 |
 

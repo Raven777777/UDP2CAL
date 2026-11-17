@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import subprocess
 from pathlib import Path
 from typing import List, Optional
@@ -14,7 +15,7 @@ from . import android as androidmod, config, env as envmod, runner
 
 PACKAGE_NAME = "com.udp2cal.app"
 LOGCAT_TAGS = "OpusEncoder:V CaptureService:V MainActivity:V"
-WIN_DEBUG_LOG = config.WINDOWS_DIR / "udp2cal_debug.log"
+WIN_DEBUG_LOG = Path(os.environ.get("LOCALAPPDATA", "")) / "UDP2CAL" / "udp2cal.log"
 
 
 def _resolve_adb(ctx, logger) -> Optional[Path]:
@@ -177,7 +178,7 @@ def run_adb(ctx, logger) -> int:
 
 def _monitor(adb: Path, logger) -> None:
     logger.blank()
-    logger.info("请在手机上：打开 udp2cal → 开启「调试模式」→ 点击「开始采集」")
+    logger.info("请在手机上：打开 udp2cal → 点击「开始采集」")
     logger.info("按 Ctrl+C 退出监控")
     logger.blank()
     try:
@@ -193,7 +194,7 @@ def _monitor(adb: Path, logger) -> None:
 
 def _open_winlog(logger) -> None:
     if not WIN_DEBUG_LOG.exists():
-        logger.warn("Windows 调试日志尚未生成（需在 Windows 端开启调试模式）")
+        logger.warn("Windows 调试日志尚未生成（需用 debug 构建运行）")
         logger.hint("期望路径: {}".format(WIN_DEBUG_LOG))
         return
     logger.info("打开 {}".format(WIN_DEBUG_LOG))
@@ -212,7 +213,7 @@ def _print_usage(logger) -> None:
     logger.info("  --install   安装 APK 到设备")
     logger.info("  --clear     清空 Logcat 缓冲")
     logger.info("  --monitor   启动 Logcat 监控 (OpusEncoder / CaptureService / MainActivity)")
-    logger.info("  --winlog    打开 Windows 调试日志 (udp2cal_debug.log)")
+    logger.info("  --winlog    打开 Windows 调试日志 (%LOCALAPPDATA%\\UDP2CAL\\udp2cal.log)")
     logger.info("  --all       执行全部上述操作")
     logger.info("  --abi ABI   目标 ABI: arm64-v8a(默认) | armeabi-v7a")
     logger.blank()

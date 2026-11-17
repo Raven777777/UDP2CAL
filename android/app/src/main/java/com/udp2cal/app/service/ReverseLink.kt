@@ -379,13 +379,13 @@ internal class ReverseLink(
         var latencyMs = 0
         // 阶跃吸收（方案 C）：与 Windows 端同一套判据与限额
         val step = Udp2CalProtocol.StepAbsorber()
-        // 起播直接预缓冲到目标水位，避免"30ms 起播后用几分钟追到 150ms"。
+        // 起播直接预缓冲到目标水位，避免"30ms 起播后用几分钟追到 200ms"。
         jitter.setStartPrebufferMs(drift.targetMs())
         var adjust = 0.0
         // 冻结水位反馈（断流 / 预缓冲未出声）：这两种状态下 water 长期低于目标，
         // 若继续积分，积分会压到 -PI_INTEGRAL_MAX 的负饱和；恢复出声后只能按
-        // ≈12 ppm/s 慢慢退，稳态水位被顶在目标之上 10–30 ms 长达几分钟，
-        // 期间还带着几分音分的音高偏移。与 windows/src/main.rs 解码线程同源。
+        // ≈1–3 ppm/s 慢慢退，稳态水位被顶在目标之上 10–30 ms 长达几分钟，
+        // 期间还带着几分音分的音高偏移。与 windows/src/session/audio.rs 解码线程同源。
         var idleFeedback = false
         // PLC→Silence 接缝的 10 ms 淡出：记录上一块**成功写出**的末样本（L/R）。
         // 解码/PLC 失败补零、重同步时清空，避免从过时电平起坡。
@@ -635,7 +635,7 @@ internal class ReverseLink(
                     // in-band FEC 时 libopus 自动退化成 PLC，故不会更差。
                     // 现场最常见的就是"包没丢、只是来晚了"（AP 攒批/省电）：
                     // 一次 >100 ms 的停顿会连丢 3 帧，以前全 PLC，听起来就是
-                    // 一下音量塌陷。判据与 windows/src/main.rs 同源。
+                    // 一下音量塌陷。判据与 windows/src/session/audio.rs 同源。
                     var fecLen = 0
                     linkLock.lock()
                     try {

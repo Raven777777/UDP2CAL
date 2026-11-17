@@ -4,7 +4,7 @@
 
 接收端稳态水位目标默认：PC 正向 200 ms / Android 反向 200 ms（抖动缓冲 + 解码/PCM 环 + 声卡缓冲，两个方向各自独立定值）；端到端延迟还包含采集、编码、发送与网络传输，实际值随设备/网络变化。界面显示的是**接收端可测部分**，不包含发送端与网络。
 
-**稳定性优先（2026-11-13 起）**：同链路 pktmon 抓包复测确认，Wi-Fi/AP 会按 ~100 ms 周期把 10 个 10 ms 包攒批交付；目标 80 ms 时这正好打成 7–10 帧 PLC。目标 200 ms 可覆盖 99–109 ms 的实测空档并留余量；代价是接收端总延迟约 200 ms。目标可用 `$env:UDP2CAL_WATER_TARGET_MS = "80"`（80–600，越界钳位）调试；链路空档更深的设备/环境须按「实测最大空档 ×1.5–1.6」定值，**不要靠压低目标去赢延迟**——水位就是断供时的全部缓冲（见 [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) §5.3）。
+**稳定性优先（2026-11-13 起）**：同链路 pktmon 抓包复测确认，Wi-Fi/AP 会按 ~100 ms 周期把 10 个 10 ms 包攒批交付；目标 80 ms 时这正好打成 7–10 帧 PLC。目标 200 ms 可覆盖 99–109 ms 的实测空档并留余量；代价是接收端总延迟约 200 ms。目标可用 `$env:UDP2CAL_WATER_TARGET_MS = "80"`（80–600，越界钳位）调试 **PC 正向**；Android 反向没有环境变量，恒为 200 ms。链路空档更深的设备/环境须按「实测最大空档 ×1.5–1.6」定值，**不要靠压低目标去赢延迟**——水位就是断供时的全部缓冲（见 [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) §5.2）。
 
 ```
 Android 手机 ↔ 双向音频 ↔ Windows PC
@@ -54,7 +54,7 @@ build.bat doctor --fix                               :: 环境体检与自动修
 
 | 文档                                           | 内容                              |
 | -------------------------------------------- | ------------------------------- |
-| [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 全部命令、编译产物、常见问题 |
+| [docs/BUILD.md](docs/BUILD.md)               | 环境要求、`build.bat` 常用构建命令与选项、编译产物、常见问题 |
 | [docs/FEATURES.md](docs/FEATURES.md)         | 两端功能特性、Opus 参数详解、界面截图           |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 项目结构、技术栈、运行时行为、代码落点、命名约定      |
 | [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **协议规范（现行）**：RTP 媒体面、控制面、时钟模型 |

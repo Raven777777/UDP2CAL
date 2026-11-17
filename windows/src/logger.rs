@@ -197,7 +197,7 @@ pub fn write_line(args: std::fmt::Arguments<'_>) {
 /// 安装 panic hook：把 panic 的线程名/位置/信息（及可用时的 backtrace）落盘。
 ///
 /// 未安装时的后果：发布版是 GUI 子系统，`eprintln!` 被系统丢弃；解码线程或
-/// UDP 接收任务 panic 后进程仍活着、`APP_RUNNING` 仍为 1、DISCOVER_REQ 照旧
+/// UDP 接收任务 panic 后进程仍活着、`Session::running` 仍为 true、DISCOVER_REQ 照旧
 /// 回 ACK，手机看到“幽灵设备”，而日志里一个字都没有。
 ///
 /// 用 `try_lock` 而不是 `lock`：panic 可能就发生在持日志锁的路径上，

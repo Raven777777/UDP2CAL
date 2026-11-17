@@ -13,7 +13,7 @@ pub const MAX_REORDER_PACKETS: usize = 64;
 ///
 /// 真正的起播水位是 [`JitterBuffer::set_start_prebuffer_ms`] 设置的目标
 /// （默认与 [`WATER_TARGET_MS`](super::WATER_TARGET_MS) 相同）：先攒到目标再播，
-/// 避免"30 ms 起播、再用 ±0.5% 的 ASRC 花 24 s 爬到 150 ms"这种隐性启动策略。
+/// 避免"30 ms 起播、再用 ±0.5% 的 ASRC 花 34 s 爬到 200 ms"这种隐性启动策略。
 pub const JITTER_START_MS: u32 = 30;
 
 /// 解码缓冲（PCM 环 + 声卡）的深度上限：达到它就不再预解码。
@@ -240,7 +240,7 @@ impl JitterBuffer {
     ///
     /// 显式启动策略：连续帧达到 [`JITTER_START_MS`] 的硬下限后，还要攒到
     /// `start_ms` 才进入 PLAYING。这样不会出现“30 ms 起播，再用 0.5% 的
-    /// 比率花 24 s 爬到 150 ms”的隐性过程。
+    /// 比率花 34 s 爬到 200 ms”的隐性过程。
     pub fn set_start_prebuffer_ms(&mut self, ms: u32) {
         self.start_ms = ms.max(JITTER_START_MS);
     }

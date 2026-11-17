@@ -612,10 +612,9 @@ pub fn start_audio(stats: Arc<AudioStats>) -> Result<AudioWriter, String> {
     // 某些驱动 30 ms），播放头的量化粒度随之变粗。这里钉成 10 ms：
     // 缓冲延迟低一档，欠载风险由上游 341 ms 的 PCM 环吸收。
     //
-    // ⚠ cpal 0.15.3 的 `buffer_size_to_duration()` 把帧数换算成 hnsBufferDuration
-    // 时少乘了 100（480 帧被算成 0.1 ms 而不是 10 ms）。共享模式下 WASAPI 会把
-    // 过小的周期向上取整到引擎最小周期，因此实际值不等于这里的请求值——
-    // 所以我们**不信任请求值**，而是从 `OutputCallbackInfo` 里实测
+    // ⚠ `BufferSize::Fixed` 只是请求值：cpal 的帧数→hns 换算有 ±1 帧以内的舍入误差，
+    // 共享模式下 WASAPI 还会把过小的周期向上取整到引擎最小周期，因此实际值不等于
+    // 这里的请求值——所以我们**不信任请求值**，而是从 `OutputCallbackInfo` 里实测
     // `playback - callback`（见 `device_latency_us`）。
     let want_frames = (actual_rate / 100).max(1); // 10 ms
     let min_frames = match supported_buffer {
