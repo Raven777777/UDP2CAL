@@ -1,6 +1,6 @@
 # UDP2CAL 文档中心
 
-> 当前版本 **v1.5.2**（协议 v3）· 本目录是项目技术文档的唯一入口。
+> 当前版本 **v1.5.3**（协议 v3）· 本目录是项目技术文档的唯一入口。
 >
 > UDP2CAL 是双向、低延迟的局域网音频串流系统：Android 手机与 Windows PC 之间
 > 通过**私有控制面 + 标准 RTP/Opus 媒体面**（协议 v3）互传音频流。
@@ -70,6 +70,7 @@ docs/
 ├─ FEATURES.md                # 功能与参数
 ├─ BUILD.md                   # 构建与产物
 ├─ LATENCY_CALIBRATION.md     # 延迟口径与实测校准
+├─ PERF_PROFILE.md            # 性能剖析工具链与基线
 ├─ CHANGELOG.md               # 版本历史
 ├─ BUGFIX.md                  # 现行代码的根因档案
 ├─ LEGAL.md                   # 许可证与合规

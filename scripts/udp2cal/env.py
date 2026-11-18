@@ -183,7 +183,8 @@ def select_java(
                 )
             )
             return None
-        pool = [info] + pool
+        # 显式指定优先于 JAVA_HOME：否则两者不同时会静默用错 JDK
+        return info
 
     supported = [j for j in pool if j.supported]
     if supported:

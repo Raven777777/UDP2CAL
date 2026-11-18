@@ -58,6 +58,7 @@ All technical documentation lives in [`docs/`](docs/README.md). (Documents are i
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)   | Project layout, tech stack, runtime behavior, code map, naming conventions |
 | [docs/PROTOCOL_V3_RTP.md](docs/PROTOCOL_V3_RTP.md) | **Protocol spec (current)**: RTP media plane, control plane, clock model |
 | [docs/LATENCY_CALIBRATION.md](docs/LATENCY_CALIBRATION.md) | Latency definitions, `playhead_ts` and DMA buffers, measurement/calibration procedure |
+| [docs/PERF_PROFILE.md](docs/PERF_PROFILE.md) | CPU profiling tools and benchmark baselines |
 | [docs/CHANGELOG.md](docs/CHANGELOG.md)         | Version history                                                       |
 | [docs/BUGFIX.md](docs/BUGFIX.md)               | Root-cause archive of bugs in the current code                        |
 | [docs/LEGAL.md](docs/LEGAL.md)                 | Copyright, GPL-3.0 licensing, third-party component licenses          |

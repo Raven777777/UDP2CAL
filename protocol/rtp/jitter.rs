@@ -371,6 +371,14 @@ impl JitterBuffer {
         let ext_seq = extend_seq(self.highest_seq, pkt.seq);
         let ext_ts = extend_ts(self.highest_ts, pkt.timestamp);
 
+        // 迟到：播放头已越过该时间戳（时间戳是播放顺序的唯一权威）。
+        // 必须先于非整帧重同步判定：否则旧时间线的重排迟到包余数与新时间线
+        // 不同，会被误判成又一次时间线断裂，白白重置解码器并丢掉新缓冲。
+        if ext_ts < self.next_ts {
+            self.stats.late += 1;
+            return InsertResult::Dropped;
+        }
+
         // 发送端按墙钟补缺口/丢积压时，补出的时间戳未必是整帧（如缺 35 ms
         // 补 1680 样本）。播放头只按 ±480 前进，一旦错开非零余数就永远
         // 匹配不到任何包：PLC 到上限后无限静音、槽位堆满后每包记溢出。
@@ -386,12 +394,6 @@ impl JitterBuffer {
             self.stats.resyncs += 1;
             self.stats.inserted += 1;
             return InsertResult::Resync;
-        }
-
-        // 迟到：播放头已越过该时间戳（时间戳是播放顺序的唯一权威）
-        if ext_ts < self.next_ts {
-            self.stats.late += 1;
-            return InsertResult::Dropped;
         }
         // 重复：同一时间戳已经在槽里
         if self.find_ts(ext_ts).is_some() {
@@ -1247,6 +1249,38 @@ mod tests {
             insert(&mut jb, 4 + i, jump_ts + 480 * i as u32, false, 10 + i as u8);
         }
         assert_eq!(pull_tags(&mut jb, 0, 4), vec![9, 11, 12, 13]);
+    }
+
+    #[test]
+    fn jb_late_packet_after_unaligned_resync_does_not_rebase_again() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        // 播掉一帧：旧时间线 next_ts = 480，余数 0
+        assert_eq!(pull_tags(&mut jb, 0, 1), vec![1]);
+
+        // 正向非整帧前跳：重同步到余数 240 的新时间线
+        let jump_ts = 480 * 3 + 1680;
+        assert_eq!(insert(&mut jb, 4, jump_ts, false, 9), InsertResult::Resync);
+        let epoch = jb.epoch;
+        let next_ts = jb.next_ts();
+        let highest_ts = jb.highest_ts();
+        let water = jb.water_ms();
+        let occupied = jb.occupancy_frames();
+
+        // 旧时间线的重排迟到包余数不同；不得触发第二次时间线重同步。
+        let late_ts = 480 * 4 + 200;
+        assert!(late_ts < next_ts as u32);
+        assert_eq!(insert(&mut jb, 5, late_ts, false, 10), InsertResult::Dropped);
+
+        assert_eq!(jb.epoch, epoch, "迟到包不得递增 epoch");
+        assert_eq!(jb.next_ts(), next_ts);
+        assert_eq!(jb.highest_ts(), highest_ts);
+        assert_eq!(jb.water_ms(), water);
+        assert_eq!(jb.occupancy_frames(), occupied);
+        assert_eq!(jb.stats.resyncs, 1);
+        assert_eq!(jb.stats.late, 1);
     }
 
     #[test]

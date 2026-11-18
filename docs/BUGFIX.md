@@ -9,6 +9,21 @@
 
 ---
 
+## 2026-11-18 — v1.5.3 全仓审查修复
+
+| 模块 | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| RTP 抖动缓冲 | 非整帧时间戳重同步后，旧时间线迟到包会再次触发重同步并清空新缓冲 | 相位检查先于 `ext_ts < next_ts` 迟到检查 | 迟到包优先丢弃；新增旧迟到包不改变 epoch/水位的回归测试 |
+| Windows / Android 接收 | 同 SSRC 发送线程重启并回退时间戳后，持续收到包仍永久静音 | 被 jitter 丢弃的包也刷新空闲计时，1 s reset 永不触发 | 仅被接纳的 RTP 包刷新 idle 时间；超时后的首包先 reset 再入队 |
+| Windows 配对 | 已配对设备断开超时后，同 device_id 的另一来源 IP 可自动接管会话并收到回传音频 | 持久配对只存公开 device_id，忙状态重置时源端点也被清空 | 批准时保存来源 IP；同 IP 自动重连，新 IP/旧配置缺 IP 时重新确认 |
+| Windows / Android FEC | 尾部洞 hold 期间包刚到时，可能把当前包当作前一帧的 FEC 载体 | PLC 与 `peek_current` 分两次加锁；hold 不推进播放头 | 仅当本次 PLC 在 pull 时已推进播放头才执行 FEC 前瞻；尾部 hold 退回正常 PLC |
+| 构建脚本 | 手工代理认证信息可能写入日志；安装失败可能自动卸载清除设置；doctor 可能使用错误 JDK/SDK | 日志回显原代理参数、失败后无提示卸载、JDK/SDK 选择与 Gradle 实际环境不一致 | 拒绝带凭证 URL、日志脱敏；降级使用保数据安装且不自动卸载；doctor 遵循显式 JDK 与各项目 local.properties |
+| Android 采集生命周期 | 自终止后 Wi-Fi 低延迟锁未释放；正常停止可能显示麦克风读取错误 | 失败清理只释放 WakeLock；取消的阻塞 read 返回负值仍报告硬件故障 | 无待重启链路时释放 Wi-Fi 锁；仅活动协程的负读才上报 stall |
+
+**验证**：protocol 98、Windows 57 单测 + 2 集成、Android 74 项 JVM/JNI、Python 51 项测试通过。未执行 Android/Windows 真机音频与 Wi-Fi 漫游测试。
+
+---
+
 ## 2026-11-13 — 全仓审查修复：采集重启竞态、doctor 假成功与管道泄漏
 
 | | |
@@ -90,9 +105,7 @@
 | 4 | Android | 播放协程退出后无人重启 | 只有 `activeReverseSsrc` 变化才启动播放；协程异常/写入连续失败会永久退出 | 控制面监督 `playJob`，2 s 退避后重启；切换会话时 `cancelAndJoin` 旧循环 |
 | 5 | Android | ACK 新鲜度受系统墙钟跳变影响；换 SSRC 与 ACK 提交有竞态 | `System.currentTimeMillis` + 无会话锁 | 改用 `elapsedRealtime`，ACK 提交与 `regenerateForwardSsrc` 同锁 |
 
-> 未修复（设计限制）：首次 CONNECT 仍只凭公开 `device_id` 绑定，未认证的局域网主机
-> 可以在 Ready 状态抢先绑定并指定 `reverse_port`，从而接收 Windows 环回声。要彻底修复
-> 需要配对码/确认对话框等认证机制，超出本次小修范围。
+> 已于 v1.5.3 缓解：本机批准时持久保存来源 IP；已配对 ID 只有从同一 IP 到达才自动放行，IP 变化或旧配置缺少来源 IP 时会重新请求本机确认。`device_id` 仍是明文公开标识，且源 IP 可伪造；需抗主动伪造仍须一次性 nonce 或预共享密钥 HMAC。
 
 ---
 

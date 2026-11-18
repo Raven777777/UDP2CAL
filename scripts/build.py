@@ -27,6 +27,7 @@ from udp2cal import android as androidmod  # noqa: E402
 from udp2cal import config, deps  # noqa: E402
 from udp2cal import env as envmod  # noqa: E402
 from udp2cal import proxy as proxymod  # noqa: E402
+from udp2cal import runner  # noqa: E402
 from udp2cal import windows_build as winmod  # noqa: E402
 from udp2cal.logger import C, Logger  # noqa: E402
 
@@ -129,10 +130,12 @@ def doctor(args) -> int:
     else:
         for sdk in sdks:
             logger.ok("{}  (来源: {})".format(sdk.root, sdk.source))
-        primary = sdks[0]
-        for key in config.ANDROID_TARGETS:
-            missing = envmod.missing_components(primary, key)
-            label = config.ANDROID_TARGETS[key]["label"]
+        # 每个项目的 Gradle 以自己 local.properties 的 sdk.dir 为准
+        for key, target in config.ANDROID_TARGETS.items():
+            project = Path(target["dir"])
+            sdk = deps.resolve_sdk(project, sdks[0], logger)
+            missing = envmod.missing_components(sdk, key)
+            label = target["label"]
             if missing:
                 logger.warn("{} 缺少: {}".format(label, ", ".join(missing)))
                 sdk_component_problems += len(missing)
@@ -199,6 +202,12 @@ def doctor(args) -> int:
         if not sdks:
             logger.error("缺少 SDK，无法修复 local.properties")
         else:
+            tool_env = None
+            if chosen:
+                tool_env = runner.prepend_path(
+                    runner.clean_env({"JAVA_HOME": str(chosen.home)}),
+                    chosen.home / "bin",
+                )
             sdk_component_problems = 0
             for key, target in config.ANDROID_TARGETS.items():
                 project = Path(target["dir"])
@@ -208,7 +217,7 @@ def doctor(args) -> int:
                 # 与 build 一致：Gradle 会读 local.properties，组件与属性文件必须是同一个 SDK
                 sdk = deps.resolve_sdk(project, sdks[0], logger)
                 deps.ensure_local_properties(project, sdk, logger)
-                deps.ensure_sdk_components(sdk, key, logger)
+                deps.ensure_sdk_components(sdk, key, logger, env=tool_env)
                 sdk_component_problems += len(envmod.missing_components(sdk, key))
         if rust and rust.rustup:
             for triple in config.WINDOWS_TARGETS.values():

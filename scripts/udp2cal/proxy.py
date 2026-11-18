@@ -17,6 +17,18 @@ from . import config
 _REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 
 
+def _redact_url_credentials(value: str) -> str:
+    """从 URL 日志中删除 userinfo，避免代理/PAC 密码落盘。"""
+    scheme, separator, rest = value.partition("://")
+    if not separator:
+        return value
+    authority, slash, suffix = rest.partition("/")
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    return "{}://{}{}{}".format(scheme, authority, slash, suffix)
+
+
+
 @dataclass
 class ProxyInfo:
     """一个可用的 HTTP 代理。"""
@@ -52,7 +64,7 @@ def _parse_server(value: str) -> Optional[Tuple[str, int]]:
                 break
         elif candidate is None:
             candidate = entry
-    if not candidate or ":" not in candidate:
+    if not candidate or "@" in candidate or ":" not in candidate:
         return None
     host, _, port_text = candidate.rpartition(":")
     try:
@@ -158,6 +170,8 @@ def parse_manual(text: str) -> Optional[ProxyInfo]:
         scheme, _, text = text.partition("://")
         if scheme.strip().lower() not in ("http", "https"):
             return None  # 仅支持 HTTP(S) 代理
+    if "@" in text:  # 不支持认证信息，避免凭证进入日志或 -D 参数
+        return None
     text = text.rstrip("/")
     if ":" not in text:
         text = text + ":1080"
@@ -193,7 +207,7 @@ def resolve(mode: str, logger) -> Optional[ProxyInfo]:
 
     manual = parse_manual(mode)
     if manual is None:
-        logger.warn("无法解析代理参数 '{}'，回退直连".format(mode))
+        logger.warn("无法解析代理参数，回退直连（仅支持 host:port 或 http://host:port，不要包含认证信息）")
         return None
     logger.info("代理: {}".format(manual.describe()))
     return manual
@@ -258,7 +272,7 @@ def report(logger) -> None:
         logger.detail("本地代理端口: 未探测到常见端口")
 
     if pac:
-        logger.detail("PAC 脚本: {}".format(pac))
+        logger.detail("PAC 脚本: {}".format(_redact_url_credentials(pac)))
 
     if registry or env_proxy or local:
         logger.hint("默认仍走直连+镜像；需要走代理时加 --proxy auto")

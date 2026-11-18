@@ -53,7 +53,15 @@ impl AudioInitState {
     }
 }
 
-/// 启动（或重启）音频解码/播放线程。
+/// PLC 之后是否允许前瞻当前包的带内 FEC。
+///
+/// 中段洞的 PLC 会推进播放头（`next_ts == plc_ts + 一帧`），下一包正是重建
+/// 本帧所需的 LBRR 载体；尾部 hold 的 PLC 不推进（`next_ts == plc_ts`），
+/// 此时 `peek_current` 看的是同一帧，不能拿它来解码前一帧的冗余。
+pub(super) fn fec_peek_allowed(plc_ts: u64, next_ts_after_pull: u64) -> bool {
+    next_ts_after_pull != plc_ts
+}
+
 ///
 /// 播放节拍完全由声卡播放头决定：
 ///   * 解码线程只在 `AudioWriter` 有空位时拉取帧，绝不无限预解码；
@@ -253,7 +261,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                 // 把解码缓冲折回媒体样本，才知道"此刻出声的那一帧"是哪个时间戳
                 let queued_media = (pipe_frames as f64 * aw.current_ratio()) as u64;
 
-                let (pull, jb_water, newest_ts, arrival, trims, step_hit, playing) = {
+                let (pull, jb_water, newest_ts, arrival, trims, step_hit, playing, fec_ok) = {
                     let mut jb = spawn_session.jitter();
                     // 播放头在 pull / 裁剪之前取值：它们都会推进 next_ts，
                     // 用推进后的值扣 queued_media 会把可听点算新一帧。
@@ -293,6 +301,10 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     }
 
                     let r = jb.pull(ring_ms, pipe_ms, &mut payload);
+                    let fec_ok = match r {
+                        protocol::rtp::Pull::Plc { ts } => fec_peek_allowed(ts, jb.next_ts()),
+                        _ => false,
+                    };
                     let highest = jb.highest_ts();
                     let audible_ts = play_ts.saturating_sub(queued_media);
                     (
@@ -303,6 +315,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                         jb.stats.step_trims,
                         hit,
                         jb.is_playing(),
+                        fec_ok,
                     )
                 };
                 let water = jb_water.saturating_add(pipe_ms);
@@ -447,12 +460,14 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                         // in-band FEC 时 libopus 会自动退化成 PLC，故不会更差。
                         // 现实中这正好覆盖"包迟到/被 AP 攒批挤掉"的短洞：
                         // 过去每洞必 PLC（30 ms 听起来就是一下音量塌陷）。
-                        let fec_n = {
+                        let fec_n = if fec_ok {
                             let jb = spawn_session.jitter();
                             match jb.peek_current(&mut payload) {
                                 Some(len) => dec.decode_fec(&payload[..len]),
                                 None => None,
                             }
+                        } else {
+                            None
                         };
                         if fec_n.is_some() {
                             FEC_FRAMES.fetch_add(1, Ordering::Relaxed);

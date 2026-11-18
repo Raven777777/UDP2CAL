@@ -15,6 +15,9 @@ pub struct Config {
     pub device_id: u64,
     /// 已批准的手机设备 ID；0 = 尚未配对。首次连接必须由本机用户确认。
     pub paired_device: u64,
+    /// 已批准设备的来源 IP（不含端口：手机每次重连的源端口都会变）。
+    /// `None` = 旧版本注册表或尚未批准；同 ID 的新来源必须重新确认。
+    pub paired_device_ip: Option<std::net::IpAddr>,
     pub reverse_enabled: u32,
     /// 正向接收目标水位（ms）；0 = 未显式设置，回退环境变量/默认值
     pub water_target_ms: u32,
@@ -58,6 +61,7 @@ impl Default for Config {
             auto_start: 0,
             device_id: 0,
             paired_device: 0,
+            paired_device_ip: None,
             reverse_enabled: 0,
             water_target_ms: 0,
         }
@@ -119,6 +123,7 @@ impl Config {
             auto_start: get_dword(&path, "auto_start", 0),
             device_id: resolve_device_id(stored_id),
             paired_device: get_qword(&path, "paired_device", 0),
+            paired_device_ip: parse_paired_ip(&get_string(&path, "paired_device_ip", "")),
             reverse_enabled: get_dword(&path, "reverse_enabled", 0),
             water_target_ms: sanitize_water_target(get_dword(&path, "water_target_ms", 0)),
         }
@@ -133,6 +138,13 @@ impl Config {
         // 注意：写回的是已缓存的稳定 ID，不会重新生成
         key.set_value("device_id", &self.get_device_id())?;
         key.set_value("paired_device", &self.paired_device)?;
+        key.set_value(
+            "paired_device_ip",
+            &self
+                .paired_device_ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+        )?;
         key.set_value("reverse_enabled", &self.reverse_enabled)?;
         key.set_value("water_target_ms", &self.water_target_ms)?;
         Ok(())
@@ -178,6 +190,12 @@ impl Config {
     }
 }
 
+/// 注册表里的配对来源 IP 是外部输入：缺失或无法解析一律当作未记录，
+/// 后续连接重新走本机确认，绝不因坏值静默放行。
+fn parse_paired_ip(stored: &str) -> Option<std::net::IpAddr> {
+    stored.trim().parse().ok()
+}
+
 fn get_string(key: &RegKey, name: &str, default: &str) -> String {
     key.get_value(name).unwrap_or_else(|_| default.to_string())
 }
@@ -215,6 +233,17 @@ mod tests {
         );
         // 归一后的值必须能安全地截断成 u16
         assert_eq!(sanitize_port(u32::MAX) as u16, DEFAULT_LISTEN_PORT as u16);
+    }
+
+    #[test]
+    fn paired_ip_parses_legacy_missing_and_roundtrips() {
+        assert_eq!(parse_paired_ip(""), None);
+        assert_eq!(parse_paired_ip("not-an-ip"), None);
+        assert_eq!(Config::default().paired_device_ip, None);
+        for s in ["192.0.2.10", "2001:db8::1"] {
+            let ip: std::net::IpAddr = s.parse().unwrap();
+            assert_eq!(parse_paired_ip(&ip.to_string()), Some(ip));
+        }
     }
 
     #[test]

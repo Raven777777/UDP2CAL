@@ -156,7 +156,8 @@ RELEASE_KEY_PASSWORD=******
 
 - **已配置** → Release 使用该密钥签名，可覆盖升级旧版本（需与旧 APK 同一密钥）。
 - **未配置** → 回落到本机调试密钥 `~/.android/debug.keystore`（每台机器不同、不入库），构建仍可通过且 APK 可安装，但**仅供自测**；构建日志会打印警告。
-- 若设备上已装过用其他密钥签名的旧版，安装会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，需先 `adb uninstall com.udp2cal.app`。
+- 若设备上已装过用其他密钥签名的旧版，安装会报 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。安装脚本不会自动卸载，以免清除 `device_id`、连接目标和用户设置；确需切换签名时，请先确认可丢失这些应用私有数据，再在设备设置中手动卸载旧版后安装。
+- 若遇到 `INSTALL_FAILED_VERSION_DOWNGRADE`，安装脚本会先用 `adb install -r -d` 尝试保留数据降级；若设备拒绝，脚本停止，不会自动卸载。
 
 ---
 

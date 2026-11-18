@@ -25,6 +25,26 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.coroutines.coroutineContext
 
+/** RTP 连续空闲超过该值：下个包到达时重置抖动缓冲，避免本地静音把播放头推过后被判 late */
+internal const val REVERSE_IDLE_RESET_MS = 1_000L
+
+/** 空闲计时是否已过期（0 = 本会话尚无被接纳的媒体，不触发重置）。 */
+internal fun reverseIdleExpired(lastAt: Long, nowMono: Long): Boolean =
+    lastAt != 0L && nowMono - lastAt > REVERSE_IDLE_RESET_MS
+
+/**
+ * 仅**实际入队**的包刷新空闲计时；被 late/duplicate/overflow 丢弃的包保持旧值。
+ *
+ * 发送端线程重启沿用同一 reverse SSRC，但 seq/timestamp 重新随机。新时间线的包
+ * 可能持续被判 late 而全部丢弃；若它们也刷新计时，空闲重置永不触发，播放头就
+ * 永远停在旧时间线上，表现为重启后一直静音。
+ */
+internal fun nextReverseIdleAt(lastAt: Long, nowMono: Long, accepted: Boolean): Long =
+    if (accepted) nowMono else lastAt
+
+/** Tail-hold PLC does not advance the playhead, so the current packet cannot provide FEC for itself. */
+internal fun plcAllowsFec(prePullTs: Long, postPullTs: Long): Boolean = postPullTs != prePullTs
+
 /**
  * 反向链路：接收（只插入）+ 播放（按播放头拉取）。
  *
@@ -43,9 +63,6 @@ internal class ReverseLink(
     private val playDispatcher: CoroutineDispatcher,
 ) {
     companion object {
-        /** RTP 连续空闲超过该值：下个包到达时重置抖动缓冲，避免本地静音把播放头推过后被判 late */
-        private const val REVERSE_IDLE_RESET_MS = 1_000L
-
         private const val TAG = SERVICE_TAG
     }
 
@@ -285,20 +302,19 @@ internal class ReverseLink(
             val nowMono = SystemClock.elapsedRealtime()
             linkLock.lock()
             try {
-                // 长时间没有 RTP（Windows 暂停播放/端点重建）后，本地静音已经
-                // 把 nextTs 推到接近墙钟。恢复的第一个包必须先重置时间线，
+                // 长时间没有可用媒体（Windows 暂停播放/端点重建/发送线程重启）后，
+                // 本地静音已经把 nextTs 推到接近墙钟。恢复的第一个包必须先重置时间线，
                 // 否则会被当作 late 丢掉，听起来就是“恢复后一直没声音”。
-                if (lastReversePacketAt != 0L &&
-                    nowMono - lastReversePacketAt > REVERSE_IDLE_RESET_MS
-                ) {
+                // 计时只在包被实际接纳时刷新：发送端重启后旧时间线的新包可能持续被丢弃。
+                if (reverseIdleExpired(lastReversePacketAt, nowMono)) {
                     Log.i(TAG, "反向 RTP 空闲 ${nowMono - lastReversePacketAt}ms，重置抖动缓冲")
                     jitter.reset()
                 }
-                lastReversePacketAt = nowMono
-                jitter.insert(
+                val accepted = jitter.insert(
                     seq, timestamp, marker,
                     buf, payloadOffset, payloadLength
                 )
+                lastReversePacketAt = nextReverseIdleAt(lastReversePacketAt, nowMono, accepted)
                 linkSignal.signalAll()
             } finally {
                 linkLock.unlock()
@@ -434,6 +450,7 @@ internal class ReverseLink(
             var jbOverflow = 0L
             var arrivalNanos = -1L
             var head = 0L
+            var fecAllowed = false
             // 阶跃吸收的本 tick 结论（锁内决定，锁外记日志）
             var stepBefore = 0
             var stepWant = 0
@@ -511,7 +528,9 @@ internal class ReverseLink(
                 // 全部余量，用它做 PLC 截止判据（设备缓冲不是固定延迟）。
                 // 尾部洞 hold 期间返回 PLC 但不推进 nextTs；播放节拍仍由 AudioTrack
                 // 的阻塞写决定，不靠时间戳推进。
+                val pullTs = jitter.nextTs
                 code = jitter.pull(pipeMs, pipeMs, payload)
+                fecAllowed = code == Udp2CalProtocol.Pull.PLC && plcAllowsFec(pullTs, jitter.nextTs)
                 // 可听点之前还压着的媒体量（设备帧 → 媒体样本要用当前比率换算）
                 val queuedMedia = (pipeFrames.toDouble() * resampler.ratio).toLong()
                 val audibleTs = (jitter.nextTs - queuedMedia).coerceAtLeast(0L)
@@ -676,7 +695,9 @@ internal class ReverseLink(
                     var fecLen = 0
                     linkLock.lock()
                     try {
-                        fecLen = jitter.peek(fecPayload)
+                        if (fecAllowed) {
+                            fecLen = jitter.peek(fecPayload)
+                        }
                     } finally {
                         linkLock.unlock()
                     }

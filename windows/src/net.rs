@@ -134,7 +134,18 @@ impl std::hash::Hash for ReceiverKey {
     }
 }
 
-/// `run_with` 只接受函数指针，因此从这里取回 `Session` 并启动接收流。
+/// 空闲计时只由**被接受**的 RTP 包刷新。
+///
+/// 被丢弃的包（如发送端重启后同 SSRC 的向后时间戳）若也刷新，`RTP_IDLE_RESET_MS`
+/// 的 1 s 窗口永远不会到期，时间线就无法通过 reset 自愈。
+fn rtp_activity_at(last: Option<Instant>, accepted: bool, now: Instant) -> Option<Instant> {
+    if accepted {
+        Some(now)
+    } else {
+        last
+    }
+}
+
 ///
 /// `+ use<>` 让返回的 opaque 类型不捕获入参生命周期——否则它无法强制转换成
 /// `for<'a> fn(&'a ReceiverKey) -> _`（流本身只持有 `Arc` 与 `String` 的所有权）。
@@ -229,7 +240,7 @@ pub(crate) fn udp_receiver_stream(
             let mut last_stats = Instant::now();
             let mut last_liveness = Instant::now();
             let mut byte_count: u64 = 0;
-            // 最近一次通过校验的 RTP 包到达时刻（空闲恢复判据，见 RTP_IDLE_RESET_MS）
+            // 最近一次被 JitterBuffer 接纳的 RTP 包到达时刻（空闲恢复判据，见 RTP_IDLE_RESET_MS）
             let mut last_rtp_at: Option<Instant> = None;
 
             loop {
@@ -312,7 +323,7 @@ pub(crate) fn udp_receiver_stream(
                                 RTP_IDLE_RESET_MS
                             );
                         }
-                        last_rtp_at = Some(Instant::now());
+                        last_rtp_at = rtp_activity_at(last_rtp_at, accepted, Instant::now());
                         if accepted {
                             byte_count += len as u64;
                             RTP_RX_PACKETS.fetch_add(1, Ordering::Relaxed);
@@ -346,4 +357,21 @@ pub(crate) fn udp_receiver_stream(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rtp_activity_at;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_accepted_rtp_updates_idle_timestamp() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_millis(500);
+
+        assert_eq!(rtp_activity_at(None, false, t0), None);
+        assert_eq!(rtp_activity_at(Some(t0), false, later), Some(t0));
+        assert_eq!(rtp_activity_at(None, true, t0), Some(t0));
+        assert_eq!(rtp_activity_at(Some(t0), true, later), Some(later));
+    }
 }

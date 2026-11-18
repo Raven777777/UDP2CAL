@@ -70,6 +70,16 @@ internal data class EncoderCfg(
 /** 语音模式：由编码器快照（而非再次读 Prefs）决定音源与 AEC 路由。 */
 internal fun EncoderCfg.voiceMode(): Boolean = signal == 3001
 
+/**
+ * 读返回负值时是否作为设备失效上报。
+ *
+ * AudioRecord.read 阻塞等待期间调用 stop() 会唤醒它并返回负值；若采集协程
+ * 此时已经取消，那是正常停止路径，必须安静退出，不能把“读取失败”写进 UI。
+ * 只有协程仍在运行时出现的负返回才是真实设备失效。
+ */
+internal fun shouldReportCaptureStall(readResult: Int, stillActive: Boolean): Boolean =
+    readResult < 0 && stillActive
+
 /** 音源描述枚举 */
 private object AudioSourceLabel {
     const val MIC_RAW = "MIC直出"
@@ -416,8 +426,11 @@ internal class ForwardLink(
             val n = readInto(pcm, filled, FRAME - filled)
             readNs += System.nanoTime() - readStart
             if (n < 0) {
-                // 设备失效：不空转，交给外层收尾
-                host.onCaptureStalled()
+                // 设备失效：不空转，交给外层收尾。正常停止时 stopRecord() 会
+                // 唤醒阻塞读并返回负值；此时协程已取消，不能误报“读取失败”。
+                if (shouldReportCaptureStall(n, coroutineContext.isActive)) {
+                    host.onCaptureStalled()
+                }
                 return
             }
             filled += n

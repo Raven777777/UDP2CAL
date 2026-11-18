@@ -1,4 +1,4 @@
-"""adb 安装失败后是否卸载重装的判定。"""
+"""adb 安装失败后不自动卸载，避免清除应用数据。"""
 
 import unittest
 from pathlib import Path
@@ -22,25 +22,49 @@ class _AdbLogger(FakeLogger):
         self._log("blank", "")
 
 
-class UninstallPolicyTest(unittest.TestCase):
-    def test_signature_conflict_retries_after_uninstall(self):
-        output = "adb: failed to install app.apk: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]"
-        self.assertTrue(adb.should_uninstall(output))
+class InstallFailurePolicyTest(unittest.TestCase):
+    def _install_with_results(self, results):
+        logger = FakeLogger()
+        with patch.object(adb.runner, "run", side_effect=results) as run:
+            ok = adb._install(Path("adb"), Path("app-debug.apk"), logger)
+        return ok, run, logger
 
-    def test_version_downgrade_retries_after_uninstall(self):
-        output = "Failure [INSTALL_FAILED_VERSION_DOWNGRADE: Downgrade detected]"
-        self.assertTrue(adb.should_uninstall(output))
+    def test_version_downgrade_retries_with_downgrade_flag(self):
+        ok, run, logger = self._install_with_results([
+            runner.RunResult(code=1, lines=["Failure [INSTALL_FAILED_VERSION_DOWNGRADE: Downgrade detected]"]),
+            runner.RunResult(code=0, lines=["Success"]),
+        ])
+        self.assertTrue(ok)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            ["adb", "install", "-r", "app-debug.apk"],
+            ["adb", "install", "-r", "-d", "app-debug.apk"],
+        ])
+        self.assertNotIn("uninstall", [arg for command in commands for arg in command])
+        self.assertTrue(any("版本降级" in text for text in logger.texts("warn")))
 
-    def test_storage_full_does_not_uninstall(self):
-        output = "adb: failed to install app.apk: Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"
-        self.assertFalse(adb.should_uninstall(output))
+    def test_version_downgrade_retry_failure_keeps_data(self):
+        ok, run, logger = self._install_with_results([
+            runner.RunResult(code=1, lines=["Failure [INSTALL_FAILED_VERSION_DOWNGRADE]"]),
+            runner.RunResult(code=1, lines=["Failure [INSTALL_FAILED_VERSION_DOWNGRADE]"]),
+        ])
+        self.assertFalse(ok)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("uninstall", run.call_args.args[0])
+        self.assertTrue(any("未卸载" in text for text in logger.texts("error")))
+        self.assertTrue(any("手动卸载" in text for text in logger.texts("hint")))
 
-    def test_offline_device_does_not_uninstall(self):
-        output = "error: device offline"
-        self.assertFalse(adb.should_uninstall(output))
-
-    def test_empty_output_does_not_uninstall(self):
-        self.assertFalse(adb.should_uninstall(""))
+    def test_signature_conflict_does_not_uninstall(self):
+        ok, run, logger = self._install_with_results([
+            runner.RunResult(code=1, lines=[
+                "adb: failed to install app.apk: Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE: signatures do not match]",
+            ]),
+        ])
+        self.assertFalse(ok)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], ["adb", "install", "-r", "app-debug.apk"])
+        self.assertTrue(any("未卸载" in text for text in logger.texts("error")))
+        self.assertTrue(any("手动卸载" in text and "私有数据" in text for text in logger.texts("hint")))
 
     def test_failure_reason_line(self):
         output = "Performing Streamed Install\nadb: failed to install app.apk: Failure [INSTALL_FAILED_INSUFFICIENT_STORAGE]"

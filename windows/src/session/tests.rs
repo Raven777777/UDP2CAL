@@ -2,6 +2,15 @@ use super::*;
 use std::time::{Duration, Instant};
 
 #[test]
+fn tail_hold_plc_must_not_peek_fec() {
+    assert!(!audio::fec_peek_allowed(0, 0));
+    assert!(audio::fec_peek_allowed(
+        0,
+        protocol::rtp::FRAME_SAMPLES as u64
+    ));
+}
+
+#[test]
 fn discovery_limiter_is_bounded_and_resets_per_second() {
     let mut bucket = std::collections::HashMap::new();
     let source = "192.0.2.1".parse().unwrap();
@@ -110,33 +119,44 @@ fn reverse_restart_is_immediate_when_stale_but_dead_retries_are_limited() {
 
 #[test]
 fn pairing_prompts_only_until_approved_or_denied() {
+    let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+    let other: std::net::IpAddr = "192.0.2.11".parse().unwrap();
     assert_eq!(
-        pairing_action(0, 0xAA, false, 0, false),
+        pairing_action(0, None, 0xAA, ip, false, 0, false),
         PairingAction::Prompt
     );
     assert_eq!(
-        pairing_action(0xAA, 0xAA, false, 0, false),
+        pairing_action(0xAA, Some(ip), 0xAA, ip, false, 0, false),
         PairingAction::Allow
     );
     assert_eq!(
-        pairing_action(0xAA, 0xBB, false, 0, false),
+        pairing_action(0xAA, Some(ip), 0xAA, other, false, 0, false),
         PairingAction::Prompt
     );
     assert_eq!(
-        pairing_action(0, 0xAA, true, 0, false),
+        pairing_action(0xAA, None, 0xAA, ip, false, 0, false),
+        PairingAction::Prompt,
+        "旧配置缺少配对 IP 时必须重新确认"
+    );
+    assert_eq!(
+        pairing_action(0xAA, Some(ip), 0xBB, ip, false, 0, false),
+        PairingAction::Prompt
+    );
+    assert_eq!(
+        pairing_action(0, None, 0xAA, ip, true, 0, false),
         PairingAction::Ignore
     );
     assert_eq!(
-        pairing_action(0, 0xAA, false, 0xAA, false),
+        pairing_action(0, None, 0xAA, ip, false, 0xAA, false),
         PairingAction::Ignore
     );
     assert_eq!(
-        pairing_action(0, 0xAA, false, 0xBB, false),
+        pairing_action(0, None, 0xAA, ip, false, 0xBB, false),
         PairingAction::Ignore
     );
-    // 已绑定的设备本身就已获准：即便拒绝表/旧弹窗还在，也不能被踢回 Prompt
+    // 已绑定的设备已由精确 endpoint 校验，拒绝表/旧弹窗不能将其踢回 Prompt。
     assert_eq!(
-        pairing_action(0xAA, 0xBB, true, 0xCC, true),
+        pairing_action(0xAA, Some(ip), 0xBB, other, true, 0xCC, true),
         PairingAction::Allow
     );
 }
@@ -174,29 +194,34 @@ fn session_reset_clears_binding_and_bumps_jitter_epoch() {
 fn session_pairing_state_is_instance_scoped_and_bounded() {
     let a = Session::for_test();
     let b = Session::for_test();
+    let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+    let other: std::net::IpAddr = "192.0.2.11".parse().unwrap();
     assert_eq!(a.paired_device(), 0);
 
-    a.set_paired_device(0xAA);
+    a.set_paired_device(0xAA, ip);
     assert_eq!(a.paired_device(), 0xAA);
+    assert_eq!(a.pairing_action_for(0xAA, ip, false), PairingAction::Allow);
     assert_eq!(
-        a.pairing_action_for(0xAA, false),
-        PairingAction::Allow
+        a.pairing_action_for(0xAA, other, false),
+        PairingAction::Prompt,
+        "已配对 ID 从新 IP 来时必须重新确认"
     );
-    // 同一 ID 在另一个会话里仍是未配对状态：不再有进程级串扰
-    assert_eq!(
-        b.pairing_action_for(0xAA, false),
-        PairingAction::Prompt
-    );
+    a.set_paired_device(0xAA, other);
+    assert_eq!(a.pairing_action_for(0xAA, other, false), PairingAction::Allow);
+    assert_eq!(a.pairing_action_for(0xAA, ip, false), PairingAction::Prompt);
+
+    // 同一 ID 在另一个会话里仍是未配对状态：不再有进程级串扰。
+    assert_eq!(b.pairing_action_for(0xAA, ip, false), PairingAction::Prompt);
 
     assert!(a.claim_pairing_prompt(0xBB));
     assert!(!a.claim_pairing_prompt(0xCC), "单槽只允许一个待确认设备");
     assert_eq!(
-        a.pairing_action_for(0xCC, false),
+        a.pairing_action_for(0xCC, ip, false),
         PairingAction::Ignore
     );
     a.clear_pairing_prompt();
     assert_eq!(
-        a.pairing_action_for(0xCC, false),
+        a.pairing_action_for(0xCC, ip, false),
         PairingAction::Prompt
     );
 
@@ -214,17 +239,17 @@ fn session_pairing_state_is_instance_scoped_and_bounded() {
     assert!(!a.is_denied(0), "最早的拒绝记录必须被淘汰");
     assert!(a.is_denied(19), "最新的拒绝记录必须保留");
     assert_eq!(
-        a.pairing_action_for(3, false),
+        a.pairing_action_for(3, ip, false),
         PairingAction::Prompt,
         "已被淘汰的 ID 应重新允许弹窗"
     );
     assert_eq!(
-        a.pairing_action_for(19, false),
+        a.pairing_action_for(19, ip, false),
         PairingAction::Ignore,
         "仍在拒绝表中的 ID 必须被忽略"
     );
     assert_eq!(
-        b.pairing_action_for(3, false),
+        b.pairing_action_for(3, ip, false),
         PairingAction::Prompt
     );
 }

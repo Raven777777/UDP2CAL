@@ -5,7 +5,9 @@
 
 ---
 
-## 未发布 — 预期延迟运行时可调
+## v1.5.3 — 2026-11-18 · 音频链路、版本审查与性能基线
+
+### 预期延迟运行时可调
 
 - 接收目标水位（`WATER_TARGET_MS`）不再只能靠编译常量/环境变量：
   - Windows 托盘右键新增“预期延迟”子菜单（80/120/160/200/300 ms），选择后写注册表
@@ -20,7 +22,7 @@
 - 文档：README、PROTOCOL_V3_RTP.md（§6.3 / §7.2 / §7.7 / §7.10.1 / §12）、LATENCY_CALIBRATION.md、
   FEATURES.md 同步更新。
 
-## 未发布 — 重采样器三端单源
+### 重采样器三端单源与结构收敛
 
 - 新增 `protocol/resampler.rs`：32 相 × 48 抽头 Kaiser sinc FIR（`CUTOFF=0.42`、`β=10`、每相 DC 归一），任意声道数、交错 f32、跨块相位连续。
 - `windows/src/audio.rs`（播放）删除内嵌 FIR 与系数表，改为调用共享核心；比率、历史段与调制语义不变。
@@ -29,6 +31,24 @@
 - Windows 端会话级状态收敛为 `Arc<Session>`：`JITTER` / `P2P_STATE` / `REVERSE_SENDER` / 配对与音频初始化等进程静态改为 `Session` 字段，由 `app::run` 注入广播线程、接收流、解码线程与 UI；锁顺序记录在 `session/mod.rs` 头部，单测可创建独立实例。
 - `protocol/jni.rs` 的标量 getter 统一由 `handle_scalar!` 宏生成（`JitterBuffer` / `StepAbsorber` / `DriftController` / `DeviceRateEstimator` / `Resampler`），删除逐点手写的 JNI 入口。
 - 其他修复：缺口 PLC 区分中段洞与尾部洞（c3f1034）；时间戳非整帧跳变立即重同步（9e94639）；Android 发送节拍改为发送前对齐（4138ba8）；结构上 Windows main.rs / Android CaptureService / protocol rtp.rs 拆分为模块（e61e05e / 1f2af77 / 6728100）。
+
+### 1.5.2 发布后的功能与可靠性修复
+- Android Wi-Fi 网络绑定与断网/恢复感知，Windows 音频调度优化（`ebd64d4`）。
+- 修正 VB-Cable 默认播放端点识别为 `CABLE Input`（`9cbbc39`）。
+- 修复起播静音、时间戳与反向生命周期边界问题，补充 Rust/Android/Python 回归测试（`d100e06`）。
+- 统一三端重采样器为共享 Rust 实现，并将 Windows 会话状态收敛到会话实例；拆分 Android、Windows 与协议模块（`5dfffc5`、`86bf8f8` 及相关拆分提交）。
+- 支持运行时调整两端预期延迟目标（80/120/160/200/300 ms），变更立即作用于当前接收端（`51b6c53`）。
+- 增加性能剖析与基准工具链；性能测量边界见 [PERF_PROFILE.md](PERF_PROFILE.md)（`ba7b082`）。
+- Android `versionCode` 增至 13；Windows、协议 crate 与应用版本统一为 1.5.3。
+- 全面审查与修复：RTP 迟到包不再触发第二次相位重同步；Android/Windows 仅在接受媒体包时刷新空闲计时，修复同 SSRC 发送端重启后的静音恢复；尾部 hold PLC 不再误用当前包做 FEC 前瞻。
+- Windows 配对记住批准设备的源 IP；同一 device_id 从新 IP 重连时重新要求用户确认，避免过期会话被局域网其他端点接管。
+- 修复代理认证信息进入构建日志；ADB 安装失败不再自动卸载丢失用户数据，版本降级优先以 `adb install -r -d` 保留数据重试；doctor 遵循显式 JDK 与各项目 `local.properties` SDK。
+- Android 采集结束时释放 Wi-Fi 低延迟锁；正常停止时取消中的麦克风读错误不再显示为硬件故障。
+
+### 发布说明校正
+- v1.5.2 的历史说明曾称 Opus FEC 默认开启、预期丢包率为 10%；但 2026-11-04 的默认设置变更已在 v1.5.2 发布前将其恢复为关闭 / 0%，同时将默认信号类型设为音乐。v1.5.2 实际发布值与当前功能说明一致：FEC 关闭、预期丢包率 0%。弱网场景需在 Android 设置中手动开启 FEC 并设置非零丢包率。
+
+---
 
 ## v1.5.2 — 2026-11-13 · 稳定性优先与可靠性修复
 
@@ -109,11 +129,11 @@
 > 依据 [archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md](archive/PLAN_SUNSHINE_ALIGNMENT_2026-10-28.md)
 > 的 S1–S11，**不改协议语义**：只动默认值、日志、状态卡与调度优先级。
 
-**Opus 带内 FEC 默认打开**
-- `Prefs.kt`：`opus_fec` 默认 0 → **2**（与设置页勾选状态一致），`opus_packet_loss` 默认 0 → **10**。
-  两者必须同时改：`packet_loss=0` 时 libopus 认为无需冗余，等于把 FEC 白开。
+**Opus 带内 FEC 默认打开（发布前已恢复默认关闭）**
+- 下文记录的是 2026-10-28 当时的实现与默认值。2026-11-04 的默认设置变更在 v1.5.2 发布前将 FEC 改回关闭（0）、预期丢包率改回 0%；当前设置见 [FEATURES.md](FEATURES.md) 与本文件「发布说明校正」。
+- `Prefs.kt`：当时将 `opus_fec` 默认 0 → **2**、`opus_packet_loss` 默认 0 → **10**。两者必须同时改：`packet_loss=0` 时 libopus 认为无需冗余，等于把 FEC 白开。
   10 ms 帧的带内 FEC 不增加包数与延迟（上一帧的 LBRR 搭在本包里），接收端重建路径早已就绪。
-  该默认值在 V2 时代被刻意改成 0（见 archive/BUGFIX_V2_ERA.md），本轮按“接收端已完备”的现状回退。
+  该默认值在 V2 时代被刻意改成 0（见 archive/BUGFIX_V2_ERA.md），此历史变更随后在发布前回退。
 
 **丢包可观测**
 - `protocol/rtp.rs` 新增 `expected_packets()` / `lost_estimate()`：序号跨度 − 成功入槽数，

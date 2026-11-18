@@ -1,6 +1,6 @@
 [package]
 name = "udp2cal-protocol"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "UDP2CAL 协议 v3：控制面 + RTP/Opus 媒体面 (Rust实现)"

@@ -33,7 +33,7 @@ use crate::capture;
 use crate::config;
 use crate::logf;
 use crate::protocol;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::Thread;
@@ -177,6 +177,9 @@ pub(crate) struct Session {
     // ── 配对 ──
     /// 已批准的手机设备 ID。0 = 未配对：所有 CONNECT 都必须先经过本机确认。
     paired_device: AtomicU64,
+    /// 已批准设备的来源 IP。只看 IP，不看 Android 每次重连变化的源端口。
+    /// 旧配置无 IP 时同 ID 连接必须重新确认。
+    paired_device_ip: Mutex<Option<IpAddr>>,
     /// 当前已提示、等待用户处理的设备 ID（0 = 无）。同一时间只弹一个请求。
     pairing_prompted: AtomicU64,
     /// 本次运行内被拒绝的设备 ID（不落盘；重启后重新征求确认）。
@@ -223,6 +226,7 @@ impl Session {
             device_name,
             cfg.listen_port,
             cfg.paired_device,
+            cfg.paired_device_ip,
             cfg.reverse_enabled != 0,
             cfg.resolved_water_target_ms(),
         ))
@@ -233,6 +237,7 @@ impl Session {
         device_name: String,
         listen_port: u32,
         paired_device: u64,
+        paired_device_ip: Option<IpAddr>,
         reverse_enabled: bool,
         water_target_ms: u32,
     ) -> Self {
@@ -251,6 +256,7 @@ impl Session {
             },
             reverse_shared: Arc::new(capture::ReverseShared::new()),
             paired_device: AtomicU64::new(paired_device),
+            paired_device_ip: Mutex::new(paired_device_ip),
             pairing_prompted: AtomicU64::new(0),
             pairing_denied: Mutex::new(Vec::new()),
             running: AtomicBool::new(false),
@@ -270,6 +276,7 @@ impl Session {
             "test".into(),
             protocol::DEFAULT_LISTEN_PORT as u32,
             0,
+            None,
             false,
             protocol::rtp::WATER_TARGET_MS,
         ))
@@ -396,8 +403,13 @@ impl Session {
         self.paired_device.load(Ordering::Acquire)
     }
 
-    pub(crate) fn set_paired_device(&self, id: u64) {
+    /// 用户批准时同时记录来源 IP；新端口不影响同一设备重连。
+    pub(crate) fn set_paired_device(&self, id: u64, ip: IpAddr) {
         self.paired_device.store(id, Ordering::Release);
+        *self
+            .paired_device_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(ip);
     }
 
     pub(crate) fn clear_pairing_prompt(&self) {
@@ -431,10 +443,16 @@ impl Session {
         denied.push(id);
     }
 
-    fn pairing_action_for(&self, id: u64, bound: bool) -> PairingAction {
+    fn pairing_action_for(&self, id: u64, src_ip: IpAddr, bound: bool) -> PairingAction {
+        let paired_ip = *self
+            .paired_device_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pairing_action(
             self.paired_device(),
+            paired_ip,
             id,
+            src_ip,
             self.is_denied(id),
             self.pairing_prompted.load(Ordering::Acquire),
             bound,
@@ -638,7 +656,7 @@ impl Session {
         // 绑定、不回调反向编码器，只弹一次确认。用户允许后手机的下一次 1 Hz
         // CONNECT 才真正建立会话。
         let device_id = u64::from_be_bytes(header.device_id);
-        match self.pairing_action_for(device_id, same_device) {
+        match self.pairing_action_for(device_id, src_addr.ip(), same_device) {
             PairingAction::Allow => {}
             PairingAction::Ignore => return,
             PairingAction::Prompt => {
@@ -833,9 +851,18 @@ fn reverse_target(src: &SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-/// 纯决策：已绑定（`bound`）/ 已批准 → 放行；已拒绝/已有弹窗 → 忽略；否则请求本机确认。
-fn pairing_action(paired: u64, id: u64, denied: bool, prompted: u64, bound: bool) -> PairingAction {
-    if bound || paired == id {
+/// 纯决策：已精确验证 endpoint（`bound`）或已配对 ID 且来源 IP 相同才自动放行；
+/// 已拒绝/已有弹窗 → 忽略；否则请求本机确认。旧配置未记录 IP 时也要求重新确认。
+fn pairing_action(
+    paired: u64,
+    paired_ip: Option<IpAddr>,
+    id: u64,
+    src_ip: IpAddr,
+    denied: bool,
+    prompted: u64,
+    bound: bool,
+) -> PairingAction {
+    if bound || (paired == id && paired_ip == Some(src_ip)) {
         PairingAction::Allow
     } else if denied || prompted != 0 {
         PairingAction::Ignore

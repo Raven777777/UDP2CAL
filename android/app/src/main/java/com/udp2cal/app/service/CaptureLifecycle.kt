@@ -259,8 +259,14 @@ internal class CaptureLifecycle(
                     pendingRestart = null
                     pendingRestartIsExplicit = false
                     if (restart != null) {
+                        // 重启路径继续持有 Wi-Fi 锁，下一条链路直接复用。
                         doStartCapture(restart)
                     } else if (!hasNewCapture) {
+                        // 会话真正结束（失败/读失败/停采集）：归还 Wi-Fi 低延迟锁。
+                        // 失败自终止时 stopCapture 不会运行，而绑定中的 Service 也不会
+                        // onDestroy，只能在这里释放，否则锁会一直留在网卡上耗电。
+                        try { wifiLock?.release() } catch (_: Exception) {}
+                        wifiLock = null
                         status.update { it.copy(isRunning = false) }
                         try { service.stopForeground(Service.STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
                         service.stopSelf()

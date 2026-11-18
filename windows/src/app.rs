@@ -487,7 +487,8 @@ impl AppState {
             Message::AllowPairing => {
                 if let Some(req) = self.pending_pair.take() {
                     self.config.paired_device = req.device_id;
-                    self.session.set_paired_device(req.device_id);
+                    self.config.paired_device_ip = Some(req.addr.ip());
+                    self.session.set_paired_device(req.device_id, req.addr.ip());
                     self.session.clear_pairing_prompt();
                     // 保存失败时 persist_config 已写入错误提示，不能覆盖掉。
                     if self.persist_config() {
