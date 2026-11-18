@@ -52,7 +52,7 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 - **优雅断连**：断连不退出采集，持续发 CONNECT 等待重连，收到 ACK 自动恢复
 - **持久化设备 ID**：8 字节标识，SharedPreferences 存储，用于连接绑定
 
-![Android 主界面](assets/android-modern-main.webp)
+![Android 主界面](assets/android-modern-main.png)
 
 ---
 
@@ -87,7 +87,9 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 - **防火墙自动放行**（静默 `NETSH`，覆盖专用/公用网络，仅限本地子网）
 - **单实例互斥**：`CreateMutexW` 防止重复启动
 
-![Windows 接收端 UI](assets/windows-main.webp)
+![Windows 接收端 UI](assets/windows-main.png)
+
+![Windows 接收端 占用](assets/windows-usage.png)
 
 ---
 
@@ -108,7 +110,8 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 
 > 除"麦克风音源"和"测试音"外，所有参数在运行中热更新，无需重启采集流。
 
-![Android 高级设置面板](assets/android-modern-settings.webp)
+![Android 高级设置面板](assets/android-modern-settings.png)
+![Android LEGAL](assets/android-modern-legal.png)
 
 ---
 

@@ -1,6 +1,6 @@
 **[English](README.md) | 中文**
 
-# UDP2CAL — 局域网双向音频串流
+# UDP2CAL
 
 把 Android 手机当作电脑的麦克风与扬声器：手机麦克风音频经 Opus 编码通过局域网送达 PC 的虚拟声卡，PC 扬声器音频反向回传到手机听筒。
 
