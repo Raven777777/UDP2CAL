@@ -6,8 +6,10 @@ import android.net.Network
 import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Log
+import androidx.annotation.StringRes
 import com.udp2cal.app.DiscoveryManager
 import com.udp2cal.app.Prefs
+import com.udp2cal.app.R
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
 import com.udp2cal.app.WifiNetworkBinder
@@ -170,7 +172,9 @@ internal class CaptureLifecycle(
         // ATOMIC：launch 后立刻 stopCapture 也不会在“未启动”状态被取消，
         // 否则协程体（含 finally 拆除）永远不跑，captureJob 会永久占位。
         captureJob = scope.launch(start = CoroutineStart.ATOMIC) {
-            status.update { it.copy(isRunning = true, errorMsg = "") }
+            status.update {
+                it.copy(isRunning = true, errorRes = 0, errorArgs = emptyList(), fatal = false)
+            }
             try {
                 // 被 stop 取消时尽早失败，finally 仍会执行完整拆除
                 ensureActive()
@@ -179,7 +183,7 @@ internal class CaptureLifecycle(
                 if (!sender.connect()) {
                     // 连接失败时 socket 可能已创建：必须显式关闭，否则句柄泄漏
                     sender.close()
-                    fail("网络连接失败")
+                    fail(R.string.error_network_connect)
                     return@launch
                 }
                 udpSender = sender
@@ -197,11 +201,11 @@ internal class CaptureLifecycle(
                         isRunning = true,
                         sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
                         bitrateTargetKbps = cfg.bitrateKbps,
-                        vbrMode = cfg.vbrLabel(),
+                        vbrMode = cfg.vbrMode(),
                         // 状态卡片的「带宽」一行读的就是这个字段；以前从没赋过值，
                         // 于是永远渲染成 "—"，看起来像"改了带宽没反应"
                         opusBandwidth = cfg.bandwidth,
-                        opusMode = if (voiceMode) "语音模式" else "全频模式",
+                        mode = if (voiceMode) CaptureMode.VOICE else CaptureMode.FULLBAND,
                         connected = false,
                         deviceId = Udp2CalProtocol.deviceIdToString(deviceId),
                     )
@@ -221,8 +225,15 @@ internal class CaptureLifecycle(
                 forward.run(sender, cfg, params.testTone)
             } catch (_: CancellationException) {
             } catch (e: Exception) {
+                // 内部异常文本不直接当 UI 文案：日志保留细节，界面显示可翻译的通用错误
                 Log.e(TAG, "采集异常", e)
-                status.update { it.copy(isRunning = false, errorMsg = e.message ?: "未知错误") }
+                status.update {
+                    it.copy(
+                        isRunning = false,
+                        errorRes = R.string.error_unknown,
+                        errorArgs = emptyList(),
+                    )
+                }
                 hasNewCapture = false
             } finally {
                 // 控制协程可能在 NonCancellable 里调用 jitter.reset()；必须等它
@@ -239,10 +250,7 @@ internal class CaptureLifecycle(
                 try { if (wakeLock.isHeld) wakeLock.release() } catch (_: Exception) {}
 
                 // 硬件初始化硬故障时不得无限重启。
-                val fatal = status.value.errorMsg.let {
-                    it.contains("麦克风初始化失败") || it.contains("麦克风不支持") ||
-                        it.contains("编码器初始化失败") || it.contains("编码器帧大小无效")
-                }
+                val fatal = status.value.fatal
                 if (fatal) Log.e(TAG, "硬件初始化硬故障，禁止自动重试")
 
                 // 对象已全部拆除，此时才清空任务槽并安装下一条链路；两者与
@@ -360,7 +368,8 @@ internal class CaptureLifecycle(
             it.copy(
                 connected = false,
                 reverseAudio = false,
-                errorMsg = if (hasWifiNow) "网络已切换（正在重连）" else "Wi-Fi 已断开（等待网络恢复）",
+                errorRes = if (hasWifiNow) R.string.status_network_switched else R.string.status_wifi_lost,
+                errorArgs = emptyList(),
             )
         }
         if (hasWifiNow) requestLinkRestart()
@@ -370,14 +379,22 @@ internal class CaptureLifecycle(
     // ForwardLink.Host
     // ══════════════════════════════════════════════════════════
 
-    override fun fail(message: String) {
-        status.update { it.copy(isRunning = false, errorMsg = message) }
+    override fun fail(@StringRes id: Int, vararg args: Any) {
+        status.update {
+            it.copy(
+                isRunning = false,
+                errorRes = id,
+                errorArgs = args.toList(),
+            )
+        }
         hasNewCapture = false
         service.stopSelf()
     }
 
     override fun onCaptureStalled() {
-        status.update { it.copy(errorMsg = "麦克风读取失败，请重新开始采集") }
+        status.update {
+            it.copy(errorRes = R.string.error_mic_read, errorArgs = emptyList())
+        }
         hasNewCapture = false
     }
 

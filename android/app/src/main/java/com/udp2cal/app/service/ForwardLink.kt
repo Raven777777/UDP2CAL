@@ -9,8 +9,10 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.os.SystemClock
 import android.util.Log
+import androidx.annotation.StringRes
 import androidx.core.content.ContextCompat
 import com.udp2cal.app.Prefs
+import com.udp2cal.app.R
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
 import com.udp2cal.app.native.OpusEncoder
@@ -59,11 +61,11 @@ internal data class EncoderCfg(
         }
     }
 
-    /** 状态卡展示用：当前码率控制模式的短标签 */
-    fun vbrLabel(): String = when {
-        vbr == 0 -> "CBR"
-        vbrConstraint == 1 -> "VBR·约束"
-        else -> "VBR"
+    /** 状态卡展示用：当前码率控制模式 */
+    fun vbrMode(): VbrMode = when {
+        vbr == 0 -> VbrMode.CBR
+        vbrConstraint == 1 -> VbrMode.VBR_CONSTRAINED
+        else -> VbrMode.VBR
     }
 }
 
@@ -80,17 +82,7 @@ internal fun EncoderCfg.voiceMode(): Boolean = signal == 3001
 internal fun shouldReportCaptureStall(readResult: Int, stillActive: Boolean): Boolean =
     readResult < 0 && stillActive
 
-/** 音源描述枚举 */
-private object AudioSourceLabel {
-    const val MIC_RAW = "MIC直出"
-    const val MIC_RAW_FALLBACK = "已回退MIC直出"
-    const val RAW_UNPROCESSED = "原始直出(UNPROCESSED)"
-    const val VOICE_RECOGNITION = "语音识别(VOICE_RECOGNITION)"
-    const val SYSTEM_NS = "系统硬件降噪"
-    const val SYSTEM_NS_FALLBACK = "系统硬件降噪(已回退MIC)"
-    const val AEC_ENABLED = " + AEC已启用"
-    const val AEC_UNAVAILABLE = " + AEC不可用"
-}
+/** 音源描述见 [AudioSource]；界面按枚举映射资源字符串。 */
 
 /**
  * 正向链路：采集 → 编码 → RTP → 主 socket。
@@ -114,8 +106,8 @@ internal class ForwardLink(
 
     /** 正向链路向会话生命周期请求的动作 */
     interface Host {
-        /** 硬件初始化失败：写错误并停止服务 */
-        fun fail(message: String)
+        /** 硬件初始化失败：写错误并停止服务。错误用资源 id，便于切换语言后重取文案。 */
+        fun fail(@StringRes id: Int, vararg args: Any)
 
         /** 采集设备失效：本次链路结束，不再自动重连 */
         fun onCaptureStalled()
@@ -163,11 +155,13 @@ internal class ForwardLink(
         appliedSignal = cfg0.signal
         appliedTestTone = testTone
         if (!enc.start()) {
-            host.fail("编码器初始化失败")
+            status.update { it.copy(fatal = true) }
+            host.fail(R.string.error_encoder_init)
             return null
         }
         if (enc.frameSize != FRAME) {
-            host.fail("编码器帧大小无效（${enc.frameSize}）")
+            status.update { it.copy(fatal = true) }
+            host.fail(R.string.error_encoder_frame_size, enc.frameSize)
             return null
         }
         return cfg0
@@ -177,6 +171,8 @@ internal class ForwardLink(
     suspend fun run(sender: UdpSender, cfg: EncoderCfg, testTone: Boolean) {
         val enc = encoder ?: return
         val voiceMode = cfg.voiceMode()
+        // 会话开始统一清空上一次的音源/AEC 状态；失败分支不必逐处重置。
+        status.update { it.copy(audioSource = AudioSource.MIC_DIRECT, aec = AecState.NONE) }
         withContext(dispatcher) {
             if (testTone) runTestToneLoop(enc, sender, voiceMode)
             else runMicCaptureLoop(enc, sender, cfg)
@@ -204,7 +200,8 @@ internal class ForwardLink(
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) !=
             PackageManager.PERMISSION_GRANTED
         ) {
-            host.fail("麦克风初始化失败（未授权）")
+            status.update { it.copy(fatal = true) }
+            host.fail(R.string.error_mic_init_denied)
             return
         }
         // 采集/编码/发送跑在同一条线程上：提到音频优先级，避免被后台任务抢占
@@ -215,7 +212,8 @@ internal class ForwardLink(
             AudioFormat.ENCODING_PCM_16BIT
         )
         if (minBufSize == AudioRecord.ERROR || minBufSize == AudioRecord.ERROR_BAD_VALUE) {
-            host.fail("麦克风不支持 48 kHz 单声道采集")
+            status.update { it.copy(fatal = true) }
+            host.fail(R.string.error_mic_unsupported)
             return
         }
         val bufferSize = minBufSize.coerceAtLeast(FRAME * 2 * 4)
@@ -223,33 +221,33 @@ internal class ForwardLink(
         // 音源候选（按优先级）：首选音源初始化失败时回退 MIC 直出。
         // 3003=UNPROCESSED / 3004=VOICE_RECOGNITION 都不做系统降噪处理，
         // 用于绕过系统级 AI 降噪对高频的削切。
-        val attempts: List<Pair<Int, String>> = when (cfg.signal) {
+        val attempts: List<Pair<Int, AudioSource>> = when (cfg.signal) {
             3001 -> listOf(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION to AudioSourceLabel.SYSTEM_NS,
-                MediaRecorder.AudioSource.MIC to AudioSourceLabel.SYSTEM_NS_FALLBACK,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION to AudioSource.SYSTEM_NS,
+                MediaRecorder.AudioSource.MIC to AudioSource.SYSTEM_NS_FALLBACK,
             )
             3003 -> listOf(
-                MediaRecorder.AudioSource.UNPROCESSED to AudioSourceLabel.RAW_UNPROCESSED,
-                MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW_FALLBACK,
+                MediaRecorder.AudioSource.UNPROCESSED to AudioSource.RAW_UNPROCESSED,
+                MediaRecorder.AudioSource.MIC to AudioSource.MIC_DIRECT_FALLBACK,
             )
             3004 -> listOf(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION to AudioSourceLabel.VOICE_RECOGNITION,
-                MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW_FALLBACK,
+                MediaRecorder.AudioSource.VOICE_RECOGNITION to AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC to AudioSource.MIC_DIRECT_FALLBACK,
             )
-            else -> listOf(MediaRecorder.AudioSource.MIC to AudioSourceLabel.MIC_RAW)
+            else -> listOf(MediaRecorder.AudioSource.MIC to AudioSource.MIC_DIRECT)
         }
-        var sourceLabel: String = AudioSourceLabel.MIC_RAW
-        for ((source, label) in attempts) {
+        var source: AudioSource = AudioSource.MIC_DIRECT
+        for ((audioSource, label) in attempts) {
             try {
                 audioRecord = AudioRecord(
-                    source,
+                    audioSource,
                     Udp2CalProtocol.OPUS_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufferSize
                 )
             } catch (_: Exception) {
             }
             if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                sourceLabel = label
+                source = label
                 break
             }
             audioRecord?.release()
@@ -258,23 +256,24 @@ internal class ForwardLink(
 
         val record = audioRecord
         if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
-            status.update { it.copy(audioSource = AudioSourceLabel.MIC_RAW) }
-            host.fail("麦克风初始化失败")
+            status.update { it.copy(audioSource = AudioSource.MIC_DIRECT, aec = AecState.NONE, fatal = true) }
+            host.fail(R.string.error_mic_init)
             return
         }
 
+        var aecState = AecState.NONE
         if (voiceMode && AcousticEchoCanceler.isAvailable()) {
             try {
                 val aec = AcousticEchoCanceler.create(record.audioSessionId)
                 if (aec != null) {
                     aec.enabled = true
                     aecInstance = aec
-                    sourceLabel += AudioSourceLabel.AEC_ENABLED
+                    aecState = AecState.ENABLED
                 } else {
-                    sourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
+                    aecState = AecState.UNAVAILABLE
                 }
             } catch (e: Exception) {
-                sourceLabel += AudioSourceLabel.AEC_UNAVAILABLE
+                aecState = AecState.UNAVAILABLE
                 Log.w(TAG, "AEC create 失败", e)
             }
         }
@@ -284,7 +283,7 @@ internal class ForwardLink(
         host.ensurePlayer(voiceMode, record.audioSessionId)
 
         record.startRecording()
-        status.update { it.copy(audioSource = sourceLabel, isRunning = true) }
+        status.update { it.copy(audioSource = source, aec = aecState, isRunning = true) }
 
         try {
             sendFrames(enc, sender) { buf, off, len ->
@@ -297,7 +296,9 @@ internal class ForwardLink(
 
     private suspend fun runTestToneLoop(enc: OpusEncoder, sender: UdpSender, voiceMode: Boolean) {
         host.ensurePlayer(voiceMode, 0)
-        status.update { it.copy(audioSource = "1kHz 测试音", isRunning = true) }
+        status.update {
+            it.copy(audioSource = AudioSource.TEST_TONE, aec = AecState.NONE, isRunning = true)
+        }
         val omega = 2.0 * Math.PI * 1000.0 / Udp2CalProtocol.OPUS_SAMPLE_RATE
         var phase = 0.0
         // 节拍由 sendFrames 的 1 帧整形统一负责，这里只负责把样本填满
@@ -363,7 +364,7 @@ internal class ForwardLink(
         status.update {
             it.copy(
                 bitrateTargetKbps = want.bitrateKbps,
-                vbrMode = want.vbrLabel(),
+                vbrMode = want.vbrMode(),
                 opusBandwidth = want.bandwidth,
             )
         }

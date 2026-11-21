@@ -1,6 +1,7 @@
 //! 系统托盘、图标与原生窗口激活。
 
 use crate::app::Message;
+use crate::i18n;
 use crate::logf;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{HWND, LPARAM};
@@ -42,11 +43,12 @@ pub(crate) fn load_icon_rgba() -> (Vec<u8>, u32, u32) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum TrayCommand {
     Restore,
     Quit,
     SetWaterTarget(u32),
+    SetLanguage(String),
 }
 
 /// 预期延迟档位（ms），与 Android 高级设置保持一致。
@@ -57,6 +59,9 @@ const WATER_TARGET_STEPS_MS: [u32; 5] = [80, 120, 160, 200, 300];
 thread_local! {
     static WATER_TARGET_ITEMS: std::cell::RefCell<Vec<(u32, tray_icon::menu::CheckMenuItem)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// 托盘对象同样只能在创建它的线程上操作；语言切换时用它重建菜单。
+    static TRAY_ICON: std::cell::RefCell<Option<tray_icon::TrayIcon>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 static TRAY_COMMANDS: OnceLock<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<TrayCommand>>> =
@@ -70,6 +75,7 @@ pub(crate) fn install_tray(
     width: u32,
     height: u32,
     water_target_ms: u32,
+    language: &str,
 ) -> Option<tray_icon::TrayIcon> {
     let (sender, receiver) = tokio::sync::mpsc::channel(16);
     let _ = TRAY_COMMANDS.set(tokio::sync::Mutex::new(receiver));
@@ -96,34 +102,15 @@ pub(crate) fn install_tray(
                     }
                 });
                 let _ = sender.try_send(TrayCommand::SetWaterTarget(ms));
+            } else if event.id.0 == "lang-system" {
+                let _ = sender.try_send(TrayCommand::SetLanguage(String::new()));
+            } else if let Some(code) = event.id.0.strip_prefix("lang-") {
+                let _ = sender.try_send(TrayCommand::SetLanguage(code.to_string()));
             }
         },
     ));
 
-    let tray_menu = tray_icon::menu::Menu::new();
-    let delay_menu =
-        tray_icon::menu::Submenu::with_id("water-target-menu", "预期延迟", true);
-    let mut delay_items = Vec::new();
-    for ms in WATER_TARGET_STEPS_MS {
-        let item = tray_icon::menu::CheckMenuItem::with_id(
-            format!("water-{ms}"),
-            format!("{ms}ms"),
-            true,
-            ms == water_target_ms,
-            None,
-        );
-        let _ = delay_menu.append(&item);
-        delay_items.push((ms, item));
-    }
-    // 二次安装（理论上不会发生）时覆盖旧句柄，保持勾选态更新指向当前菜单
-    WATER_TARGET_ITEMS.with(|slot| *slot.borrow_mut() = delay_items);
-    let _ = tray_menu.append(&delay_menu);
-    let quit_item = tray_icon::menu::MenuItemBuilder::new()
-        .id("quit".into())
-        .text("退出")
-        .enabled(true)
-        .build();
-    let _ = tray_menu.append(&quit_item);
+    let menu = build_menu(water_target_ms, language);
 
     let tray_icon_img = match tray_icon::Icon::from_rgba(icon_rgba, width, height) {
         Ok(icon) => icon,
@@ -133,18 +120,92 @@ pub(crate) fn install_tray(
         }
     };
     match tray_icon::TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
+        .with_menu(Box::new(menu))
         .with_tooltip("UDP2CAL")
         .with_icon(tray_icon_img)
         .with_menu_on_left_click(false)
         .build()
     {
-        Ok(tray) => Some(tray),
+        Ok(tray) => {
+            TRAY_ICON.with(|slot| *slot.borrow_mut() = Some(tray.clone()));
+            Some(tray)
+        }
         Err(e) => {
             logf!("[Tray] 托盘创建失败: {e}");
             None
         }
     }
+}
+
+fn build_menu(water_target_ms: u32, language: &str) -> tray_icon::menu::Menu {
+    let tray_menu = tray_icon::menu::Menu::new();
+    let delay_menu = tray_icon::menu::Submenu::with_id(
+        "water-target-menu",
+        i18n::t("menu.expected_latency"),
+        true,
+    );
+    let mut delay_items = Vec::new();
+    for ms in WATER_TARGET_STEPS_MS {
+        let item = tray_icon::menu::CheckMenuItem::with_id(
+            format!("water-{ms}"),
+            format!("{ms}{}", i18n::t("unit.ms")),
+            true,
+            ms == water_target_ms,
+            None,
+        );
+        let _ = delay_menu.append(&item);
+        delay_items.push((ms, item));
+    }
+    WATER_TARGET_ITEMS.with(|slot| *slot.borrow_mut() = delay_items);
+    let _ = tray_menu.append(&delay_menu);
+
+    let language_menu = tray_icon::menu::Submenu::with_id(
+        "language-menu",
+        i18n::t("menu.language"),
+        true,
+    );
+    let system_item = tray_icon::menu::CheckMenuItem::with_id(
+        "lang-system",
+        i18n::t("menu.system"),
+        true,
+        language.is_empty(),
+        None,
+    );
+    let _ = language_menu.append(&system_item);
+    let active = i18n::active_code();
+    let explicit = !language.is_empty();
+    for (code, name) in i18n::available() {
+        let item = tray_icon::menu::CheckMenuItem::with_id(
+            format!("lang-{code}"),
+            name,
+            true,
+            explicit && active == code,
+            None,
+        );
+        let _ = language_menu.append(&item);
+    }
+    let _ = tray_menu.append(&language_menu);
+
+    let quit_item = tray_icon::menu::MenuItemBuilder::new()
+        .id("quit".into())
+        .text(i18n::t("menu.quit"))
+        .enabled(true)
+        .build();
+    let _ = tray_menu.append(&quit_item);
+    tray_menu
+}
+
+/// 语言切换后重建托盘菜单。托盘对象绑定在创建线程上；若当前线程没有它
+/// （理论上不会发生），主窗口仍会更新，菜单在下一次启动时使用新语言。
+pub(crate) fn refresh_menu(water_target_ms: u32, language: &str) {
+    let menu = build_menu(water_target_ms, language);
+    TRAY_ICON.with(|slot| match slot.try_borrow() {
+        Ok(slot) => match slot.as_ref() {
+            Some(tray) => tray.set_menu(Some(Box::new(menu))),
+            None => logf!("[Tray] 语言菜单刷新跳过：托盘尚未创建"),
+        },
+        Err(_) => logf!("[Tray] 语言菜单刷新跳过：托盘状态被占用"),
+    });
 }
 
 /// 单实例：按窗口标题激活已运行的实例
@@ -222,6 +283,7 @@ pub(crate) fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> 
                     }
                     TrayCommand::Quit => Message::Quit,
                     TrayCommand::SetWaterTarget(ms) => Message::SetWaterTarget(ms),
+                    TrayCommand::SetLanguage(code) => Message::SetLanguage(code),
                 };
                 // 托盘事件是可重复的用户点击：UI 卡住时丢一次点击比阻塞托盘
                 // 线程好；仅接收端已退出才退出转发循环。

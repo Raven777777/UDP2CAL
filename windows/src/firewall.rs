@@ -8,6 +8,7 @@
 // 极易被截断成另一条规则（进而每次启动都"删不掉旧的、再加一条新的"）。
 // 因此规则名保持 ASCII 且不含空格。
 
+use crate::i18n;
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -25,7 +26,8 @@ fn netsh(args: &[String]) -> std::io::Result<std::process::Output> {
 /// 添加/更新放行规则。
 /// `audio_port` 为实际监听端口；`program` 为当前可执行文件路径。
 pub fn add_firewall_rule(audio_port: u16) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| i18n::tf("error.exe_path", &[("err", &e)]))?;
     let program = format!("program=\"{}\"", exe.display());
     let ports = format!("localport={DISCOVERY_PORT},{audio_port}");
 
@@ -53,7 +55,7 @@ pub fn add_firewall_rule(audio_port: u16) -> Result<(), String> {
         "profile=any".into(),
         "remoteip=localsubnet".into(),
     ])
-    .map_err(|e| format!("防火墙命令执行失败: {e}"))?;
+    .map_err(|e| i18n::tf("error.firewall_cmd", &[("err", &e)]))?;
 
     if result.status.success() {
         Ok(())
@@ -61,9 +63,9 @@ pub fn add_firewall_rule(audio_port: u16) -> Result<(), String> {
         let detail = String::from_utf8_lossy(&result.stderr);
         let detail = detail.trim();
         Err(if detail.is_empty() {
-            "防火墙规则添加失败（需要管理员权限）".to_string()
+            i18n::t("error.firewall_rule")
         } else {
-            format!("防火墙规则添加失败（需要管理员权限）: {detail}")
+            i18n::tf("error.firewall_rule_detail", &[("detail", &detail)])
         })
     }
 }

@@ -17,7 +17,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="UDP2CAL"
+        android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.UDP2CAL">

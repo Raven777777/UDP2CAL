@@ -11,6 +11,8 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.udp2cal.app.AppLocale
+import com.udp2cal.app.R
 import com.udp2cal.app.WifiNetworkBinder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -118,11 +120,27 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
     /** 高级设置：反向（PC→手机）目标水位，运行时立即生效 */
     fun setReverseWaterTargetMs(ms: Int) = lifecycle.setReverseWaterTargetMs(ms)
 
+    /** 语言切换后立即重建前台通知（通知文本不随状态变化，需显式刷新）。 */
+    fun refreshNotification() {
+        if (notificationJob == null) return
+        createNotificationChannel()
+        try {
+            startForeground(1, buildNotification())
+        } catch (_: Exception) {
+        }
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel("udp2cal_capture", "采集服务", NotificationManager.IMPORTANCE_LOW)
-                    .apply { setShowBadge(false) }
+                NotificationChannel(
+                    "udp2cal_capture",
+                    AppLocale.s(this, R.string.channel_name),
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = AppLocale.s(this@CaptureService, R.string.channel_desc)
+                    setShowBadge(false)
+                }
             )
         }
     }
@@ -130,26 +148,33 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
     /** 通知栏实际展示的内容：只有这些字段变化才需要重建前台通知 */
     private data class NotificationKey(
         val connected: Boolean,
-        val modeLabel: String,
-        val audioLabel: String,
+        val mode: CaptureMode,
+        val source: AudioSource,
+        val aec: AecState,
     )
 
     private fun notificationKey(status: CaptureStatus): NotificationKey = NotificationKey(
         connected = status.connected,
-        modeLabel = if (status.opusMode.contains("语音")) "语音" else "音乐",
-        audioLabel = when {
-            status.audioSource.contains("AEC已启用") -> "NS+AGC+AEC"
-            status.audioSource.contains("硬件降噪") -> "NS+AGC"
-            else -> "MIC-Direct"
-        },
+        mode = status.mode,
+        source = status.audioSource,
+        aec = status.aec,
     )
 
     private fun buildNotification(): Notification {
         val key = notificationKey(statusBus.value)
-        val connStr = if (key.connected) "已连接" else "等待连接"
+        val connected = AppLocale.s(
+            this,
+            if (key.connected) R.string.notification_connected else R.string.notification_waiting,
+        )
+        val mode = AppLocale.s(this, key.mode.labelRes)
+        var source = AppLocale.s(this, key.source.sourceRes)
+        if (key.aec != AecState.NONE) {
+            source += " + " + AppLocale.s(this, key.aec.aecRes)
+        }
+        val text = AppLocale.s(this, R.string.notification_text, connected, mode, source)
         return NotificationCompat.Builder(this, "udp2cal_capture")
-            .setContentTitle("UDP2CAL")
-            .setContentText("$connStr · ${key.modeLabel} ${key.audioLabel}")
+            .setContentTitle(AppLocale.s(this, R.string.app_name))
+            .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .build()

@@ -23,6 +23,48 @@ fn main() {
         res.set_icon(ico_path.to_str().unwrap());
         let _ = res.compile();
     }
+
+    generate_embedded_langs();
+}
+
+/// 扫描 lang/*.lang 生成内嵌语言表：新增语言只需放入文件并重新编译，无需改 Rust 代码。
+fn generate_embedded_langs() {
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("lang") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("lang") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+
+    // 语言文件是源码的一部分；缺失时必须在构建期失败，否则 exe 会直接
+    // 把 key（如 notice.port_invalid）显示给用户。
+    let has_english = files.iter().any(|path| {
+        path.file_stem().and_then(|stem| stem.to_str()) == Some("en-US")
+    });
+    assert!(has_english, "缺少 lang/en-US.lang：请确认 windows/lang 已随源码提交");
+
+    let mut code = String::from("pub static EMBEDDED_LANGS: &[(&str, &str)] = &[\n");
+    for path in &files {
+        let code_tag = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        code.push_str(&format!(
+            "    ({code_tag:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/lang/{file_name}\"))),\n"
+        ));
+    }
+    code.push_str("];\n");
+    std::fs::write(out_dir.join("embedded_langs.rs"), code).unwrap();
+    println!("cargo:rerun-if-changed=lang");
 }
 
 /// 自动检测 Windows Kits SDK 路径，查找 rc.exe

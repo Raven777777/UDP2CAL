@@ -18,6 +18,15 @@ object Prefs {
         prefs = ctx.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
     }
 
+    /** 供 attachBaseContext 在 init 之前读取界面语言；空串 = 跟随系统。 */
+    internal fun savedLanguage(ctx: Context): String =
+        ctx.getSharedPreferences(NAME, Context.MODE_PRIVATE)
+            .getString("language", "") ?: ""
+
+    var language: String
+        get() = prefs.getString("language", "") ?: ""
+        set(v) = prefs.edit().putString("language", v).apply()
+
     var targetIp: String
         get() = prefs.getString("target_ip", "192.168.1.100") ?: "192.168.1.100"
         set(v) = prefs.edit().putString("target_ip", v).apply()

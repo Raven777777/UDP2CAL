@@ -1,6 +1,157 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UDP2CAL</string>
-    <string name="channel_name">采集服务</string>
-    <string name="channel_desc">音频采集服务运行中</string>
+    <string name="app_subtitle">Android ↔ PC · LAN audio</string>
+
+    <string name="permission_title">Microphone permission required</string>
+    <string name="permission_message">UDP2CAL needs microphone access to capture phone audio. Allow Microphone in system settings, then return.</string>
+    <string name="action_settings">Settings</string>
+    <string name="action_later">Later</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_back">← Back</string>
+    <string name="action_start">Start</string>
+    <string name="action_stop">Stop</string>
+    <string name="action_advanced">Advanced</string>
+    <string name="action_blackout">Screen off</string>
+    <string name="action_manual_input">Manual</string>
+    <string name="action_collapse">Collapse</string>
+    <string name="action_auto_discover">Auto discover</string>
+    <string name="action_searching">Searching…</string>
+    <string name="action_select">Select →</string>
+
+    <string name="status_connected">Connected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_disconnected">Not connected</string>
+
+    <string name="discover_searching">Searching for PCs on the LAN…</string>
+    <string name="discover_not_found">No receiver found. Make sure the PC app is running and both are on the same Wi-Fi.</string>
+    <plurals name="discover_found">
+        <item quantity="one">Found %1$d device, please choose</item>
+        <item quantity="other">Found %1$d devices, please choose</item>
+    </plurals>
+
+    <string name="target_title">Target device</string>
+    <string name="target_none">Not selected</string>
+    <string name="target_ip">Target IP</string>
+    <string name="target_port">Port</string>
+
+    <string name="device_title">Select receiver</string>
+    <string name="device_selected">Selected: %1$s:%2$d (%3$s)</string>
+
+    <string name="battery_title">Keep the connection with the screen off</string>
+    <string name="battery_desc">Add to the battery optimization allowlist; some ROMs also require autostart and background data.</string>
+
+    <string name="test_tone_title">1 kHz test tone</string>
+    <string name="test_tone_on">Test the audio link without a microphone</string>
+    <string name="test_tone_off">Uses the microphone when off</string>
+
+    <string name="opus_status_title">Opus encoding status</string>
+    <string name="opus_exclusive">● Exclusive connection</string>
+    <string name="opus_not_connected">● Not connected</string>
+    <string name="opus_mode">Mode</string>
+    <string name="opus_bandwidth">Bandwidth</string>
+    <string name="opus_input_sample_rate">Input sample rate</string>
+    <string name="opus_realtime_bitrate">Realtime bitrate</string>
+    <string name="opus_target_bitrate">Target bitrate</string>
+    <string name="opus_vbr_mode">VBR mode</string>
+
+    <string name="mode_voice">Voice mode</string>
+    <string name="mode_fullband">Fullband mode</string>
+
+    <string name="vbr_cbr">CBR</string>
+    <string name="vbr_constrained">VBR·constrained</string>
+    <string name="vbr_vbr">VBR</string>
+
+    <string name="reverse_title">Reverse stream (PC→Phone)</string>
+    <string name="reverse_active">● Active</string>
+    <string name="reverse_bitrate">Bitrate</string>
+    <string name="reverse_jitter">Jitter buffer</string>
+    <string name="reverse_bandwidth">Audio bandwidth</string>
+    <string name="reverse_fb_stereo">FB 48 kHz stereo</string>
+
+    <string name="settings_encoding">Encoding parameters</string>
+    <string name="settings_complexity">Encoding complexity: %1$d</string>
+    <string name="settings_mic_source">Microphone source</string>
+    <string name="settings_mic_source_hint">Raw/recognition bypass system noise processing; changing the source rebuilds capture, and unsupported sources fall back to MIC direct.</string>
+    <string name="settings_bandwidth">Audio bandwidth</string>
+    <string name="settings_bandwidth_hint">Limits the encoded frequency range; lower saves bitrate. WB/SWB for voice, FB for music.</string>
+    <string name="settings_bitrate">Bitrate</string>
+    <string name="settings_bitrate_hint">%1$d kbps ≈ %2$d bytes/frame (10 ms), Opus limit 1275 bytes</string>
+    <string name="settings_dtx">DTX (no transmission when silent)</string>
+    <string name="settings_vbr">VBR (dynamic bitrate)</string>
+    <string name="settings_vbr_forced">VBR is forced while DTX is on</string>
+    <string name="settings_vbr_constraint">VBR bitrate constraint</string>
+    <string name="settings_vbr_strict">Strictly stay under the target bitrate</string>
+    <string name="settings_vbr_loose">May temporarily exceed the target bitrate</string>
+    <string name="settings_fec_section">Forward error correction and loss tolerance</string>
+    <string name="settings_fec">FEC (forward error correction)</string>
+    <string name="settings_fec_hint">Redundant data can recover lost packets</string>
+    <string name="settings_packet_loss">Expected packet loss: %1$d%%</string>
+    <string name="settings_loss_none">No loss expected; loss resilience disabled</string>
+    <string name="settings_loss_low">Low loss: light redundancy</string>
+    <string name="settings_loss_medium">Medium loss: more redundancy and robustness</string>
+    <string name="settings_loss_high">High loss: maximum redundancy, lower bitrate efficiency</string>
+    <string name="settings_water_target">Expected latency: %1$dms</string>
+    <string name="settings_water_target_hint">Target buffer for the PC→phone reverse stream; lower means less latency but more dropouts on jittery networks.</string>
+
+    <string name="mic_voice">Voice</string>
+    <string name="mic_direct">Direct</string>
+    <string name="mic_raw">Raw</string>
+    <string name="mic_recognition">Recognition</string>
+
+    <string name="bw_nb">Narrowband NB · 8 kHz</string>
+    <string name="bw_mb">Medium band MB · 12 kHz</string>
+    <string name="bw_wb">Wideband WB · 16 kHz</string>
+    <string name="bw_swb">Super-wideband SWB · 24 kHz</string>
+    <string name="bw_fb">Fullband FB · 48 kHz</string>
+    <string name="bw_short_nb">NB</string>
+    <string name="bw_short_mb">MB</string>
+    <string name="bw_short_wb">WB</string>
+    <string name="bw_short_swb">SWB</string>
+    <string name="bw_short_fb">FB</string>
+
+    <string name="language_title">Language</string>
+    <string name="language_system">Follow system</string>
+    <string name="language_name">English</string>
+
+    <string name="about_title">About</string>
+    <string name="about_version">v%1$s</string>
+    <string name="about_author">By 四折光曲 &amp; 井水玉藻</string>
+    <string name="about_license">This program is free software, released under GPL v3</string>
+    <string name="about_tagline">Bidirectional LAN audio streaming</string>
+    <string name="about_desc">Phone mic → PC + PC speakers → phone</string>
+    <string name="about_features">Opus codec · Acoustic echo cancellation · Low latency</string>
+
+    <string name="channel_name">Capture service</string>
+    <string name="channel_desc">Audio capture service is running</string>
+    <string name="notification_connected">Connected</string>
+    <string name="notification_waiting">Waiting for connection</string>
+    <string name="notification_text">%1$s · %2$s · %3$s</string>
+
+    <string name="source_mic_direct">MIC direct</string>
+    <string name="source_mic_direct_fallback">Fell back to MIC direct</string>
+    <string name="source_raw_unprocessed">Raw (UNPROCESSED)</string>
+    <string name="source_voice_recognition">Voice recognition (VOICE_RECOGNITION)</string>
+    <string name="source_system_ns">System noise suppression</string>
+    <string name="source_system_ns_fallback">System noise suppression (fell back to MIC)</string>
+    <string name="source_test_tone">1 kHz test tone</string>
+    <string name="source_aec_enabled">AEC enabled</string>
+    <string name="source_aec_unavailable">AEC unavailable</string>
+
+    <string name="error_network_connect">Network connection failed</string>
+    <string name="error_unknown">Unknown error</string>
+    <string name="error_encoder_init">Encoder initialization failed</string>
+    <string name="error_encoder_frame_size">Invalid encoder frame size (%1$d)</string>
+    <string name="error_mic_init_denied">Microphone initialization failed (permission denied)</string>
+    <string name="error_mic_unsupported">Microphone does not support 48 kHz mono capture</string>
+    <string name="error_mic_init">Microphone initialization failed</string>
+    <string name="error_mic_read">Microphone read failed; start capture again</string>
+    <string name="status_network_switched">Network changed (reconnecting)</string>
+    <string name="status_wifi_lost">Wi-Fi disconnected (waiting for network)</string>
+    <string name="status_disconnected_waiting">Disconnected (waiting to reconnect)</string>
+
+    <string name="jitter_late">Late %1$d</string>
+    <string name="jitter_overflow">Overflow %1$d</string>
+    <string name="jitter_plc">PLC %1$d (hold %2$d, peak %3$d)</string>
+    <string name="jitter_resync">Resync %1$d</string>
 </resources>

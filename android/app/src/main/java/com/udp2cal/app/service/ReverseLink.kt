@@ -3,8 +3,10 @@ package com.udp2cal.app.service
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
+import com.udp2cal.app.AppLocale
 import com.udp2cal.app.AudioPlayer
 import com.udp2cal.app.Prefs
+import com.udp2cal.app.R
 import com.udp2cal.app.StreamResampler
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
@@ -183,7 +185,7 @@ internal class ReverseLink(
         }
         playJob = scope.launch(playDispatcher) { reversePlayLoop() }
         status.update {
-            it.copy(reverseAudio = true, reverseBw = "FB 48 kHz 立体声")
+            it.copy(reverseAudio = true)
         }
     }
 
@@ -327,10 +329,26 @@ internal class ReverseLink(
                     // 抖动缓冲的“生病”指标必须能被眼睛看到：只写在日志里没人翻。
                     // 每秒取一次（JNI getter，代价可忽略）。
                     val jbSummary = buildList {
-                        if (jitter.late > 0) add("迟到 ${jitter.late}")
-                        if (jitter.overflow > 0) add("溢出 ${jitter.overflow}")
-                        if (jitter.plcFrames > 0) add("PLC ${jitter.plcFrames}(hold ${jitter.holdFrames}，峰 ${jitter.maxPlcRun})")
-                        if (jitter.resyncs > 0) add("重同步 ${jitter.resyncs}")
+                        if (jitter.late > 0) {
+                            add(AppLocale.s(context, R.string.jitter_late, jitter.late))
+                        }
+                        if (jitter.overflow > 0) {
+                            add(AppLocale.s(context, R.string.jitter_overflow, jitter.overflow))
+                        }
+                        if (jitter.plcFrames > 0) {
+                            add(
+                                AppLocale.s(
+                                    context,
+                                    R.string.jitter_plc,
+                                    jitter.plcFrames,
+                                    jitter.holdFrames,
+                                    jitter.maxPlcRun,
+                                )
+                            )
+                        }
+                        if (jitter.resyncs > 0) {
+                            add(AppLocale.s(context, R.string.jitter_resync, jitter.resyncs))
+                        }
                     }.joinToString(" · ")
                     status.update {
                         it.copy(

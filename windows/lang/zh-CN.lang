@@ -1,0 +1,79 @@
+# UDP2CAL Windows 语言文件
+# 格式：key = value，以 # 或 ; 开头的行是注释。
+# 占位符写作 {name}；所有语言文件必须包含同一组 key。
+# 新增语言：复制本文件为 <code>.lang，翻译后重新编译。
+
+language.name = 简体中文
+
+app.tagline = ENJOY ME
+
+status.stopped = ● 已停止
+status.connected = ● 已连接
+status.disconnected = ● 已断开
+status.waiting = ● 等待连接
+status.p2p_busy = ● 已占用
+status.p2p_idle = ● 空闲
+status.vb_cable = ● VB-Cable
+status.vb_cable_missing = ● VB-Cable 未安装
+
+footer.latency = 延迟 {ms}ms · 丢样 {dropped} · 欠载 {underrun}
+footer.broadcast_addr = 广播地址: 255.255.255.255:44043
+footer.reverse_on = ● 反向串流已启用
+footer.reverse_off = ○ 反向串流未启用
+footer.broadcasting = ● 广播中
+footer.muted = ● 已静音
+
+ui.listen_port = 监听端口
+ui.target_address = 目标地址
+ui.bitrate = 码率
+ui.level = 电平
+ui.start = 启动
+ui.stop = 停止
+ui.auto_start = 开机自启
+ui.reverse_stream = 反向串流
+ui.not_enabled = 未启用
+
+pair.title = 新设备请求连接
+pair.ip = IP  {ip}
+pair.device_id = 标识  {id}
+pair.hint = 只在确认这是你的手机时允许
+pair.allow = 允许
+pair.deny = 拒绝
+
+unit.kbps = kbps
+unit.db = dB
+unit.ms = ms
+
+msg.already_running = 程序已在运行中（已尝试切换到已有窗口）
+
+notice.firewall_and_tray = {err}；托盘不可用，关闭窗口将直接退出
+notice.tray_unavailable = 托盘不可用，关闭窗口将直接退出
+notice.config_save_failed = 配置保存失败：{err}
+notice.port_invalid = 端口号无效，请输入 1-65535
+notice.port_zero = 端口号不能为 0
+notice.port_reserved = 端口 {port} 保留给局域网发现服务，请改用其它端口
+notice.ip_empty = 监听地址不能为空
+notice.ip_invalid = 监听地址「{ip}」不是合法的 IP
+notice.firewall_restore_failed = 无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}；原端口规则恢复也失败（{re}）。请以管理员身份运行后重试
+notice.firewall_failed = 无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}：{err}。请以管理员身份运行后重试
+notice.pair_allowed = 已允许 {ip}（{id}）连接，等待手机重连
+notice.pair_denied = 已拒绝 {ip}（{id}）的连接请求
+
+engine.audio_stream_failed = 音频输出流失效，重建失败：请检查 VB-Cable/音频服务后重新开始
+engine.listen_failed = 监听 {addr} 失败：{kind}（端口被占用或地址不可用）
+engine.decoder_failed = Opus 解码器初始化失败
+engine.device_failed = 音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）
+engine.audio_timeout = 音频初始化超时（音频设备无响应），请检查音频服务后重新开始
+
+error.auto_start_open = 打开自启注册表失败: {err}
+error.exe_path = 获取程序路径失败: {err}
+error.auto_start_write = 写入自启注册表失败（可能被杀毒软件拦截）: {err}
+error.auto_start_delete = 删除自启注册表失败: {err}
+error.firewall_cmd = 防火墙命令执行失败: {err}
+error.firewall_rule = 防火墙规则添加失败（需要管理员权限）
+error.firewall_rule_detail = 防火墙规则添加失败（需要管理员权限）: {detail}
+
+menu.expected_latency = 预期延迟
+menu.quit = 退出
+menu.language = 语言
+menu.system = 跟随系统

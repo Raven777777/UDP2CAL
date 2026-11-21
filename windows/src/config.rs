@@ -1,4 +1,5 @@
 // 配置管理 - 注册表读写
+use crate::i18n;
 use std::sync::OnceLock;
 use udp2cal_protocol::rtp::{WATER_TARGET_MAX_MS, WATER_TARGET_MIN_MS};
 use winreg::RegKey;
@@ -21,6 +22,8 @@ pub struct Config {
     pub reverse_enabled: u32,
     /// 正向接收目标水位（ms）；0 = 未显式设置，回退环境变量/默认值
     pub water_target_ms: u32,
+    /// 界面语言代码；空串 = 跟随系统
+    pub language: String,
 }
 
 /// 进程级设备 ID 缓存。
@@ -64,6 +67,7 @@ impl Default for Config {
             paired_device_ip: None,
             reverse_enabled: 0,
             water_target_ms: 0,
+            language: String::new(),
         }
     }
 }
@@ -81,6 +85,15 @@ fn resolve_device_id(stored: u64) -> u64 {
         }
         id
     })
+}
+
+/// 只读取界面语言：单实例提示发生在完整配置加载之前，避免第二实例
+/// 触发设备 ID 生成/写入。
+pub fn load_language() -> String {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(REG_PATH, KEY_READ)
+        .map(|key| get_string(&key, "language", ""))
+        .unwrap_or_default()
 }
 
 impl Config {
@@ -126,6 +139,7 @@ impl Config {
             paired_device_ip: parse_paired_ip(&get_string(&path, "paired_device_ip", "")),
             reverse_enabled: get_dword(&path, "reverse_enabled", 0),
             water_target_ms: sanitize_water_target(get_dword(&path, "water_target_ms", 0)),
+            language: get_string(&path, "language", ""),
         }
     }
 
@@ -147,6 +161,7 @@ impl Config {
         )?;
         key.set_value("reverse_enabled", &self.reverse_enabled)?;
         key.set_value("water_target_ms", &self.water_target_ms)?;
+        key.set_value("language", &self.language)?;
         Ok(())
     }
 
@@ -168,21 +183,22 @@ impl Config {
                 "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
                 KEY_SET_VALUE,
             )
-            .map_err(|e| format!("打开自启注册表失败: {e}"))?;
+            .map_err(|e| i18n::tf("error.auto_start_open", &[("err", &e)]))?;
 
         if enable {
-            let exe = std::env::current_exe().map_err(|e| format!("获取程序路径失败: {e}"))?;
+            let exe = std::env::current_exe()
+                .map_err(|e| i18n::tf("error.exe_path", &[("err", &e)]))?;
             // 必须加引号：路径含空格时未加引号的 Run 项会被系统截断解析
             let quoted = format!("\"{}\"", exe.display());
             run_key
                 .set_value(RUN_VALUE, &quoted)
-                .map_err(|e| format!("写入自启注册表失败（可能被杀毒软件拦截）: {e}"))?;
+                .map_err(|e| i18n::tf("error.auto_start_write", &[("err", &e)]))?;
             self.auto_start = 1;
         } else {
             match run_key.delete_value(RUN_VALUE) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("删除自启注册表失败: {e}")),
+                Err(e) => return Err(i18n::tf("error.auto_start_delete", &[("err", &e)])),
             }
             self.auto_start = 0;
         }

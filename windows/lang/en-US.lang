@@ -1,0 +1,79 @@
+# UDP2CAL Windows language file
+# Format: key = value. Lines starting with # or ; are comments.
+# Placeholders use {name}. Keep every key present in all language files.
+# Add a language: copy this file to <code>.lang, translate the values, rebuild.
+
+language.name = English
+
+app.tagline = ENJOY ME
+
+status.stopped = ● Stopped
+status.connected = ● Connected
+status.disconnected = ● Disconnected
+status.waiting = ● Waiting
+status.p2p_busy = ● In use
+status.p2p_idle = ● Idle
+status.vb_cable = ● VB-Cable
+status.vb_cable_missing = ● VB-Cable not installed
+
+footer.latency = Latency {ms}ms · Dropped {dropped} · Underruns {underrun}
+footer.broadcast_addr = Broadcast address: 255.255.255.255:44043
+footer.reverse_on = ● Reverse stream enabled
+footer.reverse_off = ○ Reverse stream disabled
+footer.broadcasting = ● Broadcasting
+footer.muted = ● Muted
+
+ui.listen_port = Listen port
+ui.target_address = Target address
+ui.bitrate = Bitrate
+ui.level = Level
+ui.start = Start
+ui.stop = Stop
+ui.auto_start = Always
+ui.reverse_stream = Reverse
+ui.not_enabled = Disabled
+
+pair.title = New device connection request
+pair.ip = IP  {ip}
+pair.device_id = ID  {id}
+pair.hint = Allow only if this is your phone
+pair.allow = Allow
+pair.deny = Deny
+
+unit.kbps = kbps
+unit.db = dB
+unit.ms = ms
+
+msg.already_running = UDP2CAL is already running (tried to focus the existing window)
+
+notice.firewall_and_tray = {err}; tray unavailable, closing the window will exit
+notice.tray_unavailable = Tray unavailable, closing the window will exit
+notice.config_save_failed = Failed to save settings: {err}
+notice.port_invalid = Invalid port. Enter a value from 1 to 65535
+notice.port_zero = Port cannot be 0
+notice.port_reserved = Port {port} is reserved for LAN discovery. Choose another port
+notice.ip_empty = Listen address cannot be empty
+notice.ip_invalid = Listen address "{ip}" is not a valid IP
+notice.firewall_restore_failed = Could not add a firewall rule for port {port}; still using port {old_port}, and restoring the old rule also failed ({re}). Run as administrator and retry
+notice.firewall_failed = Could not add a firewall rule for port {port}; still using port {old_port}: {err}. Run as administrator and retry
+notice.pair_allowed = Allowed {ip} ({id}) to connect; waiting for the phone to reconnect
+notice.pair_denied = Denied the connection request from {ip} ({id})
+
+engine.audio_stream_failed = Audio output stream failed and could not be rebuilt. Check VB-Cable/audio service and start again
+engine.listen_failed = Failed to listen on {addr}: {kind} (port in use or address unavailable)
+engine.decoder_failed = Failed to initialize the Opus decoder
+engine.device_failed = Failed to initialize the audio device (install VB-Cable and restart the app)
+engine.audio_timeout = Audio initialization timed out (device not responding). Check the audio service and start again
+
+error.auto_start_open = Failed to open the startup registry key: {err}
+error.exe_path = Failed to get the executable path: {err}
+error.auto_start_write = Failed to write the startup registry value (possibly blocked by antivirus): {err}
+error.auto_start_delete = Failed to delete the startup registry value: {err}
+error.firewall_cmd = Failed to run the firewall command: {err}
+error.firewall_rule = Failed to add the firewall rule (administrator required)
+error.firewall_rule_detail = Failed to add the firewall rule (administrator required): {detail}
+
+menu.expected_latency = Expected latency
+menu.quit = Quit
+menu.language = Language
+menu.system = Follow system

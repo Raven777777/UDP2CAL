@@ -2,6 +2,7 @@
 
 use crate::app::{AppState, Message, NoticeLevel};
 use crate::diag::LATENCY_MS;
+use crate::i18n::{t, tf};
 use iced::widget::{
     Space, button, column, container, opaque, progress_bar, row, stack, text, text_input,
 };
@@ -9,12 +10,6 @@ use iced::{Alignment, Color, Element, Length, Task};
 use std::sync::atomic::Ordering;
 
 impl AppState {
-    /// 状态点文字：靠 `status_text` 区分"已断开"与"等待连接"。
-    /// 这里只影响显示，不再参与配色判定。
-    fn status_is_disconnected(&self) -> bool {
-        self.status_text.contains("断开")
-    }
-
     pub(crate) fn view(&self) -> Element<'_, Message> {
         let bg = Color::from_rgb(0.08, 0.08, 0.10);
         let card_bg = Color::from_rgb(0.13, 0.13, 0.16);
@@ -25,16 +20,16 @@ impl AppState {
         let dim = Color::from_rgb(0.55, 0.55, 0.60);
 
         let (sc, st) = if !self.is_running {
-            (grey, "● 已停止")
+            (grey, t("status.stopped"))
         } else if self.connected {
-            (accent, "● 已连接")
+            (accent, t("status.connected"))
         } else {
             (
                 red,
-                if self.status_is_disconnected() {
-                    "● 已断开"
+                if self.disconnected {
+                    t("status.disconnected")
                 } else {
-                    "● 等待连接"
+                    t("status.waiting")
                 },
             )
         };
@@ -45,15 +40,15 @@ impl AppState {
         let (p2p_state, p2p_color) = if !self.is_running {
             (String::new(), dim)
         } else if p2p.is_busy() {
-            ("● 已占用".to_string(), Color::from_rgb(0.95, 0.55, 0.15))
+            (t("status.p2p_busy"), Color::from_rgb(0.95, 0.55, 0.15))
         } else {
-            ("● 空闲".to_string(), accent)
+            (t("status.p2p_idle"), accent)
         };
 
         let vb_str = if self.vb_cable_installed {
-            "● VB-Cable"
+            t("status.vb_cable")
         } else {
-            "● VB-Cable 未安装"
+            t("status.vb_cable_missing")
         };
         let vb_color = if self.vb_cable_installed {
             Color::from_rgb(0.25, 0.80, 0.40)
@@ -69,36 +64,35 @@ impl AppState {
             let s = self.session.audio_stats().snapshot();
             // 延迟放在最前：它是用户唯一能直接感知的指标，
             // 重采样计数已失去诊断价值（比率每帧都在动），只在日志里保留
-            format!(
-                "延迟 {}ms · 丢样 {} · 欠载 {}",
-                LATENCY_MS.load(Ordering::Relaxed),
-                short_num(s.dropped),
-                short_num(s.underrun)
+            tf(
+                "footer.latency",
+                &[
+                    ("ms", &LATENCY_MS.load(Ordering::Relaxed)),
+                    ("dropped", &short_num(s.dropped)),
+                    ("underrun", &short_num(s.underrun)),
+                ],
             )
         } else {
-            "广播地址: 255.255.255.255:44043".to_string()
+            t("footer.broadcast_addr")
         };
         let (footer_right, footer_right_color) = if !self.is_running {
             (String::new(), dim)
         } else if self.connected {
             if self.reverse_enabled {
-                (
-                    "● 反向串流已启用".to_string(),
-                    Color::from_rgb(0.25, 0.80, 0.40),
-                )
+                (t("footer.reverse_on"), Color::from_rgb(0.25, 0.80, 0.40))
             } else {
-                ("○ 反向串流未启用".to_string(), dim)
+                (t("footer.reverse_off"), dim)
             }
         } else {
             let bc_on = self.session.running() && !p2p.is_busy();
             if bc_on {
-                ("● 广播中".to_string(), accent)
+                (t("footer.broadcasting"), accent)
             } else {
-                ("● 已静音".to_string(), dim)
+                (t("footer.muted"), dim)
             }
         };
 
-        let mk = |label: &'static str, color: Color, msg: Message| {
+        let mk = |label: String, color: Color, msg: Message| {
             button(text(label).size(16))
                 .on_press(msg)
                 .width(Length::Fill)
@@ -167,7 +161,7 @@ impl AppState {
         let base = container(
             column![
                 row![
-                    text("ENJOY ME").size(20),
+                    text(t("app.tagline")).size(20),
                     Space::new().width(Length::Fill),
                     text(st).color(sc).size(11),
                     Space::new().width(8),
@@ -179,9 +173,9 @@ impl AppState {
                 Space::new().height(8.0),
                 container(column![
                     text(if self.is_running {
-                        "监听端口"
+                        t("ui.listen_port")
                     } else {
-                        "目标地址"
+                        t("ui.target_address")
                     })
                     .size(14)
                     .color(dim),
@@ -263,23 +257,23 @@ impl AppState {
                 container(column![
                     row![
                         column![
-                            text("码率").size(12).color(dim),
+                            text(t("ui.bitrate")).size(12).color(dim),
                             Space::new().height(2),
                             row![
                                 text(format!("{:.0}", self.last_bitrate as u32)).size(22),
                                 Space::new().width(3),
-                                text("kbps").size(11).color(dim)
+                                text(t("unit.kbps")).size(11).color(dim)
                             ]
                             .align_y(Alignment::End)
                         ]
                         .width(Length::FillPortion(1)),
                         column![
-                            text("电平").size(12).color(dim),
+                            text(t("ui.level")).size(12).color(dim),
                             Space::new().height(2),
                             row![
                                 text(format!("{:.0}", self.last_level_db as i32)).size(22),
                                 Space::new().width(3),
-                                text("dB").size(11).color(dim)
+                                text(t("unit.db")).size(11).color(dim)
                             ]
                             .align_y(Alignment::End)
                         ]
@@ -318,14 +312,18 @@ impl AppState {
                 Space::new().height(15),
                 row![
                     mk(
-                        if self.is_running { "停止" } else { "启动" },
+                        if self.is_running {
+                            t("ui.stop")
+                        } else {
+                            t("ui.start")
+                        },
                         btn_c,
                         Message::ToggleRunning,
                     )
                     .width(Length::FillPortion(1)),
                     Space::new().width(8),
                     mk(
-                        "开机自启",
+                        t("ui.auto_start"),
                         auto_c,
                         Message::ToggleAutoStart(!self.config.is_auto_start()),
                     )
@@ -333,7 +331,14 @@ impl AppState {
                     Space::new().width(8),
                     if self.is_running {
                         let rev_on = self.reverse_enabled;
-                        button(text(if rev_on { "反向串流" } else { "未启用" }).size(16))
+                        button(
+                            text(if rev_on {
+                                t("ui.reverse_stream")
+                            } else {
+                                t("ui.not_enabled")
+                            })
+                            .size(16),
+                        )
                             .width(Length::FillPortion(1))
                             .height(34)
                             .style(move |_, _| iced::widget::button::Style {
@@ -352,7 +357,7 @@ impl AppState {
                             })
                     } else {
                         mk(
-                            "反向串流",
+                            t("ui.reverse_stream"),
                             if self.reverse_enabled { accent } else { grey },
                             Message::ToggleReverse(!self.reverse_enabled),
                         )
@@ -383,17 +388,23 @@ impl AppState {
         };
         let card = container(
             column![
-                text("新设备请求连接").size(14).color(Color::WHITE),
-                text(format!("IP  {}", req.addr.ip())).size(11).color(dim),
-                text(format!("标识  {:016x}", req.device_id))
-                    .size(10)
-                    .color(grey),
-                text("只在确认这是你的手机时允许").size(10).color(grey),
+                text(t("pair.title")).size(14).color(Color::WHITE),
+                text(tf("pair.ip", &[("ip", &req.addr.ip())]))
+                    .size(11)
+                    .color(dim),
+                text(tf(
+                    "pair.device_id",
+                    &[("id", &format!("{:016x}", req.device_id))],
+                ))
+                .size(10)
+                .color(grey),
+                text(t("pair.hint")).size(10).color(grey),
                 Space::new().height(2),
                 row![
-                    mk("允许", accent, Message::AllowPairing).width(Length::FillPortion(1)),
+                    mk(t("pair.allow"), accent, Message::AllowPairing)
+                        .width(Length::FillPortion(1)),
                     Space::new().width(8),
-                    mk("拒绝", red, Message::DenyPairing).width(Length::FillPortion(1)),
+                    mk(t("pair.deny"), red, Message::DenyPairing).width(Length::FillPortion(1)),
                 ],
             ]
             .spacing(6),

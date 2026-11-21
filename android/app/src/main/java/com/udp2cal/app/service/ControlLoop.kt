@@ -2,6 +2,7 @@ package com.udp2cal.app.service
 
 import com.udp2cal.app.DiscoveryManager
 import com.udp2cal.app.Prefs
+import com.udp2cal.app.R
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
 import kotlinx.coroutines.delay
@@ -52,16 +53,19 @@ internal class ControlLoop(
             if (fresh != connected) {
                 connected = fresh
                 if (fresh) {
-                    status.update { it.copy(connected = true, errorMsg = "") }
+                    status.update {
+                        it.copy(connected = true, errorRes = 0, errorArgs = emptyList())
+                    }
                 } else {
                     status.update {
                         it.copy(
                             connected = false, reverseAudio = false,
-                            errorMsg = if (isWifiAwaitingReconnect()) {
-                                "Wi-Fi 已断开（等待网络恢复）"
+                            errorRes = if (isWifiAwaitingReconnect()) {
+                                R.string.status_wifi_lost
                             } else {
-                                "已断开（等待重连）"
+                                R.string.status_disconnected_waiting
                             },
+                            errorArgs = emptyList(),
                         )
                     }
                     reverse.resetSession()

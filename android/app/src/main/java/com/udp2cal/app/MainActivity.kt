@@ -39,6 +39,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -47,6 +48,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -57,12 +59,20 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import com.udp2cal.app.service.CaptureMode
 import com.udp2cal.app.service.CaptureService
+import com.udp2cal.app.service.VbrMode
+import com.udp2cal.app.service.labelRes
+import com.udp2cal.app.service.vbrRes
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     companion object { private const val TAG = "MainActivity" }
+
+    override fun attachBaseContext(newBase: Context) {
+        super.attachBaseContext(AppLocale.wrapActivity(newBase))
+    }
 
     private var captureService: CaptureService? = null
     private var serviceBound = false
@@ -146,7 +156,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val activity = LocalContext.current as Activity
-            var showOpusSettings by remember { mutableStateOf(false) }
+            var showOpusSettings by rememberSaveable { mutableStateOf(false) }
             var blackout by remember { mutableStateOf(false) }
             val window = activity.window
 
@@ -192,7 +202,12 @@ class MainActivity : ComponentActivity() {
                         if (showOpusSettings) {
                             OpusSettingsScreen(
                                 onBack = { showOpusSettings = false },
-                                service = serviceState.value
+                                service = serviceState.value,
+                                onLanguageChanged = { tag ->
+                                    Prefs.language = tag
+                                    captureService?.refreshNotification()
+                                    recreate()
+                                }
                             )
                         } else {
                             MainScreen(
@@ -249,21 +264,18 @@ class MainActivity : ComponentActivity() {
                 if (permissionDenied.value) {
                     AlertDialog(
                         onDismissRequest = { permissionDenied.value = false },
-                        title = { Text("需要麦克风权限") },
-                        text = {
-                            Text(
-                                "UDP2CAL 需要录音权限才能采集手机音频。" +
-                                    "请在系统设置中允许「麦克风」后返回。"
-                            )
-                        },
+                        title = { Text(stringResource(R.string.permission_title)) },
+                        text = { Text(stringResource(R.string.permission_message)) },
                         confirmButton = {
                             TextButton(onClick = {
                                 permissionDenied.value = false
                                 openAppSettings()
-                            }) { Text("去设置") }
+                            }) { Text(stringResource(R.string.action_settings)) }
                         },
                         dismissButton = {
-                            TextButton(onClick = { permissionDenied.value = false }) { Text("稍后") }
+                            TextButton(onClick = { permissionDenied.value = false }) {
+                                Text(stringResource(R.string.action_later))
+                            }
                         }
                     )
                 }
@@ -316,10 +328,16 @@ fun MainScreen(
     var showDeviceDialog by remember { mutableStateOf(false) }
     var discoveredDevices by remember { mutableStateOf<List<DiscoveryManager.DiscoverResult>>(emptyList()) }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
 
     LaunchedEffect(service) {
         service?.status?.collect { status ->
-            isRunning = status.isRunning; errorMsg = status.errorMsg
+            isRunning = status.isRunning
+            errorMsg = if (status.errorRes != 0) {
+                ctx.getString(status.errorRes, *status.errorArgs.toTypedArray())
+            } else {
+                ""
+            }
             connected = status.connected
         }
     }
@@ -327,14 +345,16 @@ fun MainScreen(
     val discover: () -> Unit = {
         scope.launch {
             isSearching = true
-            errorMsg = "正在搜索局域网内的PC端..."
+            errorMsg = ctx.getString(R.string.discover_searching)
             val devices = DiscoveryManager.discoverServers()
             if (devices.isEmpty()) {
-                errorMsg = "未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下"
+                errorMsg = ctx.getString(R.string.discover_not_found)
             } else {
                 discoveredDevices = devices
                 showDeviceDialog = true
-                errorMsg = "找到 ${devices.size} 个设备，请选择"
+                errorMsg = ctx.resources.getQuantityString(
+                    R.plurals.discover_found, devices.size, devices.size
+                )
             }
             isSearching = false
         }
@@ -347,9 +367,9 @@ fun MainScreen(
         else -> Color(0xFF888888)
     }
     val statusText = when {
-        connected && isRunning -> "已连接"
-        isRunning -> "正在连接…"
-        else -> "未连接"
+        connected && isRunning -> stringResource(R.string.status_connected)
+        isRunning -> stringResource(R.string.status_connecting)
+        else -> stringResource(R.string.status_disconnected)
     }
     val statusPulse = rememberInfiniteTransition(label = "statusPulse")
     val statusDotAlpha by statusPulse.animateFloat(
@@ -381,7 +401,7 @@ fun MainScreen(
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Text("UDP2CAL", fontSize = 24.sp, color = Color(0xFF00E676))
-        Text("Android ↔ PC · 局域网音频", fontSize = 11.sp, color = Color(0xFF777777))
+        Text(stringResource(R.string.app_subtitle), fontSize = 11.sp, color = Color(0xFF777777))
 
         Surface(
             color = statusColor.copy(alpha = 0.12f),
@@ -428,7 +448,7 @@ fun MainScreen(
                 )
             ) {
                 Text(
-                    if (isRunning) "停止" else "开始",
+                    stringResource(if (isRunning) R.string.action_stop else R.string.action_start),
                     fontSize = 19.sp,
                     fontWeight = FontWeight.Medium,
                     letterSpacing = 2.sp
@@ -444,9 +464,10 @@ fun MainScreen(
             Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
-                        Text("目标设备", fontSize = 13.sp, color = Color(0xFF888888))
+                        Text(stringResource(R.string.target_title), fontSize = 13.sp, color = Color(0xFF888888))
                         Text(
-                            if (targetIp.isBlank()) "未选择" else "$targetIp:$shownPort",
+                            if (targetIp.isBlank()) stringResource(R.string.target_none)
+                            else "$targetIp:$shownPort",
                             fontSize = 16.sp,
                             color = if (targetIp.isBlank()) Color(0xFFAAAAAA) else Color.White
                         )
@@ -455,7 +476,13 @@ fun MainScreen(
                         onClick = { showManualConfig = !showManualConfig },
                         enabled = !isRunning
                     ) {
-                        Text(if (showManualConfig) "收起" else "手动输入", color = Color(0xFF00B0FF))
+                        Text(
+                            stringResource(
+                                if (showManualConfig) R.string.action_collapse
+                                else R.string.action_manual_input
+                            ),
+                            color = Color(0xFF00B0FF)
+                        )
                     }
                 }
                 OutlinedButton(
@@ -465,7 +492,11 @@ fun MainScreen(
                 ) {
                     Icon(AutorenewIcon, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(if (isSearching) "搜索中…" else "自动发现")
+                    Text(
+                        stringResource(
+                            if (isSearching) R.string.action_searching else R.string.action_auto_discover
+                        )
+                    )
                 }
                 AnimatedVisibility(showManualConfig) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -475,7 +506,7 @@ fun MainScreen(
                                 if (it != targetIp) Prefs.targetDeviceId = ""
                                 targetIp = it
                             },
-                            label = { Text("目标 IP") },
+                            label = { Text(stringResource(R.string.target_ip)) },
                             singleLine = true,
                             enabled = !isRunning,
                             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
@@ -488,7 +519,7 @@ fun MainScreen(
                                 if (it != targetPort) Prefs.targetDeviceId = ""
                                 targetPort = it
                             },
-                            label = { Text("端口") },
+                            label = { Text(stringResource(R.string.target_port)) },
                             singleLine = true,
                             enabled = !isRunning,
                             modifier = Modifier.fillMaxWidth().onFocusChanged { fs ->
@@ -509,19 +540,18 @@ fun MainScreen(
                 modifier = Modifier.weight(1f).height(44.dp),
                 shape = RoundedCornerShape(22.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp)
-            ) { Text("息屏省电", color = Color(0xFF00B0FF), fontSize = 13.sp) }
+            ) { Text(stringResource(R.string.action_blackout), color = Color(0xFF00B0FF), fontSize = 13.sp) }
             OutlinedButton(
                 onClick = onOpenSettings,
                 modifier = Modifier.weight(1f).height(44.dp),
                 shape = RoundedCornerShape(22.dp),
                 contentPadding = PaddingValues(horizontal = 8.dp)
-            ) { Text("高级设置", color = Color(0xFFAAAAAA), fontSize = 13.sp) }
+            ) { Text(stringResource(R.string.action_advanced), color = Color(0xFFAAAAAA), fontSize = 13.sp) }
         }
 
         // 息屏断流引导：仅当未加入电池优化白名单时显示。
         // 每秒一次的 CONNECT 心跳就是系统认账的保活，白名单足够，无需加密心跳。
         if (!batteryWhitelisted) {
-            val ctx = LocalContext.current
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
@@ -532,9 +562,9 @@ fun MainScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("息屏保持连接", fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                        Text(stringResource(R.string.battery_title), fontSize = 13.sp, color = Color(0xFFB0B0B0))
                         Text(
-                            "加入电池优化白名单；国产 ROM 还需允许自启动与后台联网",
+                            stringResource(R.string.battery_desc),
                             fontSize = 11.sp, color = Color(0xFF777777)
                         )
                     }
@@ -556,7 +586,7 @@ fun MainScreen(
                                 }
                             }
                         }
-                    ) { Text("去设置", color = Color(0xFF00B0FF)) }
+                    ) { Text(stringResource(R.string.action_settings), color = Color(0xFF00B0FF)) }
                 }
             }
         }
@@ -571,7 +601,7 @@ fun MainScreen(
     if (showDeviceDialog && discoveredDevices.isNotEmpty()) {
         AlertDialog(
             onDismissRequest = { showDeviceDialog = false },
-            title = { Text("选择接收端", color = Color.White) },
+            title = { Text(stringResource(R.string.device_title), color = Color.White) },
             text = {
                 LazyColumn {
                     items(discoveredDevices) { device ->
@@ -582,7 +612,12 @@ fun MainScreen(
                                 Prefs.targetIp = device.ip
                                 Prefs.targetPort = device.port
                                 Prefs.targetDeviceId = Udp2CalProtocol.deviceIdToString(device.deviceId)
-                                errorMsg = "已选择: ${device.ip}:${device.port} (${device.deviceName})"
+                                errorMsg = ctx.getString(
+                                    R.string.device_selected,
+                                    device.ip,
+                                    device.port,
+                                    device.deviceName,
+                                )
                                 showDeviceDialog = false
                                 showManualConfig = false
                             },
@@ -593,7 +628,7 @@ fun MainScreen(
                                     Text(device.deviceName, fontSize = 15.sp, color = Color(0xFF00E676))
                                     Text("${device.ip}:${device.port}", fontSize = 13.sp, color = Color(0xFFAAAAAA))
                                 }
-                                Text("选择 →", fontSize = 12.sp, color = Color(0xFF00B0FF))
+                                Text(stringResource(R.string.action_select), fontSize = 12.sp, color = Color(0xFF00B0FF))
                             }
                         }
                     }
@@ -601,7 +636,7 @@ fun MainScreen(
             },
             confirmButton = {
                 TextButton(onClick = { showDeviceDialog = false }) {
-                    Text("取消", color = Color(0xFF888888))
+                    Text(stringResource(R.string.action_cancel), color = Color(0xFF888888))
                 }
             },
             containerColor = Color(0xFF0D0D1A)
@@ -609,16 +644,37 @@ fun MainScreen(
     }
 }
 
-/** 带宽码（Opus 枚举值）→ 滑块与状态卡片共用的文案表 */
+/** 带宽码（Opus 枚举值）→ 滑块与状态卡片共用的文案资源 */
 private val BW_CODES = intArrayOf(1101, 1102, 1103, 1104, 1105)
-private val BW_LABELS = arrayOf(
-    "窄带 NB · 8 kHz",
-    "中带 MB · 12 kHz",
-    "宽带 WB · 16 kHz",
-    "超宽带 SWB · 24 kHz",
-    "全频带 FB · 48 kHz",
+private val BW_LABEL_RES = intArrayOf(
+    R.string.bw_nb,
+    R.string.bw_mb,
+    R.string.bw_wb,
+    R.string.bw_swb,
+    R.string.bw_fb,
 )
-private val BW_SHORT = arrayOf("NB", "MB", "WB", "SWB", "FB")
+private val BW_SHORT_RES = intArrayOf(
+    R.string.bw_short_nb,
+    R.string.bw_short_mb,
+    R.string.bw_short_wb,
+    R.string.bw_short_swb,
+    R.string.bw_short_fb,
+)
+
+/** 麦克风音源档位 → 短标签资源 */
+private val MIC_SIGNAL_CODES = intArrayOf(3001, 3002, 3003, 3004)
+private val MIC_SIGNAL_LABEL_RES = intArrayOf(
+    R.string.mic_voice,
+    R.string.mic_direct,
+    R.string.mic_raw,
+    R.string.mic_recognition,
+)
+
+@Composable
+private fun bwDisplayName(bw: Int): String {
+    val index = BW_CODES.indexOf(bw)
+    return if (index >= 0) stringResource(BW_LABEL_RES[index]) else ""
+}
 
 /** 反向接收目标水位五档（ms） */
 private val WATER_TARGET_STEPS_MS = intArrayOf(80, 120, 160, 200, 300)
@@ -626,7 +682,8 @@ private val WATER_TARGET_STEPS_MS = intArrayOf(80, 120, 160, 200, 300)
 @Composable
 fun OpusSettingsScreen(
     onBack: () -> Unit,
-    service: CaptureService?
+    service: CaptureService?,
+    onLanguageChanged: (String) -> Unit
 ) {
     val context = LocalContext.current
     val versionName = remember {
@@ -649,16 +706,15 @@ fun OpusSettingsScreen(
 
     // ── 运行时状态 ──
     var isRunning by remember { mutableStateOf(false) }
-    var opusMode by remember { mutableStateOf("") }
+    var mode by remember { mutableStateOf(CaptureMode.FULLBAND) }
     var realtimeKbps by remember { mutableStateOf(0f) }
     var sampleRateHz by remember { mutableStateOf(0) }
     var targetKbps by remember { mutableStateOf(0) }
-    var vbrMode by remember { mutableStateOf("") }
+    var vbrMode by remember { mutableStateOf(VbrMode.CBR) }
     var connected by remember { mutableStateOf(false) }
     var opusBandwidth by remember { mutableStateOf(0) }
     var reverseAudio by remember { mutableStateOf(false) }
     var reverseBitrateKbps by remember { mutableStateOf(0f) }
-    var reverseBw by remember { mutableStateOf("") }
     var reverseJitter by remember { mutableStateOf("") }
 
     // 1kHz 测试音
@@ -667,7 +723,7 @@ fun OpusSettingsScreen(
     LaunchedEffect(service) {
         service?.status?.collect { status ->
             isRunning = status.isRunning
-            opusMode = status.opusMode
+            mode = status.mode
             realtimeKbps = status.bitrateKbps
             sampleRateHz = status.sampleRateHz
             targetKbps = status.bitrateTargetKbps
@@ -676,17 +732,11 @@ fun OpusSettingsScreen(
             opusBandwidth = status.opusBandwidth
             reverseAudio = status.reverseAudio
             reverseBitrateKbps = status.reverseBitrateKbps
-            reverseBw = status.reverseBw
             reverseJitter = status.reverseJitter
         }
     }
 
-    // 带宽码（Opus 枚举值 1101..1105）→ 显示文本。
-    // 滑块与状态卡片共用同一张表，避免两处文案各自漂移。
-    fun bwDisplayName(bw: Int): String {
-        val i = BW_CODES.indexOf(bw)
-        return if (i >= 0) BW_LABELS[i] else ""
-    }
+    // 带宽码（Opus 枚举值 1101..1105）→ 显示文本由 bwDisplayName 统一处理。
 
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(top = 44.dp, start = 20.dp, end = 20.dp, bottom = 24.dp),
@@ -694,9 +744,9 @@ fun OpusSettingsScreen(
     ) {
         // ═══ 顶部导航 ═══
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回", fontSize = 16.sp, color = Color(0xFF00E676)) }
+            TextButton(onClick = onBack) { Text(stringResource(R.string.action_back), fontSize = 16.sp, color = Color(0xFF00E676)) }
             Spacer(Modifier.width(10.dp))
-            Text("高级设置", fontSize = 18.sp, color = Color.White)
+            Text(stringResource(R.string.action_advanced), fontSize = 18.sp, color = Color.White)
         }
 
         // ═══ 1kHz 测试音开关（移入高级设置） ═══
@@ -708,9 +758,11 @@ fun OpusSettingsScreen(
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                 Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column {
-                    Text("1kHz 测试音", fontSize = 14.sp, color = if (testToneMode) Color(0xFFFF9800) else Color(0xFFAAAAAA))
-                    Text(if (testToneMode) "无需麦克风即可测试音频链路" else "关闭时使用麦克风采集",
-                        fontSize = 11.sp, color = Color(0xFF666666))
+                    Text(stringResource(R.string.test_tone_title), fontSize = 14.sp, color = if (testToneMode) Color(0xFFFF9800) else Color(0xFFAAAAAA))
+                    Text(
+                        stringResource(if (testToneMode) R.string.test_tone_on else R.string.test_tone_off),
+                        fontSize = 11.sp, color = Color(0xFF666666)
+                    )
                 }
                 Switch(checked = testToneMode, onCheckedChange = {
                     testToneMode = it; Prefs.testToneMode = it
@@ -728,18 +780,25 @@ fun OpusSettingsScreen(
             ) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("Opus 编码状态", fontSize = 13.sp, color = Color(0xFF888888))
-                        Text(if (connected) "● 独占连接" else "● 未连接",
+                        Text(stringResource(R.string.opus_status_title), fontSize = 13.sp, color = Color(0xFF888888))
+                        Text(
+                            stringResource(
+                                if (connected) R.string.opus_exclusive else R.string.opus_not_connected
+                            ),
                             fontSize = 11.sp,
-                            color = if (connected) Color(0xFF00E676) else Color(0xFFFF5252))
+                            color = if (connected) Color(0xFF00E676) else Color(0xFFFF5252)
+                        )
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("模式", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(opusMode.ifEmpty { "—" }, fontSize = 13.sp,
-                            color = if (opusMode.contains("语音")) Color(0xFFFF9800) else Color(0xFF00B0FF))
+                        Text(stringResource(R.string.opus_mode), fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(
+                            stringResource(mode.labelRes),
+                            fontSize = 13.sp,
+                            color = if (mode == CaptureMode.VOICE) Color(0xFFFF9800) else Color(0xFF00B0FF)
+                        )
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(stringResource(R.string.opus_bandwidth), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         // 运行时显示**已生效**值（编码器上报），未运行时显示**已配置**值，
                         // 这样任何时候改滑块都能在这一行看到结果
                         Text(
@@ -750,27 +809,27 @@ fun OpusSettingsScreen(
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         // 采集/编码输入固定 48 kHz；"带宽"指的是编码后保留的频率范围，
                         // 两者不是一回事，标签写清楚免得看起来自相矛盾
-                        Text("输入采样率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(stringResource(R.string.opus_input_sample_rate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         Text(if (sampleRateHz > 0) "${sampleRateHz / 1000}kHz" else "48kHz", fontSize = 13.sp, color = Color.White)
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("实时码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(stringResource(R.string.opus_realtime_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         Text(if (realtimeKbps > 0f) "%.1fkbps".format(realtimeKbps) else "—", fontSize = 13.sp, color = Color(0xFF00E676))
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("目标码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        Text(stringResource(R.string.opus_target_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                         val shownKbps = if (isRunning && targetKbps > 0) targetKbps else bitrate
                         Text("${shownKbps}kbps", fontSize = 13.sp, color = Color.White)
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text("VBR模式", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        // 与 EncoderCfg.vbrLabel() 同义：DTX 会强制 VBR
+                        Text(stringResource(R.string.opus_vbr_mode), fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                        // 与 EncoderCfg.vbrMode() 同义：DTX 会强制 VBR
                         val shownVbr = when {
-                            !(vbr || dtx) -> "CBR"
-                            vbrConstraint -> "VBR·约束"
-                            else -> "VBR"
+                            !(vbr || dtx) -> VbrMode.CBR
+                            vbrConstraint -> VbrMode.VBR_CONSTRAINED
+                            else -> VbrMode.VBR
                         }
-                        Text(if (isRunning && vbrMode.isNotEmpty()) vbrMode else shownVbr, fontSize = 13.sp, color = Color(0xFFB0B0B0))
+                        Text(stringResource((if (isRunning) vbrMode else shownVbr).vbrRes), fontSize = 13.sp, color = Color(0xFFB0B0B0))
                     }
                 }
             }
@@ -784,25 +843,25 @@ fun OpusSettingsScreen(
                 ) {
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                            Text("反向串流 (PC→Phone)", fontSize = 13.sp, color = Color(0xFF888888))
-                            Text("● 活跃", fontSize = 11.sp, color = Color(0xFF00E676))
+                            Text(stringResource(R.string.reverse_title), fontSize = 13.sp, color = Color(0xFF888888))
+                            Text(stringResource(R.string.reverse_active), fontSize = 11.sp, color = Color(0xFF00E676))
                         }
                         if (reverseBitrateKbps > 0f) {
                             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text("码率", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text(stringResource(R.string.reverse_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                                 Text("%.1fkbps".format(reverseBitrateKbps), fontSize = 13.sp, color = Color(0xFF00E676))
                             }
                         }
                         if (reverseJitter.isNotEmpty()) {
                             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text("抖动缓冲", fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text(stringResource(R.string.reverse_jitter), fontSize = 13.sp, color = Color(0xFFAAAAAA))
                                 Text(reverseJitter, fontSize = 12.sp, color = Color(0xFFB0B0B0))
                             }
                         }
-                        if (reverseBw.isNotEmpty()) {
+                        if (reverseAudio) {
                             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text("音频带宽", fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                                Text(reverseBw, fontSize = 13.sp, color = Color.White)
+                                Text(stringResource(R.string.reverse_bandwidth), fontSize = 13.sp, color = Color(0xFFAAAAAA))
+                                Text(stringResource(R.string.reverse_fb_stereo), fontSize = 13.sp, color = Color.White)
                             }
                         }
                     }
@@ -815,15 +874,14 @@ fun OpusSettingsScreen(
         }
 
         // ═══ Opus 编码参数设置 ═══
-        Text("编码参数", fontSize = 15.sp, color = Color(0xFF00E676))
+        Text(stringResource(R.string.settings_encoding), fontSize = 15.sp, color = Color(0xFF00E676))
 
-        Text("编码复杂度 (Complexity): ${complexity.toInt()}", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_complexity, complexity.toInt()), fontSize = 14.sp, color = Color.White)
         Slider(value = complexity, onValueChange = { complexity = it; Prefs.opusComplexity = it.toInt() }, valueRange = 1f..10f, steps = 8, modifier = Modifier.fillMaxWidth())
 
-        Text("麦克风音源 (Mic Source)", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_mic_source), fontSize = 14.sp, color = Color.White)
         run {
-            val values = intArrayOf(3001, 3002, 3003, 3004)
-            val shortLabels = arrayOf("语音", "直出", "原始", "识别")
+            val values = MIC_SIGNAL_CODES
             val lastIdx = values.lastIndex
             val idx = values.indexOf(signalType).takeIf { it >= 0 } ?: 1
             Slider(
@@ -840,17 +898,21 @@ fun OpusSettingsScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                shortLabels.forEachIndexed { i, code ->
-                    Text(code, fontSize = 10.sp, color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888))
+                MIC_SIGNAL_LABEL_RES.forEachIndexed { i, res ->
+                    Text(
+                        stringResource(res),
+                        fontSize = 10.sp,
+                        color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888)
+                    )
                 }
             }
             Text(
-                "原始/识别不走系统降噪处理；换源会自动重建采集链路，音源不支持时自动回退 MIC 直出",
+                stringResource(R.string.settings_mic_source_hint),
                 fontSize = 11.sp, color = Color(0xFF888888)
             )
         }
 
-        Text("音频带宽 (Bandwidth)", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_bandwidth), fontSize = 14.sp, color = Color.White)
         run {
             // 与码率滑块保持完全一致的版式：标题 → 当前值 → 滑块 → 刻度 → 说明
             val lastIdx = BW_CODES.lastIndex
@@ -869,22 +931,22 @@ fun OpusSettingsScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                BW_SHORT.forEachIndexed { i, code ->
+                BW_SHORT_RES.forEachIndexed { i, res ->
                     Text(
-                        code,
+                        stringResource(res),
                         fontSize = 10.sp,
                         color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888)
                     )
                 }
             }
             Text(
-                "限制编码频率范围，越低越省码率；语音推荐 WB/SWB，音乐用 FB",
+                stringResource(R.string.settings_bandwidth_hint),
                 fontSize = 11.sp, color = Color(0xFF888888)
             )
         }
 
         // 码率：五档滑块。协议上限 512 kbps（10 ms 帧下 640 字节/帧，远低于 1275）
-        Text("码率 (Bitrate)", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_bitrate), fontSize = 14.sp, color = Color.White)
         run {
             val steps = Udp2CalProtocol.BITRATE_STEPS_KBPS
             val lastIdx = steps.lastIndex
@@ -912,13 +974,17 @@ fun OpusSettingsScreen(
                 }
             }
             Text(
-                "${steps[idx]} kbps ≈ ${steps[idx] * 1000 / 8 * 10 / 1000} 字节/帧（10 ms），Opus 上限 1275 字节",
+                stringResource(
+                    R.string.settings_bitrate_hint,
+                    steps[idx],
+                    steps[idx] * 1000 / 8 * 10 / 1000,
+                ),
                 fontSize = 11.sp, color = Color(0xFF888888)
             )
         }
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Text("DTX (静音时不传输)", fontSize = 14.sp, color = Color.White)
+            Text(stringResource(R.string.settings_dtx), fontSize = 14.sp, color = Color.White)
             Switch(checked = dtx, onCheckedChange = {
                 dtx = it
                 Prefs.opusDtx = if (it) 1 else 0
@@ -928,10 +994,10 @@ fun OpusSettingsScreen(
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column {
-                Text("VBR (动态码率)", fontSize = 14.sp,
+                Text(stringResource(R.string.settings_vbr), fontSize = 14.sp,
                     color = if (dtx) Color(0xFF666666) else Color.White)
                 if (dtx) {
-                    Text("开启DTX时强制启用VBR", fontSize = 11.sp, color = Color(0xFFFF9800))
+                    Text(stringResource(R.string.settings_vbr_forced), fontSize = 11.sp, color = Color(0xFFFF9800))
                 }
             }
             Switch(
@@ -945,8 +1011,13 @@ fun OpusSettingsScreen(
         if (vbr || dtx) {
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
                 Column {
-                    Text("VBR 码率约束", fontSize = 14.sp, color = Color.White)
-                    Text(if (vbrConstraint) "严格不超过目标码率" else "可临时超过目标码率", fontSize = 11.sp, color = Color(0xFF888888))
+                    Text(stringResource(R.string.settings_vbr_constraint), fontSize = 14.sp, color = Color.White)
+                    Text(
+                        stringResource(
+                            if (vbrConstraint) R.string.settings_vbr_strict else R.string.settings_vbr_loose
+                        ),
+                        fontSize = 11.sp, color = Color(0xFF888888)
+                    )
                 }
                 Switch(
                     checked = vbrConstraint,
@@ -957,12 +1028,12 @@ fun OpusSettingsScreen(
         }
 
         Spacer(Modifier.height(8.dp))
-        Text("前向纠错与丢包容错", fontSize = 15.sp, color = Color(0xFF00E676))
+        Text(stringResource(R.string.settings_fec_section), fontSize = 15.sp, color = Color(0xFF00E676))
 
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
             Column {
-                Text("FEC (前向纠错)", fontSize = 14.sp, color = Color.White)
-                Text("包丢失时可用冗余数据恢复", fontSize = 11.sp, color = Color(0xFF888888))
+                Text(stringResource(R.string.settings_fec), fontSize = 14.sp, color = Color.White)
+                Text(stringResource(R.string.settings_fec_hint), fontSize = 11.sp, color = Color(0xFF888888))
             }
             Switch(
                 checked = fec,
@@ -971,12 +1042,16 @@ fun OpusSettingsScreen(
             )
         }
 
-        Text("预期丢包率: ${packetLoss.toInt()}%", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_packet_loss, packetLoss.toInt()), fontSize = 14.sp, color = Color.White)
         Text(
-            if (packetLoss == 0f) "无丢包预期，关闭抗丢包优化"
-            else if (packetLoss <= 5f) "低丢包：轻量冗余保护"
-            else if (packetLoss <= 15f) "中丢包：增加冗余与鲁棒性"
-            else "高丢包：最大冗余保护，码率效率降低",
+            stringResource(
+                when {
+                    packetLoss == 0f -> R.string.settings_loss_none
+                    packetLoss <= 5f -> R.string.settings_loss_low
+                    packetLoss <= 15f -> R.string.settings_loss_medium
+                    else -> R.string.settings_loss_high
+                }
+            ),
             fontSize = 11.sp, color = Color(0xFF888888)
         )
         Slider(
@@ -985,7 +1060,7 @@ fun OpusSettingsScreen(
             valueRange = 0f..30f, steps = 29, modifier = Modifier.fillMaxWidth()
         )
 
-        Text("预期延迟: ${waterTarget}ms", fontSize = 14.sp, color = Color.White)
+        Text(stringResource(R.string.settings_water_target, waterTarget), fontSize = 14.sp, color = Color.White)
         run {
             val lastIdx = WATER_TARGET_STEPS_MS.lastIndex
             val idx = WATER_TARGET_STEPS_MS.indexOf(waterTarget).takeIf { it >= 0 }
@@ -1015,9 +1090,44 @@ fun OpusSettingsScreen(
                 }
             }
             Text(
-                "PC→手机反向串流的目标缓冲；越低延迟越小，网络抖动大时更容易断音",
+                stringResource(R.string.settings_water_target_hint),
                 fontSize = 11.sp, color = Color(0xFF888888)
             )
+        }
+
+        // ═══ 语言 ═══
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider(color = Color(0xFF333333))
+        Spacer(Modifier.height(12.dp))
+
+        Text(stringResource(R.string.language_title), fontSize = 15.sp, color = Color(0xFF00E676))
+        val languageOptions = remember {
+            listOf(AppLocale.SYSTEM to context.getString(R.string.language_system)) +
+                AppLocale.available(context)
+        }
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
+            shape = MaterialTheme.shapes.medium
+        ) {
+            Column(Modifier.padding(vertical = 4.dp)) {
+                languageOptions.forEach { (tag, name) ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable { onLanguageChanged(tag) }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = Prefs.language == tag,
+                            onClick = { onLanguageChanged(tag) },
+                            colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF00E676))
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(name, fontSize = 14.sp, color = Color.White)
+                    }
+                }
+            }
         }
 
         // ═══ 关于页面 ═══
@@ -1025,7 +1135,7 @@ fun OpusSettingsScreen(
         HorizontalDivider(color = Color(0xFF333333))
         Spacer(Modifier.height(12.dp))
 
-        Text("关于", fontSize = 15.sp, color = Color(0xFF00E676))
+        Text(stringResource(R.string.about_title), fontSize = 15.sp, color = Color(0xFF00E676))
 
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -1038,14 +1148,14 @@ fun OpusSettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
-                Text("v$versionName", fontSize = 13.sp, color = Color(0xFF888888))
+                Text(stringResource(R.string.about_version, versionName), fontSize = 13.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(4.dp))
-                Text("作者：四折光曲 & 井水玉藻", fontSize = 14.sp, color = Color(0xFFCCCCCC))
-                Text("本程序为自由软件，以 GPL v3 许可证发布", fontSize = 12.sp, color = Color(0xFF666666))
+                Text(stringResource(R.string.about_author), fontSize = 14.sp, color = Color(0xFFCCCCCC))
+                Text(stringResource(R.string.about_license), fontSize = 12.sp, color = Color(0xFF666666))
                 Spacer(Modifier.height(8.dp))
-                Text("双向局域网音频串流", fontSize = 14.sp, color = Color(0xFF00B0FF))
-                Text("手机麦克风→PC + PC扬声器→手机", fontSize = 12.sp, color = Color(0xFF888888))
-                Text("Opus编码 · 声学回声消除 · 低延迟", fontSize = 12.sp, color = Color(0xFF888888))
+                Text(stringResource(R.string.about_tagline), fontSize = 14.sp, color = Color(0xFF00B0FF))
+                Text(stringResource(R.string.about_desc), fontSize = 12.sp, color = Color(0xFF888888))
+                Text(stringResource(R.string.about_features), fontSize = 12.sp, color = Color(0xFF888888))
                 Spacer(Modifier.height(8.dp))
                 Text("https://github.com/Raven777777/UDP2CAL", fontSize = 12.sp, color = Color(0xFF00E676), textAlign = TextAlign.Center)
             }

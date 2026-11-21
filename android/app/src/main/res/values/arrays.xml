@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 支持的应用内语言；新增语言时在这里加 tag，并在 res/values-<tag>/strings.xml 提供翻译。 -->
+    <string-array name="language_tags">
+        <item>en</item>
+        <item>zh</item>
+        <item>ja</item>
+    </string-array>
+</resources>

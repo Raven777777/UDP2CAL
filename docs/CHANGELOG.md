@@ -5,6 +5,26 @@
 
 ---
 
+## 未发布 · 多语言支持
+
+### Windows（单 exe 内嵌语言文件）
+
+- 新增 `windows/lang/en-US.lang` / `zh-CN.lang` / `ja-JP.lang`：`key = value` 格式，支持 `{name}` 占位符。
+- `build.rs` 自动扫描 `lang/*.lang` 生成内嵌语言表，`i18n.rs` 负责解析与取词；语言文件随 exe 编译，不产生外置文件。
+- 语言选择：跟随系统 UI 语言（`GetUserDefaultLocaleName`，精确 → 主语言前缀 → 英文），托盘新增「语言」子菜单可即时切换并写注册表 `HKCU\Software\UDP2CAL\language`。
+- 界面、托盘、单实例提示、端口/地址校验、防火墙/自启错误全部改为 key 取词；删除用中文子串判断连接状态的逻辑（改为 `disconnected` 布尔）。
+- 新增 `i18n` 单元测试：解析、占位符、内嵌语言 key 集合一致性。
+
+### Android（资源文件 + 应用内切换）
+
+- `res/values/strings.xml` 改为英文默认，新增 `res/values-zh/strings.xml`；主界面、高级设置、通知、运行时状态与错误全部改用资源字符串。
+- 新增 `AppLocale`：`attachBaseContext` 覆盖 locale，Service 侧 `AppLocale.s()` 取词；高级设置新增「语言」卡片（跟随系统 / English / 简体中文 / 日本語），写入 `SharedPreferences.language` 并刷新前台通知。
+- 运行时状态改为稳定枚举（`CaptureMode` / `AudioSource` / `AecState` / `VbrMode`），不再用中文子串判断模式或音源；硬件硬故障改用 `fatal` 标志。
+- 新增 `scripts/tests/test_i18n.py`：校验中英文 key、占位符与语言索引一致。
+- 新增语言：增加 `values-<tag>/strings.xml` 并在 `values/arrays.xml` 的 `language_tags` 加一项，无需改 Kotlin 代码。
+
+---
+
 ## v1.5.3 — 2026-11-18 · 音频链路、版本审查与性能基线
 
 ### 预期延迟运行时可调

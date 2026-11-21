@@ -17,7 +17,8 @@ udp2cal/
 │     │  ├─ Udp2CalProtocol.kt       # 协议常量与 DTO 胶水（行为全部由 Rust 提供，见「协议单一实现」）
 │     │  ├─ AudioPlayer.kt           # 反向播放（48kHz 立体声，最小缓冲 + low-latency）
 │     │  ├─ StreamResampler.kt       # 反向流重采样的 JNI 胶水（实现见 protocol/resampler.rs）
-│     │  ├─ Prefs.kt                 # SharedPreferences 配置
+│     │  ├─ Prefs.kt                 # SharedPreferences 配置（含界面语言）
+│     │  ├─ AppLocale.kt             # 应用内语言覆盖：attachBaseContext / Service 取词
 │     │  ├─ WifiNetworkBinder.kt     # Wi-Fi Network 选择 / socket 绑定与回调
 │     │  ├─ service/CaptureService.kt    # 前台服务外壳：Binder/通知/Wi-Fi 回调/停机 join
 │     │  ├─ service/CaptureLifecycle.kt  # 会话编排：链路启停/重启排队/网络层与任务槽
@@ -39,7 +40,8 @@ udp2cal/
 │  │  │  ├─ mod.rs     # Session 状态容器、P2P 绑定、配对、反向发送器、CONNECT 处理
 │  │  │  ├─ audio.rs   # 抖动缓冲、解码/播放线程（含两级漂移校正）
 │  │  │  └─ tests.rs   # 控制面纯逻辑与独立 Session 实例测试
-│  │  ├─ tray.rs       # 系统托盘、图标加载、原生窗口激活
+│  │  ├─ tray.rs       # 系统托盘、图标加载、原生窗口激活、语言切换菜单
+│  │  ├─ i18n.rs       # 内嵌语言表解析、当前语言、t()/tf() 取词
 │  │  ├─ diag.rs       # 诊断计数器与周期统计日志
 │  │  ├─ audio.rs      # cpal 输出 + 无锁 PCM 环 + played_frames + 可微调比率重采样
 │  │  ├─ capture.rs    # WASAPI Loopback（事件驱动）+ Opus 10 ms + RTP 发送
@@ -51,7 +53,8 @@ udp2cal/
 │  │  ├─ logger.rs     # 日志文件 + 轮转 + panic hook
 │  │  └─ protocol.rs   # 协议重新导出
 │  ├─ Cargo.toml
-│  └─ build.rs      # 构建脚本：icon.png → ICO，嵌入 PE 资源
+│  ├─ lang/         # 内嵌语言文件（en-US / zh-CN / ja-JP .lang），build.rs 自动扫描
+│  └─ build.rs      # 构建脚本：icon.png → ICO，嵌入 PE 资源；扫描 lang/ 生成内嵌语言表
 ├─ protocol/       # 协议真源（Rust crate）：protocol.rs 控制面 + rtp/ 媒体面 + resampler.rs 重采样 + jni.rs JNI 表面
 ├─ vendor/         # audiopus / audiopus_sys 本地补丁副本（Cargo [patch.crates-io]）
 ├─ docs/           # 项目文档（本目录）
@@ -409,7 +412,24 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 
 ---
 
-## 八、相关文档
+## 八、多语言
+
+两端都只跟随系统语言，并提供应用内切换；日志保持中文。
+
+- **Windows**：`windows/lang/*.lang`（UTF-8、`key = value`、`{name}` 占位符）由
+  `build.rs` 扫描后在编译期 `include_str!` 进 exe，保持单文件分发。运行时按
+  `HKCU\Software\UDP2CAL\language`（空串 = 跟随系统）选择；托盘「语言」子菜单可即时切换。
+  新增语言 = 放入一个 `.lang` 文件并重新编译，无需改 Rust 代码。
+- **Android**：`res/values/`（英文默认）+ `res/values-<tag>/strings.xml`。
+  `AppLocale` 通过 `attachBaseContext` 覆盖 locale，Service 侧用 `AppLocale.s()` 取词；
+  高级设置「语言」卡片写入 `SharedPreferences.language`。新增语言 = 增加
+  `values-<tag>/strings.xml` 并在 `values/arrays.xml` 的 `language_tags` 加一项。
+- 运行时状态（模式 / 音源 / AEC / VBR）使用枚举而非中文子串，翻译后不会破坏状态判断。
+- `scripts/tests/test_i18n.py` 校验中英文资源 key 与占位符一致。
+
+---
+
+## 九、相关文档
 
 | 文档 | 内容 |
 | --- | --- |

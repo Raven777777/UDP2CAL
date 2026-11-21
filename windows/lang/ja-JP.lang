@@ -1,0 +1,79 @@
+# UDP2CAL Windows 言語ファイル
+# 形式：key = value。# または ; で始まる行はコメントです。
+# プレースホルダーは {name}。すべての言語ファイルで同じ key を揃えてください。
+# 言語追加：このファイルを <code>.lang にコピーして翻訳し、再ビルドしてください。
+
+language.name = 日本語
+
+app.tagline = ENJOY ME
+
+status.stopped = ● 停止中
+status.connected = ● 接続済み
+status.disconnected = ● 切断
+status.waiting = ● 接続待ち
+status.p2p_busy = ● 使用中
+status.p2p_idle = ● 待機中
+status.vb_cable = ● VB-Cable
+status.vb_cable_missing = ● VB-Cable 未インストール
+
+footer.latency = 遅延 {ms}ms · 欠落 {dropped} · アンダーラン {underrun}
+footer.broadcast_addr = ブロードキャストアドレス: 255.255.255.255:44043
+footer.reverse_on = ● 逆方向ストリーム有効
+footer.reverse_off = ○ 逆方向ストリーム無効
+footer.broadcasting = ● ブロードキャスト中
+footer.muted = ● ミュート
+
+ui.listen_port = 待受ポート
+ui.target_address = 接続先アドレス
+ui.bitrate = ビットレート
+ui.level = レベル
+ui.start = 開始
+ui.stop = 停止
+ui.auto_start = 自動起動
+ui.reverse_stream = 逆方向
+ui.not_enabled = 無効
+
+pair.title = 新しいデバイスの接続要求
+pair.ip = IP  {ip}
+pair.device_id = ID  {id}
+pair.hint = 自分のスマートフォンであることを確認してから許可してください
+pair.allow = 許可
+pair.deny = 拒否
+
+unit.kbps = kbps
+unit.db = dB
+unit.ms = ms
+
+msg.already_running = UDP2CAL は既に実行中です（既存のウィンドウを前面に表示しようとしました）
+
+notice.firewall_and_tray = {err}。トレイが使用できないため、ウィンドウを閉じると終了します
+notice.tray_unavailable = トレイが使用できないため、ウィンドウを閉じると終了します
+notice.config_save_failed = 設定の保存に失敗しました: {err}
+notice.port_invalid = ポート番号が無効です。1〜65535 の値を入力してください
+notice.port_zero = ポート番号に 0 は使用できません
+notice.port_reserved = ポート {port} は LAN 検出サービス用に予約されています。別のポートを指定してください
+notice.ip_empty = 待受アドレスを空にすることはできません
+notice.ip_invalid = 待受アドレス「{ip}」は有効な IP ではありません
+notice.firewall_restore_failed = ポート {port} のファイアウォール規則を追加できませんでした。ポート {old_port} を引き続き使用しますが、元の規則の復元にも失敗しました（{re}）。管理者として実行して再試行してください
+notice.firewall_failed = ポート {port} のファイアウォール規則を追加できませんでした。ポート {old_port} を引き続き使用します: {err}。管理者として実行して再試行してください
+notice.pair_allowed = {ip}（{id}）の接続を許可しました。スマートフォンの再接続を待っています
+notice.pair_denied = {ip}（{id}）からの接続要求を拒否しました
+
+engine.audio_stream_failed = 音声出力ストリームでエラーが発生し、再構築できませんでした。VB-Cable/オーディオサービスを確認してから再度開始してください
+engine.listen_failed = {addr} で待ち受けできませんでした: {kind}（ポート使用中またはアドレス使用不可）
+engine.decoder_failed = Opus デコーダーの初期化に失敗しました
+engine.device_failed = オーディオデバイスの初期化に失敗しました（VB-Cable をインストールしてアプリを再起動してください）
+engine.audio_timeout = オーディオの初期化がタイムアウトしました（デバイスが応答しません）。オーディオサービスを確認してから再度開始してください
+
+error.auto_start_open = スタートアップのレジストリキーを開けませんでした: {err}
+error.exe_path = 実行ファイルのパスを取得できませんでした: {err}
+error.auto_start_write = スタートアップのレジストリ値を書き込めませんでした（ウイルス対策ソフトにブロックされた可能性があります）: {err}
+error.auto_start_delete = スタートアップのレジストリ値を削除できませんでした: {err}
+error.firewall_cmd = ファイアウォールコマンドの実行に失敗しました: {err}
+error.firewall_rule = ファイアウォール規則の追加に失敗しました（管理者権限が必要です）
+error.firewall_rule_detail = ファイアウォール規則の追加に失敗しました（管理者権限が必要です）: {detail}
+
+menu.expected_latency = 目標遅延
+menu.quit = 終了
+menu.language = 言語
+menu.system = システムに従う

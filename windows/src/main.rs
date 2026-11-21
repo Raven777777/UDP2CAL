@@ -10,6 +10,7 @@ mod decoder;
 mod diag;
 mod firewall;
 mod hires;
+mod i18n;
 mod logger;
 mod net;
 mod power;

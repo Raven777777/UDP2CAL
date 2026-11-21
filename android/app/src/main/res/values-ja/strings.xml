@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UDP2CAL</string>
+    <string name="app_subtitle">Android ↔ PC · LAN オーディオ</string>
+
+    <string name="permission_title">マイクの権限が必要です</string>
+    <string name="permission_message">UDP2CAL がスマートフォンの音声を取得するには録音権限が必要です。システム設定で「マイク」を許可してから戻ってください。</string>
+    <string name="action_settings">設定を開く</string>
+    <string name="action_later">後で</string>
+    <string name="action_cancel">キャンセル</string>
+    <string name="action_back">← 戻る</string>
+    <string name="action_start">開始</string>
+    <string name="action_stop">停止</string>
+    <string name="action_advanced">詳細設定</string>
+    <string name="action_blackout">画面オフ</string>
+    <string name="action_manual_input">手動入力</string>
+    <string name="action_collapse">閉じる</string>
+    <string name="action_auto_discover">自動検出</string>
+    <string name="action_searching">検索中…</string>
+    <string name="action_select">選択 →</string>
+
+    <string name="status_connected">接続済み</string>
+    <string name="status_connecting">接続中…</string>
+    <string name="status_disconnected">未接続</string>
+
+    <string name="discover_searching">LAN 上の PC を検索中…</string>
+    <string name="discover_not_found">受信側が見つかりません。PC 側アプリが起動しており、同じ Wi-Fi に接続されていることを確認してください。</string>
+    <plurals name="discover_found">
+        <item quantity="other">%1$d 台のデバイスが見つかりました。選択してください</item>
+    </plurals>
+
+    <string name="target_title">接続先デバイス</string>
+    <string name="target_none">未選択</string>
+    <string name="target_ip">接続先 IP</string>
+    <string name="target_port">ポート</string>
+
+    <string name="device_title">受信側を選択</string>
+    <string name="device_selected">選択済み: %1$s:%2$d (%3$s)</string>
+
+    <string name="battery_title">画面オフ中も接続を維持</string>
+    <string name="battery_desc">バッテリー最適化の許可リストに追加してください。一部の ROM では自動起動とバックグラウンド通信の許可も必要です。</string>
+
+    <string name="test_tone_title">1 kHz テストトーン</string>
+    <string name="test_tone_on">マイクなしで音声経路をテストできます</string>
+    <string name="test_tone_off">オフ時はマイクを使用します</string>
+
+    <string name="opus_status_title">Opus エンコード状態</string>
+    <string name="opus_exclusive">● 専用接続</string>
+    <string name="opus_not_connected">● 未接続</string>
+    <string name="opus_mode">モード</string>
+    <string name="opus_bandwidth">帯域幅</string>
+    <string name="opus_input_sample_rate">入力サンプルレート</string>
+    <string name="opus_realtime_bitrate">リアルタイムビットレート</string>
+    <string name="opus_target_bitrate">目標ビットレート</string>
+    <string name="opus_vbr_mode">VBR モード</string>
+
+    <string name="mode_voice">音声モード</string>
+    <string name="mode_fullband">全帯域モード</string>
+
+    <string name="vbr_cbr">CBR</string>
+    <string name="vbr_constrained">VBR・制約付き</string>
+    <string name="vbr_vbr">VBR</string>
+
+    <string name="reverse_title">逆方向 (PC→スマホ)</string>
+    <string name="reverse_active">● アクティブ</string>
+    <string name="reverse_bitrate">ビットレート</string>
+    <string name="reverse_jitter">ジッターバッファ</string>
+    <string name="reverse_bandwidth">音声帯域幅</string>
+    <string name="reverse_fb_stereo">FB 48 kHz ステレオ</string>
+
+    <string name="settings_encoding">エンコード設定</string>
+    <string name="settings_complexity">エンコード複雑度 (Complexity): %1$d</string>
+    <string name="settings_mic_source">マイク音源 (Mic Source)</string>
+    <string name="settings_mic_source_hint">Raw/認識はシステムのノイズ処理を通りません。音源を変更するとキャプチャ経路が再構築され、非対応の音源は MIC 直通にフォールバックします。</string>
+    <string name="settings_bandwidth">音声帯域幅 (Bandwidth)</string>
+    <string name="settings_bandwidth_hint">エンコードする周波数範囲を制限します。低いほどビットレートを節約できます。音声は WB/SWB、音楽は FB を推奨します。</string>
+    <string name="settings_bitrate">ビットレート (Bitrate)</string>
+    <string name="settings_bitrate_hint">%1$d kbps ≈ %2$d バイト/フレーム（10 ms）、Opus の上限は 1275 バイト</string>
+    <string name="settings_dtx">DTX (無音時に送信しない)</string>
+    <string name="settings_vbr">VBR (可変ビットレート)</string>
+    <string name="settings_vbr_forced">DTX 有効時は VBR が強制されます</string>
+    <string name="settings_vbr_constraint">VBR ビットレート制約</string>
+    <string name="settings_vbr_strict">目標ビットレートを厳密に超えない</string>
+    <string name="settings_vbr_loose">一時的に目標ビットレートを超えることを許可</string>
+    <string name="settings_fec_section">前方誤り訂正とパケットロス耐性</string>
+    <string name="settings_fec">FEC (前方誤り訂正)</string>
+    <string name="settings_fec_hint">パケット損失時に冗長データから復元できます</string>
+    <string name="settings_packet_loss">想定パケット損失率: %1$d%%</string>
+    <string name="settings_loss_none">損失想定なし。パケットロス対策は無効</string>
+    <string name="settings_loss_low">低損失：軽量な冗長保護</string>
+    <string name="settings_loss_medium">中損失：冗長性と堅牢性を強化</string>
+    <string name="settings_loss_high">高損失：最大限の冗長保護。ビットレート効率は低下</string>
+    <string name="settings_water_target">目標遅延: %1$dms</string>
+    <string name="settings_water_target_hint">PC→スマートフォンの逆方向ストリームの目標バッファです。低いほど遅延は減りますが、ネットワークのジッタが大きいと音切れしやすくなります。</string>
+
+    <string name="mic_voice">音声</string>
+    <string name="mic_direct">直通</string>
+    <string name="mic_raw">Raw</string>
+    <string name="mic_recognition">認識</string>
+
+    <string name="bw_nb">狭帯域 NB · 8 kHz</string>
+    <string name="bw_mb">中帯域 MB · 12 kHz</string>
+    <string name="bw_wb">広帯域 WB · 16 kHz</string>
+    <string name="bw_swb">超広帯域 SWB · 24 kHz</string>
+    <string name="bw_fb">全帯域 FB · 48 kHz</string>
+    <string name="bw_short_nb">NB</string>
+    <string name="bw_short_mb">MB</string>
+    <string name="bw_short_wb">WB</string>
+    <string name="bw_short_swb">SWB</string>
+    <string name="bw_short_fb">FB</string>
+
+    <string name="language_title">言語</string>
+    <string name="language_system">システムに従う</string>
+    <string name="language_name">日本語</string>
+
+    <string name="about_title">このアプリについて</string>
+    <string name="about_version">v%1$s</string>
+    <string name="about_author">作者：四折光曲 &amp; 井水玉藻</string>
+    <string name="about_license">本プログラムは自由ソフトウェアであり、GPL v3 ライセンスで公開されています</string>
+    <string name="about_tagline">双方向 LAN オーディオストリーミング</string>
+    <string name="about_desc">スマートフォンのマイク→PC + PC のスピーカー→スマートフォン</string>
+    <string name="about_features">Opus エンコード · 音響エコーキャンセル · 低遅延</string>
+
+    <string name="channel_name">キャプチャサービス</string>
+    <string name="channel_desc">音声キャプチャサービスが実行中です</string>
+    <string name="notification_connected">接続済み</string>
+    <string name="notification_waiting">接続待ち</string>
+    <string name="notification_text">%1$s · %2$s · %3$s</string>
+
+    <string name="source_mic_direct">MIC 直通</string>
+    <string name="source_mic_direct_fallback">MIC 直通にフォールバック</string>
+    <string name="source_raw_unprocessed">Raw (UNPROCESSED)</string>
+    <string name="source_voice_recognition">音声認識 (VOICE_RECOGNITION)</string>
+    <string name="source_system_ns">システムノイズ抑制</string>
+    <string name="source_system_ns_fallback">システムノイズ抑制 (MIC にフォールバック)</string>
+    <string name="source_test_tone">1 kHz テストトーン</string>
+    <string name="source_aec_enabled">AEC 有効</string>
+    <string name="source_aec_unavailable">AEC 利用不可</string>
+
+    <string name="error_network_connect">ネットワーク接続に失敗しました</string>
+    <string name="error_unknown">不明なエラー</string>
+    <string name="error_encoder_init">エンコーダーの初期化に失敗しました</string>
+    <string name="error_encoder_frame_size">エンコーダーのフレームサイズが無効です (%1$d)</string>
+    <string name="error_mic_init_denied">マイクの初期化に失敗しました（権限がありません）</string>
+    <string name="error_mic_unsupported">マイクが 48 kHz モノラルキャプチャに対応していません</string>
+    <string name="error_mic_init">マイクの初期化に失敗しました</string>
+    <string name="error_mic_read">マイクの読み取りに失敗しました。キャプチャを再開してください</string>
+    <string name="status_network_switched">ネットワークが切り替わりました（再接続中）</string>
+    <string name="status_wifi_lost">Wi-Fi が切断されました（ネットワークの復帰を待機中）</string>
+    <string name="status_disconnected_waiting">切断されました（再接続待ち）</string>
+
+    <string name="jitter_late">遅延 %1$d</string>
+    <string name="jitter_overflow">オーバーフロー %1$d</string>
+    <string name="jitter_plc">PLC %1$d（hold %2$d、ピーク %3$d）</string>
+    <string name="jitter_resync">再同期 %1$d</string>
+</resources>

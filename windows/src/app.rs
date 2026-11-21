@@ -4,6 +4,7 @@ use crate::audio;
 use crate::config;
 use crate::diag;
 use crate::firewall;
+use crate::i18n;
 use crate::logf;
 use crate::logger;
 use crate::net;
@@ -30,6 +31,8 @@ pub(crate) enum Message {
     ToggleAutoStart(bool),
     /// 托盘切换接收目标水位（ms）
     SetWaterTarget(u32),
+    /// 托盘切换界面语言（空串 = 跟随系统）
+    SetLanguage(String),
     StatusUpdate(StatusInfo),
     Disconnected,
     /// 引擎级失败（监听失败 / 音频初始化失败）：必须回到停止态并把原因显示出来
@@ -77,9 +80,10 @@ pub(crate) struct AppState {
     pub(crate) port_valid: bool,
     pub(crate) is_running: bool,
     pub(crate) connected: bool,
+    /// 是否处于“已断开”而非“等待首次连接”（用于状态点文案）
+    pub(crate) disconnected: bool,
     pub(crate) last_bitrate: f32,
     pub(crate) last_level_db: f32,
-    pub(crate) status_text: String,
     /// 需要直接展示给用户的提示（错误 / 警告 / 断开原因）
     pub(crate) notice: String,
     /// 提示级别，决定配色
@@ -98,10 +102,15 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     logger::init();
     // 任何线程 panic 都要落盘：GUI 子系统下 stderr 会被丢弃
     logger::install_panic_hook();
+    i18n::init();
     logf!("[App] 启动 v{}", env!("CARGO_PKG_VERSION"));
     if let Some(p) = logger::path() {
         logf!("[App] 日志文件: {}", p.display());
     }
+
+    // 配置先于单实例提示加载：重复启动的提示也要用用户已选的语言。
+    // 只读语言，不触发设备 ID 的生成/落盘。
+    i18n::set_active(&config::load_language());
 
     // SAFETY: 三处 `PCWSTR::from_raw` 的缓冲都是本作用域内的 `Vec<u16>`，
     // 以 `\0` 结尾且生命周期覆盖调用；`CreateMutexW` 句柄故意泄漏到进程结束
@@ -113,7 +122,7 @@ pub(crate) fn run() -> Result<(), iced::Error> {
             // 先尝试把已运行实例的窗口拉到前台；再提示，避免"双击没反应"
             tray::focus_existing_window("UDP2CAL");
             let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect();
-            let msg: Vec<u16> = "程序已在运行中（已尝试切换到已有窗口）\0"
+            let msg: Vec<u16> = format!("{}\0", i18n::t("msg.already_running"))
                 .encode_utf16()
                 .collect();
             MessageBoxW(
@@ -154,6 +163,7 @@ pub(crate) fn run() -> Result<(), iced::Error> {
         w,
         h,
         startup_cfg.resolved_water_target_ms(),
+        &startup_cfg.language,
     );
     let tray_ok = tray_icon.is_some();
     if !tray_ok {
@@ -162,9 +172,9 @@ pub(crate) fn run() -> Result<(), iced::Error> {
 
     // 首条提示：防火墙失败 / 托盘降级，二者可能同时出现
     let startup_notice: String = match (&firewall_warning, tray_ok) {
-        (Some(err), false) => format!("{err}；托盘不可用，关闭窗口将直接退出"),
+        (Some(err), false) => i18n::tf("notice.firewall_and_tray", &[("err", err)]),
         (Some(err), true) => err.clone(),
-        (None, false) => "托盘不可用，关闭窗口将直接退出".to_string(),
+        (None, false) => i18n::t("notice.tray_unavailable"),
         (None, true) => String::new(),
     };
 
@@ -181,9 +191,9 @@ pub(crate) fn run() -> Result<(), iced::Error> {
                 port_valid: true,
                 is_running: false,
                 connected: false,
+                disconnected: false,
                 last_bitrate: 0.0,
                 last_level_db: -60.0,
-                status_text: String::new(),
                 notice: startup_notice.clone(),
                 notice_level: if firewall_warning.is_some() || !tray_ok {
                     NoticeLevel::Error
@@ -239,7 +249,7 @@ impl AppState {
             Ok(()) => true,
             Err(e) => {
                 logf!("[Config] 保存配置失败: {e}");
-                self.notice = format!("配置保存失败：{e}");
+                self.notice = i18n::tf("notice.config_save_failed", &[("err", &e)]);
                 self.notice_level = NoticeLevel::Error;
                 false
             }
@@ -293,6 +303,18 @@ impl AppState {
                 self.session.set_water_target_ms(ms);
                 Task::none()
             }
+            Message::SetLanguage(code) => {
+                self.config.language = code;
+                i18n::set_active(&self.config.language);
+                if self.persist_config() {
+                    self.notice.clear();
+                }
+                tray::refresh_menu(
+                    self.config.resolved_water_target_ms(),
+                    &self.config.language,
+                );
+                Task::none()
+            }
             Message::ToggleRunning => {
                 if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
                     return Task::none();
@@ -305,44 +327,42 @@ impl AppState {
                     self.session.reset_to_ready();
                     self.is_running = false;
                     self.connected = false;
+                    self.disconnected = false;
                     self.pending_pair = None;
                     self.session.clear_pairing_prompt();
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
-                    self.status_text.clear();
                     self.notice.clear();
                 } else {
                     let port: u16 = match self.port_input.parse() {
                         Ok(p) => p,
                         Err(_) => {
-                            self.notice = "端口号无效，请输入 1-65535".into();
+                            self.notice = i18n::t("notice.port_invalid");
                             self.notice_level = NoticeLevel::Error;
                             return Task::none();
                         }
                     };
                     if port == 0 {
-                        self.notice = "端口号不能为 0".into();
+                        self.notice = i18n::t("notice.port_zero");
                         self.notice_level = NoticeLevel::Error;
                         return Task::none();
                     }
                     // 44043 是常驻发现服务的绑定端口：监听它必定冲突，
                     // 而且坏端口一旦落盘，之后每次启动都会失败。
                     if port == protocol::DISCOVER_PORT {
-                        self.notice = format!(
-                            "端口 {port} 保留给局域网发现服务，请改用其它端口"
-                        );
+                        self.notice = i18n::tf("notice.port_reserved", &[("port", &port)]);
                         self.notice_level = NoticeLevel::Error;
                         return Task::none();
                     }
                     // 监听地址必须是本机地址；空/非法值会让 bind 直接失败
                     let ip = self.ip_input.trim().to_string();
                     if ip.is_empty() {
-                        self.notice = "监听地址不能为空".into();
+                        self.notice = i18n::t("notice.ip_empty");
                         self.notice_level = NoticeLevel::Error;
                         return Task::none();
                     }
                     if ip.parse::<std::net::IpAddr>().is_err() && ip != "localhost" {
-                        self.notice = format!("监听地址「{ip}」不是合法的 IP");
+                        self.notice = i18n::tf("notice.ip_invalid", &[("ip", &ip)]);
                         self.notice_level = NoticeLevel::Error;
                         return Task::none();
                     }
@@ -362,11 +382,13 @@ impl AppState {
                                 .transpose()
                                 .err();
                             self.notice = match restore {
-                                Some(re) => format!(
-                                    "无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}；原端口规则恢复也失败（{re}）。请以管理员身份运行后重试"
+                                Some(re) => i18n::tf(
+                                    "notice.firewall_restore_failed",
+                                    &[("port", &port), ("old_port", &old_port), ("re", &re)],
                                 ),
-                                None => format!(
-                                    "无法为端口 {port} 添加防火墙规则，仍使用原端口 {old_port}：{err}。请以管理员身份运行后重试"
+                                None => i18n::tf(
+                                    "notice.firewall_failed",
+                                    &[("port", &port), ("old_port", &old_port), ("err", &err)],
                                 ),
                             };
                             self.notice_level = NoticeLevel::Error;
@@ -392,9 +414,9 @@ impl AppState {
                     self.session.reset_to_ready();
                     self.is_running = true;
                     self.connected = false;
+                    self.disconnected = false;
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
-                    self.status_text = "等待连接...".into();
                     if saved {
                         self.notice.clear();
                     }
@@ -411,7 +433,7 @@ impl AppState {
                     && self.session.audio_state() == session::AudioInitState::DeviceFailed
                 {
                     return self.update(Message::EngineError(
-                        "音频输出流失效，重建失败：请检查 VB-Cable/音频服务后重新开始".into(),
+                        i18n::t("engine.audio_stream_failed"),
                     ));
                 }
                 // 「已连接」= 控制面绑定存在。规范 6.4 明确保活只看控制面，
@@ -427,11 +449,11 @@ impl AppState {
                         if self.notice_level == NoticeLevel::Info {
                             self.notice.clear();
                         }
-                        self.status_text.clear();
+                        self.disconnected = false;
                     } else if self.is_running {
                         self.last_bitrate = 0.0;
                         self.last_level_db = -60.0;
-                        self.status_text = "已断开".into();
+                        self.disconnected = true;
                     }
                 }
                 self.last_bitrate = info.bitrate_kbps;
@@ -449,7 +471,7 @@ impl AppState {
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
                     // 只更新顶部状态点（● 已断开），底部提示行不再重复同一信息
-                    self.status_text = "已断开".into();
+                    self.disconnected = true;
                 }
                 Task::none()
             }
@@ -459,11 +481,11 @@ impl AppState {
                 self.session.reset_to_ready();
                 self.is_running = false;
                 self.connected = false;
+                self.disconnected = false;
                 self.pending_pair = None;
                 self.session.clear_pairing_prompt();
                 self.last_bitrate = 0.0;
                 self.last_level_db = -60.0;
-                self.status_text.clear();
                 self.notice = msg;
                 self.notice_level = NoticeLevel::Error;
                 Task::none()
@@ -492,10 +514,12 @@ impl AppState {
                     self.session.clear_pairing_prompt();
                     // 保存失败时 persist_config 已写入错误提示，不能覆盖掉。
                     if self.persist_config() {
-                        self.notice = format!(
-                            "已允许 {}（{:016x}）连接，等待手机重连",
-                            req.addr.ip(),
-                            req.device_id
+                        self.notice = i18n::tf(
+                            "notice.pair_allowed",
+                            &[
+                                ("ip", &req.addr.ip()),
+                                ("id", &format!("{:016x}", req.device_id)),
+                            ],
                         );
                         self.notice_level = NoticeLevel::Info;
                     }
@@ -511,10 +535,12 @@ impl AppState {
                 if let Some(req) = self.pending_pair.take() {
                     self.session.deny_pairing(req.device_id);
                     self.session.clear_pairing_prompt();
-                    self.notice = format!(
-                        "已拒绝 {}（{:016x}）的连接请求",
-                        req.addr.ip(),
-                        req.device_id
+                    self.notice = i18n::tf(
+                        "notice.pair_denied",
+                        &[
+                            ("ip", &req.addr.ip()),
+                            ("id", &format!("{:016x}", req.device_id)),
+                        ],
                     );
                     self.notice_level = NoticeLevel::Info;
                     logf!(

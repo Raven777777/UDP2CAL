@@ -2,6 +2,7 @@
 
 use crate::app::{Message, StatusInfo};
 use crate::diag::{AUDIO_LEVEL_DB, RTP_RX_DROPPED, RTP_RX_PACKETS};
+use crate::i18n;
 use crate::logf;
 use crate::protocol;
 use crate::session::{self, AudioInitState, RTP_IDLE_RESET_MS, Session};
@@ -178,12 +179,13 @@ pub(crate) fn udp_receiver_stream(
                 match tokio::net::UdpSocket::bind((listen_ip.as_str(), listen_port as u16)).await {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = output
-                            .send(Message::EngineError(format!(
-                                "监听 {bind_addr} 失败：{}（端口被占用或地址不可用）",
-                                e.kind()
-                            )))
-                            .await;
+                        // 先拼成 String 再 await：带 `&dyn Display` 的临时值跨 await
+                        // 会让整个接收流不再是 Send。
+                        let message = i18n::tf(
+                            "engine.listen_failed",
+                            &[("addr", &bind_addr), ("kind", &e.kind())],
+                        );
+                        let _ = output.send(Message::EngineError(message)).await;
                         return;
                     }
                 };
@@ -208,15 +210,13 @@ pub(crate) fn udp_receiver_stream(
             match session.audio_state() {
                 AudioInitState::DecoderFailed => {
                     let _ = output
-                        .send(Message::EngineError("Opus 解码器初始化失败".into()))
+                        .send(Message::EngineError(i18n::t("engine.decoder_failed")))
                         .await;
                     return;
                 }
                 AudioInitState::DeviceFailed => {
                     let _ = output
-                        .send(Message::EngineError(
-                            "音频设备初始化失败（请确认 VB-Cable 已安装后重启程序）".into(),
-                        ))
+                        .send(Message::EngineError(i18n::t("engine.device_failed")))
                         .await;
                     return;
                 }
@@ -224,9 +224,7 @@ pub(crate) fn udp_receiver_stream(
                     // start_audio 已有 2.5 s 上限；3 s 后仍 Pending 说明初始化线程
                     // 卡在设备打开等路径，不能当作已连接放行。
                     let _ = output
-                        .send(Message::EngineError(
-                            "音频初始化超时（音频设备无响应），请检查音频服务后重新开始".into(),
-                        ))
+                        .send(Message::EngineError(i18n::t("engine.audio_timeout")))
                         .await;
                     return;
                 }

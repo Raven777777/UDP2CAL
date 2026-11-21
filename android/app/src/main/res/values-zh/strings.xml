@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UDP2CAL</string>
+    <string name="app_subtitle">Android ↔ PC · 局域网音频</string>
+
+    <string name="permission_title">需要麦克风权限</string>
+    <string name="permission_message">UDP2CAL 需要录音权限才能采集手机音频。请在系统设置中允许「麦克风」后返回。</string>
+    <string name="action_settings">去设置</string>
+    <string name="action_later">稍后</string>
+    <string name="action_cancel">取消</string>
+    <string name="action_back">← 返回</string>
+    <string name="action_start">开始</string>
+    <string name="action_stop">停止</string>
+    <string name="action_advanced">高级设置</string>
+    <string name="action_blackout">息屏省电</string>
+    <string name="action_manual_input">手动输入</string>
+    <string name="action_collapse">收起</string>
+    <string name="action_auto_discover">自动发现</string>
+    <string name="action_searching">搜索中…</string>
+    <string name="action_select">选择 →</string>
+
+    <string name="status_connected">已连接</string>
+    <string name="status_connecting">正在连接…</string>
+    <string name="status_disconnected">未连接</string>
+
+    <string name="discover_searching">正在搜索局域网内的PC端…</string>
+    <string name="discover_not_found">未找到接收端，请确保 PC 端已打开且在同一 Wi-Fi 下</string>
+    <plurals name="discover_found">
+        <item quantity="other">找到 %1$d 个设备，请选择</item>
+    </plurals>
+
+    <string name="target_title">目标设备</string>
+    <string name="target_none">未选择</string>
+    <string name="target_ip">目标 IP</string>
+    <string name="target_port">端口</string>
+
+    <string name="device_title">选择接收端</string>
+    <string name="device_selected">已选择: %1$s:%2$d (%3$s)</string>
+
+    <string name="battery_title">息屏保持连接</string>
+    <string name="battery_desc">加入电池优化白名单；国产 ROM 还需允许自启动与后台联网</string>
+
+    <string name="test_tone_title">1kHz 测试音</string>
+    <string name="test_tone_on">无需麦克风即可测试音频链路</string>
+    <string name="test_tone_off">关闭时使用麦克风采集</string>
+
+    <string name="opus_status_title">Opus 编码状态</string>
+    <string name="opus_exclusive">● 独占连接</string>
+    <string name="opus_not_connected">● 未连接</string>
+    <string name="opus_mode">模式</string>
+    <string name="opus_bandwidth">带宽</string>
+    <string name="opus_input_sample_rate">输入采样率</string>
+    <string name="opus_realtime_bitrate">实时码率</string>
+    <string name="opus_target_bitrate">目标码率</string>
+    <string name="opus_vbr_mode">VBR模式</string>
+
+    <string name="mode_voice">语音模式</string>
+    <string name="mode_fullband">全频模式</string>
+
+    <string name="vbr_cbr">CBR</string>
+    <string name="vbr_constrained">VBR·约束</string>
+    <string name="vbr_vbr">VBR</string>
+
+    <string name="reverse_title">反向串流 (PC→Phone)</string>
+    <string name="reverse_active">● 活跃</string>
+    <string name="reverse_bitrate">码率</string>
+    <string name="reverse_jitter">抖动缓冲</string>
+    <string name="reverse_bandwidth">音频带宽</string>
+    <string name="reverse_fb_stereo">FB 48 kHz 立体声</string>
+
+    <string name="settings_encoding">编码参数</string>
+    <string name="settings_complexity">编码复杂度 (Complexity): %1$d</string>
+    <string name="settings_mic_source">麦克风音源 (Mic Source)</string>
+    <string name="settings_mic_source_hint">原始/识别不走系统降噪处理；换源会自动重建采集链路，音源不支持时自动回退 MIC 直出</string>
+    <string name="settings_bandwidth">音频带宽 (Bandwidth)</string>
+    <string name="settings_bandwidth_hint">限制编码频率范围，越低越省码率；语音推荐 WB/SWB，音乐用 FB</string>
+    <string name="settings_bitrate">码率 (Bitrate)</string>
+    <string name="settings_bitrate_hint">%1$d kbps ≈ %2$d 字节/帧（10 ms），Opus 上限 1275 字节</string>
+    <string name="settings_dtx">DTX (静音时不传输)</string>
+    <string name="settings_vbr">VBR (动态码率)</string>
+    <string name="settings_vbr_forced">开启DTX时强制启用VBR</string>
+    <string name="settings_vbr_constraint">VBR 码率约束</string>
+    <string name="settings_vbr_strict">严格不超过目标码率</string>
+    <string name="settings_vbr_loose">可临时超过目标码率</string>
+    <string name="settings_fec_section">前向纠错与丢包容错</string>
+    <string name="settings_fec">FEC (前向纠错)</string>
+    <string name="settings_fec_hint">包丢失时可用冗余数据恢复</string>
+    <string name="settings_packet_loss">预期丢包率: %1$d%%</string>
+    <string name="settings_loss_none">无丢包预期，关闭抗丢包优化</string>
+    <string name="settings_loss_low">低丢包：轻量冗余保护</string>
+    <string name="settings_loss_medium">中丢包：增加冗余与鲁棒性</string>
+    <string name="settings_loss_high">高丢包：最大冗余保护，码率效率降低</string>
+    <string name="settings_water_target">预期延迟: %1$dms</string>
+    <string name="settings_water_target_hint">PC→手机反向串流的目标缓冲；越低延迟越小，网络抖动大时更容易断音</string>
+
+    <string name="mic_voice">语音</string>
+    <string name="mic_direct">直出</string>
+    <string name="mic_raw">原始</string>
+    <string name="mic_recognition">识别</string>
+
+    <string name="bw_nb">窄带 NB · 8 kHz</string>
+    <string name="bw_mb">中带 MB · 12 kHz</string>
+    <string name="bw_wb">宽带 WB · 16 kHz</string>
+    <string name="bw_swb">超宽带 SWB · 24 kHz</string>
+    <string name="bw_fb">全频带 FB · 48 kHz</string>
+    <string name="bw_short_nb">NB</string>
+    <string name="bw_short_mb">MB</string>
+    <string name="bw_short_wb">WB</string>
+    <string name="bw_short_swb">SWB</string>
+    <string name="bw_short_fb">FB</string>
+
+    <string name="language_title">语言</string>
+    <string name="language_system">跟随系统</string>
+    <string name="language_name">简体中文</string>
+
+    <string name="about_title">关于</string>
+    <string name="about_version">v%1$s</string>
+    <string name="about_author">作者：四折光曲 &amp; 井水玉藻</string>
+    <string name="about_license">本程序为自由软件，以 GPL v3 许可证发布</string>
+    <string name="about_tagline">双向局域网音频串流</string>
+    <string name="about_desc">手机麦克风→PC + PC扬声器→手机</string>
+    <string name="about_features">Opus编码 · 声学回声消除 · 低延迟</string>
+
+    <string name="channel_name">采集服务</string>
+    <string name="channel_desc">音频采集服务运行中</string>
+    <string name="notification_connected">已连接</string>
+    <string name="notification_waiting">等待连接</string>
+    <string name="notification_text">%1$s · %2$s · %3$s</string>
+
+    <string name="source_mic_direct">MIC直出</string>
+    <string name="source_mic_direct_fallback">已回退MIC直出</string>
+    <string name="source_raw_unprocessed">原始直出(UNPROCESSED)</string>
+    <string name="source_voice_recognition">语音识别(VOICE_RECOGNITION)</string>
+    <string name="source_system_ns">系统硬件降噪</string>
+    <string name="source_system_ns_fallback">系统硬件降噪(已回退MIC)</string>
+    <string name="source_test_tone">1kHz 测试音</string>
+    <string name="source_aec_enabled">AEC已启用</string>
+    <string name="source_aec_unavailable">AEC不可用</string>
+
+    <string name="error_network_connect">网络连接失败</string>
+    <string name="error_unknown">未知错误</string>
+    <string name="error_encoder_init">编码器初始化失败</string>
+    <string name="error_encoder_frame_size">编码器帧大小无效（%1$d）</string>
+    <string name="error_mic_init_denied">麦克风初始化失败（未授权）</string>
+    <string name="error_mic_unsupported">麦克风不支持 48 kHz 单声道采集</string>
+    <string name="error_mic_init">麦克风初始化失败</string>
+    <string name="error_mic_read">麦克风读取失败，请重新开始采集</string>
+    <string name="status_network_switched">网络已切换（正在重连）</string>
+    <string name="status_wifi_lost">Wi-Fi 已断开（等待网络恢复）</string>
+    <string name="status_disconnected_waiting">已断开（等待重连）</string>
+
+    <string name="jitter_late">迟到 %1$d</string>
+    <string name="jitter_overflow">溢出 %1$d</string>
+    <string name="jitter_plc">PLC %1$d(hold %2$d，峰 %3$d)</string>
+    <string name="jitter_resync">重同步 %1$d</string>
+</resources>
