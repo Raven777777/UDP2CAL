@@ -11,6 +11,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.security.SecureRandom
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * UDP 发送器（v3）
@@ -96,7 +97,17 @@ class UdpSender(
     /** ACK 下发的反向 SSRC；0 表示反向未启用 */
     @Volatile var reverseSsrc: Int = 0; private set
 
-    suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun connect(): Boolean = try {
+        connectInner()
+    } catch (e: CancellationException) {
+        // connect 体本身没有挂起点：取消可能发生在两个 socket 建好、字段已赋值
+        // 之后，由 withContext 退出时抛出。调用方拿不到 sender 引用，只能在这里
+        // 回收两个套接字与 ACK 线程。
+        close()
+        throw e
+    }
+
+    private suspend fun connectInner(): Boolean = withContext(Dispatchers.IO) {
         var sockLocal: DatagramSocket? = null
         var revSockLocal: DatagramSocket? = null
         try {

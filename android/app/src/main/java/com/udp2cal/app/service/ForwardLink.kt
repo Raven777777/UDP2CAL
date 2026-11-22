@@ -434,6 +434,12 @@ internal class ForwardLink(
                 }
                 return
             }
+            if (n == 0) {
+                // READ_BLOCKING 下返回 0 很罕见（设备暂时没产出数据）。立即重试
+                // 会变成忙等，让出 2 ms 给系统补数据，也给取消一个观察点。
+                delay(2)
+                continue
+            }
             filled += n
             if (filled > maxFilled) maxFilled = filled  // 仅未满一帧的装配余量，不是应用层队列
             if (filled < FRAME) continue

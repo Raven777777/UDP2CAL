@@ -75,7 +75,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private var captureService: CaptureService? = null
-    private var serviceBound = false
+    /** bindService() 的返回值：为 true 就必须 unbind，即使 onServiceConnected 还没回调 */
+    private var bindRequested = false
     private var pendingStart: (() -> Unit)? = null
     private val serviceState = mutableStateOf<CaptureService?>(null)
 
@@ -83,11 +84,10 @@ class MainActivity : ComponentActivity() {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             captureService = (service as CaptureService.LocalBinder).getService()
             serviceState.value = captureService
-            serviceBound = true
             pendingStart?.invoke(); pendingStart = null
         }
         override fun onServiceDisconnected(name: ComponentName?) {
-            captureService = null; serviceState.value = null; serviceBound = false
+            captureService = null; serviceState.value = null
         }
     }
 
@@ -146,7 +146,7 @@ class MainActivity : ComponentActivity() {
         // 发现广播/连接前就要能选 Wi-Fi 网络；监听本身由 CaptureService 起停
         WifiNetworkBinder.init(applicationContext)
         refreshBatteryWhitelist()
-        bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
+        bindRequested = bindService(Intent(this, CaptureService::class.java), connection, Context.BIND_AUTO_CREATE)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -305,7 +305,14 @@ class MainActivity : ComponentActivity() {
             notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 
-    override fun onDestroy() {pendingStart = null; if (serviceBound) unbindService(connection) ; super.onDestroy() }
+    override fun onDestroy() {
+        pendingStart = null
+        if (bindRequested) {
+            bindRequested = false
+            runCatching { unbindService(connection) }
+        }
+        super.onDestroy()
+    }
 }
 
 @Composable

@@ -8,18 +8,22 @@
 //! 为什么不用两点线性插值：它的幅度响应是 `|cos(ω/2)|`，相位差半个样本时
 //! 12 kHz 掉 3 dB、24 kHz 全陷。而比率微调让相位以 `u×Fs` 持续扫掠，于是
 //! 那 3 dB 变成常年高频颤动（u=0.5% 时约 240 Hz）。多相 FIR 把插值误差
-//! 变成纯相位表密度问题（`1/(2×32) = 0.016` 样本），与比率无关。
+//! 变成纯相位表密度问题：相位取最近档（最近邻落在末档之后时进位到下一
+//! 输入样本的相位 0），误差 ≤`1/(2×32) = 0.015625` 样本，与比率无关。
 //!
 //! 处理流程：
 //! 1. 把上一块的尾段 `hist` 与本块拼成 `work`（交错）；
-//! 2. `pos` 是当前输出点落在**本块**输入上的连续位置（可为负＝仍在历史段）；
+//! 2. `next_pos` 是下一个输出点在**全局输入样本轴**上的位置，扣除本块
+//!    起始下标即块内连续位置（可为负＝仍在历史段）；跨块不做位置减法，
+//!    因此任意分块与一次大块的输出逐样本一致；
 //! 3. 只有当抽头窗口完全落在已知数据内时才发出样本——不做外插，
 //!    也不需要"比率恰好为 1 就直通"的分支（群延迟固定 ≈24.5 样本，恒定无害）；
 //! 4. 保存本块尾段，供下一块跨块插值。
 //!
 //! 相位表按每相 DC 增益归一（`sum == 1`），否则恒定直流会随相位留下纹波。
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::rtp::RESAMPLE_MAX_ADJUST;
 
@@ -29,8 +33,12 @@ pub const RESAMPLE_PHASES: usize = 32;
 pub const RESAMPLE_TAPS: usize = 48;
 /// 半窗长
 pub const RESAMPLE_HALF: usize = RESAMPLE_TAPS / 2;
-/// 归一化截止频率（cycles/sample）：0.42 × 48 kHz = 20.2 kHz，
-/// 加上过渡带后阻带起点约 0.49，折返分量落在带外
+/// 归一化截止频率上限（cycles/sample，以输入样本计）：0.42 × 48 kHz =
+/// 20.2 kHz，加上过渡带后阻带起点约 0.49，折返分量落在带外。
+///
+/// 上采样与 1:1 用该值；降采样时输出 Nyquist 换算回输入样本是 `0.5/ratio`，
+/// 截止必须收紧到 `min(0.42, 0.5/ratio)`，否则高于新 Nyquist 的输入会原样
+/// 折返（96k→48k 时 26 kHz 以上曾 0 dB 混叠）。
 pub const RESAMPLE_CUTOFF: f64 = 0.42;
 /// Kaiser 窗 β（≈100 dB 阻带）
 pub const RESAMPLE_BETA: f64 = 10.0;
@@ -46,11 +54,19 @@ const MIN_BASE_RATIO: f64 = 0.1;
 /// 支持的最大源/设备比率
 const MAX_BASE_RATIO: f64 = 10.0;
 
-/// 一个满幅输入块在最小比率 + 最负相位下可能产出的最大帧数。
+/// 降采样相位表的比率量化步数。
 ///
-/// 相位最负为 `-(HALF+1)`，与满块合并后相当于最多 `MAX_INPUT_FRAMES` 帧的
-/// 输入跨度，因此 `MAX_INPUT_FRAMES / MIN_RATIO` 已覆盖；多出的
-/// `RESAMPLE_HIST + 1` 是边界取整余量。
+/// 比率向上取整到 `1/RESAMPLE_RATIO_QUANT` 档后再生成表，保证表截止
+/// `0.5/量化比率 <= 0.5/实际比率`——宁可过渡带略窄，也不能留下混叠。
+/// 支持的比率范围最多约 640 档，运行时通常只缓存 1–2 张表。
+const RESAMPLE_RATIO_QUANT: f64 = 64.0;
+
+/// 一个满幅输入块在最小比率下可能产出的最大帧数。
+///
+/// 按全局 `next_pos` 轴：块首位置可低至块首输入下标 `-(HALF+1)`（上一块
+/// 停下的位置），发出条件是 `next_pos < 块尾下标 -(HALF+1)`，因此一个
+/// `MAX_INPUT_FRAMES` 块的输出不超过 `MAX_INPUT_FRAMES / MIN_RATIO + 1`；
+/// 多出的 `RESAMPLE_HIST + 1` 是边界取整与历史的余量。
 pub const MAX_OUTPUT_FRAMES: usize = {
     let min_ratio = MIN_BASE_RATIO * (1.0 - RESAMPLE_MAX_ADJUST);
     (MAX_INPUT_FRAMES as f64 / min_ratio) as usize + RESAMPLE_HIST + 1
@@ -63,8 +79,16 @@ pub struct Resampler {
     base_ratio: f64,
     /// 比率微调量（±0.005），由漂移控制器周期写入
     adjust: f64,
-    /// 当前输出点落在输入上的连续位置（源样本，可为负＝仍落在历史段）
-    pos: f64,
+    /// 下一个输出点在**全局输入样本轴**上的位置。
+    ///
+    /// 用全局位置而不是“相对本块的 `pos` + 每块减 frames”，是为了让
+    /// 任意分块顺序产生完全相同的相位序列：跨块不再做 `pos -= frames`
+    /// 的浮点减法，分块与单块逐样本一致。
+    next_pos: f64,
+    /// 当前输入块第一帧在全局输入样本轴上的下标（只用低 53 位精度）。
+    input_base: u64,
+    /// 当前比率对应的相位表（按降采样比率分档缓存，见 [`coef_table`]）
+    coefs: Arc<CoefTable>,
     /// 每声道 [`RESAMPLE_HIST`] 帧历史（交错，长度 `HIST * channels`）
     hist: Vec<f32>,
     /// `hist ++ 本块` 拼接缓冲（交错），复用避免高频分配
@@ -78,7 +102,9 @@ impl Resampler {
             channels,
             base_ratio: 1.0,
             adjust: 0.0,
-            pos: 0.0,
+            next_pos: 0.0,
+            input_base: 0,
+            coefs: coef_table(1.0),
             hist: vec![0.0; RESAMPLE_HIST * channels],
             work: Vec::with_capacity((RESAMPLE_HIST + MAX_INPUT_FRAMES) * channels),
         }
@@ -110,6 +136,8 @@ impl Resampler {
         } else {
             1.0
         };
+        // 降采样时换用更窄的截止（上采样/1:1 仍命中 0.42 那张表）
+        self.coefs = coef_table(self.base_ratio);
         self.reset();
     }
 
@@ -124,7 +152,8 @@ impl Resampler {
 
     /// 清空相位与历史（新数据重新从静音淡入）
     pub fn reset(&mut self) {
-        self.pos = 0.0;
+        self.next_pos = 0.0;
+        self.input_base = 0;
         self.hist.fill(0.0);
     }
 
@@ -147,38 +176,44 @@ impl Resampler {
         self.work.extend_from_slice(input);
 
         // 2) 相位推进（只有窗口完全落在已知数据内才发出样本）
-        let table = coef_table();
+        //
+        // 判定用全局输入位置：`next_pos < block_end - HALF - 1`。因此不足
+        // HALF+2 帧的小块也会把“窗口只依赖历史段”的样本发出去，剩余样本
+        // 留在下一块继续，不再出现整块零输出与相位钳位丢样。
+        let table = &self.coefs;
         let ratio = self.ratio();
-        let mut pos = self.pos;
-        if frames > RESAMPLE_HALF + 1 {
-            // 窗口右端不得越出本块：base <= frames - HALF - 1
-            let limit = frames as f64 - RESAMPLE_HALF as f64 - 1.0;
-            while pos < limit {
-                let base = pos.floor();
-                let frac = pos - base;
-                let phase = ((frac * RESAMPLE_PHASES as f64) as usize).min(RESAMPLE_PHASES - 1);
-                let coefs = &table[phase];
-                // work 中本块第 i 帧的下标是 i + HIST；
-                // 抽头窗口从帧 base + 1 - HALF 开始，乘声道数换成样本下标。
-                let w0 = base as isize + (RESAMPLE_HIST as isize + 1 - RESAMPLE_HALF as isize);
-                debug_assert!(w0 >= 0, "相位越过历史段下界: pos={pos}");
-                let w0 = w0 as usize * channels;
-                for c in 0..channels {
-                    let mut acc = 0.0f32;
-                    for (j, &coef) in coefs.iter().enumerate() {
-                        acc += coef * self.work[w0 + j * channels + c];
-                    }
-                    out.push(acc);
+        let block_base = self.input_base as f64;
+        let block_end = self.input_base + frames as u64;
+        let mut next_pos = self.next_pos;
+        let limit = block_end as f64 - RESAMPLE_HALF as f64 - 1.0;
+        while next_pos < limit {
+            // 本块内的连续位置；可为负（窗口左侧落在 hist 里）
+            let pos = next_pos - block_base;
+            let floor = pos.floor();
+            let frac = pos - floor;
+            // 最近邻取相位；frac 落入末档右半（≥31.5/32）时进位到下一输入
+            // 样本的相位 0（见 [`nearest_phase`]）。
+            let (base, phase) = nearest_phase(floor, frac);
+            let coefs = &table[phase];
+            // work 中本块第 i 帧的下标是 i + HIST；
+            // 抽头窗口从帧 base + 1 - HALF 开始，乘声道数换成样本下标。
+            let w0 = base as isize + (RESAMPLE_HIST as isize + 1 - RESAMPLE_HALF as isize);
+            debug_assert!(
+                w0 >= 0,
+                "相位越过历史段下界: pos={pos}（next_pos={next_pos}）"
+            );
+            let w0 = w0 as usize * channels;
+            for c in 0..channels {
+                let mut acc = 0.0f32;
+                for (j, &coef) in coefs.iter().enumerate() {
+                    acc += coef * self.work[w0 + j * channels + c];
                 }
-                pos += ratio;
+                out.push(acc);
             }
+            next_pos += ratio;
         }
-        self.pos = pos - frames as f64;
-        // 防御：连续收到极小输入块时 pos 会一路后退，钳在历史段范围内
-        let floor_pos = -((RESAMPLE_HALF + 1) as f64);
-        if self.pos < floor_pos {
-            self.pos = floor_pos;
-        }
+        self.next_pos = next_pos;
+        self.input_base = block_end;
 
         // 3) 保存尾段作为下一块的历史
         let tail = self.work.len() - RESAMPLE_HIST * channels;
@@ -189,6 +224,21 @@ impl Resampler {
 }
 
 type CoefTable = [[f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
+
+/// 把块内小数位置映射到（整数基准, 相位档）。
+///
+/// 最近邻为第 [`RESAMPLE_PHASES`] 档（`frac ≥ 31.5/32`）时，取下一输入样本
+/// 的相位 0，即 `(base + 1, 0)`；这是与相位 32 等价且无需额外表项的表达。
+/// 若像旧实现那样钳回 31 档，最坏误差会从 `1/(2×32)` 退化为 `1/32`。
+#[inline]
+fn nearest_phase(base: f64, frac: f64) -> (f64, usize) {
+    let phase = (frac * RESAMPLE_PHASES as f64 + 0.5) as usize;
+    if phase >= RESAMPLE_PHASES {
+        (base + 1.0, 0)
+    } else {
+        (base, phase)
+    }
+}
 
 /// 零阶修正贝塞尔函数（Kaiser 窗用）。级数展开即可，β ≤ 10 时收敛极快。
 fn bessel_i0(x: f64) -> f64 {
@@ -205,42 +255,74 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// 生成/取用相位表（首次调用时计算，之后只读）
-fn coef_table() -> &'static CoefTable {
-    static TABLE: OnceLock<CoefTable> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let win_norm = bessel_i0(RESAMPLE_BETA);
-        let mut table = [[0.0f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
-        let w = 2.0 * RESAMPLE_CUTOFF;
-        for (p, coefs) in table.iter_mut().enumerate() {
-            let frac = p as f64 / RESAMPLE_PHASES as f64;
-            let mut sum = 0.0f64;
-            for (j, c) in coefs.iter_mut().enumerate() {
-                // 抽头 j 对应的输入样本与插值中心的距离（单位：样本）
-                let x = j as f64 - (RESAMPLE_HALF as f64 - 1.0) - frac;
-                let sinc = if x.abs() < 1e-9 {
-                    1.0
-                } else {
-                    (std::f64::consts::PI * w * x).sin() / (std::f64::consts::PI * w * x)
-                };
-                let u = x / RESAMPLE_HALF as f64;
-                let win = if u.abs() >= 1.0 {
-                    0.0
-                } else {
-                    bessel_i0(RESAMPLE_BETA * (1.0 - u * u).sqrt()) / win_norm
-                };
-                let h = w * sinc * win;
-                *c = h as f32;
-                sum += h;
-            }
-            // 每相单独归一：保证 DC 增益精确为 1，否则会留下低频起伏
-            let inv = 1.0 / sum;
-            for c in coefs.iter_mut() {
-                *c = (*c as f64 * inv) as f32;
-            }
+/// 相位表缓存：key 是量化后的降采样比率（0 表示 0.42 上限表）。
+///
+/// 表只在 `set_source_rate` 时生成/查找；`process_into` 直接读实例里的
+/// `Arc`，热路径无锁。多个 `Resampler` 共享同一份缓存。
+static COEF_TABLES: OnceLock<Mutex<HashMap<u32, Arc<CoefTable>>>> = OnceLock::new();
+
+/// 比率 ->（缓存键, 截止频率）。
+///
+/// 实际比率还会被 `adjust` 放大最多 0.5%，这里按最坏情况取截止，保证微调
+/// 期间也不混叠。降采样时把比率**向上**量化到 1/64 档，使表截止不高于
+/// 精确值 `0.5/ratio`——宁可过渡带略窄，也不能留下混叠。
+fn cutoff_for_ratio(base_ratio: f64) -> (u32, f64) {
+    let worst_ratio = base_ratio * (1.0 + RESAMPLE_MAX_ADJUST);
+    let cutoff = (0.5 / worst_ratio).min(RESAMPLE_CUTOFF);
+    if cutoff >= RESAMPLE_CUTOFF {
+        (0, RESAMPLE_CUTOFF)
+    } else {
+        let q = ((worst_ratio * RESAMPLE_RATIO_QUANT).ceil() as u32).max(1);
+        (q, 0.5 / (q as f64 / RESAMPLE_RATIO_QUANT))
+    }
+}
+
+/// 取用（必要时生成）与比率匹配的相位表。
+fn coef_table(base_ratio: f64) -> Arc<CoefTable> {
+    let (key, cutoff) = cutoff_for_ratio(base_ratio);
+    let cache = COEF_TABLES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(table) = cache.get(&key) {
+        return Arc::clone(table);
+    }
+    let table = Arc::new(build_coef_table(cutoff));
+    cache.insert(key, Arc::clone(&table));
+    table
+}
+
+/// 生成一张截止为 `cutoff`（cycles/input-sample）的 Kaiser 窗多相表。
+fn build_coef_table(cutoff: f64) -> CoefTable {
+    let win_norm = bessel_i0(RESAMPLE_BETA);
+    let mut table = [[0.0f32; RESAMPLE_TAPS]; RESAMPLE_PHASES];
+    let w = 2.0 * cutoff;
+    for (p, coefs) in table.iter_mut().enumerate() {
+        let frac = p as f64 / RESAMPLE_PHASES as f64;
+        let mut sum = 0.0f64;
+        for (j, c) in coefs.iter_mut().enumerate() {
+            // 抽头 j 对应的输入样本与插值中心的距离（单位：样本）
+            let x = j as f64 - (RESAMPLE_HALF as f64 - 1.0) - frac;
+            let sinc = if x.abs() < 1e-9 {
+                1.0
+            } else {
+                (std::f64::consts::PI * w * x).sin() / (std::f64::consts::PI * w * x)
+            };
+            let u = x / RESAMPLE_HALF as f64;
+            let win = if u.abs() >= 1.0 {
+                0.0
+            } else {
+                bessel_i0(RESAMPLE_BETA * (1.0 - u * u).sqrt()) / win_norm
+            };
+            let h = w * sinc * win;
+            *c = h as f32;
+            sum += h;
         }
-        table
-    })
+        // 每相单独归一：保证 DC 增益精确为 1，否则会留下低频起伏
+        let inv = 1.0 / sum;
+        for c in coefs.iter_mut() {
+            *c = (*c as f64 * inv) as f32;
+        }
+    }
+    table
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -401,6 +483,71 @@ mod tests {
     }
 
     #[test]
+    fn phase_rounding_error_never_exceeds_half_a_step() {
+        // 相位量化的等价性质：把 [0,1) 上密集扫描的 frac 映射到 32 档，
+        // 输出位置（进位后 base + phase/32）与精确位置的差必须 ≤ 1/(2×32)。
+        // 旧实现把最近邻 32 钳回 31，frac 接近 1 时误差会到 1/32。
+        let bound = 1.0 / (2.0 * RESAMPLE_PHASES as f64);
+        let mut max_err = 0.0f64;
+        const STEPS: usize = 1_000_000;
+        for k in 0..STEPS {
+            let frac = k as f64 / STEPS as f64;
+            let (base, phase) = nearest_phase(7.0, frac);
+            let got = base + phase as f64 / RESAMPLE_PHASES as f64;
+            max_err = max_err.max((got - (7.0 + frac)).abs());
+        }
+        assert!(
+            max_err <= bound,
+            "最大相位误差 {max_err:.6} 超过半档 {bound:.6}"
+        );
+        // 进位区必须真正走到下一输入样本的相位 0，而不是钳回末档
+        assert_eq!(
+            nearest_phase(0.0, 1.0 - 0.5 / RESAMPLE_PHASES as f64),
+            (1.0, 0)
+        );
+        assert_eq!(nearest_phase(0.0, 0.0), (0.0, 0));
+        assert_eq!(nearest_phase(0.0, 31.4 / 32.0), (0.0, 31));
+    }
+
+    #[test]
+    fn carry_at_the_last_emitted_sample_reads_the_final_work_frame() {
+        // 最紧进位边界：ratio = 47999/48000，480 帧块。最后一个发出位置
+        // 455×ratio = 454.9905，frac 落入进位区（≥31.5/32）；进位后
+        // base = 455，最大抽头下标恰为 work 的最后一帧（每声道 529 帧），
+        // 再多一帧就越界 panic。该用例把“进位路径读到最后样本”固化为回归。
+        let mut r = Resampler::new(1);
+        r.set_source_rate(47_999, 48_000);
+        let ratio = r.ratio();
+        let limit = 480.0 - RESAMPLE_HALF as f64 - 1.0;
+        let mut expected = 0usize;
+        let mut last = 0.0f64;
+        let mut p = 0.0f64;
+        while p < limit {
+            last = p;
+            expected += 1;
+            p += ratio;
+        }
+        // 确认最后一个发出位置确实落在进位区（否则用例没覆盖修复点）
+        let frac = last - last.floor();
+        assert!(
+            frac >= 1.0 - 0.5 / RESAMPLE_PHASES as f64,
+            "用例未覆盖进位区: frac={frac}"
+        );
+        // 进位后抽头窗口的最大下标 = 每声道 work 的最后一帧
+        let carried_base = last.floor() + 1.0;
+        let taps_end = carried_base as usize + RESAMPLE_HIST + 1 - RESAMPLE_HALF + RESAMPLE_TAPS
+            - 1;
+        assert_eq!(taps_end, RESAMPLE_HIST + 480 - 1);
+
+        let mut out = Vec::new();
+        let produced = r.process_into(&[0.5f32; 480], &mut out);
+        assert_eq!(produced, expected);
+        assert_eq!(out.len(), expected);
+        assert!(produced <= MAX_OUTPUT_FRAMES);
+        assert!(out.iter().all(|v| v.is_finite()), "进位路径产出了非有限值");
+    }
+
+    #[test]
     fn adjust_is_clamped_and_nan_is_ignored() {
         let mut r = Resampler::new(1);
         r.set_ratio_adjust(9.0);
@@ -545,6 +692,152 @@ mod tests {
                 "产出 {produced} 超过上界 {MAX_OUTPUT_FRAMES}"
             );
             assert_eq!(out.len(), produced * 2);
+        }
+    }
+
+    #[test]
+    fn coef_tables_are_tiered_and_cached() {
+        // 上采样 / 1:1 共用 0.42 那张表（ratio=1 行为与历史实现一致）
+        let base = coef_table(1.0);
+        assert!(Arc::ptr_eq(&base, &coef_table(0.5)));
+        assert_eq!(cutoff_for_ratio(1.0), (0, RESAMPLE_CUTOFF));
+
+        // 降采样按最坏比率向上量化，表截止不得高于 0.5/ratio
+        let worst = 2.0 * (1.0 + RESAMPLE_MAX_ADJUST);
+        let (key, cutoff) = cutoff_for_ratio(2.0);
+        assert!(key > 0, "降采样必须使用独立表");
+        assert!(cutoff <= 0.5 / worst, "截止 {cutoff} 高于安全上限");
+        assert!((cutoff - 0.25).abs() < 0.01, "96k→48k 截止 {cutoff}");
+
+        // 同一比率复用同一张表；更高比率只会更窄
+        assert!(Arc::ptr_eq(&coef_table(2.0), &coef_table(2.0)));
+        assert!(cutoff_for_ratio(4.0).1 < cutoff);
+    }
+
+    /// 确定性伪随机交错信号（不引入 rand 依赖）。
+    fn noise(frames: usize, channels: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed | 1;
+        (0..frames * channels)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// 按 `chunks` 指定的帧数分块喂入同一段输入，返回拼接后的输出。
+    fn run_chunks(src: u32, dev: u32, channels: usize, pcm: &[f32], chunks: &[usize]) -> Vec<f32> {
+        let frames = pcm.len() / channels;
+        let mut r = Resampler::new(channels);
+        r.set_source_rate(src, dev);
+        let mut out = Vec::new();
+        let mut all = Vec::new();
+        let mut pos = 0;
+        for &n in chunks {
+            let end = (pos + n).min(frames);
+            r.process_into(&pcm[pos * channels..end * channels], &mut out);
+            all.extend_from_slice(&out);
+            pos = end;
+            if pos == frames {
+                break;
+            }
+        }
+        assert_eq!(pos, frames, "分块没有覆盖全部输入");
+        all
+    }
+
+    #[test]
+    fn arbitrary_chunking_matches_one_block() {
+        // 任意分块（含 ≤HALF+1 的极小块）必须与一次大块逐样本一致：
+        // 全局相位轴避免了跨块 `pos -= frames` 的浮点误差，也消除了
+        // 小块的整块零输出与相位钳位丢样。
+        let total = 4_000;
+        let channels = 2;
+        let pcm = noise(total, channels, 0x243F_6A88_85A3_08D3);
+        let pattern = [
+            20usize, 7, 480, 1, 33, 2, 257, 20, 20, 25, 26, 3, 191, 1, 409,
+        ];
+        let mut chunks = Vec::new();
+        let mut left = total;
+        while left > 0 {
+            for &n in &pattern {
+                let n = n.min(left);
+                if n == 0 {
+                    break;
+                }
+                chunks.push(n);
+                left -= n;
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+
+        // ratio=1、上采样、整数/非整数降采样都覆盖。
+        for &(src, dev) in &[
+            (48_000u32, 48_000u32),
+            (44_100, 48_000),
+            (96_000, 48_000),
+            (48_000, 44_100),
+        ] {
+            let one = run_chunks(src, dev, channels, &pcm, &[total]);
+            let many = run_chunks(src, dev, channels, &pcm, &chunks);
+            assert_eq!(
+                one.len(),
+                many.len(),
+                "src={src} dev={dev}: 分块改变了输出帧数"
+            );
+            assert_eq!(one, many, "src={src} dev={dev}: 分块输出与单块不逐样本一致");
+        }
+    }
+
+    /// 输入 `tone_hz` 正弦经 src→48 kHz 后，折返分量的幅度（dB，越负越干净）。
+    ///
+    /// 折返分量 = 滤波后残留在输出 Nyquist 以下的输入高频；幅度按输出 RMS
+    /// 折算，通带内信号（如 12 kHz）应给出 ≈0 dB。
+    fn alias_attenuation_db(src_hz: u32, tone_hz: f64) -> f64 {
+        let frames = src_hz as usize / 2; // 0.5 s，保证整周期且覆盖瞬态
+        let pcm: Vec<f32> = (0..frames)
+            .map(|i| (2.0 * std::f64::consts::PI * tone_hz * i as f64 / src_hz as f64).sin() as f32)
+            .collect();
+        let mut r = Resampler::new(1);
+        r.set_source_rate(src_hz, 48_000);
+        let block = (src_hz as usize / 100).max(1); // 10 ms 输入块
+        let mut out = Vec::new();
+        let mut all = Vec::new();
+        for chunk in pcm.chunks(block) {
+            r.process_into(chunk, &mut out);
+            all.extend_from_slice(&out);
+        }
+        let skip = 480.min(all.len() / 2); // 跳过 10 ms 启动瞬态
+        let amp = rms(&all[skip..]) * std::f64::consts::SQRT_2;
+        -20.0 * amp.max(1e-12).log10()
+    }
+
+    #[test]
+    fn downsampling_suppresses_aliases() {
+        // 旧实现固定 0.42 截止：96k→48k 时 26 kHz 折返 0 dB。
+        // 新表按 min(0.42, 0.5/ratio) 收紧；48 抽头的过渡带较宽，26 kHz
+        // 仍落在过渡带内，深阻带从更高频开始（30/40 kHz 已 ≥50 dB）。
+        let a96_26 = alias_attenuation_db(96_000, 26_000.0);
+        let a96_30 = alias_attenuation_db(96_000, 30_000.0);
+        let a192_26 = alias_attenuation_db(192_000, 26_000.0);
+        let a192_40 = alias_attenuation_db(192_000, 40_000.0);
+        eprintln!(
+            "折返衰减: 96k@26k={a96_26:.1} dB, 96k@30k={a96_30:.1} dB, \
+             192k@26k={a192_26:.1} dB, 192k@40k={a192_40:.1} dB"
+        );
+        assert!(a96_26 >= 12.0, "96k→48k 26 kHz 折返仅 {a96_26:.1} dB");
+        assert!(a96_30 >= 50.0, "96k→48k 30 kHz 折返仅 {a96_30:.1} dB");
+        assert!(a192_26 >= 8.0, "192k→48k 26 kHz 折返仅 {a192_26:.1} dB");
+        assert!(a192_40 >= 50.0, "192k→48k 40 kHz 折返仅 {a192_40:.1} dB");
+
+        // 1:1 与上采样继续使用 0.42 截止：12 kHz 通带不得被新分档波及。
+        for &(src, dev) in &[(48_000u32, 48_000u32), (44_100, 48_000)] {
+            let a = alias_attenuation_db(src, 12_000.0);
+            assert!(a < 0.5, "src={src} dev={dev} 的 12 kHz 通带衰减 {a:.2} dB");
         }
     }
 }

@@ -530,6 +530,12 @@ impl ReverseSender {
         let mut last_sent_ts: Option<u32> = None;
         // 端点最近一次真正给出数据的时间：只用于恢复时补偿媒体时间戳。
         let mut last_frame_at = Instant::now();
+        // 缺口补偿的待应用量：`timestamp` 只在发送时赋给队首帧，若在追加
+        // 新数据时立即推进，会把仍在排队的旧帧一起前移。每个补偿记账为
+        // “再消费对应帧数后应用”，补偿才落在旧内容之后、新内容之前。
+        // 用队列而非单值：连续缺口各自保留边界，前一次补偿不会被后一次
+        // 合并推到新数据之后。
+        let mut pending_ts_advances = PendingTsAdvances::default();
 
         // ── 1 帧节拍整形 ──
         // WASAPI 环回事件通常一次带回一个周期（10/20 ms），直接发就是"两包挨着、
@@ -669,17 +675,31 @@ impl ReverseSender {
                 } else {
                     resampled.clear();
                 }
+                // 缺口按**丢弃前**的完整覆盖时长计算：下面丢弃的原始媒体
+                // 会作为独立补偿显式记账，若 covered 只算保留部分，同一段
+                // 丢弃媒体会被 gap_advance 再计一次。
+                let covered_ms = (resampled.len() as u64 / 2) * 1000 / 48_000;
+                let mut dropped_advance: u32 = 0;
                 if resampled.len() > MAX_FRAME_BACKLOG {
                     let excess = resampled.len() - MAX_FRAME_BACKLOG;
                     stats
                         .dropped_samples
                         .fetch_add(excess as u64, Ordering::Relaxed);
                     resampled.drain(..excess);
-                    // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当连续
-                    timestamp = timestamp.wrapping_add((excess / 2) as u32);
+                    // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当
+                    // 连续。但它位于已排队的旧帧之后，立即推进会把旧帧一起
+                    // 前移；并入下面的队列补偿，随旧帧消费到边界时兑现。
+                    dropped_advance = frame_grid_advance(excess);
                 }
-                let new_ms = (resampled.len() as u64 / 2) * 1000 / 48_000;
-                timestamp = timestamp.wrapping_add(gap_advance_samples(idle_ms, new_ms));
+                // 补偿必须落在“已入队的旧帧之后、新数据之前”：此时全局
+                // timestamp 描述的是队首帧，立即推进会把旧帧一起前移。
+                // 边界与 drain 路径同样用 div_ceil：不足一帧的队尾残留也
+                // 算占用一个帧边界，避免两侧对残留的折算口径不一致。
+                pending_ts_advances.queue(
+                    pcm_buf.len().div_ceil(FRAME_INTERLEAVED),
+                    gap_advance_samples(idle_ms, covered_ms).wrapping_add(dropped_advance),
+                    &mut timestamp,
+                );
                 for &s in &resampled {
                     let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                     pcm_buf.push(v);
@@ -693,8 +713,10 @@ impl ReverseSender {
                 stats
                     .dropped_samples
                     .fetch_add(excess as u64, Ordering::Relaxed);
-                // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC
-                timestamp = timestamp.wrapping_add((excess / 2) as u32);
+                // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC。
+                // 推进量取整到整帧，保持 480 网格（见 `frame_grid_advance`）。
+                timestamp = timestamp.wrapping_add(frame_grid_advance(excess));
+                pending_ts_advances.after_drain(excess, &mut timestamp);
             }
             // 只保留最近 40 ms 的统计峰值；超限时旧数据已经丢掉
             stats
@@ -711,6 +733,7 @@ impl ReverseSender {
                 stats
                     .dropped_samples
                     .fetch_add(excess as u64, Ordering::Relaxed);
+                pending_ts_advances.after_drain(excess, &mut timestamp);
             }
 
             // 只发到点的帧：节拍整形。槽位落后超过半个帧就重锚（见 `advance_slot`），
@@ -819,6 +842,9 @@ impl ReverseSender {
                         }
                     }
                 }
+                // 缺口补偿在本帧的 ts_start 已经使用之后才兑现：它是紧跟在
+                // 队首旧帧后面的静默间隔，下一帧（新数据）才落在缺口之后。
+                pending_ts_advances.after_frame_sent(&mut timestamp);
             }
         }
 
@@ -884,13 +910,110 @@ fn slot_is_late(slot: Instant, gap: Duration, now: Instant) -> bool {
 
 /// 环回断流补偿：只有超过 2 帧的缺口才推进 RTP 时间戳。
 /// 读到的样本已覆盖一段时间（`covered_ms`），必须从墙钟缺口里扣掉，
-/// 否则正常抖动会被重复计时。返回要补的采样数（10 ms = 480）。
+/// 否则正常抖动会被重复计时。返回值取整到整帧（10 ms = 480）。
+///
+/// 接收端用 `ext_ts % 480 != next_ts % 480` 判定时间线断裂并全量重同步。
+/// 墙钟毫秒受事件唤醒抖动与 `as_millis()` 截断影响，通常不是 10 ms 的
+/// 整数倍；若直接按 `gap_ms * 48` 换算，恢复包会偏离 480 网格，20–200 ms
+/// 的普通静默恢复（提示音、换歌、暂停）每次都会触发一次可闻爆音。
 fn gap_advance_samples(idle_ms: u64, covered_ms: u64) -> u32 {
     let gap_ms = idle_ms.saturating_sub(covered_ms);
     if gap_ms > u64::from(rtp::FRAME_MS) * 2 {
-        (gap_ms * u64::from(rtp::FRAME_SAMPLES) / u64::from(rtp::FRAME_MS)) as u32
+        let frame_ms = u64::from(rtp::FRAME_MS);
+        // 四舍五入到最近的整帧，保持时间戳余数不变。
+        let frames = (gap_ms + frame_ms / 2) / frame_ms;
+        (frames * u64::from(rtp::FRAME_SAMPLES)) as u32
     } else {
         0
+    }
+}
+
+/// 丢弃媒体对应的时间戳推进：交错样本数 → 四舍五入到整帧。
+///
+/// 接收端用 `ext_ts % 480 != next_ts % 480` 判定时间线断裂并全量重同步。
+/// 丢弃量（重采样预入队超额、`pcm_buf` 超额 drain）通常不是整帧；若直接按
+/// `samples / 2` 推进，恢复包会落在 480 网格之外，每丢一次就触发一次可闻
+/// 爆音。四舍五入到最近整帧，保持时间戳余数不变；不足半帧的丢弃不补偿
+/// （与 `gap_advance_samples` 的两帧阈值同样属于正常抖动范畴）。
+fn frame_grid_advance(interleaved_samples: usize) -> u32 {
+    let mono = interleaved_samples / 2;
+    let frames = (mono + FRAME_MONO / 2) / FRAME_MONO;
+    (frames as u32) * rtp::FRAME_SAMPLES
+}
+
+/// 缺口补偿的待兑现队列。
+///
+/// `timestamp` 描述的是下一帧发送时的时戳；若队列里还有缺口前的旧帧，
+/// 立即推进会把它们一起前移，接收端看到的时间跳变就落在旧内容之前。
+/// 每个补偿因此记为“再消费 `after` 帧后把 `advance` 计入时间戳”。
+///
+/// 必须用队列而非单值：两个缺口之间若还有一批新数据尚未发出，合并成
+/// “最大边界”会把前一次补偿从旧数据与第一批新数据之间推到第一批之后。
+/// 边界随队列前移逐帧递减，兑现顺序与缺口发生顺序一致。
+#[derive(Default)]
+struct PendingTsAdvances {
+    /// `(after_frames, advance)`，按 `after_frames` 递增；项数受队列深度约束。
+    entries: std::collections::VecDeque<(usize, u32)>,
+}
+
+impl PendingTsAdvances {
+    /// 新缺口到达。`queued_frames` 是当前 `pcm_buf` 的帧数。
+    fn queue(&mut self, queued_frames: usize, advance: u32, timestamp: &mut u32) {
+        if advance == 0 {
+            return;
+        }
+        if queued_frames == 0 {
+            // 队列已空：没有需要保护的旧帧，含此前未兑现的补偿一并立即推进。
+            let total = self
+                .entries
+                .drain(..)
+                .fold(advance, |acc, (_, a)| acc.wrapping_add(a));
+            *timestamp = timestamp.wrapping_add(total);
+            return;
+        }
+        // 两个缺口落在同一边界（两次读取之间没有发出帧）时直接合并，
+        // 队列长度保持在很小的范围内。
+        if let Some(last) = self.entries.back_mut() {
+            if last.0 == queued_frames {
+                last.1 = last.1.wrapping_add(advance);
+                return;
+            }
+        }
+        self.entries.push_back((queued_frames, advance));
+    }
+
+    /// 已从队首发出一帧：所有边界前移一帧，兑现落到 0 的项。
+    fn after_frame_sent(&mut self, timestamp: &mut u32) {
+        for entry in &mut self.entries {
+            entry.0 = entry.0.saturating_sub(1);
+        }
+        while let Some((after, advance)) = self.entries.front().copied() {
+            if after > 0 {
+                break;
+            }
+            self.entries.pop_front();
+            *timestamp = timestamp.wrapping_add(advance);
+        }
+    }
+
+    /// 队首被丢弃 `drained_samples` 个交错样本后，修正待应用补偿的位置。
+    /// 边界前的帧若已被丢弃，补偿必须立刻兑现，不能等一个不存在的“旧帧”。
+    /// 丢弃量按整帧折算；不足一帧的零头也视为跨过了一帧边界。
+    fn after_drain(&mut self, drained_samples: usize, timestamp: &mut u32) {
+        if drained_samples == 0 {
+            return;
+        }
+        let drained_frames = drained_samples.div_ceil(FRAME_INTERLEAVED);
+        for entry in &mut self.entries {
+            entry.0 = entry.0.saturating_sub(drained_frames);
+        }
+        while let Some((after, advance)) = self.entries.front().copied() {
+            if after > 0 {
+                break;
+            }
+            self.entries.pop_front();
+            *timestamp = timestamp.wrapping_add(advance);
+        }
     }
 }
 
@@ -940,11 +1063,139 @@ enum SampleKind {
     I32,
 }
 
+/// 环回端点支持的声道数上限（与 `parse_mix_format` 保持一致）。
+const MAX_CAPTURE_CHANNELS: usize = 32;
+
+// WAVEFORMATEXTENSIBLE 声道掩码位（KS Speaker 常量）
+const SPEAKER_FRONT_LEFT: u32 = 0x1;
+const SPEAKER_FRONT_RIGHT: u32 = 0x2;
+const SPEAKER_FRONT_CENTER: u32 = 0x4;
+const SPEAKER_BACK_LEFT: u32 = 0x10;
+const SPEAKER_BACK_RIGHT: u32 = 0x20;
+const SPEAKER_FRONT_LEFT_OF_CENTER: u32 = 0x40;
+const SPEAKER_FRONT_RIGHT_OF_CENTER: u32 = 0x80;
+const SPEAKER_SIDE_LEFT: u32 = 0x200;
+const SPEAKER_SIDE_RIGHT: u32 = 0x400;
+
+/// 多声道 → 立体声下混权重（按输入声道索引）。
+/// 系数取 0.707（-3 dB），LFE 不混入，避免低频能量叠加削波。
+#[derive(Clone, Copy, Debug)]
+struct Downmix {
+    left: [f32; MAX_CAPTURE_CHANNELS],
+    right: [f32; MAX_CAPTURE_CHANNELS],
+}
+
+/// 没有可靠 channelMask 时，按常见声道数推测标准顺序。
+fn default_channel_mask(channels: usize) -> u32 {
+    match channels {
+        3 => 0x7,   // FL FR FC
+        4 => 0x33,  // FL FR BL BR
+        5 => 0x37,  // FL FR FC BL BR
+        6 => 0x3F,  // 5.1
+        7 => 0x70F, // FL FR FC LFE SL SR BC
+        8 => 0x63F, // 7.1
+        _ if channels >= MAX_CAPTURE_CHANNELS => u32::MAX,
+        _ => (1u32 << channels) - 1,
+    }
+}
+
+/// 按 channelMask 生成下混权重：
+/// `L' = L + 0.707*C + 0.707*Ls + 0.707*Lc`，右声道对称；LFE 不混入。
+///
+/// WAVEFORMATEXTENSIBLE 的交错顺序 = mask 中置位从低到高的顺序。mask 缺失
+/// 或与声道数不符时退回 `default_channel_mask`，至少保证中央/环绕声道不丢。
+fn build_downmix(channels: usize, channel_mask: u32) -> Option<Downmix> {
+    if channels <= 2 {
+        return None;
+    }
+    let mask = if channel_mask != 0 && channel_mask.count_ones() as usize == channels {
+        channel_mask
+    } else {
+        default_channel_mask(channels)
+    };
+
+    // 声道索引 → 扬声器位
+    let mut speaker_bits = [0u32; MAX_CAPTURE_CHANNELS];
+    let mut n = 0;
+    for bit in 0..MAX_CAPTURE_CHANNELS {
+        let speaker = 1u32 << bit;
+        if mask & speaker != 0 && n < channels {
+            speaker_bits[n] = speaker;
+            n += 1;
+        }
+    }
+
+    let mut downmix = Downmix {
+        left: [0.0; MAX_CAPTURE_CHANNELS],
+        right: [0.0; MAX_CAPTURE_CHANNELS],
+    };
+    let mut add = |speaker: u32, l: f32, r: f32| {
+        if let Some(ch) = speaker_bits[..n].iter().position(|&s| s == speaker) {
+            downmix.left[ch] += l;
+            downmix.right[ch] += r;
+        }
+    };
+
+    let surround = std::f32::consts::FRAC_1_SQRT_2;
+    add(SPEAKER_FRONT_LEFT, 1.0, 0.0);
+    add(SPEAKER_FRONT_RIGHT, 0.0, 1.0);
+    add(SPEAKER_FRONT_CENTER, surround, surround);
+    add(SPEAKER_BACK_LEFT, surround, 0.0);
+    add(SPEAKER_SIDE_LEFT, surround, 0.0);
+    add(SPEAKER_BACK_RIGHT, 0.0, surround);
+    add(SPEAKER_SIDE_RIGHT, 0.0, surround);
+    add(SPEAKER_FRONT_LEFT_OF_CENTER, surround, 0.0);
+    add(SPEAKER_FRONT_RIGHT_OF_CENTER, 0.0, surround);
+    // LFE / BACK_CENTER / 顶部声道不参与：低频叠加最容易过载。
+
+    Some(downmix)
+}
+
+/// 把一帧多声道样本写成固定立体声：≤2 声道直接取前两路（单声道复制），
+/// >2 声道按 `Downmix` 权重求和并限幅。
+#[inline]
+fn write_stereo<T: Copy>(
+    src: &[T],
+    frames: usize,
+    channels: usize,
+    c0: usize,
+    c1: usize,
+    downmix: Option<&Downmix>,
+    out: &mut Vec<f32>,
+    to_f32: impl Fn(T) -> f32,
+) {
+    match downmix {
+        Some(dm) => {
+            for f in 0..frames {
+                let base = f * channels;
+                let mut l = 0.0f32;
+                let mut r = 0.0f32;
+                for ch in 0..channels {
+                    let s = to_f32(src[base + ch]);
+                    l += s * dm.left[ch];
+                    r += s * dm.right[ch];
+                }
+                out.push(l.clamp(-1.0, 1.0));
+                out.push(r.clamp(-1.0, 1.0));
+            }
+        }
+        None => {
+            for f in 0..frames {
+                let base = f * channels;
+                out.push(to_f32(src[base + c0]));
+                out.push(to_f32(src[base + c1]));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CaptureFormat {
     channels: usize,
     kind: SampleKind,
     sample_rate: u32,
+    /// channels > 2 时的下混权重；≤2 声道为 None（保持原样直取）。
+    downmix: Option<Downmix>,
 }
 
 struct LoopbackCapture {
@@ -1099,7 +1350,7 @@ impl LoopbackCapture {
         // SAFETY: `GetBuffer` 成功时保证 `data_ptr` 指向连续 `frames * channels`
         // 个样本的内存，布局与混音格式一致（`self.format`），并且在 `ReleaseBuffer`
         // 之前不被释放；SILENT 标志或空指针时不读。切片长度严格取
-        // `frames * channels`，`c0/c1` 的下标都小于 `channels`。
+        // `frames * channels`，`c0/c1` 与下混声道索引都小于 `channels`。
         unsafe {
             let mut data_ptr: *mut u8 = std::ptr::null_mut();
             let mut frames: u32 = 0;
@@ -1137,31 +1388,27 @@ impl LoopbackCapture {
             let channels = self.format.channels;
             let c0 = 0usize;
             let c1 = if channels > 1 { 1 } else { 0 };
+            let downmix = self.format.downmix.as_ref();
 
             match self.format.kind {
                 SampleKind::F32 => {
                     let src =
                         std::slice::from_raw_parts(data_ptr as *const f32, frame_count * channels);
-                    for f in 0..frame_count {
-                        out.push(src[f * channels + c0]);
-                        out.push(src[f * channels + c1]);
-                    }
+                    write_stereo(src, frame_count, channels, c0, c1, downmix, out, |s| s);
                 }
                 SampleKind::I16 => {
                     let src =
                         std::slice::from_raw_parts(data_ptr as *const i16, frame_count * channels);
-                    for f in 0..frame_count {
-                        out.push(src[f * channels + c0] as f32 / 32768.0);
-                        out.push(src[f * channels + c1] as f32 / 32768.0);
-                    }
+                    write_stereo(src, frame_count, channels, c0, c1, downmix, out, |s| {
+                        s as f32 / 32768.0
+                    });
                 }
                 SampleKind::I32 => {
                     let src =
                         std::slice::from_raw_parts(data_ptr as *const i32, frame_count * channels);
-                    for f in 0..frame_count {
-                        out.push(src[f * channels + c0] as f32 / 2_147_483_648.0);
-                        out.push(src[f * channels + c1] as f32 / 2_147_483_648.0);
-                    }
+                    write_stereo(src, frame_count, channels, c0, c1, downmix, out, |s| {
+                        s as f32 / 2_147_483_648.0
+                    });
                 }
             }
 
@@ -1183,7 +1430,7 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     }
     let wf = unsafe { &*fmt };
     let channels = wf.nChannels as usize;
-    if channels == 0 || channels > 32 {
+    if channels == 0 || channels > MAX_CAPTURE_CHANNELS {
         return None;
     }
     let sample_rate = wf.nSamplesPerSec;
@@ -1192,12 +1439,15 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
     }
     let bits = wf.wBitsPerSample;
     let tag = wf.wFormatTag;
+    let mut channel_mask = 0u32;
 
     let is_float = match (tag, wf.cbSize) {
         (3, _) => true,  // WAVE_FORMAT_IEEE_FLOAT
         (1, _) => false, // WAVE_FORMAT_PCM
         (0xFFFE, cb_size) if cb_size >= 22 => {
             let ext = unsafe { &*(fmt as *const WAVEFORMATEXTENSIBLE) };
+            // 多声道（5.1/7.1）下混依赖 mask 识别中央/环绕；非扩展格式没有该字段。
+            channel_mask = ext.dwChannelMask;
             ext.SubFormat.data1 == 3
         }
         _ => return None,
@@ -1225,6 +1475,7 @@ unsafe fn parse_mix_format(fmt: *const WAVEFORMATEX) -> Option<CaptureFormat> {
         channels,
         kind,
         sample_rate,
+        downmix: build_downmix(channels, channel_mask),
     })
 }
 
@@ -1273,10 +1524,142 @@ mod tests {
         assert_eq!(gap_advance_samples(0, 10), 0);
         assert_eq!(gap_advance_samples(20, 0), 0);
         assert_eq!(gap_advance_samples(20, 5), 0);
-        // 超过 2 帧才补；21 ms -> 1008 采样
-        assert_eq!(gap_advance_samples(21, 0), 1008);
+        // 超过 2 帧才补，且四舍五入到整帧：21 ms -> 2 帧 = 960 采样
+        assert_eq!(gap_advance_samples(21, 0), 960);
+        assert_eq!(gap_advance_samples(24, 0), 960);
+        assert_eq!(gap_advance_samples(25, 0), 1440);
         // 扣掉样本自身覆盖的时间：100 - 40 = 60 ms -> 2880 采样
         assert_eq!(gap_advance_samples(100, 40), 2880);
+    }
+
+    #[test]
+    fn gap_advance_stays_on_the_480_sample_grid() {
+        // 接收端用时间戳余数判定时间线断裂；任何超过 2 帧的墙钟缺口，
+        // 补偿量都必须是整帧，否则每次静默恢复都会全量重同步。
+        for idle in 21u64..=300 {
+            for covered in [0u64, 7, 13, 29] {
+                let advance = gap_advance_samples(idle, covered);
+                assert_eq!(
+                    advance % rtp::FRAME_SAMPLES,
+                    0,
+                    "idle={idle} covered={covered} -> {advance}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_media_advance_stays_on_the_480_grid() {
+        // 合成场景：缺口补偿（已按整帧取整）与丢弃媒体推进叠加后，最终
+        // 时间戳推进必须仍是 480 的整数倍，否则接收端会全量重同步。
+        for interleaved in [0usize, 1, 239, 240, 479, 480, 959, 960, 961, 1_920, 3_841] {
+            let dropped = frame_grid_advance(interleaved);
+            assert_eq!(
+                dropped % rtp::FRAME_SAMPLES,
+                0,
+                "interleaved={interleaved} -> {dropped}"
+            );
+            for idle in [0u64, 5, 21, 47, 300] {
+                for covered in [0u64, 7, 13, 29] {
+                    let advance = gap_advance_samples(idle, covered).wrapping_add(dropped);
+                    assert_eq!(
+                        advance % rtp::FRAME_SAMPLES,
+                        0,
+                        "idle={idle} covered={covered} interleaved={interleaved} -> {advance}"
+                    );
+                }
+            }
+        }
+        // 取整边界：不足半帧不补偿，半帧及以上落到最近的整帧。
+        assert_eq!(frame_grid_advance(479), 0);
+        assert_eq!(frame_grid_advance(480), rtp::FRAME_SAMPLES);
+        assert_eq!(frame_grid_advance(959), rtp::FRAME_SAMPLES);
+        assert_eq!(frame_grid_advance(1_440), 2 * rtp::FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn pending_ts_advance_waits_for_queued_frames() {
+        let mut ts = 1_000u32;
+        let mut pending = PendingTsAdvances::default();
+
+        // 队列非空：补偿记账，不立即推进 timestamp
+        pending.queue(2, 960, &mut ts);
+        assert_eq!(ts, 1_000);
+        assert_eq!(pending.entries.back(), Some(&(2, 960)));
+
+        // 新缺口位于更远的边界：保留两个独立边界，不合并
+        pending.queue(3, 480, &mut ts);
+        assert_eq!(ts, 1_000);
+        assert_eq!(
+            pending.entries.iter().copied().collect::<Vec<_>>(),
+            vec![(2, 960), (3, 480)]
+        );
+    }
+
+    #[test]
+    fn pending_ts_advance_applies_immediately_when_queue_is_empty() {
+        let mut ts = 1_000u32;
+        let mut pending = PendingTsAdvances::default();
+        pending.queue(2, 960, &mut ts);
+        // 队列已空：此前未兑现的补偿与新缺口一起立即兑现
+        pending.queue(0, 480, &mut ts);
+        assert_eq!(ts, 2_440);
+        assert!(pending.entries.is_empty());
+    }
+
+    #[test]
+    fn pending_ts_advance_lands_after_old_frames() {
+        // 模拟发送循环：旧帧按 480 连续，补偿在它们全部发出后才进入时间戳。
+        let mut ts = 1_000u32;
+        let mut pending = PendingTsAdvances::default();
+        pending.queue(2, 960, &mut ts);
+
+        let mut starts = Vec::new();
+        for _ in 0..3 {
+            ts = ts.wrapping_add(rtp::FRAME_SAMPLES);
+            starts.push(ts.wrapping_sub(rtp::FRAME_SAMPLES));
+            pending.after_frame_sent(&mut ts);
+        }
+        // 前两帧（旧内容）连续；第三帧（新数据）晚一个缺口 960 采样。
+        assert_eq!(starts, vec![1_000, 1_480, 2_920]);
+    }
+
+    #[test]
+    fn second_gap_keeps_the_first_compensation_boundary() {
+        // 回归：两个缺口之间还有一批新数据未发出时，单值记账会把第一个
+        // 补偿推到这批数据之后。每个缺口必须挂在各自的队列边界上。
+        let mut ts = 1_000u32;
+        let mut pending = PendingTsAdvances::default();
+        pending.queue(1, 960, &mut ts);
+        pending.queue(3, 480, &mut ts);
+
+        let mut starts = Vec::new();
+        for _ in 0..4 {
+            ts = ts.wrapping_add(rtp::FRAME_SAMPLES);
+            starts.push(ts.wrapping_sub(rtp::FRAME_SAMPLES));
+            pending.after_frame_sent(&mut ts);
+        }
+        // 旧帧 1000；第一个缺口 960 之后第一批新数据从 2440 开始；
+        // 第一批（2 帧）之后第二个缺口 480 才生效。
+        assert_eq!(starts, vec![1_000, 2_440, 2_920, 3_880]);
+    }
+
+    #[test]
+    fn queued_ts_advance_is_flushed_when_its_frames_are_drained() {
+        let mut ts = 1_000u32;
+        let mut pending = PendingTsAdvances::default();
+        pending.queue(2, 960, &mut ts);
+        assert_eq!(pending.entries.back(), Some(&(2, 960)));
+
+        // 丢掉 1 帧：边界仍在，补偿继续等待
+        pending.after_drain(FRAME_INTERLEAVED, &mut ts);
+        assert_eq!(ts, 1_000);
+        assert_eq!(pending.entries.back(), Some(&(1, 960)));
+
+        // 边界前的最后一帧也丢了：补偿必须立刻兑现
+        pending.after_drain(FRAME_INTERLEAVED, &mut ts);
+        assert_eq!(ts, 1_960);
+        assert!(pending.entries.is_empty());
     }
 
     #[test]
@@ -1421,6 +1804,55 @@ mod tests {
         assert_eq!(fmt.sample_rate, 44_100);
         assert_eq!(fmt.channels, 2);
         assert_eq!(fmt.kind, SampleKind::F32);
+    }
+
+    #[test]
+    fn downmix_51_mixes_center_and_surround_and_ignores_lfe() {
+        const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let dm = build_downmix(6, 0x3F).expect("5.1 需要下混");
+        assert_eq!(dm.left[0], 1.0); // FL
+        assert_eq!(dm.right[1], 1.0); // FR
+        assert_eq!(dm.left[2], S); // FC
+        assert_eq!(dm.right[2], S);
+        assert_eq!(dm.left[3], 0.0); // LFE 不混入
+        assert_eq!(dm.right[3], 0.0);
+        assert_eq!(dm.left[4], S); // BL
+        assert_eq!(dm.right[5], S); // BR
+    }
+
+    #[test]
+    fn downmix_71_uses_mask_order_for_side_surround() {
+        const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        // FL FR FC LFE BL BR SL SR
+        let dm = build_downmix(8, 0x63F).expect("7.1 需要下混");
+        assert_eq!(dm.left[4], S); // BL
+        assert_eq!(dm.right[5], S); // BR
+        assert_eq!(dm.left[6], S); // SL
+        assert_eq!(dm.right[7], S); // SR
+    }
+
+    #[test]
+    fn downmix_preserves_stereo_and_mono_paths() {
+        assert!(build_downmix(1, 0).is_none());
+        assert!(build_downmix(2, 0x3).is_none());
+    }
+
+    #[test]
+    fn downmix_falls_back_when_mask_is_missing() {
+        const S: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        // 非扩展格式没有 channelMask：按 5.1 标准顺序，中央声道不能丢
+        let dm = build_downmix(6, 0).expect("多声道必须有下混");
+        assert_eq!((dm.left[2], dm.right[2]), (S, S));
+    }
+
+    #[test]
+    fn write_stereo_downmixes_and_clamps() {
+        // 3 声道 FL=FR=FC=0.8 -> 0.8 + 0.707*0.8 = 1.365，必须限幅
+        let src = [0.8f32, 0.8, 0.8];
+        let dm = build_downmix(3, 0x7).expect("3 声道需要下混");
+        let mut out = Vec::new();
+        write_stereo(&src, 1, 3, 0, 1, Some(&dm), &mut out, |s| s);
+        assert_eq!(out, vec![1.0, 1.0]);
     }
 
     #[test]

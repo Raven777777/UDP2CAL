@@ -153,6 +153,9 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             let mut last_stats = Instant::now();
             let mut last_packet_at = Instant::now();
             let mut last_newest_ts = 0u64;
+            // 最近一次 PLC/欠载（水位触底）的时刻：恢复期内禁止阶跃裁剪，
+            // 见 `StepAbsorber` 的 `can_trim` 契约。
+            let mut underrun_at: Option<Instant> = None;
             let mut idle_feedback = false;
             // PLC→Silence 接缝的 10 ms 淡出：记录上一块**成功写出**的末样本。
             // 解码失败补零 / 重同步 / 设备重建时清空，避免从过时电平起坡。
@@ -181,6 +184,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                         last_packet_at = Instant::now();
                         idle_feedback = false;
                         last_pcm = None;
+                        underrun_at = None;
                         AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
                     }
                     std::thread::park_timeout(Duration::from_millis(50));
@@ -226,6 +230,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                                 protocol::rtp::DeviceRateEstimator::with_rate(device_rate);
                             step = protocol::rtp::StepAbsorber::new();
                             last_pcm = None;
+                            underrun_at = None;
                             spawn_session.set_audio_state(AudioInitState::Ready);
                             logf!("[Audio] 输出流已重建（{} Hz）", aw.device_rate);
                         }
@@ -248,6 +253,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     step.reset();
                     aw.flush();
                     last_pcm = None;
+                    underrun_at = None;
                 }
 
                 // ── 水位（唯一观测量）──
@@ -274,7 +280,14 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     // 直接清槽位会让有状态解码器与发送端错位，接缝处爆音。
                     let before_water = jb.occupancy_ms();
                     let before_total = before_water.saturating_add(pipe_ms);
-                    let decision = step.decide(before_water, pipe_ms, jb.is_playing(), water_target);
+                    // `StepAbsorber` 契约：刚发生 PLC/欠载时的水位回升多半是
+                    // 恢复回填，不是真实积压。恢复期长度取步进判据自己的确认
+                    // 窗口（STEP_TRIM_HOLD_MS），过后才重新允许裁剪。
+                    let in_recovery = underrun_at.is_some_and(|t| {
+                        t.elapsed() < Duration::from_millis(protocol::rtp::STEP_TRIM_HOLD_MS as u64)
+                    });
+                    let can_trim = jb.is_playing() && !in_recovery;
+                    let decision = step.decide(before_water, pipe_ms, can_trim, water_target);
                     let mut hit: Option<(u32, u32, u32, bool)> = None;
                     if decision.frames > 0 {
                         let mut trimmed = 0u32;
@@ -319,6 +332,15 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                     )
                 };
                 let water = jb_water.saturating_add(pipe_ms);
+                // 本次 tick 是 PLC/静音（丢包、迟到、尾部洞），或可播放水位已经
+                // 触底（≤1 帧）：都意味着刚欠载，随后到达的攒批是恢复回填。
+                if matches!(
+                    pull,
+                    protocol::rtp::Pull::Plc { .. } | protocol::rtp::Pull::Silence { .. }
+                ) || (playing && water <= protocol::rtp::FRAME_MS)
+                {
+                    underrun_at = Some(Instant::now());
+                }
                 if newest_ts != last_newest_ts {
                     last_newest_ts = newest_ts;
                     last_packet_at = Instant::now();
@@ -517,7 +539,10 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
                 if last_stats.elapsed() > Duration::from_millis(100) {
                     let level_db = if rms_count > 0 {
                         let rms = (rms_sum / rms_count as f64).sqrt() as f32;
-                        20.0 * (rms.max(1e-10)).log10()
+                        // 窗口内全是 0.0 PCM（数字静音被编成零谱帧）时
+                        // log10(1e-10) = -200；与 idle 路径一致钳到 -60，
+                        // 否则界面会显示 -200 dB。
+                        (20.0 * (rms.max(1e-10)).log10()).max(-60.0)
                     } else {
                         -60.0
                     };

@@ -177,6 +177,17 @@ impl DriftController {
     /// 返回反馈比率微调量：水位偏高 → 正数 → 重采样比率变大 → 每秒产出的
     /// 设备帧变少（见 `AudioWriter::set_ratio_adjust`）。
     pub fn update(&mut self, water_ms: u32, device_frames: u64) -> f64 {
+        if device_frames < self.last_device {
+            // 设备帧回退（AudioTrack flush / 音频路径重建）：与
+            // [`DeviceRateEstimator::observe`](super::DeviceRateEstimator::observe)
+            // 的回退分支一致——旧增量基线不可比，整块状态作废并以新计数
+            // 重新起算。旧实现用 `saturating_sub` 恒得 0 后直接返回且**不更新
+            // `last_device`**，PI / 水位低通 / 斜率限制会一直冻结，直到计数
+            // 重新越过旧基线（可能是数亿帧）。
+            self.reset();
+            self.last_device = device_frames;
+            return self.adjust;
+        }
         let dframes = device_frames.saturating_sub(self.last_device);
         if dframes == 0 {
             return self.adjust;
@@ -536,6 +547,34 @@ mod tests {
         }
         assert_eq!(d.ratio_updates, updates);
         assert_eq!(d.adjust(), adjust);
+    }
+
+    #[test]
+    fn drift_rebases_when_device_frame_counter_rolls_back() {
+        // AudioTrack flush / 音频路径重建会让设备累计帧数回退。旧实现
+        // saturating_sub 恒得 0 后直接返回且不更新 last_device，调节会冻结
+        // 到计数重新越过旧基线。回退必须视为计数源重置（同
+        // DeviceRateEstimator），以新计数为基线继续评估。
+        let mut d = DriftController::with_target(48_000, WATER_TARGET_MS);
+        let mut dev = 5_000_000u64;
+        let a = run_pi(&mut d, WATER_TARGET_MS + 60, 2000, &mut dev);
+        assert!(a > 0.0, "先让控制器进入调节状态: {a}");
+        assert!(d.ratio_updates > 0);
+
+        // 设备计数回退（新音频路径从 0 附近重新起算）
+        let updates_before = d.ratio_updates;
+        d.update(WATER_TARGET_MS + 60, 0);
+        assert_eq!(d.adjust(), 0.0, "计数源重置应清空旧调节量");
+
+        // 之后必须从新基线继续评估，而不是永久返回旧的 adjust
+        let a2 = run_pi(&mut d, WATER_TARGET_MS + 60, 2000, &mut dev);
+        assert!(
+            d.ratio_updates > updates_before,
+            "回退后必须恢复评估（回退前 {}，回退后 {}）",
+            updates_before,
+            d.ratio_updates
+        );
+        assert!(a2 > 0.0, "回退后应恢复调节作用: {a2}");
     }
 
     #[test]

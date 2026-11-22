@@ -20,6 +20,9 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
 
     @Volatile private var handle: Long = 0
 
+    /** stop() 之后置位：会话已收尾，reset() 不得再创建新句柄（否则无人 destroy）。 */
+    @Volatile private var stopped: Boolean = false
+
     /** 每通道帧采样数（10 ms = 480） */
     val frameSize: Int
         get() = Udp2CalProtocol.OPUS_FRAME_SAMPLES
@@ -31,6 +34,7 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
     @Synchronized
     fun start(): Boolean {
         if (handle != 0L) return true
+        stopped = false
         handle = OpusDecodeNative.decoderCreate(sampleRateHz, channels)
         if (handle == 0L) {
             Log.e(TAG, "解码器创建失败")
@@ -81,9 +85,15 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
         return OpusDecodeNative.decoderDecodeFec(h, data, offset, length, pcmOut, 0)
     }
 
-    /** 重建解码器状态（重同步 / 新会话） */
+    /**
+     * 重建解码器状态（重同步 / 新会话）。
+     *
+     * destroy+create 在同一把锁内完成（方法本身 @Synchronized），不会被
+     * stop() 插在中间。stop() 之后不再重建：此时对象已无人持有新句柄。
+     */
     @Synchronized
     fun reset() {
+        if (stopped) return
         val h = handle
         if (h != 0L) OpusDecodeNative.decoderDestroy(h)
         handle = OpusDecodeNative.decoderCreate(sampleRateHz, channels)
@@ -91,6 +101,7 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
 
     @Synchronized
     fun stop() {
+        stopped = true
         val h = handle
         if (h != 0L) {
             OpusDecodeNative.decoderDestroy(h)

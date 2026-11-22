@@ -23,6 +23,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -61,6 +63,14 @@ internal class CaptureLifecycle(
     private val lifecycleLock = Any()
     @Volatile private var captureJob: Job? = null
     @Volatile private var controlJob: Job? = null
+
+    /**
+     * 收尾时 join 超时、引用已从任务槽清掉的协程。
+     *
+     * 它们仍可能在原生调用里（如控制协程的 jitter.reset()）；服务停机必须
+     * 能 join 到，否则 closeNative 会与它们竞争同一块 Rust 内存。
+     */
+    private val lingeringJobs = CopyOnWriteArrayList<Job>()
     @Volatile private var activeForward: ForwardLink? = null
     @Volatile private var udpSender: UdpSender? = null
 
@@ -236,12 +246,22 @@ internal class CaptureLifecycle(
                 }
                 hasNewCapture = false
             } finally {
-                // 控制协程可能在 NonCancellable 里调用 jitter.reset()；必须等它
-                // 真正退出再清引用，否则 onDestroy 拿不到句柄可 join，原生堆已
-                // 释放而它还在调用（use-after-free）。
+                // 控制协程可能在 NonCancellable 里调用 jitter.reset()；必须确认它
+                // 退出后才能 closeNative，否则原生堆已释放而它还在调用
+                // （use-after-free）。HAL 卡住时不能无限等：超时后保留引用，
+                // 服务停机前再 join。
                 val ctrl = controlJob
                 controlJob = null
-                withContext(NonCancellable) { ctrl?.cancelAndJoin() }
+                withContext(NonCancellable) {
+                    val joined = withTimeoutOrNull(2000) {
+                        ctrl?.cancelAndJoin()
+                        true
+                    } ?: false
+                    if (!joined) {
+                        ctrl?.let { lingeringJobs.add(it) }
+                        Log.w(TAG, "控制协程 2 s 内未退出，继续收尾")
+                    }
+                }
                 reverse.stopAndJoin()
                 forward.teardown()
                 try { udpSender?.close() } catch (_: Exception) {}
@@ -273,6 +293,9 @@ internal class CaptureLifecycle(
                         // 会话真正结束（失败/读失败/停采集）：归还 Wi-Fi 低延迟锁。
                         // 失败自终止时 stopCapture 不会运行，而绑定中的 Service 也不会
                         // onDestroy，只能在这里释放，否则锁会一直留在网卡上耗电。
+                        // 同时停掉通知收集器：否则 stopForeground 之后的下一次状态
+                        // 发射又会 startForeground，留下"等待连接"的残留通知。
+                        service.onSessionEnded()
                         try { wifiLock?.release() } catch (_: Exception) {}
                         wifiLock = null
                         status.update { it.copy(isRunning = false) }
@@ -313,10 +336,17 @@ internal class CaptureLifecycle(
     }
 
     /** onDestroy 用：在 stopCapture 清空任务槽之前取一份待 join 的协程快照 */
-    fun sessionJobs(): List<Job> = buildList {
-        controlJob?.let(::add)
-        captureJob?.let(::add)
-        addAll(reverse.jobs())
+    fun sessionJobs(): List<Job> = synchronized(lifecycleLock) {
+        // 只清彻底完成的：已取消但仍在 finally/挂起恢复中的 Job 满足
+        // isActive == false 而 isCompleted == false，绝不能在这里移除，
+        // 否则服务停机会 join 不到它，closeNative 与它的 JNI 调用竞争。
+        lingeringJobs.removeAll(lingeringJobs.filter { it.isCompleted })
+        buildList {
+            controlJob?.let(::add)
+            captureJob?.let(::add)
+            addAll(reverse.jobs())
+            addAll(lingeringJobs)
+        }
     }
 
     /** 服务停机：热循环专用线程都已空闲后才可关闭，不留孤儿线程 */

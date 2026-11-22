@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.coroutines.coroutineContext
@@ -82,6 +83,13 @@ internal class ReverseLink(
     @Volatile private var player: AudioPlayer? = null
     @Volatile private var rxJob: Job? = null
     @Volatile private var playJob: Job? = null
+
+    /**
+     * 收尾 join 超时、引用已从任务槽清掉的协程（含 startPlayback 换代的旧播放
+     * 协程）。它们可能仍在调用抖动缓冲/漂移控制器的原生函数；服务停机必须
+     * 能 join 到，否则 closeNative 会与它们竞争同一块 Rust 内存。
+     */
+    private val lingeringJobs = CopyOnWriteArrayList<Job>()
     @Volatile private var lastReverseStartAt = 0L
     /** 最近一次通过校验的反向 RTP 到达时刻（monotonic ms）；接收/播放协程共享 */
     @Volatile private var lastReversePacketAt = 0L
@@ -130,6 +138,8 @@ internal class ReverseLink(
      * 已退出（AudioTrack/解码器异常）→ 冷却 2 s 后自动重启。
      */
     suspend fun applyRemoteSsrc(ssrc: Int) {
+        // 局部捕获：本轮判断用的是同一份引用，避免与 playJob 的并发替换竞争。
+        val playing = playJob
         if (ssrc != activeSsrc) {
             activeSsrc = ssrc
             if (ssrc == 0) {
@@ -140,7 +150,10 @@ internal class ReverseLink(
             }
         } else if (
             ssrc != 0 &&
-            playJob?.isActive != true &&
+            // 只有 null 或彻底完成才算“已退出”：已取消仍在执行的 Job
+            // isCompleted == false（isActive 也为 false），不能在此重启，
+            // 否则会与旧循环并发消费同一个解码器/AudioPlayer。
+            (playing == null || playing.isCompleted) &&
             SystemClock.elapsedRealtime() - lastReverseStartAt > 2000
         ) {
             // 播放协程可能因 AudioTrack/解码器异常退出，而 SSRC 没变；
@@ -162,11 +175,23 @@ internal class ReverseLink(
         // 但控制循环不能被 AudioTrack/HAL 卡死，超时后记录并继续。
         val old = playJob
         playJob = null
-        val joined = withTimeoutOrNull(1000) {
-            old?.cancelAndJoin()
-            true
-        } ?: false
-        if (!joined) Log.w(TAG, "旧反向播放协程 1 s 内未退出，继续启动新会话")
+        // 整段包进 NonCancellable：若控制协程恰在此刻被取消，withTimeoutOrNull
+        // 的 block 可能不执行，old 既已脱离 playJob 槽又未被 cancel 或登记进
+        // lingeringJobs，会脱离会话继续运行。与 stopAndJoin 的做法一致。
+        val joined = withContext(NonCancellable) {
+            val done = withTimeoutOrNull(1000) {
+                old?.cancelAndJoin()
+                true
+            } ?: false
+            if (!done) {
+                // 保留引用：它仍可能在原生调用里，服务停机时必须能 join 到。
+                old?.let { lingeringJobs.add(it) }
+            }
+            done
+        }
+        if (!joined) {
+            Log.w(TAG, "旧反向播放协程 1 s 内未退出，继续启动新会话")
+        }
         linkLock.lock()
         try {
             jitter.reset()
@@ -174,8 +199,11 @@ internal class ReverseLink(
         } finally {
             linkLock.unlock()
         }
-        // 接收协程与会话同生命周期（见 launchReverseReceiver）
-        player?.flush()
+        // 接收协程与会话同生命周期（见 launchReverseReceiver）。
+        // 旧循环没退出时它可能正卡在 AudioTrack.write 并持有 trackLock：
+        // 此时 flush 会跟着永久卡住控制协程，必须与 stopAndJoin 一样只在
+        // 确认退出后才 flush。
+        if (joined) player?.flush()
         lastReverseStartAt = SystemClock.elapsedRealtime()
         linkLock.lock()
         try {
@@ -233,26 +261,74 @@ internal class ReverseLink(
             linkLock.unlock()
         }
         // 播放协程没退出时不要再抢 trackLock：它可能正卡在 AudioTrack.write，
-        // flush 会跟着一起卡住；teardownSession 的 player.stop() 负责最终释放。
+        // flush 会跟着一起卡住；teardownSession 会在确认播放协程退出后才 stop()
+        // （未退出时宁可跳过释放，也不阻塞会话收尾）。
         if (joined) player?.flush()
         status.update {
             it.copy(reverseAudio = false, reverseBitrateKbps = 0f, reverseJitter = "")
         }
     }
 
-    /** 会话收尾：停接收协程与本次会话的音频对象（原生句柄保留到服务停机） */
-    fun teardownSession() {
-        rxJob?.cancel()
+    /**
+     * 会话收尾：停接收/播放协程与本次会话的音频对象（原生句柄保留到服务停机）。
+     *
+     * 接收协程阻塞在 `receive()` 上，取消唤不醒它；调用方必须先关闭 socket，
+     * 这里再等它真正退出。播放协程若卡在 AudioTrack.write，join 会超时——
+     * 记录后继续收尾，服务停机前的重试 join 仍会包含它。
+     */
+    suspend fun teardownSession() {
+        // 收尾一开始就禁止 recover() 重建：即使播放协程还活着，也不能在
+        // player 字段被置空之后建出一条无人释放的新 track。
+        player?.markStopped()
+        val rx = rxJob
         rxJob = null
+        val play = playJob
+        val rxJoined = withContext(NonCancellable) {
+            withTimeoutOrNull(1000) {
+                rx?.cancelAndJoin()
+                true
+            } ?: false
+        }
+        if (!rxJoined) {
+            // 槽位已清空：必须自己保留引用，否则服务停机时 join 不到它。
+            rx?.let { lingeringJobs.add(it) }
+            Log.w(TAG, "反向接收协程 1 s 内未退出，继续收尾")
+        }
+        val playJoined = withContext(NonCancellable) {
+            withTimeoutOrNull(1000) {
+                play?.cancelAndJoin()
+                true
+            } ?: false
+        }
+        if (!playJoined) {
+            Log.w(TAG, "反向播放协程 1 s 内未退出，继续收尾")
+        } else if (playJob === play) {
+            playJob = null
+        }
         decoder?.stop()
         decoder = null
-        player?.stop()
+        val p = player
         player = null
+        // 播放协程仍卡在 writeBlocking 并持有 trackLock：此时 stop() 会跟着
+        // 阻塞，把整条采集收尾拖死。宁可不释放这一个 track，也不能死锁。
+        val playbackActive = (play != null && !playJoined) || lingeringJobs.any { !it.isCompleted }
+        if (playbackActive) {
+            Log.w(TAG, "播放协程未退出，跳过 AudioTrack 释放以避免持锁阻塞")
+        } else {
+            p?.stop()
+        }
         activeSsrc = 0
     }
 
     /** 待 join 的协程快照；顺序与 onDestroy 的等待顺序一致 */
-    fun jobs(): List<Job> = listOfNotNull(rxJob, playJob)
+    fun jobs(): List<Job> = buildList {
+        rxJob?.let(::add)
+        playJob?.let(::add)
+        // 只清彻底完成的：已取消但仍在执行的 Job isActive == false 而
+        // isCompleted == false，移除它会让 closeNative 与它的 JNI 调用竞争。
+        lingeringJobs.removeAll(lingeringJobs.filter { it.isCompleted })
+        addAll(lingeringJobs)
+    }
 
     /** 服务停机：归还 JitterBuffer/DriftController/DeviceRateEstimator 的 Rust 堆 */
     fun closeNative() {
@@ -290,6 +366,9 @@ internal class ReverseLink(
                 continue
             }
             val len = pkt.length
+            // receive 返回后先确认取消：从这里到 insert 之间没有别的挂起点，
+            // 已取消的协程若不检查会继续触碰 jitter 的原生句柄，与 closeNative 竞争。
+            coroutineContext.ensureActive()
             if (expectedAddr != null && pkt.address != expectedAddr) continue
             // 槽位顺序见 Udp2CalProtocol.parseRtpInto
             if (!Udp2CalProtocol.parseRtpInto(buf, len, rtp)) continue
@@ -302,6 +381,7 @@ internal class ReverseLink(
             val payloadLength = rtp[5].toInt()
 
             val nowMono = SystemClock.elapsedRealtime()
+            var accepted = false
             linkLock.lock()
             try {
                 // 长时间没有可用媒体（Windows 暂停播放/端点重建/发送线程重启）后，
@@ -312,7 +392,7 @@ internal class ReverseLink(
                     Log.i(TAG, "反向 RTP 空闲 ${nowMono - lastReversePacketAt}ms，重置抖动缓冲")
                     jitter.reset()
                 }
-                val accepted = jitter.insert(
+                accepted = jitter.insert(
                     seq, timestamp, marker,
                     buf, payloadOffset, payloadLength
                 )
@@ -321,7 +401,9 @@ internal class ReverseLink(
             } finally {
                 linkLock.unlock()
             }
-            byteCount += len
+            // 只有真正入队的包才计入反向码率：被抖动缓冲丢弃（late/重复/溢出）
+            // 的包不代表实际承载的音频。
+            if (accepted) byteCount += len
 
             val now = System.currentTimeMillis()
             if (now - lastReport >= 1000) {

@@ -162,6 +162,32 @@ fn pairing_prompts_only_until_approved_or_denied() {
 }
 
 #[test]
+fn ui_stop_does_not_wait_for_the_restart_lock() {
+    // 回归：restart 持锁同步 join 旧线程时（驱动挂起可达数秒），UI 停止
+    // 若阻塞等锁会整窗冻结。它必须置停止请求后立即返回。
+    let session = Session::for_test();
+    let serial = session
+        .reverse
+        .restart
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let started = Instant::now();
+    session.reset_to_ready();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "UI 停止被 restart 锁阻塞了 {:?}",
+        started.elapsed()
+    );
+    assert!(
+        session.reverse.stop_requested.load(Ordering::Acquire),
+        "拿不到 restart 锁时必须置停止请求"
+    );
+    // 放锁后收尾线程会取走（此处为空的）发送器并退出；请求本身保留到
+    // 下一次 restart 清除。
+    drop(serial);
+}
+
+#[test]
 fn session_reset_clears_binding_and_bumps_jitter_epoch() {
     let session = Session::for_test();
     let src: SocketAddr = "192.0.2.10:50000".parse().unwrap();

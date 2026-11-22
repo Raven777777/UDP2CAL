@@ -63,6 +63,9 @@ class AudioPlayer(private val context: Context) {
     @Volatile private var startedVoiceMode: Boolean = true
     @Volatile private var startedSessionId: Int = 0
 
+    /** stop() 之后置位：会话已收尾，recover() 不得再重建 track（否则无人释放）。 */
+    @Volatile private var stopped: Boolean = false
+
     /** start() 前的路由快照；stop() 只恢复本次确实改过的部分 */
     private var savedAudioMode: Int = AudioManager.MODE_NORMAL
     private var savedSpeakerphone: Boolean = false
@@ -74,6 +77,9 @@ class AudioPlayer(private val context: Context) {
         // stop() 交错，否则新 track 会失去引用且路由不复位。
         // 锁序恒为 linkLock → trackLock（本方法内不获取 linkLock）。
         synchronized(trackLock) {
+        // 刻意不复位 stopped：markStopped() 是无锁立即置位的收尾标记，
+        // 若在这里写回 false，会把 recover() 的 stop 与 start 之间（或
+        // start 执行期间）置位的标记吞掉。新建实例初值即 false，无需复位。
         startedVoiceMode = voiceMode
         startedSessionId = audioSessionId
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -289,37 +295,71 @@ class AudioPlayer(private val context: Context) {
      */
     fun recover(): Boolean {
         Log.w(TAG, "AudioTrack 失效，尝试原地重建")
-        // 保留累计播放头：DriftController 用 device_frames 做差分，若重建后
-        // 归零会被 saturating_sub 卡死直到重新追平旧计数。新 track 从 0 开始
-        // 计数，这里把旧累计值作为基准，后续 raw 增量继续累加。
-        val baseHead = synchronized(trackLock) { headFrames }
-        stop()
-        val ok = start(startedSessionId, startedVoiceMode)
-        if (ok) {
-            synchronized(trackLock) {
+        // stop+start 必须在**同一个** trackLock 临界区内完成：否则会话收尾的
+        // player.stop() 可能插在中间，把新 track 建在已失去引用的对象上（泄漏）。
+        return synchronized(trackLock) {
+            if (stopped) {
+                // 会话已收尾（teardown 已 stop 并把 player 置空）：不能再重建。
+                Log.w(TAG, "AudioPlayer 已停止，放弃重建")
+                return@synchronized false
+            }
+            // 保留累计播放头：DriftController 用 device_frames 做差分。
+            // 新 track 从 0 开始计数，这里把旧累计值作为基准，后续 raw 增量继续累加，
+            // 让 device_frames 在重建前后保持单调。计数回退本身已由
+            // protocol/rtp/drift.rs 的 update() 处理（回退时 reset() 并以新计数
+            // 重新起算，不会再冻结），所以这只是沿用旧行为、避免无谓的重基准，
+            // 不是正确性必需。
+            val baseHead = headFrames
+            // 不调用 stop()：stop() 会置位收尾标记，而本次重建尚未被禁止。
+            releaseTrackLocked()
+            val ok = start(startedSessionId, startedVoiceMode)
+            // start() 不会复位 stopped，这里能可靠捕获在释放旧 track 与重建
+            // 之间置位的收尾标记：刚建出的 track 必须立即释放，不能留成孤儿。
+            if (ok && stopped) {
+                releaseTrackLocked()
+                return@synchronized false
+            }
+            if (ok) {
                 headRaw = 0
                 headFrames = baseHead
                 // 旧 track 未播出的数据已丢弃，新 track 初始欠载为 0
                 writtenFrames = baseHead
             }
+            ok
         }
-        return ok
+    }
+
+    /**
+     * 会话收尾但无法安全调用 [stop] 时，立即禁止后续 [recover] 再建 track。
+     *
+     * 必须**无锁**：播放协程可能正卡在 AudioTrack.write 并持有 trackLock，
+     * 在这里抢锁会把整条会话收尾拖死。正确性由 [recover] 在 start 之后的
+     * 复查兜底——那一步已持锁，能看到本标记。
+     */
+    fun markStopped() {
+        stopped = true
     }
 
     fun stop() {
         synchronized(trackLock) {
-            try { audioTrack?.pause() } catch (_: Exception) {}
-            try { audioTrack?.flush() } catch (_: Exception) {}
-            try { audioTrack?.stop() } catch (_: Exception) {}
-            try { audioTrack?.release() } catch (_: Exception) {}
-            audioTrack = null
-            headRaw = 0
-            headFrames = 0
-            writtenFrames = 0
-            // 与 start() 同一把锁：否则 teardown 的 stop() 会在 recover() 的
-            // start() 之后才恢复旧路由，把刚建立的语音路由覆盖掉。
-            restoreAudioRoute()
+            stopped = true
+            releaseTrackLocked()
         }
+    }
+
+    /** 释放当前 track 并复位计数/路由；调用方必须已持有 trackLock。 */
+    private fun releaseTrackLocked() {
+        try { audioTrack?.pause() } catch (_: Exception) {}
+        try { audioTrack?.flush() } catch (_: Exception) {}
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+        audioTrack = null
+        headRaw = 0
+        headFrames = 0
+        writtenFrames = 0
+        // 与 start() 同一把锁：否则 teardown 的 stop() 会在 recover() 的
+        // start() 之后才恢复旧路由，把刚建立的语音路由覆盖掉。
+        restoreAudioRoute()
     }
 
     /**

@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::header::{OPUS_MAX_PAYLOAD, RtpPacket, extend_seq, extend_ts};
-use super::{FRAME_MS, FRAME_SAMPLES, samples_to_ms};
+use super::{FRAME_MS, FRAME_SAMPLES, WATER_TARGET_MAX_MS, samples_to_ms};
 
 /// 重排槽位
 pub const MAX_REORDER_PACKETS: usize = 64;
@@ -250,8 +250,12 @@ impl JitterBuffer {
     /// 显式启动策略：连续帧达到 [`JITTER_START_MS`] 的硬下限后，还要攒到
     /// `start_ms` 才进入 PLAYING。这样不会出现“30 ms 起播，再用 0.5% 的
     /// 比率花 34 s 爬到 200 ms”的隐性过程。
+    ///
+    /// 上界钳到 [`WATER_TARGET_MAX_MS`]（600 ms）：[`Self::water_ms`] 最多
+    /// 64 帧 ≈ 640 ms，再高的目标永远无法达到，`pull` 会无限返回 `Wait`
+    /// 且没有任何错误反馈。600 与目标水位的允许上限同口径，保证可达。
     pub fn set_start_prebuffer_ms(&mut self, ms: u32) {
-        self.start_ms = ms.max(JITTER_START_MS);
+        self.start_ms = ms.clamp(JITTER_START_MS, WATER_TARGET_MAX_MS);
     }
 
     // ── 状态查询（供播放线程与统计使用）──
@@ -433,13 +437,33 @@ impl JitterBuffer {
         // 空闲 reset 永不触发（丢包仍刷新最后收包时间）。因此连续 N 个远跳
         // 视为时间线断裂，按 M=1 的语义重同步。
         //
+        // 判据必须同时看 `highest_ts`，不能只看 `next_ts`：预缓冲期 `next_ts`
+        // 合法地停在基准，一旦某次交付批次把水位推过“窗口 + 1 帧”（≈660 ms），
+        // 普通顺序包也会超前 `next_ts` 一个窗口以上；但它们与 `highest_ts`
+        // 连续（每个新包 ≈ `highest_ts + 480`），是正常的水位增长，应交给下方
+        // 的溢出/滑动插入逻辑（槽满丢最旧非队首包），水位合法饱和在 640 ms。
+        // 只有**同时**超前 `highest_ts` 一个窗口以上，才是真正的断点/伪造包，
+        // 未起播时也要按单包丢弃防护，否则它会直接入槽，把 `highest_ts` 和水位
+        // 钉在高位（最长约 2^31 样本），漂移控制器随后把真实队列抽干。
+        //
         // shortcut: 伪造者连发 N 个远跳包仍能触发重同步；非整帧远跳或 M=1
         // 也会直接触发（与现有重同步同级 DoS），单个 M=0 帧对齐包不会。
         // 要根治需要会话认证/包签名。
-        if !pkt.marker
-            && ext_ts.saturating_sub(self.next_ts)
-                > MAX_REORDER_PACKETS as u64 * FRAME_SAMPLES as u64
-        {
+        //
+        // 注意：未起播时免除的只是这条 **M=0 远跳** 重同步；marker 跳变与
+        // 非整帧跳变（上方两条分支）仍会 rebase。
+        //
+        // 已知限制（如实记录，不在此加判据）：未起播期的防护口径是“相对
+        // `highest_ts` 单包超窗即丢弃”。只要伪造序列的每包步进不超过一个
+        // 窗口（窗口 = 64 帧 × 480 = 30720 样本），每包都会先被接纳并抬高
+        // `highest_ts`，下一包便又落在窗口内，从而绕过防护、持续把
+        // `highest_ts` 推高（槽位反复滑出、水位显示饱和在 640 ms）。这与
+        // HEAD 的暴露面等价，是无认证 RTP 的既有威胁模型；根治仍需会话
+        // 认证/包签名。
+        let window = MAX_REORDER_PACKETS as u64 * FRAME_SAMPLES as u64;
+        let far_ahead_of_next = ext_ts.saturating_sub(self.next_ts) > window;
+        let far_ahead_of_highest = ext_ts.saturating_sub(self.highest_ts) > window;
+        if !pkt.marker && far_ahead_of_next && (self.playing || far_ahead_of_highest) {
             self.far_jumps += 1;
             if self.far_jumps < FAR_JUMP_REBASE_AFTER {
                 self.stats.overflow += 1;
@@ -1361,6 +1385,87 @@ mod tests {
     }
 
     #[test]
+    fn jb_prebuffer_batch_past_one_window_does_not_rebase() {
+        // 预缓冲期 `next_ts` 不前进，水位合法地从 0 涨到起播目标。一次交付
+        // 批次把水位从 590 推过“64 帧 + 1”后，普通顺序包也会满足 M=0 远跳
+        // 判据：旧实现连续 3 个就 rebase，清空整个预缓冲并 epoch++。
+        // 未起播时必须豁免该路径，改走溢出的滑动插入。
+        let mut jb = JitterBuffer::new();
+        jb.set_start_prebuffer_ms(WATER_TARGET_MAX_MS);
+        for i in 0..59u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8);
+        }
+        assert_eq!(jb.water_ms(), 590);
+        let epoch = jb.epoch;
+        // 一次插入 10 包：水位越过 640 ms，不得重同步
+        for i in 59..69u16 {
+            assert_ne!(
+                insert(&mut jb, i, 480 * i as u32, false, i as u8),
+                InsertResult::Resync,
+                "预缓冲期的正常水位增长不是远跳（第 {i} 包）"
+            );
+        }
+        assert_eq!(jb.epoch, epoch, "预缓冲溢出不得推 epoch");
+        assert_eq!(jb.stats.resyncs, 0);
+        assert_eq!(jb.water_ms(), 640, "水位合法饱和在 64 帧");
+        // 水位达到目标后正常起播（槽满时最旧的几帧被滑出，由 PLC 补齐）
+        assert_eq!(
+            jb.pull(0, 0, &mut [0u8; OPUS_MAX_PAYLOAD]),
+            Pull::Packet { len: 1, ts: 0 }
+        );
+        assert!(jb.is_playing());
+    }
+
+    #[test]
+    fn jb_drops_unmarked_far_jump_before_playing() {
+        // 预缓冲期与 highest_ts 连续的批次不算远跳（见上一个测试），但单个
+        // 时间戳同时超前 next_ts 与 highest_ts 一个窗口以上的伪造/断点包，
+        // 起播前也必须像起播后一样单包丢弃：否则它会入槽把 highest_ts 和水位
+        // 钉在高位，后续真实队列被漂移控制器抽干。
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        assert!(!jb.is_playing());
+        let highest = jb.highest_ts();
+        let water = jb.water_ms();
+        let far = 480 * 3 + 480_000; // next_ts + 10 s，整帧、M=0、seq 在窗口内
+        assert_eq!(insert(&mut jb, 4, far, false, 9), InsertResult::Dropped);
+        assert_eq!(jb.highest_ts(), highest, "伪造包不得拉高 highest_ts");
+        assert_eq!(jb.water_ms(), water, "伪造包不得抬升水位");
+        assert_eq!(jb.stats.resyncs, 0);
+        // 原修复场景不回归：连续批次仍可正常入队并起播
+        for i in 4..8u16 {
+            assert_eq!(
+                insert(&mut jb, i, 480 * i as u32, false, i as u8 + 1),
+                InsertResult::Inserted
+            );
+        }
+        assert_eq!(pull_tags(&mut jb, 0, 4), vec![1, 2, 3, 4]);
+        assert!(jb.is_playing());
+    }
+
+    #[test]
+    fn jb_start_prebuffer_is_clamped_to_the_reachable_max() {
+        // `water_ms()` 最大 64 帧 = 640 ms。若 start_ms 原样接受 u32::MAX，
+        // `enough_water` 永不成立，`pull` 永远 Wait 且没有任何错误反馈。
+        // 上界必须钳到可达值（WATER_TARGET_MAX_MS = 600）。
+        let mut jb = JitterBuffer::new();
+        jb.set_start_prebuffer_ms(u32::MAX);
+        assert_eq!(jb.start_ms, WATER_TARGET_MAX_MS);
+        for i in 0..MAX_REORDER_PACKETS as u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8);
+        }
+        assert_eq!(jb.water_ms(), 640);
+        assert_eq!(
+            jb.pull(0, 0, &mut [0u8; OPUS_MAX_PAYLOAD]),
+            Pull::Packet { len: 1, ts: 0 },
+            "上界钳位后插满 64 帧必须能起播"
+        );
+        assert!(jb.is_playing());
+    }
+
+    #[test]
     fn jb_starts_despite_a_known_mid_hole_after_the_base_packet() {
         // 基准包之后丢 1 帧、后续全部到达：连续量永远停在 1。
         // 起播条件必须允许“终点已知的中段洞”，否则永久静音。
@@ -1398,6 +1503,13 @@ mod tests {
         for i in 0..4u16 {
             insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
         }
+        // 远跳重同步只在起播后启用；这里先进入 PLAYING（解码缓冲满 → Wait，
+        // 不消费任何帧），模拟“播放头被背压冻住”的现场。
+        assert_eq!(
+            jb.pull(DECODE_LIMIT_MS, 0, &mut [0u8; OPUS_MAX_PAYLOAD]),
+            Pull::Wait
+        );
+        assert!(jb.is_playing());
         let highest = jb.highest_ts();
         let water = jb.water_ms();
         // seq 在窗口内、时间戳 +10 s、M=0：伪造包不得拉高 highest_ts/水位
@@ -1420,6 +1532,13 @@ mod tests {
         for i in 0..4u16 {
             insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
         }
+        // 先进入 PLAYING（解码缓冲满 → Wait，不消费）：远跳判据只对
+        // “播放头真的被背压冻住”的起播态生效。
+        assert_eq!(
+            jb.pull(DECODE_LIMIT_MS, 0, &mut [0u8; OPUS_MAX_PAYLOAD]),
+            Pull::Wait
+        );
+        assert!(jb.is_playing());
         let base = 480 * 3 + 38_400; // next_ts + 800 ms
         // seq = next_seq + 1：断流期间还丢了一个包
         assert_eq!(insert(&mut jb, 5, base, false, 5), InsertResult::Dropped);
@@ -1452,6 +1571,12 @@ mod tests {
         for i in 0..4u16 {
             insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
         }
+        // 先进入 PLAYING（解码缓冲满 → Wait，不消费），远跳才按断裂处理。
+        assert_eq!(
+            jb.pull(DECODE_LIMIT_MS, 0, &mut [0u8; OPUS_MAX_PAYLOAD]),
+            Pull::Wait
+        );
+        assert!(jb.is_playing());
         let epoch = jb.epoch;
         let far = 480 * 3 + 480_000; // next_ts + 10 s
         assert_eq!(insert(&mut jb, 4, far, false, 5), InsertResult::Dropped);

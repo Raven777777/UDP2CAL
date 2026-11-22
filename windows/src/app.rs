@@ -256,6 +256,16 @@ impl AppState {
         }
     }
 
+    /// 配置保存成功后清理提示行：只清掉 Info 级提示。
+    ///
+    /// 防火墙规则添加失败等 Error 提示不能因为一次成功的配置保存就消失：
+    /// 入站仍被拦截，而 release 构建没有控制台，用户将没有任何线索。
+    fn clear_info_notice(&mut self) {
+        if self.notice_level != NoticeLevel::Error {
+            self.notice.clear();
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::IpChanged(s) => {
@@ -273,7 +283,7 @@ impl AppState {
                 match self.config.set_auto_start(enabled) {
                     Ok(()) => {
                         if self.persist_config() {
-                            self.notice.clear();
+                            self.clear_info_notice();
                         }
                     }
                     Err(e) => {
@@ -297,7 +307,7 @@ impl AppState {
             Message::SetWaterTarget(ms) => {
                 self.config.water_target_ms = ms;
                 if self.persist_config() {
-                    self.notice.clear();
+                    self.clear_info_notice();
                 }
                 // 解码线程每轮读取该原子值，运行中也能立即换目标
                 self.session.set_water_target_ms(ms);
@@ -307,7 +317,7 @@ impl AppState {
                 self.config.language = code;
                 i18n::set_active(&self.config.language);
                 if self.persist_config() {
-                    self.notice.clear();
+                    self.clear_info_notice();
                 }
                 tray::refresh_menu(
                     self.config.resolved_water_target_ms(),
@@ -371,8 +381,11 @@ impl AppState {
                     // 旧实现异步执行并丢弃错误：非管理员时新端口被永久静默阻断，
                     // 而界面显示启动成功。失败则保留旧端口并明确提示。
                     let old_port = self.config.listen_port;
-                    if port as u32 != old_port
-                        && let Err(err) = firewall::add_firewall_rule(port) {
+                    // 本次启动实际遇到的防火墙错误。只有它需要压过“启动成功
+                    // 清空提示”的旧逻辑：入站仍被拦截，release 无日志。
+                    let mut firewall_error: Option<String> = None;
+                    if port as u32 != old_port {
+                        if let Err(err) = firewall::add_firewall_rule(port) {
                             logf!("[Firewall] 端口 {port} 规则添加失败: {err}");
                             // add 会先删旧规则；失败时尽量把旧端口的规则补回去。
                             let restore = u16::try_from(old_port)
@@ -395,6 +408,14 @@ impl AppState {
                             self.port_input = old_port.to_string();
                             return Task::none();
                         }
+                    } else if let Err(err) = firewall::add_firewall_rule(port) {
+                        // 同端口也要重试：上次启动/添加可能失败，或规则被组策略
+                        // 清理。add_firewall_rule 先删后加，重复调用是幂等的。
+                        // 失败不阻止启动（与启动路径一致），但提示必须保留到用户
+                        // 看到——不能被随后的 persist 成功清掉。
+                        logf!("[Firewall] 端口 {port} 规则重试失败: {err}");
+                        firewall_error = Some(err);
+                    }
 
                     self.config.listen_ip = ip;
                     self.config.listen_port = port as u32;
@@ -418,7 +439,13 @@ impl AppState {
                     self.last_bitrate = 0.0;
                     self.last_level_db = -60.0;
                     if saved {
-                        self.notice.clear();
+                        match firewall_error {
+                            Some(err) => {
+                                self.notice = err;
+                                self.notice_level = NoticeLevel::Error;
+                            }
+                            None => self.notice.clear(),
+                        }
                     }
                     self.vb_cable_installed = audio::detect_vb_cable().is_some();
                     // 应用反向串流设置到全局
@@ -427,11 +454,14 @@ impl AppState {
                 Task::none()
             }
             Message::StatusUpdate(info) => {
+                // 停止后接收任务可能还有一条已在途的统计：不能把码率/电平
+                // 写回“已停止”的界面。DeviceFailed 自检也只在运行态有意义。
+                if !self.is_running {
+                    return Task::none();
+                }
                 // 解码线程重建输出流失败会置 DeviceFailed；此时必须停表并提示，
                 // 不能维持“运行中”假象（played/设备时钟已冻结，永远无声）。
-                if self.is_running
-                    && self.session.audio_state() == session::AudioInitState::DeviceFailed
-                {
+                if self.session.audio_state() == session::AudioInitState::DeviceFailed {
                     return self.update(Message::EngineError(
                         i18n::t("engine.audio_stream_failed"),
                     ));
@@ -492,6 +522,13 @@ impl AppState {
             }
             Message::PeerStateChanged => Task::none(),
             Message::PairingRequest(req) => {
+                // 停止后迟到的配对请求：不弹窗、不写配对。同时释放控制面的
+                // 提示槽，避免下次启动时该设备因 prompted != 0 永远被 Ignore。
+                if !self.is_running {
+                    self.pending_pair = None;
+                    self.session.clear_pairing_prompt();
+                    return Task::none();
+                }
                 if self.pending_pair.is_none() {
                     logf!(
                         "[P2P] 未配对设备 {:016x}（{}）请求连接，等待本机确认",

@@ -44,7 +44,7 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val statusBus = StatusBus()
-    private var notificationJob: Job? = null
+    @Volatile private var notificationJob: Job? = null
 
     private lateinit var lifecycle: CaptureLifecycle
 
@@ -120,6 +120,17 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
     /** 高级设置：反向（PC→手机）目标水位，运行时立即生效 */
     fun setReverseWaterTargetMs(ms: Int) = lifecycle.setReverseWaterTargetMs(ms)
 
+    /**
+     * 会话在无重启的情况下自然结束（失败/读失败/停采集）。
+     *
+     * 停止通知收集器，避免 stopForeground 之后的下一次状态发射再次
+     * startForeground，留下与任何会话都不对应的残留通知。
+     */
+    internal fun onSessionEnded() {
+        notificationJob?.cancel()
+        notificationJob = null
+    }
+
     /** 语言切换后立即重建前台通知（通知文本不随状态变化，需显式刷新）。 */
     fun refreshNotification() {
         if (notificationJob == null) return
@@ -193,7 +204,22 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
             withTimeoutOrNull(1000) {
                 oldJobs.forEach { it.cancelAndJoin() }
                 true
+            }
+            // stopCapture 之后仍可能有协程在收尾：采集协程可能在最后一个挂起点
+            // 之后才创建反向接收协程，旧快照抓不到它。重取一次快照再 join：
+            // 第一次超时的协程也会在这里再得到 1 s。
+            val remaining = lifecycle.sessionJobs()
+            val joined = withTimeoutOrNull(1000) {
+                remaining.forEach { it.cancelAndJoin() }
+                true
             } ?: false
+            // join 期间收尾协程可能刚把超时的子协程登记进 lingering：再做一次
+            // 最终快照确认没有任何仍活跃的协程，才允许 closeNative。
+            // 必须用 isCompleted 判断：已取消但仍在执行的协程 isActive == false，
+            // 用 none { it.isActive } 会把它们误判为已退出，随后 closeNative
+            // 释放原生堆，而它们还可能在 JNI 里访问（use-after-free）。
+            val after = lifecycle.sessionJobs()
+            joined && after.all { it.isCompleted }
         }
         if (!allExited) {
             // 仍有协程没退出（如 receive() 卡死）：句柄宁可不归还——泄漏一小块

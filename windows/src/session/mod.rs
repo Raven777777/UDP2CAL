@@ -14,16 +14,18 @@
 //!
 //! 1. `reverse.restart` —— 串行化反向发送器重启；
 //! 2. `reverse.sender` —— 槽位，只做 take/store；
-//! 3. `p2p` —— 绑定关系；
-//! 4. `jitter` —— 正向抖动缓冲；
-//! 5. `reverse_shared.config` —— 反向 Opus 配置；
-//! 6. `pairing_denied` —— 本次运行内被拒设备表；
-//! 7. `decode_thread` / `retry_at` / `reject_log` / `event_log` —— 叶子锁，
+//! 3. `reverse.detached` —— 异步 stop 的旧线程句柄表，只由 restart 串行路径访问；
+//! 4. `p2p` —— 绑定关系；
+//! 5. `jitter` —— 正向抖动缓冲；
+//! 6. `reverse_shared.config` —— 反向 Opus 配置；
+//! 7. `pairing_denied` —— 本次运行内被拒设备表；
+//! 8. `decode_thread` / `retry_at` / `reject_log` / `event_log` —— 叶子锁，
 //!    不与任何其它锁嵌套。
 //!
 //! 实践上绝大多数路径只取一把锁：需要多步时先拿快照、放锁、再操作。
-//! 唯一有意的嵌套是 `reverse.restart → reverse.sender`（以及 take 之后在
-//! `restart` 保护下、**槽位锁已释放**时执行 `ReverseSender::stop()` 的 join）。
+//! 唯一有意的嵌套是 `reverse.restart → reverse.sender` /
+//! `reverse.restart → reverse.detached`（以及 take 之后在 `restart` 保护下、
+//! **槽位锁已释放**时执行 `ReverseSender::stop()` 的 join）。
 //! 任何路径都不允许在持有 `reverse.sender` 时 join：发送线程启动可能要几百
 //! 毫秒，而 keepalive 的 `reverse_sender_alive()` 与 UI 线程都要读这个槽位。
 
@@ -35,7 +37,7 @@ use crate::logf;
 use crate::protocol;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
@@ -209,9 +211,22 @@ struct ReverseState {
     /// 之外（否则 keepalive 路径的 `reverse_sender_alive()` 以及 UI 线程会被
     /// 一串到底）。但“同一时刻只有一个发送线程持有环回端点”这个不变量需要
     /// 跨线程串行化（控制面 async 任务 + UI 线程都会重启），所以单独用一把锁。
-    restart: Mutex<()>,
+    ///
+    /// `Arc` 是为了让 UI 停止在拿不到锁时能把状态带进后台收尾线程（见
+    /// [`Session::spawn_stop_after_restart`]）。
+    restart: Arc<Mutex<()>>,
     /// 反向音频发送器句柄
-    sender: Mutex<Option<capture::ReverseSender>>,
+    sender: Arc<Mutex<Option<capture::ReverseSender>>>,
+    /// 异步 stop 后由后台线程 join 的旧发送器线程句柄。
+    ///
+    /// restart 的同步路径在安装新线程前先等它们退出：旧线程可能卡在 WASAPI
+    /// 初始化，若不等就启动新采集线程，会出现两个环回端点短暂并存
+    /// （旧的还持有设备，新的已开始发送）。
+    detached: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    /// UI 停止请求。restart 持锁同步 join 期间 UI 拿不到 `restart` 锁，
+    /// 只能先置位；restart 在安装新发送器前检查它，后台收尾线程随后补一次
+    /// stop，覆盖“restart 已越过检查点、即将安装”的窗口。
+    stop_requested: Arc<AtomicBool>,
     /// 死发送线程的最小重试间隔状态：1 Hz CONNECT 若每次都完整 stop/join +
     /// 重建设备/Opus，会持续阻塞 RTP 接收。地址/SSRC/端口真实变化仍立即重启。
     retry_at: Mutex<Option<Instant>>,
@@ -250,8 +265,10 @@ impl Session {
             audio_state: AtomicU8::new(AudioInitState::Pending as u8),
             audio_stats: Arc::new(AudioStats::default()),
             reverse: ReverseState {
-                restart: Mutex::new(()),
-                sender: Mutex::new(None),
+                restart: Arc::new(Mutex::new(())),
+                sender: Arc::new(Mutex::new(None)),
+                detached: Arc::new(Mutex::new(Vec::new())),
+                stop_requested: Arc::new(AtomicBool::new(false)),
                 retry_at: Mutex::new(None),
             },
             reverse_shared: Arc::new(capture::ReverseShared::new()),
@@ -519,8 +536,16 @@ impl Session {
             .restart
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.stop_reverse_sender_under(&serial);
-        if should_start_reverse(self.running(), &self.p2p(), addr, ssrc) {
+        // 新的 restart 代表新的启动意图：清掉上一个停止请求。若 UI 在本函数
+        // 持锁期间再次停止，会因 `try_lock` 失败重新置位，安装前的检查能看到。
+        self.reverse.stop_requested.store(false, Ordering::Release);
+        self.stop_reverse_sender_under(&serial, true);
+        // 先等此前异步 stop 的旧线程退出，再安装新线程：旧线程可能卡在
+        // WASAPI 初始化，不等就会与新采集线程短暂并存。
+        self.wait_detached_reverse_senders();
+        if !self.reverse.stop_requested.load(Ordering::Acquire)
+            && should_start_reverse(self.running(), &self.p2p(), addr, ssrc)
+        {
             let sender =
                 capture::ReverseSender::start(addr, ssrc, Arc::clone(&self.reverse_shared));
             *self
@@ -532,13 +557,104 @@ impl Session {
     }
 
     /// 停止反向发送器（`stop()` 的 `join` 在槽位锁之外完成）。
+    ///
+    /// UI 停止（`reset_to_ready`）与控制面超时路径**不能等待 join**：发送线程
+    /// 的启动段是裸 WASAPI COM + 环回端点初始化，驱动/音频服务挂起时没有上限
+    /// （输出侧 `start_audio` 已用 2.5 s 上限处理同类问题）。这里把 `stop()`
+    /// 整体移到后台线程：它会先置取消标志，正常线程在 10+20 ms 内退出；挂起时
+    /// 调用方立即返回，UI 不再假死。所有共享状态都是 Arc/Atomic，先行返回安全。
+    /// （restart 路径仍同步 join，见 [`Self::stop_reverse_sender_under`]。）
+    ///
+    /// 若 restart 正持锁同步 join 旧线程，**不能阻塞等锁**（那正是 UI 在
+    /// “驱动挂起、restart 等 join”时冻结的场景）：置停止请求并交给后台
+    /// 收尾线程，等 restart 释放锁后补一次 stop。
     fn stop_reverse_sender(&self) {
-        let serial = self
-            .reverse
-            .restart
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.stop_reverse_sender_under(&serial);
+        match self.reverse.restart.try_lock() {
+            Ok(serial) => self.stop_reverse_sender_under(&serial, false),
+            Err(TryLockError::Poisoned(e)) => {
+                let serial = e.into_inner();
+                self.stop_reverse_sender_under(&serial, false);
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.reverse.stop_requested.store(true, Ordering::Release);
+                self.spawn_stop_after_restart();
+            }
+        }
+    }
+
+    /// restart 持锁期间收到的 UI 停止请求：在锁释放后补一次异步 stop。
+    ///
+    /// 只置位不够：restart 可能已经越过安装前的 `stop_requested` 检查，
+    /// 随后才执行 install。收尾线程拿到锁后先复核请求，若期间已有新 restart
+    /// 清除请求（新会话已启动）则不得误杀。join 在锁外完成，不阻塞后续 restart。
+    fn spawn_stop_after_restart(&self) {
+        // 线程创建失败（极端资源耗尽）重试一次；仍失败则留日志，由下一次
+        // restart 同步停止。不能静默丢失这次停止意图。
+        let mut last_err = None;
+        for _ in 0..2 {
+            let restart = Arc::clone(&self.reverse.restart);
+            let sender = Arc::clone(&self.reverse.sender);
+            let detached = Arc::clone(&self.reverse.detached);
+            let stop_requested = Arc::clone(&self.reverse.stop_requested);
+            let spawned = std::thread::Builder::new()
+                .name("reverse-stop-late".into())
+                .spawn(move || {
+                    let _serial = restart.lock().unwrap_or_else(|e| e.into_inner());
+                    if !stop_requested.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let old = sender.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(old) = old {
+                        // 登记必须在 restart 锁内完成：否则排队中的新 restart
+                        // 可能在“取走 sender”与“入表”之间拿到锁，看到空表
+                        // 就直接安装新线程，旧/新发送线程就会并存。
+                        // join 本身在 spawn 出的后台线程里，不阻塞这把锁。
+                        spawn_sender_join(old, &detached);
+                    }
+                });
+            match spawned {
+                Ok(_) => return,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(e) = last_err {
+            logf!("[Reverse] 延迟停止线程连续创建失败（{e}），留待下次 restart 同步停止");
+        }
+    }
+
+    /// 等待此前异步 stop 的旧发送线程退出（最多 2.5 s，对齐 `start_audio`）。
+    ///
+    /// 调用方必须持有 `reverse.restart`，因此不会与新的异步 stop 并发入表。
+    /// 超时说明旧线程仍卡在驱动/音频服务初始化：它的取消标志已置，一旦进入
+    /// 发送循环就会自行退出。此时记日志放行新线程，句柄 detach。
+    fn wait_detached_reverse_senders(&self) {
+        let pending: Vec<_> = std::mem::take(
+            &mut *self
+                .reverse
+                .detached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if pending.is_empty() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        let mut timed_out = false;
+        for handle in pending {
+            while !handle.is_finished() {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+        if timed_out {
+            logf!("[Reverse] 旧发送线程 2.5 s 内未退出，先启动新线程（取消标志已置）");
+        }
     }
 
     /// 取出槽位并 `stop()`。调用方必须已持有 `reverse.restart`
@@ -548,7 +664,10 @@ impl Session {
     /// - 阻塞持有唯一 UDP socket 的 async 接收任务（期间不读数据报）；
     /// - 阻塞 UI 线程（`reset_to_ready` 路径），整个窗口冻结；
     /// - 把每次 keepalive 都要抢同一把锁的 `reverse_sender_alive()` 一起串住。
-    fn stop_reverse_sender_under(&self, _serial: &MutexGuard<'_, ()>) {
+    ///
+    /// `wait` 为 true 时同步 join（restart 路径，已在 `spawn_blocking` 里，且
+    /// 必须等旧线程释放环回端点后才能安装新线程）；false 时交给后台线程 join。
+    fn stop_reverse_sender_under(&self, _serial: &MutexGuard<'_, ()>, wait: bool) {
         // 临时守卫在语句结束即释放，`stop()` 在锁外执行。
         let old = self
             .reverse
@@ -556,9 +675,15 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(old) = old {
+        let Some(old) = old else {
+            return;
+        };
+        if wait {
             old.stop();
+            return;
         }
+        // 后台 join，并登记句柄供 restart 同步等待（见 `wait_detached_reverse_senders`）。
+        spawn_sender_join(old, &self.reverse.detached);
     }
 
     fn reverse_retry_at(&self) -> Option<Instant> {
@@ -868,6 +993,44 @@ fn pairing_action(
         PairingAction::Ignore
     } else {
         PairingAction::Prompt
+    }
+}
+
+/// 在后台线程 join 一个已出槽的发送器，并把句柄登记到 `detached`。
+///
+/// `restart` 的同步路径在安装新线程前等待这些句柄，保证旧采集线程（可能
+/// 仍卡在 WASAPI 初始化）不会与新线程并存。登记与 `stop()` 调用都在
+/// `reverse.restart` 之外，不会形成新的锁序。线程创建失败时退回同步 join，
+/// 否则 `ReverseSender` 被裸 drop 会连取消标志都无法置位。
+fn spawn_sender_join(
+    old: capture::ReverseSender,
+    detached: &Mutex<Vec<std::thread::JoinHandle<()>>>,
+) {
+    let slot = Arc::new(Mutex::new(Some(old)));
+    let background = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("reverse-stop".into())
+        .spawn(move || {
+            let sender = background
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(sender) = sender {
+                sender.stop();
+            }
+        });
+    match spawned {
+        Ok(handle) => detached
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle),
+        Err(e) => {
+            logf!("[Reverse] 停止线程创建失败（{e}），退回同步等待发送线程退出");
+            let sender = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(sender) = sender {
+                sender.stop();
+            }
+        }
     }
 }
 
