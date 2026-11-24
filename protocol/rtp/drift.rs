@@ -47,6 +47,9 @@ pub const WATER_TARGET_MAX_MS: u32 = 600;
 /// 用户可选的目标水位档位（ms）；首档必须等于 [`WATER_TARGET_MIN_MS`]。
 pub const WATER_TARGET_STEPS_MS: [u32; 5] = [80, 120, 160, 200, 300];
 const _: () = assert!(WATER_TARGET_STEPS_MS[0] == WATER_TARGET_MIN_MS);
+// 导出到 JNI 与 Kotlin 的档位数固定为 5：扩档时必须同时更新
+// `protocol/jni/control.rs` 与 Android `Udp2CalProtocol.WATER_TARGET_STEPS_MS` 及 parity 测试。
+const _: () = assert!(WATER_TARGET_STEPS_MS.len() == 5);
 
 /// 运行时目标水位：默认 [`WATER_TARGET_MS`]，可用 `UDP2CAL_WATER_TARGET_MS` 覆盖。
 ///

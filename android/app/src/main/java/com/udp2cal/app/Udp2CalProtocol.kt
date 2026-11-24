@@ -90,6 +90,14 @@ object Udp2CalProtocol {
     const val WATER_TARGET_MIN_MS = 80
     const val WATER_TARGET_MAX_MS = 600
 
+    /**
+     * 可选水位档位（ms）。与 Rust `protocol/rtp/drift.rs` 的同名常量
+     * `WATER_TARGET_STEPS_MS` 逐项对应，由
+     * `Udp2CalProtocolTest.nativeConstantsMatchKotlinConstants` 守住；
+     * 数组不能用 `const`，故为 `val`。
+     */
+    val WATER_TARGET_STEPS_MS: IntArray = intArrayOf(80, 120, 160, 200, 300)
+
     const val DECODE_LIMIT_MS = 40
     const val PLC_LEAD_MS = 20
     const val PLC_MAX_MS = 120

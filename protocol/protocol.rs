@@ -184,6 +184,25 @@ pub fn parse_control(buf: &[u8]) -> Option<(ControlHeader, &[u8])> {
     Some((hdr, &buf[CONTROL_HEADER_SIZE..]))
 }
 
+/// 构造固定 15 字节控制头（版本、类型、负载长度大端序、设备 ID）。
+///
+/// 头布局的单一真源：[`build_control`] 与 [`build_control_to`] 都经由这里写入，
+/// 不再各写一份字段赋值。`payload_len` 必须已被调用方校验/截断到
+/// [`CONTROL_MAX_PAYLOAD`] 以内；保留字节由数组初始化保持为 0。
+fn control_header(
+    msg_type: u8,
+    device_id: &[u8; DEVICE_ID_SIZE],
+    payload_len: usize,
+) -> [u8; CONTROL_HEADER_SIZE] {
+    let mut hdr = [0u8; CONTROL_HEADER_SIZE];
+    hdr[0] = CONTROL_VERSION;
+    hdr[2] = msg_type;
+    hdr[3] = (payload_len >> 8) as u8;
+    hdr[4] = payload_len as u8;
+    hdr[7..].copy_from_slice(device_id);
+    hdr
+}
+
 /// 构造成完整控制包（分配新 Vec）
 ///
 /// 负载上限 [`CONTROL_MAX_PAYLOAD`]：超限时截断到上限（保证不会构造出非法
@@ -197,10 +216,11 @@ pub fn build_control(msg_type: u8, device_id: &[u8; DEVICE_ID_SIZE], payload: &[
         payload.len(),
         CONTROL_MAX_PAYLOAD
     );
-    let len = payload.len().min(CONTROL_MAX_PAYLOAD);
-    let mut out = vec![0u8; CONTROL_HEADER_SIZE + len];
-    build_control_to(&mut out, 0, msg_type, device_id, &payload[..len])
-        .expect("缓冲区按 15 + len 分配，截断后的负载不可能装不下");
+    let payload = &payload[..payload.len().min(CONTROL_MAX_PAYLOAD)];
+    let header = control_header(msg_type, device_id, payload.len());
+    let mut out = Vec::with_capacity(CONTROL_HEADER_SIZE + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
     out
 }
 
@@ -224,14 +244,8 @@ pub fn build_control_to(
     if end > dest.len() {
         return None;
     }
-    dest[offset] = CONTROL_VERSION;
-    dest[offset + 1] = 0;
-    dest[offset + 2] = msg_type;
-    dest[offset + 3] = (payload.len() >> 8) as u8;
-    dest[offset + 4] = payload.len() as u8;
-    dest[offset + 5] = 0;
-    dest[offset + 6] = 0;
-    dest[offset + 7..offset + 15].copy_from_slice(device_id);
+    let header = control_header(msg_type, device_id, payload.len());
+    dest[offset..offset + CONTROL_HEADER_SIZE].copy_from_slice(&header);
     dest[offset + CONTROL_HEADER_SIZE..end].copy_from_slice(payload);
     Some(total)
 }
@@ -957,6 +971,57 @@ mod tests {
         assert!(build_control_to(&mut buf, edge, TYPE_CONNECT, &DEV, &payload).is_none());
         // 不溢出的超大 offset 仍然按"缓冲区不足"拒绝
         assert!(build_control_to(&mut buf, 64, TYPE_CONNECT, &DEV, &payload).is_none());
+    }
+
+    /// `build_control` 与 `build_control_to(.., 0, ..)` 必须逐字节一致：
+    /// 两者共用 [`control_header`]，不能各写一份头布局。
+    #[test]
+    fn build_control_matches_build_control_to() {
+        // 负载内容随下标变化，避免“两边都是零”造成的假通过
+        let payload: Vec<u8> = (0..=CONTROL_MAX_PAYLOAD).map(|i| i as u8).collect();
+        for &msg_type in &[TYPE_CONNECT, TYPE_DISCOVER_REPLY] {
+            for &len in &[0usize, 1, 15, CONTROL_MAX_PAYLOAD] {
+                let expected = build_control(msg_type, &DEV, &payload[..len]);
+                let mut buf = vec![0u8; CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD];
+                let n = build_control_to(&mut buf, 0, msg_type, &DEV, &payload[..len]).unwrap();
+                assert_eq!(n, CONTROL_HEADER_SIZE + len);
+                assert_eq!(expected, &buf[..n], "msg_type={msg_type} len={len}");
+            }
+        }
+    }
+
+    /// 超限负载在 debug 构建必须被 `debug_assert` 拦下（这是文档承诺的兜底语义）。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "超过上限")]
+    fn build_control_over_limit_panics_in_debug() {
+        let payload = vec![0u8; CONTROL_MAX_PAYLOAD + 1];
+        let _ = build_control(TYPE_CONNECT, &DEV, &payload);
+    }
+
+    /// release 构建没有 `debug_assert`：`build_control` 必须截断到上限，且与
+    /// `build_control_to` 写入截断后负载的结果逐字节一致（`cargo test --release`）。
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn build_control_truncates_over_limit_payload() {
+        let payload: Vec<u8> = (0..=CONTROL_MAX_PAYLOAD).map(|i| i as u8).collect();
+        assert_eq!(payload.len(), CONTROL_MAX_PAYLOAD + 1);
+        let truncated = build_control(TYPE_CONNECT, &DEV, &payload);
+        let mut buf = vec![0u8; CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD];
+        let n = build_control_to(
+            &mut buf,
+            0,
+            TYPE_CONNECT,
+            &DEV,
+            &payload[..CONTROL_MAX_PAYLOAD],
+        )
+        .unwrap();
+        assert_eq!(n, CONTROL_HEADER_SIZE + CONTROL_MAX_PAYLOAD);
+        assert_eq!(truncated, &buf[..n]);
+        assert_eq!(
+            ControlHeader::decode(&truncated).unwrap().payload_len,
+            CONTROL_MAX_PAYLOAD as u16
+        );
     }
 
     #[test]

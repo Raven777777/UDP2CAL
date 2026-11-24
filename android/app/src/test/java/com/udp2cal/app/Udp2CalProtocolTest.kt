@@ -1089,6 +1089,11 @@ class Udp2CalProtocolTest {
             expectedWaterTarget.toLong(),
             Udp2CalProtocol.WATER_TARGET_MIN_MS.toLong(),
             Udp2CalProtocol.WATER_TARGET_MAX_MS.toLong(),
+            Udp2CalProtocol.WATER_TARGET_STEPS_MS[0].toLong(),
+            Udp2CalProtocol.WATER_TARGET_STEPS_MS[1].toLong(),
+            Udp2CalProtocol.WATER_TARGET_STEPS_MS[2].toLong(),
+            Udp2CalProtocol.WATER_TARGET_STEPS_MS[3].toLong(),
+            Udp2CalProtocol.WATER_TARGET_STEPS_MS[4].toLong(),
             Udp2CalProtocol.DECODE_LIMIT_MS.toLong(),
             Udp2CalProtocol.PLC_LEAD_MS.toLong(),
             Udp2CalProtocol.PLC_MAX_MS.toLong(),
@@ -1108,6 +1113,9 @@ class Udp2CalProtocolTest {
         )
         val actual = ProtocolNative.constants()
         assertEquals("常量个数", expected.size, actual.size)
+        // 数组只逐项比对 [0..4]；若 Kotlin/ Rust 的档位列表本身变长或漂移，
+        // 上面的常量个数断言不会红，必须显式钉住档位数。
+        assertEquals("水位档位数", 5, Udp2CalProtocol.WATER_TARGET_STEPS_MS.size)
         for (i in expected.indices) {
             assertEquals("第 $i 项常量与 Rust 不一致", expected[i], actual[i])
         }

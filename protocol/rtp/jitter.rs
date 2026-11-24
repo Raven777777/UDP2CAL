@@ -557,14 +557,14 @@ impl JitterBuffer {
             }
         }
 
-        if self.find_ts(self.next_ts).is_some() {
+        if let Some(idx) = self.find_ts(self.next_ts) {
             // 解码缓冲已够深：生产节奏必须由声卡消费节奏约束，
             // 否则断流时解码线程会以 CPU 速度填满整个环。
             if ring_ms >= DECODE_LIMIT_MS {
                 return Pull::Wait;
             }
             // `out` 放不下整帧同样返回 Wait（与原先一致，不得落入下方 PLC 分支）。
-            match self.consume_next(out) {
+            match self.consume_at(idx, out) {
                 Some((len, ts)) => return Pull::Packet { len, ts },
                 None => return Pull::Wait,
             }
@@ -651,8 +651,8 @@ impl JitterBuffer {
         if self.next_ts >= self.highest_ts {
             return Pull::Wait;
         }
-        if self.find_ts(self.next_ts).is_some() {
-            let Some((len, ts)) = self.consume_next(out) else {
+        if let Some(idx) = self.find_ts(self.next_ts) {
+            let Some((len, ts)) = self.consume_at(idx, out) else {
                 return Pull::Wait;
             };
             self.stats.step_trims += 1;
@@ -734,10 +734,12 @@ impl JitterBuffer {
         Some(len)
     }
 
-    /// 取走播放头（`next_ts`）上的真实包：拷出负载、清槽、推进时间线。
-    /// 播放头没有包或 `out` 放不下时返回 `None`（状态不变）。
-    fn consume_next(&mut self, out: &mut [u8]) -> Option<(usize, u64)> {
-        let idx = self.find_ts(self.next_ts)?;
+    /// 取走槽位 `idx` 上的真实包：拷出负载、清槽、推进时间线。
+    ///
+    /// `idx` 必须是 [`find_ts`](Self::find_ts) 探测到的有效槽位；调用方先探测
+    /// 再调用，避免同一帧对 64 个槽位扫描两遍。`out` 放不下时返回 `None`
+    /// （状态不变）。
+    fn consume_at(&mut self, idx: usize, out: &mut [u8]) -> Option<(usize, u64)> {
         let len = self.payload_at(idx, out)?;
         let played_seq = self.slots[idx].seq;
         self.slots[idx].valid = false;
@@ -889,6 +891,31 @@ mod tests {
         insert(&mut jb, 3, 1440, false, 13);
         insert(&mut jb, 1, 480, false, 11);
         assert_eq!(pull_tags(&mut jb, 0, 4), vec![10, 11, 12, 13]);
+    }
+
+    /// `pull`/`pull_trim` 先探测槽位再消费：`consume_at` 直接用探测到的索引，
+    /// 不再对同一帧做第二遍扫描。这里直接验证其副作用与出包结果。
+    #[test]
+    fn consume_at_plays_the_probed_slot() {
+        let mut jb = JitterBuffer::new();
+        for i in 0..4u16 {
+            insert(&mut jb, i, 480 * i as u32, i == 0, i as u8 + 1);
+        }
+        let idx = jb.find_ts(jb.next_ts()).expect("播放头应有包");
+        let mut out = [0u8; OPUS_MAX_PAYLOAD];
+        assert_eq!(jb.consume_at(idx, &mut out), Some((1, 0)));
+        assert_eq!(out[0], 1);
+        // 该帧已出槽，播放头与序号同步前进
+        assert!(jb.find_ts(0).is_none());
+        assert_eq!(jb.next_ts(), 480);
+        assert_eq!(jb.next_seq(), 4);
+        assert_eq!(jb.water_ms(), 30);
+
+        // `out` 放不下：返回 None 且状态不变（与 pull 转 Wait 的路径一致）
+        let idx = jb.find_ts(jb.next_ts()).expect("下一帧应在槽里");
+        assert_eq!(jb.consume_at(idx, &mut []), None);
+        assert_eq!(jb.next_ts(), 480);
+        assert!(jb.find_ts(480).is_some());
     }
 
     #[test]

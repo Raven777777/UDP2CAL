@@ -6,17 +6,13 @@
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, Optional, Sequence, Union
+from typing import Callable, Iterable, Optional, Sequence
 
 from . import runner
 from .logger import C
 
 _BOX_WIDTH = 44
 _TAIL_LINES = 15
-
-# 镜像参数既可以是现成的序列，也可以是延迟求值的工厂：返回 None 表示本次
-# 无法构造镜像参数（如 init 脚本写入失败），此时放弃重试。
-MirrorArgs = Union[Sequence[str], Callable[[], Optional[Sequence[str]]]]
 
 
 def print_failure_tail(result: runner.RunResult, logger, keywords: Iterable[str]) -> None:
@@ -47,7 +43,7 @@ def success_box(logger, lines: Iterable[str]) -> None:
 def run_with_mirror(
     run,
     cmd: Sequence[str],
-    mirror_args: MirrorArgs,
+    mirror_args: Callable[[], Optional[Sequence[str]]],
     logger,
     *,
     warn_message: str,
@@ -58,12 +54,16 @@ def run_with_mirror(
     是否进入该流程（例如 ``mirror_mode == "auto"``）由调用方判定；本函数只
     根据 ``RunResult.network_failed`` 决定是否重试。``kwargs`` 原样透传给
     两次 ``run`` 调用。
+
+    ``mirror_args`` 只接受零参数工厂，且仅在需要重试时才调用：既能延迟求值
+    （失败前不产生镜像配置等副作用），返回 ``None`` 也表示无法构造镜像参数
+    （如 init 脚本写入失败），此时放弃重试。
     """
     result = run(cmd, logger=logger, **kwargs)
     if not result.ok and result.network_failed:
         logger.blank()
         logger.warn(warn_message)
-        extra = mirror_args() if callable(mirror_args) else mirror_args
+        extra = mirror_args()
         if extra is None:
             return result
         result = run(list(cmd) + list(extra), logger=logger, **kwargs)

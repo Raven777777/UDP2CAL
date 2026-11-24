@@ -137,7 +137,8 @@ struct DecodeCtx {
 impl DecodeCtx {
     /// 创建设备与解码器并完成全部初始状态。返回 `None` 时初始化状态已被
     /// 置为对应的失败态（`DecoderFailed` / `DeviceFailed`）。
-    fn new(session: Arc<Session>, stats: Arc<audio::AudioStats>) -> Option<Self> {
+    fn new(session: Arc<Session>) -> Option<Self> {
+        let stats = session.audio_stats().clone();
         let dec = match decoder::OpusDecoder::new() {
             Ok(d) => d,
             Err(e) => {
@@ -224,6 +225,30 @@ impl DecodeCtx {
         }
     }
 
+    /// 复位估计器与 ASRC 接缝状态（单一路径，避免字段列表在多个复位点漂移）。
+    ///
+    /// `reinit=true`：输出流重建后设备时钟/播放头从 0 重新开始，
+    /// 按当前 `self.device_rate` 重新构造估计器；
+    /// `reinit=false`：空闲 / epoch 变化，沿用原实例只清历史。
+    /// 两条路径都清掉接缝电平与欠载时刻。
+    fn reset_estimators(&mut self, reinit: bool) {
+        if reinit {
+            self.drift = protocol::rtp::DriftController::with_target(
+                self.device_rate,
+                self.session.water_target_ms(),
+            );
+            self.device_rate_est =
+                protocol::rtp::DeviceRateEstimator::with_rate(self.device_rate);
+            self.step = protocol::rtp::StepAbsorber::new();
+        } else {
+            self.drift.reset();
+            self.device_rate_est.reset();
+            self.step.reset();
+        }
+        self.last_pcm = None;
+        self.underrun_at = None;
+    }
+
     /// 未运行时复位一次状态并按 50 ms 兜底轮询；返回 true 表示本 tick 应继续。
     fn handle_idle(&mut self) -> bool {
         if self.session.running() {
@@ -233,15 +258,11 @@ impl DecodeCtx {
         if !self.idle {
             self.idle = true;
             self.session.jitter().reset();
-            self.drift.reset();
-            self.device_rate_est.reset();
-            self.step.reset();
+            self.reset_estimators(false);
             self.dec.reset();
             self.aw.flush();
             self.last_packet_at = Instant::now();
             self.idle_feedback = false;
-            self.last_pcm = None;
-            self.underrun_at = None;
             AUDIO_LEVEL_DB.store((-60.0f32).to_bits(), Ordering::Relaxed);
         }
         std::thread::park_timeout(Duration::from_millis(50));
@@ -283,15 +304,7 @@ impl DecodeCtx {
                 self.session.jitter().reset();
                 self.device_rate = self.aw.device_rate.max(1);
                 // 新流的设备时钟/播放头从 0 重新开始，旧估计器历史必须作废。
-                self.drift = protocol::rtp::DriftController::with_target(
-                    self.device_rate,
-                    self.session.water_target_ms(),
-                );
-                self.device_rate_est =
-                    protocol::rtp::DeviceRateEstimator::with_rate(self.device_rate);
-                self.step = protocol::rtp::StepAbsorber::new();
-                self.last_pcm = None;
-                self.underrun_at = None;
+                self.reset_estimators(true);
                 self.session.set_audio_state(AudioInitState::Ready);
                 logf!("[Audio] 输出流已重建（{} Hz）", self.aw.device_rate);
                 true
@@ -311,12 +324,8 @@ impl DecodeCtx {
         if epoch != self.last_epoch {
             self.last_epoch = epoch;
             self.dec.reset();
-            self.drift.reset();
-            self.device_rate_est.reset();
-            self.step.reset();
+            self.reset_estimators(false);
             self.aw.flush();
-            self.last_pcm = None;
-            self.underrun_at = None;
         }
     }
 
@@ -673,7 +682,6 @@ impl DecodeCtx {
 ///     超时值只是兜底唤醒，不参与播放决策。
 pub(crate) fn init_audio_worker(session: Arc<Session>) {
     session.set_audio_state(AudioInitState::Pending);
-    let stats = session.audio_stats().clone();
     let spawn_session = Arc::clone(&session);
 
     let spawn_result = std::thread::Builder::new()
@@ -686,7 +694,7 @@ pub(crate) fn init_audio_worker(session: Arc<Session>) {
             let _mmcss = power::boost_current_thread("Audio", "解码线程");
             spawn_session.set_decode_thread(std::thread::current());
 
-            if let Some(ctx) = DecodeCtx::new(spawn_session, stats) {
+            if let Some(ctx) = DecodeCtx::new(spawn_session) {
                 ctx.run();
             }
         });

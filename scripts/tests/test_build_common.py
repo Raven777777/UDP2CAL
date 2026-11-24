@@ -149,12 +149,32 @@ class RunWithMirrorTest(unittest.TestCase):
 
         logger = self._logger()
         result = build_common.run_with_mirror(
-            run, ["build"], ["--mirror"], logger, warn_message="warn", cwd="dir", env={"A": "1"}
+            run, ["build"], lambda: ["--mirror"], logger, warn_message="warn", cwd="dir", env={"A": "1"}
         )
 
         self.assertTrue(result.ok)
         self.assertEqual(calls, [["build"]])
         self.assertEqual(logger.warns, [])
+
+    def test_success_does_not_call_mirror_factory(self):
+        calls = []
+        factory_calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return runner.RunResult(code=0, lines=[])
+
+        def mirror_args():
+            factory_calls.append(True)
+            return ["--mirror"]
+
+        result = build_common.run_with_mirror(
+            run, ["build"], mirror_args, self._logger(), warn_message="warn"
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, [["build"]])
+        self.assertEqual(factory_calls, [])
 
     def test_network_failure_retries_with_mirror_args_and_forwards_kwargs(self):
         calls = []
@@ -173,7 +193,7 @@ class RunWithMirrorTest(unittest.TestCase):
         result = build_common.run_with_mirror(
             run,
             ["build"],
-            ["--mirror"],
+            lambda: ["--mirror"],
             logger,
             warn_message="switch mirror",
             cwd="dir",
@@ -197,7 +217,7 @@ class RunWithMirrorTest(unittest.TestCase):
 
         logger = self._logger()
         result = build_common.run_with_mirror(
-            run, ["build"], ["--mirror"], logger, warn_message="warn"
+            run, ["build"], lambda: ["--mirror"], logger, warn_message="warn"
         )
 
         self.assertFalse(result.ok)
@@ -227,7 +247,7 @@ class RunWithMirrorTest(unittest.TestCase):
             return runner.RunResult(code=1, lines=["could not resolve host: crate.io"])
 
         build_common.run_with_mirror(
-            run, cmd, ["--mirror"], self._logger(), warn_message="warn"
+            run, cmd, lambda: ["--mirror"], self._logger(), warn_message="warn"
         )
 
         self.assertEqual(cmd, ["build"])

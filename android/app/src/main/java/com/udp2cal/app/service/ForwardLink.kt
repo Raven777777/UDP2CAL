@@ -29,12 +29,15 @@ import kotlin.coroutines.coroutineContext
 /** 语音模式：由编码器快照（而非再次读 Prefs）决定音源与 AEC 路由。 */
 internal fun EncoderCfg.voiceMode(): Boolean = signal == 3001
 
-/** 状态卡展示用：当前码率控制模式 */
-internal fun EncoderCfg.vbrMode(): VbrMode = when {
+/** 状态卡展示用：当前码率控制模式的**唯一推导点**。 */
+internal fun vbrModeOf(vbr: Int, vbrConstraint: Int): VbrMode = when {
     vbr == 0 -> VbrMode.CBR
     vbrConstraint == 1 -> VbrMode.VBR_CONSTRAINED
     else -> VbrMode.VBR
 }
+
+/** 状态卡展示用：当前码率控制模式 */
+internal fun EncoderCfg.vbrMode(): VbrMode = vbrModeOf(vbr, vbrConstraint)
 
 /**
  * 读返回负值时是否作为设备失效上报。

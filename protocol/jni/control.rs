@@ -21,7 +21,7 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
     env: Env,
     _this: jobject,
 ) -> jlongArray {
-    let v: [jlong; 52] = [
+    let v: [jlong; 57] = [
         CONTROL_VERSION as jlong,
         CONTROL_HEADER_SIZE as jlong,
         CONTROL_MAX_PAYLOAD as jlong,
@@ -58,6 +58,13 @@ pub unsafe extern "system" fn Java_com_udp2cal_app_native_ProtocolNative_constan
         water_target_ms() as jlong,
         crate::rtp::WATER_TARGET_MIN_MS as jlong,
         crate::rtp::WATER_TARGET_MAX_MS as jlong,
+        // 可选水位档位，顺序与 Kotlin Udp2CalProtocol.WATER_TARGET_STEPS_MS
+        // 逐项对应（由 parity 测试守住）。
+        crate::rtp::WATER_TARGET_STEPS_MS[0] as jlong,
+        crate::rtp::WATER_TARGET_STEPS_MS[1] as jlong,
+        crate::rtp::WATER_TARGET_STEPS_MS[2] as jlong,
+        crate::rtp::WATER_TARGET_STEPS_MS[3] as jlong,
+        crate::rtp::WATER_TARGET_STEPS_MS[4] as jlong,
         crate::rtp::DECODE_LIMIT_MS as jlong,
         crate::rtp::PLC_LEAD_MS as jlong,
         crate::rtp::PLC_MAX_MS as jlong,

@@ -9,6 +9,10 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Task};
 use std::sync::atomic::Ordering;
 
+/// 端口输入框占位符：监听端口是编译期常量，每次重绘无需重新格式化。
+static PORT_PLACEHOLDER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| udp2cal_protocol::DEFAULT_LISTEN_PORT.to_string());
+
 /// 文本输入框样式：除边框颜色外与默认暗色主题一致。
 fn input_style(
     border: Color,
@@ -107,10 +111,9 @@ impl AppState {
                 ],
             )
         } else {
-            tf(
-                "footer.broadcast_addr",
-                &[("port", &udp2cal_protocol::DISCOVER_PORT)],
-            )
+            // 文案依赖当前语言：由 AppState 在构造与切换语言时生成缓存，
+            // 避免每帧重绘都查表 + 格式化。
+            self.footer_broadcast.clone()
         };
         let (footer_right, footer_right_color) = if !self.is_running {
             (String::new(), dim)
@@ -233,10 +236,7 @@ impl AppState {
                                 .padding([5, 8])
                                 .style(input_style(Color::from_rgb(0.25, 0.25, 0.30))),
                             text(" : ").size(16).color(dim),
-                            text_input(
-                                &udp2cal_protocol::DEFAULT_LISTEN_PORT.to_string(),
-                                &self.port_input,
-                            )
+                            text_input(PORT_PLACEHOLDER.as_str(), &self.port_input)
                                 .on_input(Message::PortChanged)
                                 .width(68)
                                 .padding([5, 8])

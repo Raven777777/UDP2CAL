@@ -89,6 +89,9 @@ pub(crate) struct AppState {
     /// 提示级别，决定配色
     pub(crate) notice_level: NoticeLevel,
     pub(crate) vb_cable_installed: bool,
+    /// 底部广播地址文案：随当前语言生成一次，菜单切语言时更新。
+    /// 重绘频率远高于语言切换，没必要每帧重新查表 + 格式化。
+    pub(crate) footer_broadcast: String,
     pub(crate) last_toggle_instant: Instant,
     /// 上次写音频诊断日志的时间（30s 一次，避免刷盘）
     pub(crate) last_stats_log: Instant,
@@ -187,6 +190,10 @@ pub(crate) fn run() -> Result<(), iced::Error> {
             let cfg = startup_cfg.clone();
             let now = Instant::now();
             let state = AppState {
+                footer_broadcast: i18n::tf(
+                    "footer.broadcast_addr",
+                    &[("port", &protocol::DISCOVER_PORT)],
+                ),
                 session: Arc::clone(&ui_session),
                 ip_input: cfg.listen_ip.clone(),
                 port_input: cfg.listen_port.to_string(),
@@ -342,6 +349,11 @@ impl AppState {
             Message::SetLanguage(code) => {
                 self.config.language = code;
                 i18n::set_active(&self.config.language);
+                // 语言变了，缓存的底部文案必须同步刷新（构造时已设置过语言）。
+                self.footer_broadcast = i18n::tf(
+                    "footer.broadcast_addr",
+                    &[("port", &protocol::DISCOVER_PORT)],
+                );
                 if self.persist_config() {
                     self.clear_info_notice();
                 }

@@ -121,7 +121,7 @@ def build(ctx, logger) -> int:
         result = build_common.run_with_mirror(
             runner.run,
             cmd,
-            _mirror_args(),
+            _mirror_args,
             logger,
             warn_message="检测到 crates.io 访问失败，切换国内镜像重试",
             cwd=project_dir,

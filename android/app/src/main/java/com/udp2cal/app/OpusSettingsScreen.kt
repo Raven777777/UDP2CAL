@@ -18,6 +18,7 @@ import com.udp2cal.app.service.CaptureMode
 import com.udp2cal.app.service.CaptureService
 import com.udp2cal.app.service.VbrMode
 import com.udp2cal.app.service.labelRes
+import com.udp2cal.app.service.vbrModeOf
 import com.udp2cal.app.service.vbrRes
 import kotlin.math.roundToInt
 
@@ -34,16 +35,23 @@ fun OpusSettingsScreen(
         }.getOrNull().orEmpty().ifEmpty { "?" }
     }
     // ── Opus 编码参数 ──
+    // 开关初值表示**归一化后的用户意图**（非 1 即关，脏值如 2 视为关）。
+    // 生效值由 `vbr || dtx`（DTX 强制 VBR）与 EncoderCfg 统一推导，因此 VBR /
+    // VBR-约束必须读各自的 Prefs 意图，不能直接取 EncoderCfg 的推导值：否则
+    // dtx=1、vbr=0 时开关会显示"VBR 已开"，用户关掉 DTX 后界面仍停在 VBR 开，
+    // 而编码器实际按 CBR 运行。
+    val initialCfg = remember { EncoderCfg.fromPrefs() }
     var complexity by remember { mutableStateOf(Prefs.opusComplexity.toFloat()) }
     var signalType by remember { mutableStateOf(Prefs.opusSignal) }
     var bandwidth by remember { mutableStateOf(Prefs.opusBandwidth) }
-    var dtx by remember { mutableStateOf(Prefs.opusDtx != 0) }
-    var vbr by remember { mutableStateOf(Prefs.opusVbr != 0) }
+    // dtx 归一化与 EncoderCfg 一致（等价于 Prefs.opusDtx == 1）
+    var dtx by remember { mutableStateOf(initialCfg.dtx == 1) }
+    var vbr by remember { mutableStateOf(Prefs.opusVbr == 1) }
     // 码率固定为具体档位：不再有"自动分配"（它等价于用上限，且会强制开 VBR）
     var bitrate by remember { mutableStateOf(Prefs.opusBitrateKbps) }
     var fec by remember { mutableStateOf(Prefs.opusFec != 0) }
     var packetLoss by remember { mutableStateOf(Prefs.opusPacketLoss.toFloat()) }
-    var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint != 0) }
+    var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint == 1) }
     var waterTarget by remember { mutableStateOf(Prefs.waterTargetMs) }
 
     // ── 运行时状态 ──
@@ -165,12 +173,8 @@ fun OpusSettingsScreen(
                     }
                     Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
                         Text(stringResource(R.string.opus_vbr_mode), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        // 与 EncoderCfg.vbrMode() 同义：DTX 会强制 VBR
-                        val shownVbr = when {
-                            !(vbr || dtx) -> VbrMode.CBR
-                            vbrConstraint -> VbrMode.VBR_CONSTRAINED
-                            else -> VbrMode.VBR
-                        }
+                        // 与 EncoderCfg.vbrMode() 共用同一推导：DTX 会强制 VBR
+                        val shownVbr = vbrModeOf(if (vbr || dtx) 1 else 0, if (vbrConstraint) 1 else 0)
                         Text(stringResource((if (isRunning) vbrMode else shownVbr).vbrRes), fontSize = 13.sp, color = Color(0xFFB0B0B0))
                     }
                 }
@@ -352,39 +356,21 @@ fun OpusSettingsScreen(
         )
 
         Text(stringResource(R.string.settings_water_target, waterTarget), fontSize = 14.sp, color = Color.White)
-        run {
-            val lastIdx = WATER_TARGET_STEPS_MS.lastIndex
-            val idx = WATER_TARGET_STEPS_MS.indexOf(waterTarget).takeIf { it >= 0 }
-                ?: WATER_TARGET_STEPS_MS.indexOf(Udp2CalProtocol.WATER_TARGET_MS).coerceAtLeast(0)
-            Slider(
-                value = idx.toFloat(),
-                onValueChange = { v ->
-                    val i = v.roundToInt().coerceIn(0, lastIdx)
-                    val ms = WATER_TARGET_STEPS_MS[i]
-                    if (ms != waterTarget) {
-                        waterTarget = ms
-                        Prefs.waterTargetMs = ms
-                        service?.setReverseWaterTargetMs(ms)
-                    }
-                },
-                valueRange = 0f..lastIdx.toFloat(),
-                steps = WATER_TARGET_STEPS_MS.size - 2,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                WATER_TARGET_STEPS_MS.forEach { ms ->
-                    Text(
-                        "$ms",
-                        fontSize = 10.sp,
-                        color = if (ms == waterTarget) Color(0xFF00E676) else Color(0xFF888888)
-                    )
+        StepSlider(
+            value = waterTarget,
+            values = Udp2CalProtocol.WATER_TARGET_STEPS_MS,
+            tickLabels = Udp2CalProtocol.WATER_TARGET_STEPS_MS.map { it.toString() },
+            onValueChange = { ms ->
+                if (ms != waterTarget) {
+                    waterTarget = ms
+                    Prefs.waterTargetMs = ms
+                    service?.setReverseWaterTargetMs(ms)
                 }
-            }
-            Text(
-                stringResource(R.string.settings_water_target_hint),
-                fontSize = 11.sp, color = Color(0xFF888888)
-            )
-        }
+            },
+            hint = stringResource(R.string.settings_water_target_hint),
+            fallbackIndex = Udp2CalProtocol.WATER_TARGET_STEPS_MS
+                .indexOf(Udp2CalProtocol.WATER_TARGET_MS).coerceAtLeast(0),
+        )
 
         // ═══ 语言 ═══
         Spacer(Modifier.height(12.dp))

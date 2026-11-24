@@ -34,6 +34,3 @@ internal fun bwDisplayName(bw: Int): String {
     val index = BW_CODES.indexOf(bw)
     return if (index >= 0) stringResource(BW_LABEL_RES[index]) else ""
 }
-
-/** 反向接收目标水位五档（ms） */
-internal val WATER_TARGET_STEPS_MS = intArrayOf(80, 120, 160, 200, 300)
