@@ -18,8 +18,9 @@ use windows::Win32::System::Power::{
 };
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentProcess,
-    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    GetCurrentThread, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    ProcessPowerThrottling, SetProcessInformation, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
 use windows::core::w;
 
@@ -141,4 +142,23 @@ impl Drop for MmcssGuard {
             let _ = unsafe { AvRevertMmThreadCharacteristics(handle) };
         }
     }
+}
+
+/// 提升当前线程的音频调度优先级。
+///
+/// 优先注册 MMCSS "Pro Audio"；失败（音频服务被裁剪/组策略限制）时回退到
+/// `THREAD_PRIORITY_HIGHEST`，再失败只告警、不改变控制流。
+///
+/// 返回的守卫必须在线程存活期间持有：Drop 时成对归还 MMCSS 句柄。
+pub(crate) fn boost_current_thread(label: &str, role: &str) -> MmcssGuard {
+    let mmcss = MmcssGuard::acquire(label);
+    if !mmcss.is_active() {
+        // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
+        unsafe {
+            if let Err(e) = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) {
+                logf!("[{label}] {role}提权失败（{e}），继续用默认优先级");
+            }
+        }
+    }
+    mmcss
 }

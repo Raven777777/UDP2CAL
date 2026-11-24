@@ -124,7 +124,6 @@ def run_adb(ctx, logger) -> int:
         sub_ctx.target = getattr(ctx, "target", "modern")
         sub_ctx.build_type = "Debug"
         sub_ctx.abi = getattr(ctx, "abi", None) or "arm64-v8a"
-        sub_ctx.logger = logger
         code = androidmod.build(sub_ctx, logger)
         if code != 0:
             logger.error("编译失败，中止后续步骤")

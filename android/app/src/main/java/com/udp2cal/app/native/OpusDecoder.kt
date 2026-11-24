@@ -27,10 +27,6 @@ class OpusDecoder(val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE, val 
     val frameSize: Int
         get() = Udp2CalProtocol.OPUS_FRAME_SAMPLES
 
-    /** PCM 缓冲总大小 = frameSize × channels（交错） */
-    val pcmBufferSize: Int
-        get() = frameSize * channels
-
     @Synchronized
     fun start(): Boolean {
         if (handle != 0L) return true

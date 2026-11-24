@@ -31,23 +31,27 @@ set "PY="
 
 rem ---- 1) 用户显式指定 ----
 if defined UDP2CAL_PYTHON (
-    "%UDP2CAL_PYTHON%" -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
-    if not errorlevel 1 set "PY="%UDP2CAL_PYTHON%""
+    set PY_CAND="%UDP2CAL_PYTHON%"
+    call :check_python
+    if not errorlevel 1 set PY="%UDP2CAL_PYTHON%"
 )
 
 rem ---- 2) py launcher ----
 if not defined PY (
-    py -3 -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
+    set "PY_CAND=py -3"
+    call :check_python
     if not errorlevel 1 set "PY=py -3"
 )
 
 rem ---- 3) PATH 中的 python / python3 ----
 if not defined PY (
-    python -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
+    set "PY_CAND=python"
+    call :check_python
     if not errorlevel 1 set "PY=python"
 )
 if not defined PY (
-    python3 -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
+    set "PY_CAND=python3"
+    call :check_python
     if not errorlevel 1 set "PY=python3"
 )
 
@@ -85,10 +89,16 @@ rem ---- 转发执行 ----
 %PY% "%~dp0scripts\build.py" %*
 exit /b %ERRORLEVEL%
 
-rem ---- 子过程：校验候选 Python 版本后记录 ----
+rem ---- 子过程：校验候选 Python 版本后返回其状态 ----
+:check_python
+%PY_CAND% -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
+exit /b %errorlevel%
+
+rem ---- 子过程：校验目录候选并记录 ----
 :try_python
 if not exist "%~1" exit /b 0
-"%~1" -c "import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)" >nul 2>&1
+set PY_CAND="%~1"
+call :check_python
 if errorlevel 1 exit /b 0
-set "PY="%~1""
+set PY="%~1"
 exit /b 0

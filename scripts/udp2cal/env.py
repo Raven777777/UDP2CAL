@@ -12,7 +12,7 @@ import glob
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -61,19 +61,6 @@ class RustInfo:
     version: str = ""
 
 
-@dataclass
-class Report:
-    """供 doctor 汇总使用的探测结果。"""
-
-    javas: List[JavaInfo] = field(default_factory=list)
-    sdks: List[SdkInfo] = field(default_factory=list)
-    rust: Optional[RustInfo] = None
-    cmake: Optional[Path] = None
-    cmake_version: str = ""
-    msvc: Optional[Path] = None
-    adb: Optional[Path] = None
-
-
 # ---------------------------------------------------------------- JDK
 
 
@@ -90,20 +77,18 @@ def _parse_major(version: str) -> int:
         return 0
 
 
-def _read_release(home: Path) -> tuple:
+def _read_release(home: Path) -> str:
     release = home / "release"
     if not release.exists():
-        return "", ""
-    version = implementor = ""
+        return ""
+    version = ""
     try:
         for line in release.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("JAVA_VERSION="):
                 version = line.split("=", 1)[1].strip().strip('"')
-            elif line.startswith("IMPLEMENTOR="):
-                implementor = line.split("=", 1)[1].strip().strip('"')
     except OSError:
         pass
-    return version, implementor
+    return version
 
 
 def _java_version_via_cli(java_exe: Path) -> str:
@@ -118,7 +103,7 @@ def _java_version_via_cli(java_exe: Path) -> str:
 def _probe_java(home: Path, source: str) -> Optional[JavaInfo]:
     if not (home / "bin" / "java.exe").exists():
         return None
-    version, _ = _read_release(home)
+    version = _read_release(home)
     if not version:
         version = _java_version_via_cli(home / "bin" / "java.exe")
     return JavaInfo(home=home, version=version, major=_parse_major(version), source=source)
@@ -367,20 +352,6 @@ def detect_adb(sdk: Optional[SdkInfo] = None, override: Optional[str] = None) ->
         return sdk.adb
     found = shutil.which("adb")
     return Path(found) if found else None
-
-
-# ---------------------------------------------------------------- 汇总
-
-
-def collect(logger=None) -> Report:
-    report = Report()
-    report.javas = detect_javas()
-    report.sdks = detect_sdks()
-    report.rust = detect_rust()
-    report.cmake, report.cmake_version = detect_cmake()
-    report.msvc = detect_msvc()
-    report.adb = detect_adb(report.sdks[0] if report.sdks else None)
-    return report
 
 
 def describe_javas(logger, javas: List[JavaInfo]) -> None:

@@ -32,7 +32,7 @@ object Prefs {
         set(v) = prefs.edit().putString("target_ip", v).apply()
 
     var targetPort: Int
-        get() = prefs.getInt("target_port", 44044)
+        get() = prefs.getInt("target_port", Udp2CalProtocol.DEFAULT_LISTEN_PORT)
         set(v) = prefs.edit().putInt("target_port", v).apply()
 
     /** Last discovered Windows identity; blank for manually configured targets. */

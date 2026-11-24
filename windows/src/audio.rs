@@ -342,11 +342,7 @@ impl AudioWriter {
     pub fn flush(&mut self) {
         // tail 归音频回调所有：这里只能投递请求，由回调落地
         self.ring.request_flush();
-        self.reset_filter();
-    }
-
-    /// 清空重采样器状态：相位归零、历史段置零（新数据从静音淡入）
-    fn reset_filter(&mut self) {
+        // 清空重采样器状态：相位归零、历史段置零（新数据从静音淡入）
         self.resampler.reset();
     }
 
@@ -738,12 +734,8 @@ impl Drop for AudioWriter {
 /// VB-Cable 的播放端点名为 "CABLE Input"：应用写入它，对端从 "CABLE Output" 录制。
 const VB_CABLE_RENDER_NAME: &str = "CABLE Input";
 
-pub fn detect_vb_cable() -> Option<String> {
-    let host = cpal::default_host();
-    host.output_devices()
-        .ok()?
-        .filter_map(|d| d.description().ok().map(|desc| desc.name().to_string()))
-        .find(|n| n.contains(VB_CABLE_RENDER_NAME))
+pub fn detect_vb_cable() -> bool {
+    find_vb_cable_device().is_some()
 }
 
 fn find_vb_cable_device() -> Option<cpal::Device> {

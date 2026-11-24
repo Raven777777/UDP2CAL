@@ -557,26 +557,17 @@ impl JitterBuffer {
             }
         }
 
-        if let Some(idx) = self.find_ts(self.next_ts) {
+        if self.find_ts(self.next_ts).is_some() {
             // 解码缓冲已够深：生产节奏必须由声卡消费节奏约束，
             // 否则断流时解码线程会以 CPU 速度填满整个环。
             if ring_ms >= DECODE_LIMIT_MS {
                 return Pull::Wait;
             }
-            let len = self.slots[idx].len as usize;
-            if out.len() < len {
-                return Pull::Wait;
+            // `out` 放不下整帧同样返回 Wait（与原先一致，不得落入下方 PLC 分支）。
+            match self.consume_next(out) {
+                Some((len, ts)) => return Pull::Packet { len, ts },
+                None => return Pull::Wait,
             }
-            let base = idx * OPUS_MAX_PAYLOAD;
-            out[..len].copy_from_slice(&self.data[base..base + len]);
-            let played_seq = self.slots[idx].seq;
-            self.slots[idx].valid = false;
-            let ts = self.next_ts;
-            self.advance();
-            self.next_seq = self.next_seq.max(played_seq + 1);
-            self.plc_run = 0;
-            self.hold = HoldState::Idle;
-            return Pull::Packet { len, ts };
         }
 
         // PCM 提交缓冲还有余量：缺口尚未到期，继续等。
@@ -639,13 +630,7 @@ impl JitterBuffer {
     /// 返回 `None` 表示该帧的包还没到（或 `out` 放不下）。
     pub fn peek_current(&self, out: &mut [u8]) -> Option<usize> {
         let idx = self.find_ts(self.next_ts)?;
-        let len = self.slots[idx].len as usize;
-        if out.len() < len {
-            return None;
-        }
-        let base = idx * OPUS_MAX_PAYLOAD;
-        out[..len].copy_from_slice(&self.data[base..base + len]);
-        Some(len)
+        self.payload_at(idx, out)
     }
 
     /// 阶跃裁剪用：按播放顺序取出下一帧，但**由调用方解码后丢弃 PCM**。
@@ -666,20 +651,10 @@ impl JitterBuffer {
         if self.next_ts >= self.highest_ts {
             return Pull::Wait;
         }
-        if let Some(idx) = self.find_ts(self.next_ts) {
-            let len = self.slots[idx].len as usize;
-            if out.len() < len {
+        if self.find_ts(self.next_ts).is_some() {
+            let Some((len, ts)) = self.consume_next(out) else {
                 return Pull::Wait;
-            }
-            let base = idx * OPUS_MAX_PAYLOAD;
-            out[..len].copy_from_slice(&self.data[base..base + len]);
-            let played_seq = self.slots[idx].seq;
-            self.slots[idx].valid = false;
-            let ts = self.next_ts;
-            self.advance();
-            self.next_seq = self.next_seq.max(played_seq + 1);
-            self.plc_run = 0;
-            self.hold = HoldState::Idle;
+            };
             self.stats.step_trims += 1;
             return Pull::Packet { len, ts };
         }
@@ -705,23 +680,15 @@ impl JitterBuffer {
 
     /// 复位（重连 / SSRC 变化 / 手动停止）
     pub fn reset(&mut self) {
-        self.clear_slots();
-        self.next_seq = 0;
-        self.next_ts = 0;
-        self.highest_seq = 0;
-        self.highest_ts = 0;
-        self.base_seq = 0;
+        // 与 `rebase_with(0, 0, true)` 逐字段等价，只差下面三处：
+        // 未起播、丢包估计基准归零、清掉上一次会话的重同步原因。
+        self.rebase_with(0, 0, true);
         self.base_inserted = 0;
         self.started = false;
-        self.playing = false;
-        self.plc_run = 0;
-        self.far_jumps = 0;
-        self.hold = HoldState::Idle;
         // 注意：**不重置** `start_ms`。它是上层按本方向目标注入的配置，
         // 重连后仍应生效。
         // 必须清空：否则新会话会打印上一次会话的重同步原因（诊断误导）
         self.last_rebase_reason.clear();
-        self.epoch += 1;
     }
 
     // ── 内部工具 ──
@@ -756,6 +723,32 @@ impl JitterBuffer {
         self.next_ts += FRAME_SAMPLES as u64;
     }
 
+    /// 把槽位 `idx` 的负载拷进 `out`，返回载荷长度；`out` 放不下返回 `None`。
+    fn payload_at(&self, idx: usize, out: &mut [u8]) -> Option<usize> {
+        let len = self.slots[idx].len as usize;
+        if out.len() < len {
+            return None;
+        }
+        let base = idx * OPUS_MAX_PAYLOAD;
+        out[..len].copy_from_slice(&self.data[base..base + len]);
+        Some(len)
+    }
+
+    /// 取走播放头（`next_ts`）上的真实包：拷出负载、清槽、推进时间线。
+    /// 播放头没有包或 `out` 放不下时返回 `None`（状态不变）。
+    fn consume_next(&mut self, out: &mut [u8]) -> Option<(usize, u64)> {
+        let idx = self.find_ts(self.next_ts)?;
+        let len = self.payload_at(idx, out)?;
+        let played_seq = self.slots[idx].seq;
+        self.slots[idx].valid = false;
+        let ts = self.next_ts;
+        self.advance();
+        self.next_seq = self.next_seq.max(played_seq + 1);
+        self.plc_run = 0;
+        self.hold = HoldState::Idle;
+        Some((len, ts))
+    }
+
     fn find_ts(&self, ts: u64) -> Option<usize> {
         self.slots.iter().position(|s| s.valid && s.ts == ts)
     }
@@ -767,14 +760,11 @@ impl JitterBuffer {
     fn store(&mut self, pkt: &RtpPacket<'_>, seq: u64, ts: u64) {
         let len = pkt.payload.len().min(OPUS_MAX_PAYLOAD);
         // 优先找空槽；槽满时覆盖序号最小者（调用方已保证只有一个溢出）
-        let idx = self.slots.iter().position(|s| !s.valid).unwrap_or_else(|| {
-            self.slots
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, s)| s.seq)
-                .map(|(i, _)| i)
-                .unwrap_or(0)
-        });
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| !s.valid)
+            .unwrap_or_else(|| self.lowest_seq_slot(None).unwrap_or(0));
         let base = idx * OPUS_MAX_PAYLOAD;
         self.data[base..base + len].copy_from_slice(&pkt.payload[..len]);
         self.slots[idx] = PacketSlot {
@@ -812,18 +802,19 @@ impl JitterBuffer {
         best.map(|(_, at)| at)
     }
 
+    /// 在有效槽位中找 `seq` 最小者；`exclude_ts` 非空时排除该时间戳。
+    fn lowest_seq_slot(&self, exclude_ts: Option<u64>) -> Option<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.valid && Some(s.ts) != exclude_ts)
+            .min_by_key(|(_, s)| s.seq)
+            .map(|(i, _)| i)
+    }
+
     /// 丢弃扩展序号最小的非 `next` 包（缓冲满时的准入策略）
     fn drop_oldest_non_next(&mut self) {
-        let mut victim: Option<(usize, u64)> = None;
-        for (i, s) in self.slots.iter().enumerate() {
-            if !s.valid || s.ts == self.next_ts {
-                continue;
-            }
-            if victim.map(|(_, seq)| s.seq < seq).unwrap_or(true) {
-                victim = Some((i, s.seq));
-            }
-        }
-        if let Some((i, _)) = victim {
+        if let Some(i) = self.lowest_seq_slot(Some(self.next_ts)) {
             self.slots[i].valid = false;
         }
     }

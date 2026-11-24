@@ -98,7 +98,7 @@ class AndroidBuildTest(unittest.TestCase):
                 ), \
                 patch.object(android.deps, "heal_daemon_registry"), \
                 patch.object(android, "_gradle_env", return_value={}), \
-                patch.object(android, "_success_box"), \
+                patch.object(android.build_common, "success_box"), \
                 patch.object(android, "find_apk", return_value=self.apk), \
                 patch.object(android.runner, "run", side_effect=fake_run):
             code = android.build(ctx, self.logger)

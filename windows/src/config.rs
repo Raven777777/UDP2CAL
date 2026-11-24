@@ -31,8 +31,8 @@ pub struct Config {
 /// 都会生成新的随机值，导致每次 save() 都在改写设备身份。
 static DEVICE_ID: OnceLock<u64> = OnceLock::new();
 
-/// 默认监听端口（与 protocol::DEFAULT_LISTEN_PORT 一致）
-const DEFAULT_LISTEN_PORT: u32 = 44044;
+/// 默认监听端口：直接派生自协议常量，修改协议端口时无需再手改此处。
+const DEFAULT_LISTEN_PORT: u32 = udp2cal_protocol::DEFAULT_LISTEN_PORT as u32;
 
 /// 端口合法区间。注册表里的 DWORD 是外部输入（可手改、可被旧版本写入）：
 /// 超出 1..=65535 的值必须在加载时归一，因为下游有多处 `as u16` 截断

@@ -97,6 +97,8 @@ object DiscoveryManager {
      */
     internal fun parseStoredDeviceId(hex: String): ByteArray? {
         if (hex.length != Udp2CalProtocol.DEVICE_ID_SIZE * 2) return null
+        // Character.digit 对非十六进制返回 -1；必须先拒绝，否则会拼出 0xEF 之类的垃圾字节
+        if (hex.any { Character.digit(it, 16) < 0 }) return null
         return try {
             hexStringToByteArray(hex).takeIf { id -> id.any { it != 0.toByte() } }
         } catch (_: Exception) {

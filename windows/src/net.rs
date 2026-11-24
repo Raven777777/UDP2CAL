@@ -17,6 +17,26 @@ use std::time::{Duration, Instant};
 // Ready 模式: 每 1 秒广播 TYPE_DISCOVER_REPLY 到 LAN
 // Silent 模式: APP 停止 / DEVICE_BUSY 时停止广播
 
+/// 编码并发送 DISCOVER_REPLY（广播状态机与发现服务共用）。
+fn send_discover_reply(
+    socket: &std::net::UdpSocket,
+    buf: &mut [u8],
+    device_id: &[u8; protocol::DEVICE_ID_SIZE],
+    reply: &protocol::DiscoverReply,
+    dest: impl std::net::ToSocketAddrs,
+) {
+    let payload = reply.encode();
+    if let Some(total) = protocol::build_control_to(
+        buf,
+        0,
+        protocol::TYPE_DISCOVER_REPLY,
+        device_id,
+        &payload,
+    ) {
+        let _ = socket.send_to(&buf[..total], dest);
+    }
+}
+
 pub(crate) fn start_broadcast_state_machine(session: Arc<Session>) {
     std::thread::spawn(move || {
         let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -25,24 +45,22 @@ pub(crate) fn start_broadcast_state_machine(session: Arc<Session>) {
         };
         let _ = socket.set_broadcast(true);
         let device_id = session.device_id();
+        // 设备名在会话生命周期内不变：分配一次，循环里只更新端口。
+        let mut reply = protocol::DiscoverReply {
+            listen_port: 0,
+            device_name: session.device_name().to_string(),
+        };
         let mut buf = [0u8; protocol::CONTROL_HEADER_SIZE + protocol::CONTROL_MAX_PAYLOAD];
         loop {
             if session.running() && !session.p2p().is_busy() {
-                let reply = protocol::DiscoverReply {
-                    listen_port: session.listen_port() as u16,
-                    device_name: session.device_name().to_string(),
-                };
-                let payload = reply.encode();
-                if let Some(total) = protocol::build_control_to(
+                reply.listen_port = session.listen_port() as u16;
+                send_discover_reply(
+                    &socket,
                     &mut buf,
-                    0,
-                    protocol::TYPE_DISCOVER_REPLY,
                     &device_id,
-                    &payload,
-                ) {
-                    let _ =
-                        socket.send_to(&buf[..total], ("255.255.255.255", protocol::DISCOVER_PORT));
-                }
+                    &reply,
+                    ("255.255.255.255", protocol::DISCOVER_PORT),
+                );
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -68,6 +86,11 @@ pub(crate) fn start_broadcast_listener(session: Arc<Session>) {
         };
         let mut buf = [0u8; 1500];
         let my_id = session.device_id();
+        // 同上：设备名只分配一次，端口按请求实时读取。
+        let mut reply = protocol::DiscoverReply {
+            listen_port: 0,
+            device_name: session.device_name().to_string(),
+        };
         // 简单令牌桶：同一源 IP 每秒最多应答 MAX_PER_SEC 次。
         // 发现请求 15B、应答 ~15B+主机名，无限制时可被用于 UDP 反射放大。
         let mut bucket: std::collections::HashMap<std::net::IpAddr, (u32, Instant)> =
@@ -100,20 +123,8 @@ pub(crate) fn start_broadcast_listener(session: Arc<Session>) {
             if !session.running() || session.p2p().is_busy() {
                 continue;
             }
-            let reply = protocol::DiscoverReply {
-                listen_port: session.listen_port() as u16,
-                device_name: session.device_name().to_string(),
-            };
-            let body = reply.encode();
-            if let Some(total) = protocol::build_control_to(
-                &mut buf,
-                0,
-                protocol::TYPE_DISCOVER_REPLY,
-                &my_id,
-                &body,
-            ) {
-                let _ = socket.send_to(&buf[..total], src);
-            }
+            reply.listen_port = session.listen_port() as u16;
+            send_discover_reply(&socket, &mut buf, &my_id, &reply, src);
         }
     });
 }

@@ -9,6 +9,40 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length, Task};
 use std::sync::atomic::Ordering;
 
+/// 文本输入框样式：除边框颜色外与默认暗色主题一致。
+fn input_style(
+    border: Color,
+) -> impl Fn(&iced::theme::Theme, text_input::Status) -> text_input::Style {
+    move |_, status| {
+        let base = text_input::default(&iced::theme::Theme::Dark, status);
+        text_input::Style {
+            background: iced::Background::Color(Color::from_rgb(0.18, 0.18, 0.22)),
+            border: iced::Border {
+                radius: 5.0.into(),
+                color: border,
+                width: 1.0,
+            },
+            ..base
+        }
+    }
+}
+
+/// 卡片容器样式：背景 + 1px 圆角边框。
+fn card_style(
+    background: Color,
+    border: Color,
+) -> impl Fn(&iced::theme::Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(iced::Background::Color(background)),
+        border: iced::Border {
+            radius: 8.0.into(),
+            color: border,
+            width: 1.0,
+        },
+        ..Default::default()
+    }
+}
+
 impl AppState {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         let bg = Color::from_rgb(0.08, 0.08, 0.10);
@@ -73,7 +107,10 @@ impl AppState {
                 ],
             )
         } else {
-            t("footer.broadcast_addr")
+            tf(
+                "footer.broadcast_addr",
+                &[("port", &udp2cal_protocol::DISCOVER_PORT)],
+            )
         };
         let (footer_right, footer_right_color) = if !self.is_running {
             (String::new(), dim)
@@ -194,49 +231,20 @@ impl AppState {
                                 .on_input(Message::IpChanged)
                                 .width(148)
                                 .padding([5, 8])
-                                .style(move |_, status| {
-                                    let base = iced::widget::text_input::default(
-                                        &iced::theme::Theme::Dark,
-                                        status,
-                                    );
-                                    iced::widget::text_input::Style {
-                                        background: iced::Background::Color(Color::from_rgb(
-                                            0.18, 0.18, 0.22,
-                                        )),
-                                        border: iced::Border {
-                                            radius: 5.0.into(),
-                                            color: Color::from_rgb(0.25, 0.25, 0.30),
-                                            width: 1.0,
-                                        },
-                                        ..base
-                                    }
-                                }),
+                                .style(input_style(Color::from_rgb(0.25, 0.25, 0.30))),
                             text(" : ").size(16).color(dim),
-                            text_input("44044", &self.port_input)
+                            text_input(
+                                &udp2cal_protocol::DEFAULT_LISTEN_PORT.to_string(),
+                                &self.port_input,
+                            )
                                 .on_input(Message::PortChanged)
                                 .width(68)
                                 .padding([5, 8])
-                                .style(move |_, status| {
-                                    let base = iced::widget::text_input::default(
-                                        &iced::theme::Theme::Dark,
-                                        status,
-                                    );
-                                    iced::widget::text_input::Style {
-                                        background: iced::Background::Color(Color::from_rgb(
-                                            0.18, 0.18, 0.22,
-                                        )),
-                                        border: iced::Border {
-                                            radius: 5.0.into(),
-                                            color: if self.port_valid {
-                                                Color::from_rgb(0.25, 0.25, 0.30)
-                                            } else {
-                                                red
-                                            },
-                                            width: 1.0,
-                                        },
-                                        ..base
-                                    }
-                                }),
+                                .style(input_style(if self.port_valid {
+                                    Color::from_rgb(0.25, 0.25, 0.30)
+                                } else {
+                                    red
+                                })),
                         ]
                         .height(32)
                         .align_y(Alignment::Center)
@@ -244,15 +252,7 @@ impl AppState {
                 ])
                 .padding(10)
                 .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(iced::Background::Color(card_bg)),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        color: border_color,
-                        width: 1.0
-                    },
-                    ..Default::default()
-                }),
+                .style(card_style(card_bg, border_color)),
                 Space::new().height(8.0),
                 container(column![
                     row![
@@ -300,15 +300,7 @@ impl AppState {
                 ])
                 .padding(10)
                 .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(iced::Background::Color(card_bg)),
-                    border: iced::Border {
-                        radius: 8.0.into(),
-                        color: border_color,
-                        width: 1.0
-                    },
-                    ..Default::default()
-                }),
+                .style(card_style(card_bg, border_color)),
                 Space::new().height(15),
                 row![
                     mk(
@@ -411,15 +403,7 @@ impl AppState {
         )
         .padding(14)
         .width(Length::Fixed(272.0))
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(card_bg)),
-            border: iced::Border {
-                radius: 8.0.into(),
-                color: border_color,
-                width: 1.0,
-            },
-            ..Default::default()
-        });
+        .style(card_style(card_bg, border_color));
         let modal = opaque(
             container(card)
                 .width(Length::Fill)

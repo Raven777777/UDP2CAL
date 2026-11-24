@@ -1,7 +1,7 @@
 package com.udp2cal.app.service
 
 import com.udp2cal.app.DiscoveryManager
-import com.udp2cal.app.Prefs
+import com.udp2cal.app.EncoderCfg
 import com.udp2cal.app.R
 import com.udp2cal.app.Udp2CalProtocol
 import com.udp2cal.app.UdpSender
@@ -84,24 +84,22 @@ internal class ControlLoop(
     /** CONNECT 负载固定 15 字节；Opus 参数只描述**反向**（Windows 编码器） */
     private fun buildConnectPayload(): ByteArray {
         // 自动档已移除：始终发送具体档位（0 仅作跨版本兼容保留在协议里）
-        val dtx = Prefs.opusDtx == 1
-        val vbr = Prefs.opusVbr == 1 || dtx
-        val vbrConstraint = vbr && Prefs.opusVbrConstraint == 1
+        val cfg = EncoderCfg.fromPrefs()
         var flags = 0
-        if (vbr) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR
-        if (dtx) flags = flags or Udp2CalProtocol.OPUS_FLAG_DTX
-        if (vbrConstraint) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR_CONSTRAINT
-        if (Prefs.opusFec > 0) flags = flags or Udp2CalProtocol.OPUS_FLAG_FEC
+        if (cfg.vbr == 1) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR
+        if (cfg.dtx == 1) flags = flags or Udp2CalProtocol.OPUS_FLAG_DTX
+        if (cfg.vbrConstraint == 1) flags = flags or Udp2CalProtocol.OPUS_FLAG_VBR_CONSTRAINT
+        if (cfg.fec > 0) flags = flags or Udp2CalProtocol.OPUS_FLAG_FEC
 
         return Udp2CalProtocol.ConnectPayload(
             reversePort = sender.reversePort,
             forwardSsrc = sender.forwardSsrc,
-            complexity = Prefs.opusComplexity,
-            signal = mapSignal(Prefs.opusSignal),
-            bandwidth = mapBandwidth(Prefs.opusBandwidth),
+            complexity = cfg.complexity,
+            signal = mapSignal(cfg.signal),
+            bandwidth = mapBandwidth(cfg.bandwidth),
             opusFlags = flags,
-            bitrateKbps = Prefs.opusBitrateKbps.coerceAtMost(Udp2CalProtocol.BITRATE_MAX_KBPS),
-            packetLoss = Prefs.opusPacketLoss,
+            bitrateKbps = cfg.bitrateKbps,
+            packetLoss = cfg.packetLoss,
         ).encode()
     }
 

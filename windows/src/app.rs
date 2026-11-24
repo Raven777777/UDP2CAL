@@ -182,7 +182,9 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     let ui_session = Arc::clone(&session);
     let result = iced::application(
         move || {
-            let cfg = config::Config::load();
+            // 复用启动时已读出的配置：boot 是 `Fn`，克隆一份即可，
+            // 避免再读一次注册表（两次读取之间配置理论上可能被外部改写）。
+            let cfg = startup_cfg.clone();
             let now = Instant::now();
             let state = AppState {
                 session: Arc::clone(&ui_session),
@@ -200,7 +202,7 @@ pub(crate) fn run() -> Result<(), iced::Error> {
                 } else {
                     NoticeLevel::Info
                 },
-                vb_cable_installed: audio::detect_vb_cable().is_some(),
+                vb_cable_installed: audio::detect_vb_cable(),
                 reverse_enabled: cfg.reverse_enabled != 0,
                 config: cfg,
                 last_toggle_instant: now,
@@ -264,6 +266,30 @@ impl AppState {
         if self.notice_level != NoticeLevel::Error {
             self.notice.clear();
         }
+    }
+
+    /// 回到停止态：复位会话与所有随运行态变化的界面字段。
+    ///
+    /// `disable_reverse` 保留 ToggleRunning 的额外副作用；提示行由调用方
+    /// 按各自语义处理（停止时清空、引擎错误时写入错误文本）。
+    fn reset_to_stopped(&mut self, disable_reverse: bool) {
+        self.session.set_running(false);
+        if disable_reverse {
+            self.session.set_reverse_enabled(false);
+        }
+        self.session.reset_to_ready();
+        self.is_running = false;
+        self.pending_pair = None;
+        self.session.clear_pairing_prompt();
+        self.reset_connection_stats();
+    }
+
+    /// 连接状态与瞬时统计归零（启动/停止/引擎错误三条路径共用）。
+    fn reset_connection_stats(&mut self) {
+        self.connected = false;
+        self.disconnected = false;
+        self.last_bitrate = 0.0;
+        self.last_level_db = -60.0;
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -332,16 +358,7 @@ impl AppState {
                 self.last_toggle_instant = Instant::now();
 
                 if self.is_running {
-                    self.session.set_running(false);
-                    self.session.set_reverse_enabled(false);
-                    self.session.reset_to_ready();
-                    self.is_running = false;
-                    self.connected = false;
-                    self.disconnected = false;
-                    self.pending_pair = None;
-                    self.session.clear_pairing_prompt();
-                    self.last_bitrate = 0.0;
-                    self.last_level_db = -60.0;
+                    self.reset_to_stopped(true);
                     self.notice.clear();
                 } else {
                     let port: u16 = match self.port_input.parse() {
@@ -434,10 +451,7 @@ impl AppState {
                     self.session.set_running(true);
                     self.session.reset_to_ready();
                     self.is_running = true;
-                    self.connected = false;
-                    self.disconnected = false;
-                    self.last_bitrate = 0.0;
-                    self.last_level_db = -60.0;
+                    self.reset_connection_stats();
                     if saved {
                         match firewall_error {
                             Some(err) => {
@@ -447,7 +461,7 @@ impl AppState {
                             None => self.notice.clear(),
                         }
                     }
-                    self.vb_cable_installed = audio::detect_vb_cable().is_some();
+                    self.vb_cable_installed = audio::detect_vb_cable();
                     // 应用反向串流设置到全局
                     self.session.set_reverse_enabled(self.reverse_enabled);
                 }
@@ -507,15 +521,7 @@ impl AppState {
             }
             Message::EngineError(msg) => {
                 // 引擎级失败：必须回到停止态，否则界面会一直"假运行"
-                self.session.set_running(false);
-                self.session.reset_to_ready();
-                self.is_running = false;
-                self.connected = false;
-                self.disconnected = false;
-                self.pending_pair = None;
-                self.session.clear_pairing_prompt();
-                self.last_bitrate = 0.0;
-                self.last_level_db = -60.0;
+                self.reset_to_stopped(false);
                 self.notice = msg;
                 self.notice_level = NoticeLevel::Error;
                 Task::none()

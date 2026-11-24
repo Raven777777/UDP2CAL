@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
-from . import config, deps, env as envmod, proxy as proxymod, runner
+from . import build_common, config, deps, env as envmod, proxy as proxymod, runner
 
 
 def find_upx() -> Optional[Path]:
@@ -117,17 +117,28 @@ def build(ctx, logger) -> int:
         cmd += _mirror_args()
         logger.info("已强制启用 Cargo 镜像: {}".format(config.CARGO_MIRROR_REGISTRY))
 
-    result = runner.run(cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
-
-    if not result.ok and mirror_mode == "auto" and result.network_failed:
-        logger.blank()
-        logger.warn("检测到 crates.io 访问失败，切换国内镜像重试")
-        result = runner.run(cmd + _mirror_args(), logger=logger, cwd=project_dir, env=env, tail_lines=250)
+    if mirror_mode == "auto":
+        result = build_common.run_with_mirror(
+            runner.run,
+            cmd,
+            _mirror_args(),
+            logger,
+            warn_message="检测到 crates.io 访问失败，切换国内镜像重试",
+            cwd=project_dir,
+            env=env,
+            tail_lines=250,
+        )
+    else:
+        result = runner.run(cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
 
     if not result.ok:
         logger.blank()
         logger.error("编译失败（退出码 {}）".format(result.code))
-        _print_failure_tail(result, logger)
+        build_common.print_failure_tail(
+            result,
+            logger,
+            ("error", "failed", "cannot find", "undefined reference"),
+        )
         return result.code if result.code else 1
 
     # ---------------- 步骤 3：产物处理
@@ -180,28 +191,14 @@ def build(ctx, logger) -> int:
 
     final_kb = output.stat().st_size // 1024
     logger.blank()
-    from .logger import C
-
-    logger.raw(C.GREEN + "=" * 44)
-    logger.raw(C.GREEN + "   BUILD SUCCESS")
-    logger.raw(C.GREEN + "   mode:   {}".format(build_type))
-    logger.raw(C.GREEN + "   target: {}".format(triple))
-    logger.raw(C.GREEN + "   output: {}".format(output.name))
-    logger.raw(C.GREEN + "   size:   {} KB".format(final_kb))
-    logger.raw(C.GREEN + "=" * 44 + C.RESET)
+    build_common.success_box(
+        logger,
+        [
+            "BUILD SUCCESS",
+            "mode:   {}".format(build_type),
+            "target: {}".format(triple),
+            "output: {}".format(output.name),
+            "size:   {} KB".format(final_kb),
+        ],
+    )
     return 0
-
-
-def _print_failure_tail(result: runner.RunResult, logger) -> None:
-    interesting = [
-        line
-        for line in result.lines
-        if any(token in line.lower() for token in ("error", "failed", "cannot find", "undefined reference"))
-    ]
-    shown = interesting[-15:] if interesting else result.lines[-15:]
-    if shown:
-        logger.info("关键错误行:")
-        for line in shown:
-            logger.hint(line.strip()[:200])
-    if logger.path:
-        logger.info("完整日志: {}".format(logger.path))

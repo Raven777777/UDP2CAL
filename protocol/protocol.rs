@@ -79,8 +79,9 @@ pub const CONNECT_ACK_PAYLOAD_SIZE: usize = 10;
 pub const DEVICE_NAME_MAX: usize = 254;
 
 // ── Opus 参数（控制面只传反向编码器配置）──
-pub const OPUS_PAYLOAD_TYPE: u8 = 111;
-pub const OPUS_FRAME_MS: u8 = 10;
+pub use crate::rtp::OPUS_PAYLOAD_TYPE;
+pub const OPUS_FRAME_MS: u8 = crate::rtp::OPUS_FRAME_MS as u8;
+const _: () = assert!(crate::rtp::OPUS_FRAME_MS <= u8::MAX as u32);
 
 pub const OPUS_FLAG_VBR: u8 = 0x01;
 pub const OPUS_FLAG_DTX: u8 = 0x02;
@@ -197,11 +198,9 @@ pub fn build_control(msg_type: u8, device_id: &[u8; DEVICE_ID_SIZE], payload: &[
         CONTROL_MAX_PAYLOAD
     );
     let len = payload.len().min(CONTROL_MAX_PAYLOAD);
-    let mut out = Vec::with_capacity(CONTROL_HEADER_SIZE + len);
-    let mut hdr = [0u8; CONTROL_HEADER_SIZE];
-    ControlHeader::new(msg_type, len as u16, *device_id).encode(&mut hdr);
-    out.extend_from_slice(&hdr);
-    out.extend_from_slice(&payload[..len]);
+    let mut out = vec![0u8; CONTROL_HEADER_SIZE + len];
+    build_control_to(&mut out, 0, msg_type, device_id, &payload[..len])
+        .expect("缓冲区按 15 + len 分配，截断后的负载不可能装不下");
     out
 }
 
@@ -354,10 +353,10 @@ impl ConnectPayload {
     /// 校验能否接受。`Err` 携带原因（用于日志，不影响丢弃语义）。
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.payload_type != OPUS_PAYLOAD_TYPE {
-            return Err("payload_type != 111");
+            return Err("unexpected payload_type");
         }
         if self.frame_ms != OPUS_FRAME_MS {
-            return Err("frame_ms != 10");
+            return Err("unexpected frame_ms");
         }
         if self.forward_ssrc == 0 {
             return Err("forward_ssrc == 0");
@@ -380,17 +379,21 @@ impl ConnectPayload {
         Ok(())
     }
 
+    fn has_flag(&self, mask: u8) -> bool {
+        self.opus_flags & mask != 0
+    }
+
     pub fn vbr(&self) -> bool {
-        self.opus_flags & OPUS_FLAG_VBR != 0
+        self.has_flag(OPUS_FLAG_VBR)
     }
     pub fn dtx(&self) -> bool {
-        self.opus_flags & OPUS_FLAG_DTX != 0
+        self.has_flag(OPUS_FLAG_DTX)
     }
     pub fn vbr_constraint(&self) -> bool {
-        self.opus_flags & OPUS_FLAG_VBR_CONSTRAINT != 0
+        self.has_flag(OPUS_FLAG_VBR_CONSTRAINT)
     }
     pub fn fec(&self) -> bool {
-        self.opus_flags & OPUS_FLAG_FEC != 0
+        self.has_flag(OPUS_FLAG_FEC)
     }
 
     /// 生效码率：`0` → [`BITRATE_AUTO_KBPS`]；超过 [`BITRATE_MAX_KBPS`] 钳制到上限。

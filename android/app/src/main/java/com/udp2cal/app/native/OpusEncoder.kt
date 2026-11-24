@@ -1,7 +1,7 @@
 package com.udp2cal.app.native
 
 import android.util.Log
-import com.udp2cal.app.Prefs
+import com.udp2cal.app.EncoderCfg
 import com.udp2cal.app.Udp2CalProtocol
 
 /**
@@ -14,21 +14,15 @@ import com.udp2cal.app.Udp2CalProtocol
  * 负载上限 1275 字节（[Udp2CalProtocol.OPUS_MAX_PAYLOAD]）：
  * 超限的一帧由 JNI 直接丢弃，绝不截断。
  */
-class OpusEncoder(
+class OpusEncoder internal constructor(
     val sampleRateHz: Int = Udp2CalProtocol.OPUS_SAMPLE_RATE,
-    val bitrateKbps: Int = Prefs.DEFAULT_BITRATE_KBPS,
-    val complexity: Int = Prefs.opusComplexity,
-    val signalType: Int = Prefs.opusSignal,
-    val bandwidth: Int = Prefs.opusBandwidth,
-    val dtx: Int = Prefs.opusDtx,
-    vbrRaw: Int = Prefs.opusVbr,
-    val fec: Int = Prefs.opusFec,
-    val packetLoss: Int = Prefs.opusPacketLoss,
-    vbrConstraintRaw: Int = Prefs.opusVbrConstraint,
+    cfg: EncoderCfg,
 ) {
-    /** DTX 只在静音段省带宽，前提是 VBR；因此 DTX 开启时强制 VBR（不再有"自动码率"这一路强制） */
-    val vbr: Int = if (dtx == 1) 1 else vbrRaw
-    val vbrConstraint: Int = if (vbr == 1) vbrConstraintRaw else 0
+    /**
+     * 参数快照：DTX 强制 VBR、VBR 关闭则约束清零等推导由
+     * [EncoderCfg.fromPrefs] 统一完成，这里只消费结果。
+     */
+    private val cfg: EncoderCfg = cfg
 
     companion object {
         private const val TAG = "OpusEncoder"
@@ -45,11 +39,12 @@ class OpusEncoder(
         return try {
             handle = OpusNative.encoderCreate(
                 sampleRateHz,
-                Udp2CalProtocol.clampBitrateKbps(bitrateKbps),
-                complexity, signalType, bandwidth, dtx, vbr, fec, packetLoss, vbrConstraint
+                Udp2CalProtocol.clampBitrateKbps(cfg.bitrateKbps),
+                cfg.complexity, cfg.signal, cfg.bandwidth,
+                cfg.dtx, cfg.vbr, cfg.fec, cfg.packetLoss, cfg.vbrConstraint
             )
             if (handle != 0L) {
-                Log.i(TAG, "Encoder: sr=$sampleRateHz br=${Udp2CalProtocol.clampBitrateKbps(bitrateKbps)}k cplx=$complexity sig=$signalType bw=$bandwidth dtx=$dtx vbr=$vbr fec=$fec pl=$packetLoss vbrc=$vbrConstraint")
+                Log.i(TAG, "Encoder: sr=$sampleRateHz br=${Udp2CalProtocol.clampBitrateKbps(cfg.bitrateKbps)}k cplx=${cfg.complexity} sig=${cfg.signal} bw=${cfg.bandwidth} dtx=${cfg.dtx} vbr=${cfg.vbr} fec=${cfg.fec} pl=${cfg.packetLoss} vbrc=${cfg.vbrConstraint}")
                 true
             } else {
                 Log.e(TAG, "Encoder create returned 0")

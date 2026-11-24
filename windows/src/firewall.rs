@@ -10,16 +10,16 @@
 
 use crate::i18n;
 use std::os::windows::process::CommandExt;
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 const RULE_NAME: &str = "UDP2CAL-In-UDP";
 /// 发现服务固定端口
-const DISCOVERY_PORT: u16 = 44043;
+const DISCOVERY_PORT: u16 = udp2cal_protocol::DISCOVER_PORT;
 
 fn netsh(args: &[String]) -> std::io::Result<std::process::Output> {
     std::process::Command::new("netsh")
         .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
+        .creation_flags(CREATE_NO_WINDOW.0)
         .output()
 }
 

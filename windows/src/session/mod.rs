@@ -387,13 +387,18 @@ impl Session {
         f(&mut st)
     }
 
+    /// 重建媒体时间线：清空抖动缓冲并唤醒解码线程。
+    fn reset_media_timeline(&self) {
+        self.jitter().reset();
+        self.wake_decoder();
+    }
+
     /// 释放绑定：回到 READY，停反向发送，清空抖动缓冲。
     /// 控制面唯一的状态回退路径（超时 / 停止 / 引擎错误都走这里）。
     pub(crate) fn reset_to_ready(&self) {
         self.with_p2p(|st| *st = P2pState::new());
         self.stop_reverse_sender();
-        self.jitter().reset();
-        self.wake_decoder();
+        self.reset_media_timeline();
     }
 
     /// 控制面超时：绑定设备 4.5 s 没有 CONNECT → 释放绑定、停止反向、回到 Ready。
@@ -512,12 +517,9 @@ impl Session {
 
     /// 本次绑定应使用的反向 SSRC。
     /// 反向关闭（用户开关关闭或 `reverse_port == 0`）时返回 0，表示不启动反向发送。
-    fn desired_reverse_ssrc(&self, reverse_port: u16, previous: u32, regenerate: bool) -> u32 {
+    fn desired_reverse_ssrc(&self, reverse_port: u16) -> u32 {
         if reverse_port == 0 || !self.reverse_enabled() {
             return 0;
-        }
-        if previous != 0 && !regenerate {
-            return previous;
         }
         random_u32_nonzero()
     }
@@ -806,7 +808,7 @@ impl Session {
 
         if !same_device {
             // ── 建立绑定 ──
-            let reverse_ssrc = self.desired_reverse_ssrc(cfg.reverse_port, 0, true);
+            let reverse_ssrc = self.desired_reverse_ssrc(cfg.reverse_port);
             self.with_p2p(|st| {
                 st.state = DEVICE_BUSY;
                 st.device_id = header.device_id;
@@ -817,8 +819,7 @@ impl Session {
                 st.last_connect = Some(now);
             });
             // 新会话：抖动缓冲与解码器状态全部重建
-            self.jitter().reset();
-            self.wake_decoder();
+            self.reset_media_timeline();
             // 绑定成功说明该设备已获准：释放可能属于旧弹窗的提示槽，
             // 否则后续设备的 CONNECT 会因 prompted != 0 永远被 Ignore。
             self.clear_pairing_prompt();
@@ -862,7 +863,7 @@ impl Session {
         );
 
         let reverse_ssrc = if reverse_stale {
-            self.desired_reverse_ssrc(cfg.reverse_port, peer.reverse_ssrc, true)
+            self.desired_reverse_ssrc(cfg.reverse_port)
         } else {
             peer.reverse_ssrc
         };
@@ -876,8 +877,7 @@ impl Session {
         });
 
         if new_session {
-            self.jitter().reset();
-            self.wake_decoder();
+            self.reset_media_timeline();
             if self.should_log_control_event() {
                 logf!("[P2P] forward_ssrc 变化 → 新会话，已重置抖动缓冲");
             }

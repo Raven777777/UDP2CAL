@@ -4,6 +4,8 @@ use crate::app::Message;
 use crate::i18n;
 use crate::logf;
 use std::sync::OnceLock;
+// 预期延迟档位（ms），直接派生自协议常量，与 Android 高级设置保持一致。
+use udp2cal_protocol::rtp::WATER_TARGET_STEPS_MS;
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
@@ -50,9 +52,6 @@ enum TrayCommand {
     SetWaterTarget(u32),
     SetLanguage(String),
 }
-
-/// 预期延迟档位（ms），与 Android 高级设置保持一致。
-const WATER_TARGET_STEPS_MS: [u32; 5] = [80, 120, 160, 200, 300];
 
 // 勾选态需要菜单项句柄；muda 的 CheckMenuItem 内部是 Rc（非 Send/Sync），
 // 不能放进 static。菜单事件在创建菜单的线程消息泵里派发，因此按线程保存。

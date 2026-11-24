@@ -72,7 +72,6 @@ impl LogFile {
     /// 把文件截成 0。旧内容本来就轮转不出去，保留一半旧日志没有意义——目标
     /// 是让 2 MiB 上限继续成立。
     fn truncate_in_place(&mut self) -> bool {
-        let _ = self.file.flush();
         // 这个句柄只为截断；drop 之后才能把追加句柄换回去
         let truncated = OpenOptions::new()
             .create(true)
@@ -83,27 +82,21 @@ impl LogFile {
         if !truncated {
             return false;
         }
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            Ok(f) => {
-                self.file = f;
-                self.bytes = 0;
-                true
-            }
-            Err(_) => false,
-        }
+        self.reopen_append()
     }
 
     /// 覆盖上一轮备份后重建文件。返回是否成功。
     fn rotate(&mut self) -> bool {
-        let _ = self.file.flush();
         // Rust 打开文件时带 FILE_SHARE_DELETE，运行中重命名是允许的
         if std::fs::rename(&self.path, self.dir.join(ROTATED_NAME)).is_err() {
             return false;
         }
+        self.reopen_append()
+    }
+
+    /// flush 旧句柄、重新打开 append 句柄并重置字节计数。返回是否成功。
+    fn reopen_append(&mut self) -> bool {
+        let _ = self.file.flush();
         match OpenOptions::new()
             .create(true)
             .append(true)

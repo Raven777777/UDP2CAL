@@ -230,8 +230,6 @@ internal object ProtocolNative {
 
     external fun dcAdjust(h: Long): Double
 
-    external fun dcWater(h: Long): Double
-
     external fun dcIntegral(h: Long): Double
 
     external fun dcTargetMs(h: Long): Int

@@ -191,12 +191,7 @@ class UdpSender(
             // 这张 Wi-Fi 断开仍必须触发会话重建（否则永远停在"等待重连"）。
             boundNetwork = wifi
             remoteIp = addr.address?.hostAddress
-            expectedRemoteDeviceId = Prefs.targetDeviceId
-                .takeIf { it.length == Udp2CalProtocol.DEVICE_ID_SIZE * 2 }
-                ?.chunked(2)
-                ?.mapNotNull { it.toIntOrNull(16)?.toByte() }
-                ?.takeIf { it.size == Udp2CalProtocol.DEVICE_ID_SIZE }
-                ?.toByteArray()
+            expectedRemoteDeviceId = DiscoveryManager.parseStoredDeviceId(Prefs.targetDeviceId)
             startAckLoop()
             Log.i(TAG, "已连接 $addr，正向 SSRC=${"%08x".format(forwardSsrc)}，反向端口=$reversePort")
             // 连接期间被 Stop/重启/Wi-Fi 切换取消：withContext 随后会抛

@@ -169,48 +169,74 @@ internal class ReverseLink(
         activeSsrc = 0
     }
 
+    /** 清空抖动缓冲并把空闲计时归零；接收/播放协程据此重新对齐时间线。 */
+    private fun clearBuffered() {
+        linkLock.lock()
+        try {
+            jitter.reset()
+            lastReversePacketAt = 0L
+            linkSignal.signalAll()
+        } finally {
+            linkLock.unlock()
+        }
+    }
+
+    /**
+     * 取消并等待协程退出，最多 1 s；返回是否在时限内退出。
+     *
+     * 整段包进 NonCancellable：若调用方（控制/收尾协程）恰在此刻被取消，
+     * cancelAndJoin 与超时登记仍必须执行，否则协程会脱离会话继续触碰原生句柄。
+     * [registerLingering] 只在该协程已从任务槽移除时置 true——槽位仍指向它时
+     * jobs() 已经能拿到，重复登记只会让停机路径 join 两次。
+     */
+    private suspend fun joinJob(
+        job: Job?,
+        timeoutLog: String,
+        registerLingering: Boolean,
+    ): Boolean {
+        val joined = withContext(NonCancellable) {
+            val done = withTimeoutOrNull(1000) {
+                job?.cancelAndJoin()
+                true
+            } ?: false
+            if (!done && registerLingering) {
+                // 保留引用：它仍可能在原生调用里，服务停机时必须能 join 到。
+                job?.let { lingeringJobs.add(it) }
+            }
+            done
+        }
+        if (!joined) Log.w(TAG, timeoutLog)
+        return joined
+    }
+
+    /**
+     * 退役 playJob：仅在确认退出后才清空槽位（超时仍留在槽位里，jobs() 还能拿到）。
+     * [job] 默认取当前槽位；teardownSession 传入它更早捕获的引用，避免在等待接收
+     * 协程期间换入的新播放协程被误当成旧协程退役。
+     */
+    private suspend fun retirePlayJob(job: Job? = playJob): Boolean {
+        val joined = joinJob(job, "反向播放协程 1 s 内未退出，继续收尾", false)
+        if (joined && playJob === job) playJob = null
+        return joined
+    }
+
     private suspend fun startPlayback() {
         // 先等旧循环真正退出：旧循环仍可能持有同一个 native 解码器和
         // AudioPlayer，直接并发启动会出现两个消费者抢写/解码。
         // 但控制循环不能被 AudioTrack/HAL 卡死，超时后记录并继续。
         val old = playJob
+        // 这里的特殊点：先清槽位再 join。若控制协程恰在此刻被取消，旧 job
+        // 既已脱离 playJob 槽又未被 cancel 或登记进 lingeringJobs，会脱离
+        // 会话继续运行；joinJob 的 NonCancellable 保证取消/登记一定执行。
         playJob = null
-        // 整段包进 NonCancellable：若控制协程恰在此刻被取消，withTimeoutOrNull
-        // 的 block 可能不执行，old 既已脱离 playJob 槽又未被 cancel 或登记进
-        // lingeringJobs，会脱离会话继续运行。与 stopAndJoin 的做法一致。
-        val joined = withContext(NonCancellable) {
-            val done = withTimeoutOrNull(1000) {
-                old?.cancelAndJoin()
-                true
-            } ?: false
-            if (!done) {
-                // 保留引用：它仍可能在原生调用里，服务停机时必须能 join 到。
-                old?.let { lingeringJobs.add(it) }
-            }
-            done
-        }
-        if (!joined) {
-            Log.w(TAG, "旧反向播放协程 1 s 内未退出，继续启动新会话")
-        }
-        linkLock.lock()
-        try {
-            jitter.reset()
-            linkSignal.signalAll()
-        } finally {
-            linkLock.unlock()
-        }
+        val joined = joinJob(old, "旧反向播放协程 1 s 内未退出，继续启动新会话", true)
+        clearBuffered()
         // 接收协程与会话同生命周期（见 launchReverseReceiver）。
         // 旧循环没退出时它可能正卡在 AudioTrack.write 并持有 trackLock：
         // 此时 flush 会跟着永久卡住控制协程，必须与 stopAndJoin 一样只在
         // 确认退出后才 flush。
         if (joined) player?.flush()
         lastReverseStartAt = SystemClock.elapsedRealtime()
-        linkLock.lock()
-        try {
-            lastReversePacketAt = 0L
-        } finally {
-            linkLock.unlock()
-        }
         playJob = scope.launch(playDispatcher) { reversePlayLoop() }
         status.update {
             it.copy(reverseAudio = true)
@@ -222,14 +248,7 @@ internal class ReverseLink(
         // 非 suspend 版本用于服务停止路径，协程退出由服务作用域取消兜底。
         // 不置 null：留给 stopAndJoin 拿到同一个 Job 去 join（置空会 join 不到）。
         playJob?.cancel()
-        linkLock.lock()
-        try {
-            jitter.reset()
-            lastReversePacketAt = 0L
-            linkSignal.signalAll()
-        } finally {
-            linkLock.unlock()
-        }
+        clearBuffered()
         // 不在这里 flush：本方法在主线程调用，AudioTrack/HAL 卡住时会 ANR。
         // 播放协程取消后由 teardownSession 的 player.stop()（IO 线程）释放。
         status.update {
@@ -239,27 +258,9 @@ internal class ReverseLink(
 
     /** 需要保证旧循环已退出时使用（会话切换/ACK 超时/播放循环退出）。 */
     suspend fun stopAndJoin() = withContext(NonCancellable) {
-        val old = playJob
         // 与控制循环的 1 s 上限一致：HAL 卡在 write 时不能无限拖住会话收尾。
-        val joined = withTimeoutOrNull(1000) {
-            old?.cancelAndJoin()
-            true
-        } ?: false
-        if (joined) {
-            playJob = null
-        } else {
-            // 超时后保留引用：service 停机路径还要 join 它；只要它没退出，
-            // CaptureService.onDestroy 就不会 closeNative（避免 use-after-free）。
-            Log.w(TAG, "反向播放协程 1 s 内未退出，继续收尾")
-        }
-        linkLock.lock()
-        try {
-            jitter.reset()
-            lastReversePacketAt = 0L
-            linkSignal.signalAll()
-        } finally {
-            linkLock.unlock()
-        }
+        val joined = retirePlayJob()
+        clearBuffered()
         // 播放协程没退出时不要再抢 trackLock：它可能正卡在 AudioTrack.write，
         // flush 会跟着一起卡住；teardownSession 会在确认播放协程退出后才 stop()
         // （未退出时宁可跳过释放，也不阻塞会话收尾）。
@@ -283,28 +284,9 @@ internal class ReverseLink(
         val rx = rxJob
         rxJob = null
         val play = playJob
-        val rxJoined = withContext(NonCancellable) {
-            withTimeoutOrNull(1000) {
-                rx?.cancelAndJoin()
-                true
-            } ?: false
-        }
-        if (!rxJoined) {
-            // 槽位已清空：必须自己保留引用，否则服务停机时 join 不到它。
-            rx?.let { lingeringJobs.add(it) }
-            Log.w(TAG, "反向接收协程 1 s 内未退出，继续收尾")
-        }
-        val playJoined = withContext(NonCancellable) {
-            withTimeoutOrNull(1000) {
-                play?.cancelAndJoin()
-                true
-            } ?: false
-        }
-        if (!playJoined) {
-            Log.w(TAG, "反向播放协程 1 s 内未退出，继续收尾")
-        } else if (playJob === play) {
-            playJob = null
-        }
+        // 槽位已清空：joinJob 超时时会自己保留引用，否则服务停机时 join 不到它。
+        joinJob(rx, "反向接收协程 1 s 内未退出，继续收尾", true)
+        val playJoined = retirePlayJob(play)
         decoder?.stop()
         decoder = null
         val p = player
@@ -471,6 +453,21 @@ internal class ReverseLink(
             if (!player.recover()) delay(100) else delay(20)
         }
         return false
+    }
+
+    /**
+     * 把一帧 PCM 交给重采样器并写出。返回 false 表示写入通道已放弃
+     * （连续重建失败），播放协程应退出并交给监督者重启。
+     */
+    private suspend fun emit(
+        player: AudioPlayer,
+        resampler: StreamResampler,
+        pcm: ShortArray,
+        frames: Int,
+    ): Boolean {
+        val produced = resampler.process(pcm, 0, frames)
+        if (produced > 0 && !writeOrRecover(player, resampler.buffer(), produced)) return false
+        return true
     }
 
     /**
@@ -770,17 +767,11 @@ internal class ReverseLink(
                             lastR = pcm[n - 1].toInt()
                             hasLast = true
                         }
-                        val produced = resampler.process(pcm, 0, n / 2)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, pcm, n / 2)) return
                     } else {
                         // 连 PLC 都失败：补静音，保持时间线连续
                         hasLast = false
-                        val produced = resampler.process(silence, 0, silence.size / 2)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, silence, silence.size / 2)) return
                     }
                 }
 
@@ -813,18 +804,12 @@ internal class ReverseLink(
                         hasLast = true
                     }
                     if (n > 0) {
-                        val produced = resampler.process(pcm, 0, n / 2)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, pcm, n / 2)) return
                     } else {
                         // 生成不出 PLC：补静音，同样过重采样器以保持相位连续；
                         // 补零不参与淡出（没有可接续的电平）
                         hasLast = false
-                        val produced = resampler.process(silence, 0, silence.size / 2)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, silence, silence.size / 2)) return
                     }
                 }
 
@@ -840,15 +825,9 @@ internal class ReverseLink(
                             pcm[i * 2 + 1] = (lastR * k).toInt().toShort()
                         }
                         hasLast = false
-                        val produced = resampler.process(pcm, 0, frames)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, pcm, frames)) return
                     } else {
-                        val produced = resampler.process(silence, 0, silence.size / 2)
-                        if (produced > 0) {
-                            if (!writeOrRecover(player, resampler.buffer(), produced)) return
-                        }
+                        if (!emit(player, resampler, silence, silence.size / 2)) return
                     }
                 }
 
@@ -857,8 +836,7 @@ internal class ReverseLink(
                     // AudioTrack 不断流。发送端不再为“保活”合成静音，
                     // 因此这里的本地输出是唯一的空闲期供数来源。
                     if (pipeMs <= Udp2CalProtocol.PLC_LEAD_MS) {
-                        val produced = resampler.process(silence, 0, silence.size / 2)
-                        if (produced > 0 && !writeOrRecover(player, resampler.buffer(), produced)) return
+                        if (!emit(player, resampler, silence, silence.size / 2)) return
                     } else {
                         // 播放缓冲还够：等接收协程的 signal（超时只防漏唤醒）
                         linkLock.lock()

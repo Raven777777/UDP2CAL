@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import List, Optional
 
-from . import config, deps, env as envmod, proxy as proxymod, runner
+from . import build_common, config, deps, env as envmod, proxy as proxymod, runner
 
 _INIT_SCRIPT = """// 由 scripts/build.py 自动生成：直连官方仓库失败时切换到国内镜像
 // 该文件为临时产物，每次构建覆盖，不参与版本管理。
@@ -75,6 +75,14 @@ def _tool_env(base: dict, proxy) -> dict:
     if proxy is not None:
         base["JAVA_TOOL_OPTIONS"] = " ".join(proxymod.jvm_args(proxy))
     return base
+
+
+def _auto_mirror_args(logger) -> Optional[List[str]]:
+    """直连失败后生成镜像 init 脚本；写入失败时返回 None 表示放弃重试。"""
+    init_script = _write_init_script(logger)
+    if init_script is None:
+        return None
+    return ["-I", str(init_script)]
 
 
 def _gradle_home() -> str:
@@ -194,21 +202,28 @@ def build(ctx, logger) -> int:
     deps.heal_daemon_registry(_gradle_home(), logger)
 
     env = _gradle_env(java, sdk, proxy)
-    result = runner.run(base_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
-
-    if not result.ok and mirror_mode == "auto" and result.network_failed:
-        logger.blank()
-        logger.warn("检测到官方仓库访问失败，切换国内镜像重试")
-        init_script = _write_init_script(logger)
-        if init_script:
-            retry_cmd = base_cmd + ["-I", str(init_script)]
-            env = _gradle_env(java, sdk, proxy)
-            result = runner.run(retry_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
+    if mirror_mode == "auto":
+        result = build_common.run_with_mirror(
+            runner.run,
+            base_cmd,
+            lambda: _auto_mirror_args(logger),
+            logger,
+            warn_message="检测到官方仓库访问失败，切换国内镜像重试",
+            cwd=project_dir,
+            env=env,
+            tail_lines=250,
+        )
+    else:
+        result = runner.run(base_cmd, logger=logger, cwd=project_dir, env=env, tail_lines=250)
 
     if not result.ok:
         logger.blank()
         logger.error("构建失败（退出码 {}）".format(result.code))
-        _print_failure_tail(result, logger)
+        build_common.print_failure_tail(
+            result,
+            logger,
+            ("error", "failed", "caused by", "what went wrong", "exception"),
+        )
         return result.code if result.code else 1
 
     logger.step(3, 3, "收集产物")
@@ -228,37 +243,15 @@ def build(ctx, logger) -> int:
     size_kb = output.stat().st_size // 1024
     logger.ok("{} ({} KB)".format(output.name, size_kb))
     logger.blank()
-    _success_box(logger, target, ctx.abi, build_type, output.name, size_kb)
+    build_common.success_box(
+        logger,
+        [
+            "BUILD SUCCESS",
+            "project: {}".format(target["label"]),
+            "abi:     {}".format(ctx.abi),
+            "type:    {}".format(build_type),
+            "output:  {}".format(output.name),
+            "size:    {} KB".format(size_kb),
+        ],
+    )
     return 0
-
-
-def _success_box(logger, target: dict, abi: str, build_type: str, name: str, size_kb: int) -> None:
-    from .logger import C
-
-    lines = [
-        "BUILD SUCCESS",
-        "project: {}".format(target["label"]),
-        "abi:     {}".format(abi),
-        "type:    {}".format(build_type),
-        "output:  {}".format(name),
-        "size:    {} KB".format(size_kb),
-    ]
-    logger.raw(C.GREEN + "=" * 44)
-    for line in lines:
-        logger.raw(C.GREEN + "   " + line)
-    logger.raw(C.GREEN + "=" * 44 + C.RESET)
-
-
-def _print_failure_tail(result: runner.RunResult, logger) -> None:
-    interesting = [
-        line
-        for line in result.lines
-        if any(token in line.lower() for token in ("error", "failed", "caused by", "what went wrong", "exception"))
-    ]
-    shown = interesting[-15:] if interesting else result.lines[-15:]
-    if shown:
-        logger.info("关键错误行:")
-        for line in shown:
-            logger.hint(line.strip()[:200])
-    if logger.path:
-        logger.info("完整日志: {}".format(logger.path))

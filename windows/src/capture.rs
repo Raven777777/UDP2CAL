@@ -16,7 +16,7 @@ use audiopus::{Application, Bitrate, Channels, SampleRate};
 
 use crate::hires::HiResTimer;
 use crate::logf;
-use crate::power::MmcssGuard;
+use crate::power::boost_current_thread;
 use crate::protocol;
 use crate::protocol::resampler::Resampler;
 use crate::protocol::rtp;
@@ -31,18 +31,16 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
     CoUninitialize,
 };
-use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 /// DSCP EF（46）→ IP TOS 字节 0xB8。反向音频流的转发优先级最高，
 /// IPv4 可用时让 Wi-Fi 接入点 / 路由器优先转发，抑制排队抖动；IPv6 在 Windows 上不设置 TCLASS。
 const DSCP_EF_TOS: u32 = 0xB8;
 
 /// 每声道 480 采样 = 10 ms @ 48 kHz
-const FRAME_MONO: usize = 480;
+const FRAME_MONO: usize = rtp::FRAME_SAMPLES as usize;
 /// 48 kHz 采样率下 1 ms 的样本数，仅用于把 lookahead 样本数换成毫秒打印
-const OPUS_SAMPLE_RATE_PER_MS: u32 = 48;
+const OPUS_SAMPLE_RATE_PER_MS: u32 = rtp::OPUS_SAMPLE_RATE / 1000;
 /// 立体声交错样本数（一帧）
 const FRAME_INTERLEAVED: usize = FRAME_MONO * 2;
 /// 组帧缓冲硬上限：4 帧（40 ms）。超出的旧数据直接丢弃，绝不无限积压。
@@ -349,6 +347,377 @@ fn apply_config(encoder: &mut audiopus::coder::Encoder, cfg: &OpusReverseConfig)
 // 反向音频发送器
 // ═══════════════════════════════════════════════════════════════════
 
+/// 环回采集客户端的可重建状态：设备失效、音频服务重启、端点切换后，
+/// 旧客户端可能永远返回错误，必须按 500 ms 退避重建而不是一直发静音。
+struct CaptureState {
+    capture: Option<LoopbackCapture>,
+    /// 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）。
+    /// 重采样器与播放侧、Android 共用 `protocol/resampler.rs`。
+    resampler: Option<Resampler>,
+    last_capture_attempt: Option<Instant>,
+    last_capture_fail_log: Instant,
+    read_errors: u32,
+    loopback: Vec<f32>,
+    resampled: Vec<f32>,
+}
+
+impl CaptureState {
+    /// 没有可用采集客户端时，按 500 ms 退避重建；初始化失败不能直接退出线程。
+    fn ensure_capture(&mut self) {
+        if self.capture.is_none()
+            && self
+                .last_capture_attempt
+                .map(|t| t.elapsed() >= Duration::from_millis(500))
+                .unwrap_or(true)
+        {
+            self.last_capture_attempt = Some(Instant::now());
+            match LoopbackCapture::new() {
+                Some(c) => {
+                    let rate = c.sample_rate();
+                    let mut rs = Resampler::new(2);
+                    rs.set_source_rate(rate, rtp::OPUS_SAMPLE_RATE);
+                    self.resampler = Some(rs);
+                    self.capture = Some(c);
+                    self.read_errors = 0;
+                    logf!("[Reverse] 环回捕获已就绪（{} Hz）", rate);
+                }
+                None => {
+                    if self.last_capture_fail_log.elapsed() >= Duration::from_secs(5) {
+                        self.last_capture_fail_log = Instant::now();
+                        logf!("[Reverse] 环回捕获初始化失败，500 ms 后重试");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 读取一次环回数据、更新错误计数、重采样，并把媒体与缺口补偿并入组帧缓冲。
+    fn read_and_resample(
+        &mut self,
+        sender: &mut FrameSender,
+        pcm_buf: &mut Vec<i16>,
+        last_frame_at: &mut Instant,
+        stats: &ReverseStats,
+    ) {
+        let t_read = Instant::now();
+        let outcome = if let Some(c) = self.capture.as_ref() {
+            c.read_stereo(&mut self.loopback)
+        } else {
+            ReadOutcome::Empty
+        };
+        stats
+            .read_us
+            .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let got_data = match outcome {
+            ReadOutcome::Data | ReadOutcome::Empty => {
+                self.read_errors = 0;
+                matches!(outcome, ReadOutcome::Data)
+            }
+            ReadOutcome::Error(code) => {
+                self.read_errors = self.read_errors.saturating_add(1);
+                if self.read_errors == 1 || self.read_errors.is_multiple_of(50) {
+                    logf!(
+                        "[Reverse] 环回 GetBuffer 失败（hr=0x{code:08X}，连续 {} 次）",
+                        self.read_errors
+                    );
+                }
+                if self.read_errors >= 3 {
+                    logf!("[Reverse] 环回端点连续失败，重建采集客户端");
+                    self.capture = None;
+                    self.resampler = None;
+                    self.read_errors = 0;
+                    *last_frame_at = Instant::now();
+                    self.last_capture_attempt = Some(Instant::now());
+                }
+                false
+            }
+        };
+
+        if got_data {
+            // 这段“无真实媒体”的墙钟时间要补进 RTP 时间戳，否则接收端
+            // 本地静音已经把播放头推进，恢复包会被判成 late。读取到的
+            // 样本本身覆盖一段时间，必须从缺口里扣掉，避免重复计时。
+            let idle_ms = last_frame_at.elapsed().as_millis() as u64;
+            *last_frame_at = Instant::now();
+            if let Some(rs) = self.resampler.as_mut() {
+                rs.process_into(&self.loopback, &mut self.resampled);
+            } else {
+                self.resampled.clear();
+            }
+            // 缺口按**丢弃前**的完整覆盖时长计算：下面丢弃的原始媒体
+            // 会作为独立补偿显式记账，若 covered 只算保留部分，同一段
+            // 丢弃媒体会被 gap_advance 再计一次。
+            let covered_ms = (self.resampled.len() as u64 / 2) * 1000 / rtp::OPUS_SAMPLE_RATE as u64;
+            let mut dropped_advance: u32 = 0;
+            if self.resampled.len() > MAX_FRAME_BACKLOG {
+                let excess = self.resampled.len() - MAX_FRAME_BACKLOG;
+                stats
+                    .dropped_samples
+                    .fetch_add(excess as u64, Ordering::Relaxed);
+                self.resampled.drain(..excess);
+                // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当
+                // 连续。但它位于已排队的旧帧之后，立即推进会把旧帧一起
+                // 前移；并入下面的队列补偿，随旧帧消费到边界时兑现。
+                dropped_advance = frame_grid_advance(excess);
+            }
+            // 补偿必须落在“已入队的旧帧之后、新数据之前”：此时全局
+            // timestamp 描述的是队首帧，立即推进会把旧帧一起前移。
+            // 边界与 drain 路径同样用 div_ceil：不足一帧的队尾残留也
+            // 算占用一个帧边界，避免两侧对残留的折算口径不一致。
+            sender.pending_ts_advances.queue(
+                pcm_buf.len().div_ceil(FRAME_INTERLEAVED),
+                gap_advance_samples(idle_ms, covered_ms).wrapping_add(dropped_advance),
+                &mut sender.timestamp,
+            );
+            for &s in &self.resampled {
+                let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                pcm_buf.push(v);
+            }
+        }
+    }
+
+    /// 有帧在等发送窗口时用**高精度定时器**睡到下一个发送时刻；
+    /// 没有待发帧（端点空闲）时才等 WASAPI 事件——空闲路径上的等待
+    /// 精度无关紧要，没必要唤醒系统定时器。
+    fn wait_for_data(
+        &self,
+        has_frame: bool,
+        next_send_at: Instant,
+        hi_timer: Option<&HiResTimer>,
+        stats: &ReverseStats,
+    ) {
+        let wait_ms = if has_frame {
+            let now = Instant::now();
+            if next_send_at > now {
+                (next_send_at - now)
+                    .as_millis()
+                    .clamp(1, WAIT_TIMEOUT_MS as u128) as u32
+            } else {
+                0
+            }
+        } else {
+            WAIT_TIMEOUT_MS
+        };
+        let t_wait = Instant::now();
+        match (has_frame, hi_timer) {
+            (true, Some(timer)) if next_send_at > t_wait => {
+                timer.wait_until(next_send_at);
+            }
+            _ => {
+                // 已到点（无需等待）或没有高精度定时器：退回事件等待。
+                // 事件是否触发只影响延迟；发送仍按 10 ms 网格整形。
+                let _ = if let Some(c) = self.capture.as_ref() {
+                    c.wait(wait_ms)
+                } else {
+                    std::thread::sleep(Duration::from_millis(wait_ms.max(5) as u64));
+                    false
+                };
+            }
+        }
+        stats
+            .wait_us
+            .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// 帧序号/时间戳状态：由读取段与发送段共享。
+struct FrameSender {
+    seq: u16,
+    timestamp: u32,
+    first_packet: bool,
+    last_sent: Option<Instant>,
+    last_sent_ts: Option<u32>,
+    pending_ts_advances: PendingTsAdvances,
+}
+
+impl FrameSender {
+    fn new() -> Self {
+        Self {
+            seq: random_u16(),
+            timestamp: random_u32(),
+            first_packet: true,
+            last_sent: None,
+            last_sent_ts: None,
+            pending_ts_advances: PendingTsAdvances::default(),
+        }
+    }
+
+    /// 积压保护：40 ms 硬上限 + 流水线深度裁剪，并同步时间戳补偿。
+    fn trim_backlog(&mut self, pcm_buf: &mut Vec<i16>, stats: &ReverseStats) {
+        // 积压保护：超过 40 ms 只保留最新部分（发送端不得积压）
+        if pcm_buf.len() > MAX_FRAME_BACKLOG {
+            let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
+            pcm_buf.drain(..excess);
+            stats
+                .dropped_samples
+                .fetch_add(excess as u64, Ordering::Relaxed);
+            // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC。
+            // 推进量取整到整帧，保持 480 网格（见 `frame_grid_advance`）。
+            self.timestamp = self.timestamp.wrapping_add(frame_grid_advance(excess));
+            self.pending_ts_advances
+                .after_drain(excess, &mut self.timestamp);
+        }
+        // 只保留最近 40 ms 的统计峰值；超限时旧数据已经丢掉
+        stats
+            .max_backlog
+            .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
+
+        // 高精度定时器路径不消费 WASAPI 事件：一次读到 2 个周期或线程被
+        // 抢占后，组帧缓冲会多出整帧。发送严格 1 帧/10 ms，超过流水线
+        // 深度的积压永远等不到节拍，只会永久抬高发送端延迟（40 ms 上限
+        // 只截不断）。丢弃最旧的超额帧，保留最新 1-2 帧；时间戳/序号不动。
+        let excess = backlog_trim(pcm_buf.len(), PCM_MAX_QUEUED_FRAMES);
+        if excess > 0 {
+            pcm_buf.drain(..excess);
+            stats
+                .dropped_samples
+                .fetch_add(excess as u64, Ordering::Relaxed);
+            self.pending_ts_advances
+                .after_drain(excess, &mut self.timestamp);
+        }
+    }
+
+    /// 只发到点的帧：按 10 ms 网格整形，编码、打 RTP 头并发送。
+    fn send_frames(
+        &mut self,
+        pcm_buf: &mut Vec<i16>,
+        next_send_at: &mut Instant,
+        ctx: &mut SendCtx<'_>,
+        stats: &ReverseStats,
+    ) {
+        // 只发到点的帧：节拍整形。槽位落后超过半个帧就重锚（见 `advance_slot`），
+        // 绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
+        while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= *next_send_at {
+            let now = Instant::now();
+            if slot_is_late(*next_send_at, ctx.frame_gap, now) {
+                // 网格已被撕开（空闲期无声、线程被抢占、设备重开）：这一帧的
+                // "迟到量"描述的是停顿多久，不是网格多准，混进迟到统计会把
+                // 均值带偏（实测一次 8 s 无声间隔 → 均值 0.3 ms 变 4.2 ms）。
+                // 只计数。真正的卡顿幅度看 `积压峰值` 与下面的重锚次数。
+                stats.reanchors.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
+                let late_us = now.duration_since(*next_send_at).as_micros() as u64;
+                stats.late_us.fetch_add(late_us, Ordering::Relaxed);
+                stats.late_min_us.fetch_min(late_us, Ordering::Relaxed);
+                stats.late_max_us.fetch_max(late_us, Ordering::Relaxed);
+                stats.late_n.fetch_add(1, Ordering::Relaxed);
+            }
+            *next_send_at = advance_slot(*next_send_at, ctx.frame_gap, now);
+            ctx.frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
+            pcm_buf.drain(..FRAME_INTERLEAVED);
+
+            let t_encode = Instant::now();
+            let encoded = ctx.encoder.encode(ctx.frame, ctx.payload);
+            stats
+                .encode_us
+                .fetch_add(t_encode.elapsed().as_micros() as u64, Ordering::Relaxed);
+            stats.frames.fetch_add(1, Ordering::Relaxed);
+            // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限）。
+            // 时间戳仍按媒体时间前进，但**序列号不占号**：序号只属于真正
+            // 发到网络上的包。接收端 PLC/静音同样不推进序号，两边一致。
+            let len = match encoded {
+                Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => n,
+                Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
+                    // 超过 1275 字节：整帧丢弃，绝不截断
+                    stats.oversize.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Ok(_) => 0, // DTX 空帧：时间戳推进，不发包
+                Err(e) => {
+                    let n = stats.encode_errors.fetch_add(1, Ordering::Relaxed);
+                    if n < 3 {
+                        logf!("[Reverse] 编码失败: {e:?}");
+                    }
+                    0
+                }
+            };
+
+            // 时间戳每帧推进 480（含 DTX / 丢帧）
+            self.timestamp = self.timestamp.wrapping_add(rtp::FRAME_SAMPLES);
+            if len > 0 {
+                let gap_ms = self
+                    .last_sent
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(u128::MAX);
+                let ts_start = self.timestamp.wrapping_sub(rtp::FRAME_SAMPLES);
+                let ts_gap_ms = self
+                    .last_sent_ts
+                    .map(|p| {
+                        ts_start.wrapping_sub(p) as u64
+                            / (rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64)
+                    })
+                    .unwrap_or(u64::MAX);
+                let marker = self.first_packet
+                    || gap_ms > rtp::RESYNC_GAP_MS as u128
+                    || ts_gap_ms > rtp::RESYNC_GAP_MS as u64;
+                if !self.first_packet && marker {
+                    // 发送中断会让接收端重同步（flush + 重建解码器），必须计数备查
+                    stats.gaps.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(total) = rtp::write_packet(
+                    ctx.packet,
+                    marker,
+                    self.seq,
+                    ts_start,
+                    ctx.ssrc,
+                    &ctx.payload[..len],
+                ) {
+                    let t_send = Instant::now();
+                    let sent = ctx.sock.send_to(&ctx.packet[..total], ctx.target);
+                    stats
+                        .send_us
+                        .fetch_add(t_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    match sent {
+                        Ok(_) => {
+                            stats.packets.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
+                            self.last_sent = Some(Instant::now());
+                            self.last_sent_ts = Some(ts_start);
+                            self.first_packet = false;
+                            // 只有真正发出的包才消耗一个序号
+                            self.seq = self.seq.wrapping_add(1);
+                        }
+                        Err(e) => {
+                            let n = stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                            if n == 0 {
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                ) {
+                                    logf!(
+                                        "[Reverse] 发送超时（{} ms），已计入发送错误（后续同类错误不再打印）",
+                                        SEND_TIMEOUT_MS
+                                    );
+                                } else {
+                                    logf!("[Reverse] 发送失败（后续同类错误不再打印）: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // 缺口补偿在本帧的 ts_start 已经使用之后才兑现：它是紧跟在
+            // 队首旧帧后面的静默间隔，下一帧（新数据）才落在缺口之后。
+            self.pending_ts_advances
+                .after_frame_sent(&mut self.timestamp);
+        }
+    }
+}
+
+/// 发送路径的编码器与网络上下文：跨循环迭代复用，热路径上不复制缓冲。
+struct SendCtx<'a> {
+    encoder: &'a mut audiopus::coder::Encoder,
+    frame: &'a mut [i16],
+    payload: &'a mut [u8],
+    packet: &'a mut [u8],
+    sock: &'a UdpSocket,
+    target: SocketAddr,
+    ssrc: u32,
+    frame_gap: Duration,
+}
+
 pub struct ReverseSender {
     running: Arc<AtomicBool>,
     /// 线程真正退出后置 false；仅看 `Some(ReverseSender)` 不能判断它还在跑。
@@ -379,17 +748,7 @@ impl ReverseSender {
                 // 一个 ≥10 ms 的发送空档，接收端对应一个 PLC 帧（可闻）。
                 // 优先注册 MMCSS "Pro Audio" 获取音频调度配额；失败才回退到
                 // THREAD_PRIORITY_HIGHEST（受限权限/组策略只告警，继续运行）。
-                let mmcss = MmcssGuard::acquire("Reverse");
-                if !mmcss.is_active() {
-                    // SAFETY: GetCurrentThread 返回伪句柄，不转移所有权、无需关闭。
-                    unsafe {
-                        if let Err(e) =
-                            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
-                        {
-                            logf!("[Reverse] 发送线程提权失败（{e}），继续用默认优先级");
-                        }
-                    }
-                }
+                let _mmcss = boost_current_thread("Reverse", "发送线程");
                 Self::run_loop(target, ssrc, &running_clone, &alive_clone, &shared);
             })
             .ok();
@@ -468,80 +827,49 @@ impl ReverseSender {
             Err(e) => logf!("[Reverse] 读取 Opus lookahead 失败: {e:?}"),
         }
 
-        let send_sock = match bind_reverse_socket(target) {
-            Ok(s) => s,
-            Err(e) => {
-                logf!("[Reverse] UDP socket 创建失败: {e}");
-                return;
-            }
+        let send_sock = match open_reverse_socket(target) {
+            Some(s) => s,
+            None => return,
         };
-
-        // 发送超时：网络栈/发送缓冲卡住时 `send_to` 最多阻塞 20 ms，
-        // 既避免拖垮 10 ms 发送节拍，也保证 stop() 的 join 有界（10 + 20 ms）。
-        // 超时按发送失败计数，下一帧继续。
-        if let Err(e) = send_sock.set_write_timeout(Some(Duration::from_millis(SEND_TIMEOUT_MS))) {
-            logf!("[Reverse] 发送超时设置失败（{e}），继续使用阻塞发送");
-        }
-
-        // ── DSCP EF 标记（A2）──
-        // 设置本身可能被组策略拦下（DisableUserTOSSetting=1）或需要管理员，
-        // 失败不影响功能：仅告警，继续用默认优先级发送。
-        if target.is_ipv4() {
-            match socket2::SockRef::from(&send_sock).set_tos_v4(DSCP_EF_TOS) {
-                Ok(()) => logf!("[Reverse] 发送套接字已标记 DSCP EF（TOS=0xB8）"),
-                Err(e) => logf!(
-                    "[Reverse] DSCP 标记失败（{e}）：需管理员权限或 DisableUserTOSSetting=0；音频仍可正常发送"
-                ),
-            }
-        }
-        // socket2 在 Windows 不提供 IPv6 的 set_tclass_v6；不对 IPv6 套接字设置 IPv4 TOS。
-
-        // ── 发送缓冲（借鉴 Sunshine 的 1 MiB `SO_SNDBUF`）──
-        // Windows 默认发送缓冲只有 8 KiB 量级：一次调度抖动里连发几包就可能
-        // `send` 阻塞或丢包，而丢一包就是一个可闻的 PLC。反向音频码率很低
-        // （≤512 kbps，每 10 ms 一包 ≤1275 B），1 MiB 只是把突发吸收掉，
-        // 不会引入排队延迟（发送线程仍是每 10 ms 一包）。
-        const SEND_BUFFER_BYTES: usize = 1 << 20;
-        if let Err(e) = socket2::SockRef::from(&send_sock).set_send_buffer_size(SEND_BUFFER_BYTES) {
-            logf!("[Reverse] 发送缓冲设置失败（{e}），继续使用系统默认值");
-        }
 
         // 环回采集客户端可重建：设备失效（AUDCLNT_E_DEVICE_INVALIDATED）、
         // 音频服务重启、端点切换后，旧客户端可能永远返回错误。不能把它当成
         // “端点空闲”而一直发合成静音，否则重连前手机永远听不到声音。
-        let mut capture: Option<LoopbackCapture> = None;
-        // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）。
-        // 重采样器与播放侧、Android 共用 `protocol/resampler.rs`。
-        let mut resampler: Option<Resampler> = None;
-        let mut last_capture_attempt: Option<Instant> = None;
-        let mut last_capture_fail_log = Instant::now() - Duration::from_secs(10);
-        let mut read_errors: u32 = 0;
-        let mut loopback: Vec<f32> = Vec::with_capacity(2_048);
-        let mut resampled: Vec<f32> = Vec::with_capacity(2_048);
+        let mut capture_state = CaptureState {
+            capture: None,
+            // 端点混音率不是 48 kHz 时先归一再组帧（编码器固定 48 kHz）。
+            // 重采样器与播放侧、Android 共用 `protocol/resampler.rs`。
+            resampler: None,
+            last_capture_attempt: None,
+            last_capture_fail_log: Instant::now() - Duration::from_secs(10),
+            read_errors: 0,
+            loopback: Vec::with_capacity(2_048),
+            resampled: Vec::with_capacity(2_048),
+        };
         let mut pcm_buf: Vec<i16> = Vec::with_capacity(MAX_FRAME_BACKLOG);
         let mut frame = vec![0i16; FRAME_INTERLEAVED];
         let mut payload = [0u8; rtp::OPUS_MAX_PAYLOAD];
         let mut packet = [0u8; rtp::RTP_MAX_PACKET];
+        // 发送路径的编码器与网络上下文：跨循环迭代复用，避免热路径堆分配。
+        let mut ctx = SendCtx {
+            encoder: &mut encoder,
+            frame: &mut frame,
+            payload: &mut payload,
+            packet: &mut packet,
+            sock: &send_sock,
+            target,
+            ssrc,
+            frame_gap: Duration::from_millis(FRAME_MS as u64),
+        };
 
-        let mut seq: u16 = random_u16();
-        let mut timestamp: u32 = random_u32();
-        let mut first_packet = true;
-        let mut last_sent: Option<Instant> = None;
-        let mut last_sent_ts: Option<u32> = None;
+        let mut sender = FrameSender::new();
         // 端点最近一次真正给出数据的时间：只用于恢复时补偿媒体时间戳。
         let mut last_frame_at = Instant::now();
-        // 缺口补偿的待应用量：`timestamp` 只在发送时赋给队首帧，若在追加
-        // 新数据时立即推进，会把仍在排队的旧帧一起前移。每个补偿记账为
-        // “再消费对应帧数后应用”，补偿才落在旧内容之后、新内容之前。
-        // 用队列而非单值：连续缺口各自保留边界，前一次补偿不会被后一次
-        // 合并推到新数据之后。
-        let mut pending_ts_advances = PendingTsAdvances::default();
 
         // ── 1 帧节拍整形 ──
         // WASAPI 环回事件通常一次带回一个周期（10/20 ms），直接发就是"两包挨着、
         // 然后静默 20 ms"，接收端水位呈锯齿。这里把发送时刻钉在 10 ms 网格上：
         // 不是攒队列（最多只压 1 帧），而是把成簇的输出摊平。
-        let frame_gap = Duration::from_millis(FRAME_MS as u64);
         let mut next_send_at = Instant::now();
 
         // 高精度等待（详见 `hires.rs`）：毫秒级 `WaitForSingleObject` / `Sleep`
@@ -556,300 +884,80 @@ impl ReverseSender {
 
         let mut cfg_check_at = Instant::now();
         while running.load(Ordering::Relaxed) {
-            // 没有可用采集客户端时，按 500 ms 退避重建；初始化失败不能直接退出线程。
-            if capture.is_none()
-                && last_capture_attempt
-                    .map(|t| t.elapsed() >= Duration::from_millis(500))
-                    .unwrap_or(true)
-            {
-                last_capture_attempt = Some(Instant::now());
-                match LoopbackCapture::new() {
-                    Some(c) => {
-                        let rate = c.sample_rate();
-                        let mut rs = Resampler::new(2);
-                        rs.set_source_rate(rate, 48_000);
-                        resampler = Some(rs);
-                        capture = Some(c);
-                        read_errors = 0;
-                        logf!("[Reverse] 环回捕获已就绪（{} Hz）", rate);
-                    }
-                    None => {
-                        if last_capture_fail_log.elapsed() >= Duration::from_secs(5) {
-                            last_capture_fail_log = Instant::now();
-                            logf!("[Reverse] 环回捕获初始化失败，500 ms 后重试");
-                        }
-                    }
-                }
-            }
+            capture_state.ensure_capture();
 
             // ── 配置变化检测：500 ms 一次，避免每帧抢锁（发送线程不该有锁流量）──
             if cfg_check_at.elapsed() > Duration::from_millis(500) {
                 cfg_check_at = Instant::now();
                 let cfg = shared.config();
                 if cfg != applied {
-                    apply_config(&mut encoder, &cfg);
+                    apply_config(ctx.encoder, &cfg);
                     applied = cfg;
                 }
             }
 
-            // 有帧在等发送窗口时用**高精度定时器**睡到下一个发送时刻；
-            // 没有待发帧（端点空闲）时才等 WASAPI 事件——空闲路径上的等待
-            // 精度无关紧要，没必要唤醒系统定时器。
             let has_frame = pcm_buf.len() >= FRAME_INTERLEAVED;
-            let wait_ms = if has_frame {
-                let now = Instant::now();
-                if next_send_at > now {
-                    (next_send_at - now)
-                        .as_millis()
-                        .clamp(1, WAIT_TIMEOUT_MS as u128) as u32
-                } else {
-                    0
-                }
-            } else {
-                WAIT_TIMEOUT_MS
-            };
-            let t_wait = Instant::now();
-            match (has_frame, hi_timer.as_ref()) {
-                (true, Some(timer)) if next_send_at > t_wait => {
-                    timer.wait_until(next_send_at);
-                }
-                _ => {
-                    // 已到点（无需等待）或没有高精度定时器：退回事件等待。
-                    // 事件是否触发只影响延迟；发送仍按 10 ms 网格整形。
-                    let _ = if let Some(c) = capture.as_ref() {
-                        c.wait(wait_ms)
-                    } else {
-                        std::thread::sleep(Duration::from_millis(wait_ms.max(5) as u64));
-                        false
-                    };
-                }
-            }
-            stats
-                .wait_us
-                .fetch_add(t_wait.elapsed().as_micros() as u64, Ordering::Relaxed);
-            let t_read = Instant::now();
-            let outcome = if let Some(c) = capture.as_ref() {
-                c.read_stereo(&mut loopback)
-            } else {
-                ReadOutcome::Empty
-            };
-            stats
-                .read_us
-                .fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
-            let got_data = match outcome {
-                ReadOutcome::Data => {
-                    read_errors = 0;
-                    true
-                }
-                ReadOutcome::Empty => {
-                    read_errors = 0;
-                    false
-                }
-                ReadOutcome::Error(code) => {
-                    read_errors = read_errors.saturating_add(1);
-                    if read_errors == 1 || read_errors.is_multiple_of(50) {
-                        logf!(
-                            "[Reverse] 环回 GetBuffer 失败（hr=0x{code:08X}，连续 {read_errors} 次）"
-                        );
-                    }
-                    if read_errors >= 3 {
-                        logf!("[Reverse] 环回端点连续失败，重建采集客户端");
-                        capture = None;
-                        resampler = None;
-                        read_errors = 0;
-                        last_frame_at = Instant::now();
-                        last_capture_attempt = Some(Instant::now());
-                    }
-                    false
-                }
-            };
+            capture_state.wait_for_data(has_frame, next_send_at, hi_timer.as_ref(), stats);
+            capture_state.read_and_resample(
+                &mut sender,
+                &mut pcm_buf,
+                &mut last_frame_at,
+                stats,
+            );
 
-            if got_data {
-                // 这段“无真实媒体”的墙钟时间要补进 RTP 时间戳，否则接收端
-                // 本地静音已经把播放头推进，恢复包会被判成 late。读取到的
-                // 样本本身覆盖一段时间，必须从缺口里扣掉，避免重复计时。
-                let idle_ms = last_frame_at.elapsed().as_millis() as u64;
-                last_frame_at = Instant::now();
-                if let Some(rs) = resampler.as_mut() {
-                    rs.process_into(&loopback, &mut resampled);
-                } else {
-                    resampled.clear();
-                }
-                // 缺口按**丢弃前**的完整覆盖时长计算：下面丢弃的原始媒体
-                // 会作为独立补偿显式记账，若 covered 只算保留部分，同一段
-                // 丢弃媒体会被 gap_advance 再计一次。
-                let covered_ms = (resampled.len() as u64 / 2) * 1000 / 48_000;
-                let mut dropped_advance: u32 = 0;
-                if resampled.len() > MAX_FRAME_BACKLOG {
-                    let excess = resampled.len() - MAX_FRAME_BACKLOG;
-                    stats
-                        .dropped_samples
-                        .fetch_add(excess as u64, Ordering::Relaxed);
-                    resampled.drain(..excess);
-                    // 丢的是真实媒体：时间戳必须跨过它，否则接收端把断流当
-                    // 连续。但它位于已排队的旧帧之后，立即推进会把旧帧一起
-                    // 前移；并入下面的队列补偿，随旧帧消费到边界时兑现。
-                    dropped_advance = frame_grid_advance(excess);
-                }
-                // 补偿必须落在“已入队的旧帧之后、新数据之前”：此时全局
-                // timestamp 描述的是队首帧，立即推进会把旧帧一起前移。
-                // 边界与 drain 路径同样用 div_ceil：不足一帧的队尾残留也
-                // 算占用一个帧边界，避免两侧对残留的折算口径不一致。
-                pending_ts_advances.queue(
-                    pcm_buf.len().div_ceil(FRAME_INTERLEAVED),
-                    gap_advance_samples(idle_ms, covered_ms).wrapping_add(dropped_advance),
-                    &mut timestamp,
-                );
-                for &s in &resampled {
-                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    pcm_buf.push(v);
-                }
-            }
+            sender.trim_backlog(&mut pcm_buf, stats);
 
-            // 积压保护：超过 40 ms 只保留最新部分（发送端不得积压）
-            if pcm_buf.len() > MAX_FRAME_BACKLOG {
-                let excess = pcm_buf.len() - MAX_FRAME_BACKLOG;
-                pcm_buf.drain(..excess);
-                stats
-                    .dropped_samples
-                    .fetch_add(excess as u64, Ordering::Relaxed);
-                // 同上：时间戳跟随真实媒体前进，接收端才能在缺口处 PLC。
-                // 推进量取整到整帧，保持 480 网格（见 `frame_grid_advance`）。
-                timestamp = timestamp.wrapping_add(frame_grid_advance(excess));
-                pending_ts_advances.after_drain(excess, &mut timestamp);
-            }
-            // 只保留最近 40 ms 的统计峰值；超限时旧数据已经丢掉
-            stats
-                .max_backlog
-                .fetch_max(pcm_buf.len() as u64, Ordering::Relaxed);
-
-            // 高精度定时器路径不消费 WASAPI 事件：一次读到 2 个周期或线程被
-            // 抢占后，组帧缓冲会多出整帧。发送严格 1 帧/10 ms，超过流水线
-            // 深度的积压永远等不到节拍，只会永久抬高发送端延迟（40 ms 上限
-            // 只截不断）。丢弃最旧的超额帧，保留最新 1-2 帧；时间戳/序号不动。
-            let excess = backlog_trim(pcm_buf.len(), PCM_MAX_QUEUED_FRAMES);
-            if excess > 0 {
-                pcm_buf.drain(..excess);
-                stats
-                    .dropped_samples
-                    .fetch_add(excess as u64, Ordering::Relaxed);
-                pending_ts_advances.after_drain(excess, &mut timestamp);
-            }
-
-            // 只发到点的帧：节拍整形。槽位落后超过半个帧就重锚（见 `advance_slot`），
-            // 绝不用连续突发把落后的时间补回来——那正是水位锯齿的来源。
-            while pcm_buf.len() >= FRAME_INTERLEAVED && Instant::now() >= next_send_at {
-                let now = Instant::now();
-                if slot_is_late(next_send_at, frame_gap, now) {
-                    // 网格已被撕开（空闲期无声、线程被抢占、设备重开）：这一帧的
-                    // "迟到量"描述的是停顿多久，不是网格多准，混进迟到统计会把
-                    // 均值带偏（实测一次 8 s 无声间隔 → 均值 0.3 ms 变 4.2 ms）。
-                    // 只计数。真正的卡顿幅度看 `积压峰值` 与下面的重锚次数。
-                    stats.reanchors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    // 节拍迟到量：这是判断“网格是否真的准时”的唯一直接证据
-                    let late_us = now.duration_since(next_send_at).as_micros() as u64;
-                    stats.late_us.fetch_add(late_us, Ordering::Relaxed);
-                    stats.late_min_us.fetch_min(late_us, Ordering::Relaxed);
-                    stats.late_max_us.fetch_max(late_us, Ordering::Relaxed);
-                    stats.late_n.fetch_add(1, Ordering::Relaxed);
-                }
-                next_send_at = advance_slot(next_send_at, frame_gap, now);
-                frame.copy_from_slice(&pcm_buf[..FRAME_INTERLEAVED]);
-                pcm_buf.drain(..FRAME_INTERLEAVED);
-
-                let t_encode = Instant::now();
-                let encoded = encoder.encode(&frame, &mut payload);
-                stats
-                    .encode_us
-                    .fetch_add(t_encode.elapsed().as_micros() as u64, Ordering::Relaxed);
-                stats.frames.fetch_add(1, Ordering::Relaxed);
-                // `len == 0` 表示这一帧不产出负载（DTX 空帧 / 编码失败 / 超限）。
-                // 时间戳仍按媒体时间前进，但**序列号不占号**：序号只属于真正
-                // 发到网络上的包。接收端 PLC/静音同样不推进序号，两边一致。
-                let len = match encoded {
-                    Ok(n) if n > 0 && n <= rtp::OPUS_MAX_PAYLOAD => n,
-                    Ok(n) if n > rtp::OPUS_MAX_PAYLOAD => {
-                        // 超过 1275 字节：整帧丢弃，绝不截断
-                        stats.oversize.fetch_add(1, Ordering::Relaxed);
-                        0
-                    }
-                    Ok(_) => 0, // DTX 空帧：时间戳推进，不发包
-                    Err(e) => {
-                        let n = stats.encode_errors.fetch_add(1, Ordering::Relaxed);
-                        if n < 3 {
-                            logf!("[Reverse] 编码失败: {e:?}");
-                        }
-                        0
-                    }
-                };
-
-                // 时间戳每帧推进 480（含 DTX / 丢帧）
-                timestamp = timestamp.wrapping_add(rtp::FRAME_SAMPLES);
-                if len > 0 {
-                    let gap_ms = last_sent
-                        .map(|t| t.elapsed().as_millis())
-                        .unwrap_or(u128::MAX);
-                    let ts_start = timestamp.wrapping_sub(rtp::FRAME_SAMPLES);
-                    let ts_gap_ms = last_sent_ts
-                        .map(|p| {
-                            ts_start.wrapping_sub(p) as u64
-                                / (rtp::FRAME_SAMPLES as u64 / rtp::FRAME_MS as u64)
-                        })
-                        .unwrap_or(u64::MAX);
-                    let marker = first_packet
-                        || gap_ms > rtp::RESYNC_GAP_MS as u128
-                        || ts_gap_ms > rtp::RESYNC_GAP_MS as u64;
-                    if !first_packet && marker {
-                        // 发送中断会让接收端重同步（flush + 重建解码器），必须计数备查
-                        stats.gaps.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if let Some(total) =
-                        rtp::write_packet(&mut packet, marker, seq, ts_start, ssrc, &payload[..len])
-                    {
-                        let t_send = Instant::now();
-                        let sent = send_sock.send_to(&packet[..total], target);
-                        stats
-                            .send_us
-                            .fetch_add(t_send.elapsed().as_micros() as u64, Ordering::Relaxed);
-                        match sent {
-                            Ok(_) => {
-                                stats.packets.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes.fetch_add(total as u64, Ordering::Relaxed);
-                                last_sent = Some(Instant::now());
-                                last_sent_ts = Some(ts_start);
-                                first_packet = false;
-                                // 只有真正发出的包才消耗一个序号
-                                seq = seq.wrapping_add(1);
-                            }
-                            Err(e) => {
-                                let n = stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                                if n == 0 {
-                                    if matches!(
-                                        e.kind(),
-                                        std::io::ErrorKind::WouldBlock
-                                            | std::io::ErrorKind::TimedOut
-                                    ) {
-                                        logf!(
-                                            "[Reverse] 发送超时（{} ms），已计入发送错误（后续同类错误不再打印）",
-                                            SEND_TIMEOUT_MS
-                                        );
-                                    } else {
-                                        logf!("[Reverse] 发送失败（后续同类错误不再打印）: {e}");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // 缺口补偿在本帧的 ts_start 已经使用之后才兑现：它是紧跟在
-                // 队首旧帧后面的静默间隔，下一帧（新数据）才落在缺口之后。
-                pending_ts_advances.after_frame_sent(&mut timestamp);
-            }
+            sender.send_frames(&mut pcm_buf, &mut next_send_at, &mut ctx, stats);
         }
 
         logf!("[Reverse] 反向音频线程退出");
     }
+}
+
+/// 创建反向发送套接字，并完成超时、DSCP EF 与发送缓冲设置。
+///
+/// 绑定失败返回 `None`（调用方退出线程）；其余设置失败只告警，继续使用
+/// 系统默认值。各项设置顺序与原先内联代码一致。
+fn open_reverse_socket(target: SocketAddr) -> Option<UdpSocket> {
+    let send_sock = match bind_reverse_socket(target) {
+        Ok(s) => s,
+        Err(e) => {
+            logf!("[Reverse] UDP socket 创建失败: {e}");
+            return None;
+        }
+    };
+
+    // 发送超时：网络栈/发送缓冲卡住时 `send_to` 最多阻塞 20 ms，
+    // 既避免拖垮 10 ms 发送节拍，也保证 stop() 的 join 有界（10 + 20 ms）。
+    // 超时按发送失败计数，下一帧继续。
+    if let Err(e) = send_sock.set_write_timeout(Some(Duration::from_millis(SEND_TIMEOUT_MS))) {
+        logf!("[Reverse] 发送超时设置失败（{e}），继续使用阻塞发送");
+    }
+
+    // ── DSCP EF 标记（A2）──
+    // 设置本身可能被组策略拦下（DisableUserTOSSetting=1）或需要管理员，
+    // 失败不影响功能：仅告警，继续用默认优先级发送。
+    if target.is_ipv4() {
+        match socket2::SockRef::from(&send_sock).set_tos_v4(DSCP_EF_TOS) {
+            Ok(()) => logf!("[Reverse] 发送套接字已标记 DSCP EF（TOS=0xB8）"),
+            Err(e) => logf!(
+                "[Reverse] DSCP 标记失败（{e}）：需管理员权限或 DisableUserTOSSetting=0；音频仍可正常发送"
+            ),
+        }
+    }
+    // socket2 在 Windows 不提供 IPv6 的 set_tclass_v6；不对 IPv6 套接字设置 IPv4 TOS。
+
+    // ── 发送缓冲（借鉴 Sunshine 的 1 MiB `SO_SNDBUF`）──
+    // Windows 默认发送缓冲只有 8 KiB 量级：一次调度抖动里连发几包就可能
+    // `send` 阻塞或丢包，而丢一包就是一个可闻的 PLC。反向音频码率很低
+    // （≤512 kbps，每 10 ms 一包 ≤1275 B），1 MiB 只是把突发吸收掉，
+    // 不会引入排队延迟（发送线程仍是每 10 ms 一包）。
+    const SEND_BUFFER_BYTES: usize = 1 << 20;
+    if let Err(e) = socket2::SockRef::from(&send_sock).set_send_buffer_size(SEND_BUFFER_BYTES) {
+        logf!("[Reverse] 发送缓冲设置失败（{e}），继续使用系统默认值");
+    }
+
+    Some(send_sock)
 }
 
 // 反向目标可来自 IPv4 或 IPv6 的监听端；源套接字必须使用同一地址族。
@@ -1198,23 +1306,58 @@ struct CaptureFormat {
     downmix: Option<Downmix>,
 }
 
+/// 事件句柄的 RAII 所有权包装：保证 `CloseHandle` 恰好执行一次。
+///
+/// `LoopbackCapture::new()` 里的任何失败分支都可以直接 `return None`，
+/// 已创建的句柄由 `Drop` 关闭；降级到轮询时用 [`clear`](Self::clear)
+/// 主动关闭并置空，之后 `Drop` 是空操作。
+struct OwnedHandle(Option<HANDLE>);
+
+impl OwnedHandle {
+    fn new(h: Option<HANDLE>) -> Self {
+        Self(h)
+    }
+
+    /// 读取当前句柄值（`HANDLE` 是 `Copy`，不转移所有权），用于传给 Win32 调用。
+    fn raw(&self) -> Option<HANDLE> {
+        self.0
+    }
+
+    /// 关闭句柄并置空；重复调用是空操作。
+    fn clear(&mut self) {
+        if let Some(h) = self.0.take() {
+            // SAFETY: 句柄由本包装独占拥有（`take` 后立即置空），
+            // 因此 CloseHandle 对每个句柄只执行一次。
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 struct LoopbackCapture {
     client: IAudioClient,
     capture: IAudioCaptureClient,
     format: CaptureFormat,
-    event: Option<HANDLE>,
+    /// 必须最后声明：结构体字段按**声明顺序**析构，`event` 因此在
+    /// `client`/`capture` 之后才关闭句柄，与原实现“先 Stop 再 CloseHandle”
+    /// 的顺序一致。
+    event: OwnedHandle,
 }
 
 impl Drop for LoopbackCapture {
     fn drop(&mut self) {
         // SAFETY: `client` 是本结构独占拥有的 COM 接口指针（Drop 只跑一次，
-        // 无其它别名）；`event` 用 take() 取走，保证 CloseHandle 只执行一次。
-        // 两个调用都只接受有效句柄，失败返回值被忽略即等于不做事。
+        // 无其它别名）；事件句柄不在这里处理，由字段 `event` 的 OwnedHandle
+        // 在字段析构阶段恰好关闭一次。Stop 失败返回值被忽略即等于不做事。
         unsafe {
             let _ = self.client.Stop();
-            if let Some(h) = self.event.take() {
-                let _ = CloseHandle(h);
-            }
         }
     }
 }
@@ -1233,7 +1376,8 @@ impl LoopbackCapture {
     fn new() -> Option<Self> {
         // SAFETY: 整块只做 COM 调用，不解引用裸指针；`GetMixFormat` 返回的
         // 指针传给 parse_mix_format 后立刻 CoTaskMemFree，且只释放一次；
-        // 失败分支逐个关闭已取得的句柄；事件句柄的最终关闭在 Drop 里。
+        // 事件句柄由 `OwnedHandle` 独占，任何提前返回都由它的 Drop 恰好
+        // 关闭一次。
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
@@ -1244,9 +1388,12 @@ impl LoopbackCapture {
             let format = parse_mix_format(fmt_ptr);
 
             // 事件驱动：WASAPI 事件 + 10 ms 逻辑帧。缓冲区取 20 ms（事件粒度）。
-            let event = CreateEventW(None, false, false, windows::core::PCWSTR::null()).ok();
+            // 句柄所有权交给 OwnedHandle：失败的提前返回不会泄漏。
+            let mut event = OwnedHandle::new(
+                CreateEventW(None, false, false, windows::core::PCWSTR::null()).ok(),
+            );
             let mut flags = AUDCLNT_STREAMFLAGS_LOOPBACK;
-            if event.is_some() {
+            if event.raw().is_some() {
                 flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
             }
             let dur = 200_000i64; // 20 ms，单位 100 ns
@@ -1255,9 +1402,6 @@ impl LoopbackCapture {
                 .is_ok();
             CoTaskMemFree(Some(fmt_ptr as _));
             if !init_ok {
-                if let Some(h) = event {
-                    let _ = CloseHandle(h);
-                }
                 return None;
             }
 
@@ -1265,25 +1409,21 @@ impl LoopbackCapture {
                 Some(f) => f,
                 None => {
                     logf!("[Reverse] 设备混音格式不受支持（需 f32/i16/i32）");
-                    if let Some(h) = event {
-                        let _ = CloseHandle(h);
-                    }
                     return None;
                 }
             };
 
-            // 环回端点在某些驱动上不接受事件回调：失败就退回超时轮询（10 ms 粒度）
-            let mut event = event;
-            if let Some(h) = event
-                && client.SetEventHandle(h).is_err() {
-                    logf!("[Reverse] 环回端点不支持事件回调，改用 10 ms 超时轮询");
-                    let _ = CloseHandle(h);
-                    event = None;
-                }
+            // 环回端点在某些驱动上不接受事件回调：失败就退回超时轮询（10 ms 粒度）。
+            // `clear()` 关闭句柄并置空，等价于原来的 CloseHandle + event = None。
+            if let Some(h) = event.raw()
+                && client.SetEventHandle(h).is_err()
+            {
+                logf!("[Reverse] 环回端点不支持事件回调，改用 10 ms 超时轮询");
+                event.clear();
+            }
 
-            // 从这里往后不能再提前返回：`event` 是内核句柄，`Self` 没建好就没有
-            // Drop 去关它。run_loop 每 500 ms 重试一次，用 `?` 提前返回就是 2 个
-            // 句柄/秒的无界泄漏（最终 CreateEventW 失败、环回彻底起不来）。
+            // 从这里往后即使提前返回也不会泄漏：事件句柄由 `event` 的 Drop 关闭，
+            // 无论是返回 None 还是正常构造 `Self`，CloseHandle 都恰好执行一次。
             let capture: IAudioCaptureClient = match client.GetService() {
                 Ok(c) => c,
                 Err(e) => {
@@ -1291,17 +1431,11 @@ impl LoopbackCapture {
                         "[Reverse] GetService(IAudioCaptureClient) 失败: {}",
                         e.code().0
                     );
-                    if let Some(h) = event {
-                        let _ = CloseHandle(h);
-                    }
                     return None;
                 }
             };
             if let Err(e) = client.Start() {
                 logf!("[Reverse] IAudioClient::Start 失败: {}", e.code().0);
-                if let Some(h) = event {
-                    let _ = CloseHandle(h);
-                }
                 return None;
             }
             logf!(
@@ -1309,7 +1443,7 @@ impl LoopbackCapture {
                 format.channels,
                 format.kind,
                 format.sample_rate,
-                if event.is_some() {
+                if event.raw().is_some() {
                     "事件驱动"
                 } else {
                     "轮询"
@@ -1330,10 +1464,11 @@ impl LoopbackCapture {
 
     /// 等待一次数据就绪。返回 `true` 表示事件已触发，`false` 表示超时。
     fn wait(&self, timeout_ms: u32) -> bool {
-        match self.event {
+        match self.event.raw() {
             Some(h) => {
-                // SAFETY: `h` 来自 CreateEventW，在本结构存活期内始终有效
-                // （只在 Drop 里关闭），且 WaitForSingleObject 不转移所有权。
+                // SAFETY: `h` 来自 CreateEventW，所有权归 `self.event`
+                // （OwnedHandle），在本结构存活期内始终有效（只在字段析构时
+                // 关闭一次），且 WaitForSingleObject 不转移所有权。
                 let r = unsafe { WaitForSingleObject(h, timeout_ms) };
                 r == WAIT_OBJECT_0
             }

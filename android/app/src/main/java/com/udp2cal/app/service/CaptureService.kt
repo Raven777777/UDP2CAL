@@ -110,7 +110,7 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
 
     fun stopCapture() {
         // 先停通知收集器：否则 IO 侧收到 connected=false 后会在
-        // CaptureLifecycle 的 stopForeground 之后再次 startForeground，
+        // finishSession 的 stopForeground 之后再次 startForeground，
         // 停止后仍显示"等待连接"的通知。
         notificationJob?.cancel()
         notificationJob = null
@@ -123,12 +123,29 @@ class CaptureService : Service(), WifiNetworkBinder.Listener {
     /**
      * 会话在无重启的情况下自然结束（失败/读失败/停采集）。
      *
-     * 停止通知收集器，避免 stopForeground 之后的下一次状态发射再次
+     * 前台通知的停止与 `stopSelf` 统一由 Service 负责，Lifecycle 只回报
+     * 会话已结束。顺序固定为：停通知收集器 → 移除前台通知 → 停止服务。
+     * 先停收集器，避免 stopForeground 之后的下一次状态发射再次
      * startForeground，留下与任何会话都不对应的残留通知。
      */
-    internal fun onSessionEnded() {
+    internal fun finishSession() {
         notificationJob?.cancel()
         notificationJob = null
+        try {
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+        }
+        stopSelf()
+    }
+
+    /**
+     * 链路硬失败路径：仅请求服务停止，不动前台通知。
+     *
+     * 与 [finishSession] 区分：这里会话可能仍在收尾，通知收集器由
+     * 后续的 [finishSession]（或 [onDestroy]）统一处理。
+     */
+    internal fun requestStop() {
+        stopSelf()
     }
 
     /** 语言切换后立即重建前台通知（通知文本不随状态变化，需显式刷新）。 */

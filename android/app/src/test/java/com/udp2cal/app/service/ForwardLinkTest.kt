@@ -1,5 +1,6 @@
 package com.udp2cal.app.service
 
+import com.udp2cal.app.EncoderCfg
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test

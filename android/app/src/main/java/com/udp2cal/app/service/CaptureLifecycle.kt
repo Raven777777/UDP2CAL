@@ -1,6 +1,5 @@
 package com.udp2cal.app.service
 
-import android.app.Service
 import android.content.Context
 import android.net.Network
 import android.net.wifi.WifiManager
@@ -33,6 +32,9 @@ import kotlin.coroutines.cancellation.CancellationException
  *
  * 这里只保留**跨链路共享**的状态（任务槽、UdpSender、重启参数、Wi-Fi 等待标记）；
  * 正向与反向各自的运行时状态分别封装在 [ForwardLink] / [ReverseLink] 中。
+ *
+ * 前台通知与 `stopSelf` 由 [CaptureService] 统一负责，本类只回报会话状态：
+ * 自然结束调用 `finishSession()`，链路硬失败调用 `requestStop()`。
  *
  * 线程/协程模型（规范第七、八章）：
  * ```
@@ -293,14 +295,13 @@ internal class CaptureLifecycle(
                         // 会话真正结束（失败/读失败/停采集）：归还 Wi-Fi 低延迟锁。
                         // 失败自终止时 stopCapture 不会运行，而绑定中的 Service 也不会
                         // onDestroy，只能在这里释放，否则锁会一直留在网卡上耗电。
-                        // 同时停掉通知收集器：否则 stopForeground 之后的下一次状态
-                        // 发射又会 startForeground，留下"等待连接"的残留通知。
-                        service.onSessionEnded()
+                        // 通知与 stopSelf 由 Service 统一负责：finishSession 内部依次
+                        // 停通知收集器 → stopForeground → stopSelf，Lifecycle 只回报
+                        // 会话状态。
                         try { wifiLock?.release() } catch (_: Exception) {}
                         wifiLock = null
                         status.update { it.copy(isRunning = false) }
-                        try { service.stopForeground(Service.STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
-                        service.stopSelf()
+                        service.finishSession()
                     }
                 }
             }
@@ -418,7 +419,7 @@ internal class CaptureLifecycle(
             )
         }
         hasNewCapture = false
-        service.stopSelf()
+        service.requestStop()
     }
 
     override fun onCaptureStalled() {

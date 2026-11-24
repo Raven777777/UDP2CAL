@@ -34,6 +34,9 @@ class DiscoveryManagerTest {
         assertNull(DiscoveryManager.parseStoredDeviceId("0000000000000000"))
         assertNull(DiscoveryManager.parseStoredDeviceId("00112233445566"))
         assertNull(DiscoveryManager.parseStoredDeviceId("001122334455667788"))
+        // 非十六进制字符不能拼成垃圾字节后当成有效 ID，否则会永久拒绝真实 ACK
+        assertNull(DiscoveryManager.parseStoredDeviceId("00112233445566gg"))
+        assertNull(DiscoveryManager.parseStoredDeviceId("GGGGGGGGGGGGGGGG"))
         assertArrayEquals(
             byteArrayOf(0, 0, 0, 0, 0, 0, 0, 1),
             DiscoveryManager.parseStoredDeviceId("0000000000000001")

@@ -44,6 +44,10 @@ pub const WATER_TARGET_MIN_MS: u32 = 80;
 /// 覆盖值的上界：再大就是拿延迟换稳定性，超出说明环境已不适合实时音频
 pub const WATER_TARGET_MAX_MS: u32 = 600;
 
+/// 用户可选的目标水位档位（ms）；首档必须等于 [`WATER_TARGET_MIN_MS`]。
+pub const WATER_TARGET_STEPS_MS: [u32; 5] = [80, 120, 160, 200, 300];
+const _: () = assert!(WATER_TARGET_STEPS_MS[0] == WATER_TARGET_MIN_MS);
+
 /// 运行时目标水位：默认 [`WATER_TARGET_MS`]，可用 `UDP2CAL_WATER_TARGET_MS` 覆盖。
 ///
 /// 只在首次调用时读一次环境变量（`OnceLock` 缓存）：控制器每 10 ms 调一次，

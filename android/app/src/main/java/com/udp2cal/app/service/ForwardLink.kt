@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.StringRes
 import androidx.core.content.ContextCompat
+import com.udp2cal.app.EncoderCfg
 import com.udp2cal.app.Prefs
 import com.udp2cal.app.R
 import com.udp2cal.app.Udp2CalProtocol
@@ -25,52 +26,15 @@ import java.net.DatagramPacket
 import java.security.SecureRandom
 import kotlin.coroutines.coroutineContext
 
-/**
- * 编码器参数快照。
- *
- * 推导规则必须与 [`OpusEncoder`] 构造函数**逐字一致**：
- * DTX 开启 → 强制 VBR；VBR 关闭 → 约束清零。否则热更新后的状态
- * 会与"从头创建"不一致，表现为"改了别的参数，VBR 又变回去了"。
- */
-internal data class EncoderCfg(
-    val bitrateKbps: Int,
-    val complexity: Int,
-    val signal: Int,
-    val bandwidth: Int,
-    val dtx: Int,
-    val vbr: Int,
-    val vbrConstraint: Int,
-    val fec: Int,
-    val packetLoss: Int,
-) {
-    companion object {
-        fun fromPrefs(): EncoderCfg {
-            val dtx = Prefs.opusDtx.coerceIn(0, 1)
-            val vbr = if (dtx == 1) 1 else Prefs.opusVbr.coerceIn(0, 1)
-            return EncoderCfg(
-                bitrateKbps = Udp2CalProtocol.clampBitrateKbps(Prefs.opusBitrateKbps),
-                complexity = Prefs.opusComplexity,
-                signal = Prefs.opusSignal,
-                bandwidth = Prefs.opusBandwidth,
-                dtx = dtx,
-                vbr = vbr,
-                vbrConstraint = if (vbr == 1) Prefs.opusVbrConstraint.coerceIn(0, 1) else 0,
-                fec = Prefs.opusFec,
-                packetLoss = Prefs.opusPacketLoss,
-            )
-        }
-    }
-
-    /** 状态卡展示用：当前码率控制模式 */
-    fun vbrMode(): VbrMode = when {
-        vbr == 0 -> VbrMode.CBR
-        vbrConstraint == 1 -> VbrMode.VBR_CONSTRAINED
-        else -> VbrMode.VBR
-    }
-}
-
 /** 语音模式：由编码器快照（而非再次读 Prefs）决定音源与 AEC 路由。 */
 internal fun EncoderCfg.voiceMode(): Boolean = signal == 3001
+
+/** 状态卡展示用：当前码率控制模式 */
+internal fun EncoderCfg.vbrMode(): VbrMode = when {
+    vbr == 0 -> VbrMode.CBR
+    vbrConstraint == 1 -> VbrMode.VBR_CONSTRAINED
+    else -> VbrMode.VBR
+}
 
 /**
  * 读返回负值时是否作为设备失效上报。
@@ -140,15 +104,7 @@ internal class ForwardLink(
         val cfg0 = EncoderCfg.fromPrefs()
         val enc = OpusEncoder(
             sampleRateHz = Udp2CalProtocol.OPUS_SAMPLE_RATE,
-            bitrateKbps = cfg0.bitrateKbps,
-            complexity = cfg0.complexity,
-            signalType = cfg0.signal,
-            bandwidth = cfg0.bandwidth,
-            dtx = cfg0.dtx,
-            vbrRaw = cfg0.vbr,
-            fec = cfg0.fec,
-            packetLoss = cfg0.packetLoss,
-            vbrConstraintRaw = cfg0.vbrConstraint,
+            cfg = cfg0,
         )
         encoder = enc
         appliedCfg = cfg0

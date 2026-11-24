@@ -17,7 +17,7 @@ status.vb_cable = ● VB-Cable
 status.vb_cable_missing = ● VB-Cable 未インストール
 
 footer.latency = 遅延 {ms}ms · 欠落 {dropped} · アンダーラン {underrun}
-footer.broadcast_addr = ブロードキャストアドレス: 255.255.255.255:44043
+footer.broadcast_addr = ブロードキャストアドレス: 255.255.255.255:{port}
 footer.reverse_on = ● 逆方向ストリーム有効
 footer.reverse_off = ○ 逆方向ストリーム無効
 footer.broadcasting = ● ブロードキャスト中
