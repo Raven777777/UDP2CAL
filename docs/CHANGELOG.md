@@ -5,6 +5,29 @@
 
 ---
 
+## 未发布 · Windows 单实例与防火墙修复
+
+- **双开唤起重做**：重复启动不再弹提示框，而是静默唤起已运行实例——第二实例通过命名事件
+  `UDP2CAL_ShowWindow_Event`（默认 DACL 即可，与单实例锁同一 token 授权）通知第一实例，
+  并用 `AllowSetForegroundWindow` 让渡前台权限；第一实例在自己的事件循环里经
+  `Message::ShowWindow` 弹窗（`minimize(id,false)` 解除最小化 + `set_mode(Windowed)` +
+  `gain_focus`，全部走 winit）。两级转发通道用背压式发送，UI 忙时连续多次双开也不丢信号、
+  不失效。同时删除了 `msg.already_running` 提示文案（三语言）。
+- **"X 关闭失效"修复**：旧实现由第二实例裸调 `ShowWindow` 显窗，winit 可见性标志不同步，
+  之后点"X"不会执行隐藏；现在唤起与解除最小化全部走 iced 事件循环，状态始终一致。
+- **防火墙检查前置**：启动/改端口时先用防火墙 COM API（`INetFwPolicy2`）枚举全部规则，
+  要求"恰好一条 `UDP2CAL-In-UDP` 规则完全匹配"（规则名/程序路径不区分大小写 +
+  端口集合 + UDP + 入站 + Allow + 启用 + Profiles=all + LocalSubnet + 本地地址不限），
+  匹配则不再"先删后加"——修复了普通权限第二次启动误报"规则添加失败"的问题
+  （管理员建好的规则实际有效）；同名重复规则与范围不符的旧版规则都会回退增删路径自愈。
+  检查失败同样回退。
+  （曾尝试 PowerShell `Get-NetFirewallRule` 实现，实机实测单次 ~4.8 s，已改为 COM。）
+- 新增测试：`ports_match`/`program_matches`/`rule_confirmed` 表测试；唤醒事件可开可触发的
+  自动测试；`com_check_hits_stored_rule`（环境变量 `UDP2CAL_TEST_RULE_EXE` 门控，
+  依赖本机已有规则）。
+
+---
+
 ## 未发布 · 多语言支持
 
 ### Windows（单 exe 内嵌语言文件）

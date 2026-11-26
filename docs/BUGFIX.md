@@ -9,6 +9,18 @@
 
 ---
 
+## 2026-11-26 — Windows 双开唤醒、防火墙误报与"X 关闭失效"修复
+
+| # | 模块 | 现象 | 根因 | 修复 |
+|---|---|---|---|---|
+| 1 | Windows 防火墙（`firewall.rs`） | 管理员启动一次后，第二次普通启动报"防火墙规则添加失败"，尽管第一次管理员建好的规则完全有效 | 每次启动都无条件"先删后加"（`netsh delete` + `netsh add`），普通权限下两条命令都失败；delete 被静默忽略，add 失败被当作错误展示 | 增删前先经防火墙 COM API（`INetFwPolicy2`）检查：**枚举全部规则**并要求"恰好一条同名规则完全覆盖"（规则名与程序路径均不区分大小写、端口集合精确、UDP/17、入站、Allow、已启用、`Profiles=all`、`RemoteAddresses=LocalSubnet`、`LocalAddresses=*`）——范围项缺失会把历史版本（曾用 `profile=private`/无 `remoteip`）留下的不适用旧规则误判为匹配；同名重复（含大小写变体，防火墙按不敏感匹配）也不误判，枚举中断视为"未确认"（判定逻辑为纯函数 `rule_confirmed`，有表测试）。COM 检查失败回退原增删路径，行为不劣于以前 |
+| 2 | Windows 单实例（`tray.rs`/`app.rs`） | 双开弹窗不置顶且多余；弹窗唤起后的窗口点"X"关闭失效，只能托盘双击恢复 | 第二实例用裸 `ShowWindow(SW_RESTORE)` 显第一实例窗口，但 winit 内部可见性标志仍是"隐藏"；之后 `set_mode(Hidden)` 在 winit `apply_diff` 里 diff 为空提前返回，**不执行隐藏**。托盘双击走 iced 自己的 `set_mode(Windowed)` 才把状态同步回来 | 删除弹窗与 `msg.already_running` 文案。第一实例启动时创建命名自动复位事件 `UDP2CAL_ShowWindow_Event`（默认 DACL 即可：能通过单实例互斥锁闸门的进程必然也被事件放行，两者由同一 token 创建）；第二实例 `FindWindowW` → `AllowSetForegroundWindow(目标pid)` 让渡前台权限 → `OpenEventW`+`SetEvent` 后退出；第一实例在自己的事件循环里经 `Message::ShowWindow` 弹窗（`iced::window::minimize(id,false)` 解除最小化 + `set_mode(Windowed)` + `gain_focus`，全部走 winit，状态始终同步）。两级转发通道用**背压式发送**（`blocking_send`/`Sink::send`），通道满只会阻塞专用等待线程、不丢信号、订阅不失效。信号不可用（如运行中的是旧版本）才回退裸激活 |
+| 3 | Windows 退出（`tray.rs`，2 的修复引入的回归） | 托盘菜单"退出"后进程不退出、程序无响应 | 唤醒事件等待用了 `tokio::task::spawn_blocking` + `WaitForSingleObject(INFINITE)`；iced 退出时 drop 内部 tokio Runtime，而 Runtime 的 drop **无限期等待所有 blocking 池任务结束** | 等待循环改放普通 `std::thread`（不占 blocking 池、进程退出随之终结），经 tokio 通道转发信号；接收端断开后线程下次信号时自行退出 |
+
+**验证**：Windows 80 单测 + 2 集成全过（含端口/路径纯函数表测试、`rule_confirmed` 判定表测试、唤醒事件可开可触发的自动测试、环境变量门控 `com_check_hits_stored_rule`）；COM 检查命中/不命中路径实测；双开仅剩单进程且无回退日志；"X 隐藏 → 双开唤起 → 再点 X"与"最小化 → 双开唤起（解除最小化）"全流程实测通过；实机确认托盘退出、唤起与菜单正常。审查轮：两个子代理按 ponytail-review 标准审查（防火墙 1 必修 + 单实例 4 应修），独立验证代理确认 7 项全部修复并新发现 2 个应修（同名判定大小写不敏感、判定逻辑纯函数化+表测试），已修复。
+
+---
+
 ## 2026-11-18 — v1.5.3 全仓审查修复
 
 | 模块 | 现象 | 根因 | 修复 |

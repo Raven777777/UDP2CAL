@@ -44,7 +44,6 @@ unit.kbps = kbps
 unit.db = dB
 unit.ms = ms
 
-msg.already_running = UDP2CAL is already running (tried to focus the existing window)
 
 notice.firewall_and_tray = {err}; tray unavailable, closing the window will exit
 notice.tray_unavailable = Tray unavailable, closing the window will exit

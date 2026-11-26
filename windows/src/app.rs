@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
 use windows::core::PCWSTR;
 
 #[derive(Debug, Clone)]
@@ -122,18 +121,14 @@ pub(crate) fn run() -> Result<(), iced::Error> {
         let name: Vec<u16> = "UDP2CAL_SingleInstance_Mutex\0".encode_utf16().collect();
         let _ = CreateMutexW(None, true, PCWSTR::from_raw(name.as_ptr()));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            // 先尝试把已运行实例的窗口拉到前台；再提示，避免"双击没反应"
-            tray::focus_existing_window("UDP2CAL");
-            let title: Vec<u16> = "UDP2CAL\0".encode_utf16().collect();
-            let msg: Vec<u16> = format!("{}\0", i18n::t("msg.already_running"))
-                .encode_utf16()
-                .collect();
-            MessageBoxW(
-                None,
-                PCWSTR::from_raw(msg.as_ptr()),
-                PCWSTR::from_raw(title.as_ptr()),
-                MB_OK | MB_ICONINFORMATION,
-            );
+            // 已有实例在运行：不弹任何提示框，直接请求它自己弹出窗口。
+            // 信号通道不可用（运行中的是旧版本、没有唤醒事件）时才回退
+            // 到旧的裸激活——该路径会让 winit 可见性状态失同步，导致
+            // 弹出后的窗口点"X"失效，仅作为兼容兜底。
+            if !tray::signal_show_request() {
+                logf!("[App] 唤醒事件不可用，回退为直接激活已有窗口");
+                tray::focus_existing_window("UDP2CAL");
+            }
             return Ok(());
         }
     }
@@ -141,6 +136,10 @@ pub(crate) fn run() -> Result<(), iced::Error> {
     // 单实例检查通过后再接管电源：运行期保持系统唤醒、关闭 EcoQoS 降频，
     // 守卫持有到 main 结束（iced 事件循环退出）才恢复。
     let _power_guard = power::ProcessPowerGuard::acquire();
+
+    // 唤醒事件要在任何耗时初始化之前建好：第二个实例可能在配置加载/
+    // 音频初始化期间就启动并期望能通知到本实例。
+    tray::create_show_request_event();
 
     let startup_cfg = config::Config::load();
     let session = session::Session::from_config(&startup_cfg);
@@ -610,7 +609,11 @@ impl AppState {
                 ui::latest_window_task(|id| iced::window::set_mode(id, iced::window::Mode::Hidden))
             }
             Message::ShowWindow => ui::latest_window_task(|id| {
+                // 解除最小化必须走 iced（winit）而不是裸 ShowWindow：后者绕过
+                // winit 的可见性/最小化标志，可能再度造成状态失同步（"X 失效"）。
+                // 顺序：先展开最小化，再确保可见，最后抢前台。
                 Task::batch([
+                    iced::window::minimize(id, false),
                     iced::window::set_mode(id, iced::window::Mode::Windowed),
                     iced::window::gain_focus(id),
                 ])
@@ -635,6 +638,9 @@ impl AppState {
         let mut subs = vec![
             close_events,
             Subscription::run_with((), |_| tray::tray_event_stream()),
+            // id 不能与托盘流相同：run_with 的去重身份只由 id 决定，
+            // 两个 `()` 会被 iced 合并成一条流。
+            Subscription::run_with("show-request", |_| tray::show_request_stream()),
         ];
 
         if self.is_running {

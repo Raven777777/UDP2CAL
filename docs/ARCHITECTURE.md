@@ -407,6 +407,7 @@ if self.last_toggle_instant.elapsed() < Duration::from_millis(200) {
 | 开机自启 Run 键 | `UDP2CAL` |
 | 防火墙规则 | `UDP2CAL-In-UDP` |
 | 单实例互斥锁 | `UDP2CAL_SingleInstance_Mutex` |
+| 单实例唤醒事件 | `UDP2CAL_ShowWindow_Event` |
 | 发现服务端口 | `44043` |
 | Android 包名 | `com.udp2cal.app` |
 

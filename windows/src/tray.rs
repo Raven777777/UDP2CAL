@@ -3,13 +3,18 @@
 use crate::app::Message;
 use crate::i18n;
 use crate::logf;
+use iced::futures::SinkExt;
 use std::sync::OnceLock;
 // 预期延迟档位（ms），直接派生自协议常量，与 Android 高级设置保持一致。
 use udp2cal_protocol::rtp::WATER_TARGET_STEPS_MS;
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+use windows::Win32::System::Threading::{
+    CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+    SYNCHRONIZATION_ACCESS_RIGHTS,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowW, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
-    SW_RESTORE, SetForegroundWindow, ShowWindow,
+    AllowSetForegroundWindow, EnumWindows, FindWindowW, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindow,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -220,6 +225,144 @@ pub(crate) fn focus_existing_window(title: &str) {
     }
 }
 
+// ==========================================
+// 单实例唤醒：重复启动通过命名事件请求已运行实例弹出窗口
+//
+// 不能由第二个实例直接 ShowWindow 裸激活：winit 记录的可见性标志不会
+// 同步，之后点标题栏"X"时 set_mode(Hidden) 因 diff 为空而不执行隐藏，
+// 窗口关不掉（只能靠托盘双击把 iced 的状态同步回来）。正确的路径是
+// 已运行实例在自己的事件循环里弹出窗口——与托盘双击完全一致。
+// ==========================================
+
+/// 唤醒事件名（本地命名空间，按登录会话隔离）
+const SHOW_EVENT_NAME: &str = "UDP2CAL_ShowWindow_Event";
+
+/// 事件对象的 SYNCHRONIZE(0x00100000) 位；windows crate 未在 Threading 模块
+/// 暴露该常量（只在 Storage::FileSystem 有 FILE_ACCESS_RIGHTS 版本），本地定义。
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+
+/// `HANDLE`（内含裸指针）不实现 `Send/Sync`，但内核对象句柄本身可跨线程使用；
+/// 这里的句柄只在创建后只读共享，包装以放进静态存储。
+#[derive(Clone, Copy)]
+struct SharedHandle(HANDLE);
+unsafe impl Send for SharedHandle {}
+unsafe impl Sync for SharedHandle {}
+
+impl SharedHandle {
+    /// 无限期等待事件触发。内核对象句柄跨线程等待是安全的（等待方只是
+    /// 引用对象，不要求归属线程）；闭包经由此方法整体捕获，避免因
+    /// 字段级捕获（RFC 2229）把非 Send 的 `HANDLE` 直接搬进线程。
+    fn wait_forever(self) -> windows::Win32::Foundation::WAIT_EVENT {
+        unsafe { WaitForSingleObject(self.0, INFINITE) }
+    }
+}
+
+static SHOW_EVENT: OnceLock<SharedHandle> = OnceLock::new();
+
+/// 创建供后续实例发信号的自动复位命名事件，句柄泄漏到进程结束
+/// （与单实例锁同生命周期，无需关闭）。
+///
+/// 不手工构造 DACL：能检测到"已在运行"（打开互斥锁成功）的进程，必然也被
+/// 事件的默认 DACL 放行——互斥锁与事件都由同一 token 创建，默认授权包含
+/// 同一 user/logon SID；手工放行 Everyone 反而比默认更宽。
+///
+/// 创建失败只留日志：第二个实例将回退到旧的直接激活路径，功能不受影响。
+pub(crate) fn create_show_request_event() {
+    if SHOW_EVENT.get().is_some() {
+        return;
+    }
+    match create_named_show_event(SHOW_EVENT_NAME) {
+        Ok(handle) => {
+            let _ = SHOW_EVENT.set(SharedHandle(handle));
+        }
+        Err(e) => logf!("[IPC] 唤醒事件创建失败: {e}"),
+    }
+}
+
+fn create_named_show_event(name: &str) -> windows::core::Result<HANDLE> {
+    // SAFETY: `wide` 以 0 结尾，指针在调用期间有效；返回的句柄归调用方。
+    unsafe {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        CreateEventW(None, false, false, PCWSTR::from_raw(wide.as_ptr()))
+    }
+}
+
+/// 第二个实例调用：请求运行中的实例弹出主窗口。
+///
+/// 顺序关键：先 `AllowSetForegroundWindow` 让渡前台权限（本实例刚被用户
+/// 启动、持有该权限；运行中的实例是后台进程，没有让渡就抢不到前台），
+/// 再 SetEvent。返回 false 表示信号通道不可用（运行中的是旧版本、
+/// 或事件未创建），调用方应回退到旧的直接激活路径。
+pub(crate) fn signal_show_request() -> bool {
+    unsafe {
+        let wide: Vec<u16> = "UDP2CAL".encode_utf16().chain(std::iter::once(0)).collect();
+        if let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR::from_raw(wide.as_ptr())) {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid != 0 {
+                let _ = AllowSetForegroundWindow(pid);
+            }
+        }
+        let name: Vec<u16> = SHOW_EVENT_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let Ok(event) = OpenEventW(
+            SYNCHRONIZATION_ACCESS_RIGHTS(EVENT_MODIFY_STATE.0 | SYNCHRONIZE_ACCESS),
+            false,
+            PCWSTR::from_raw(name.as_ptr()),
+        ) else {
+            return false;
+        };
+        let signaled = SetEvent(event).is_ok();
+        let _ = CloseHandle(event);
+        signaled
+    }
+}
+
+/// 订阅唤醒事件：第二个实例要求弹出窗口时，经 iced 事件循环处理
+/// （解除最小化 + 同步可见性 + 聚焦，见 `Message::ShowWindow` 处理器）。
+///
+/// ⚠ 等待必须放在普通 `std::thread` 上，不能用 `tokio::task::spawn_blocking`：
+/// iced 退出时 drop 内部的 tokio Runtime，而 Runtime 的 drop 会无限期等待
+/// 所有 blocking 池任务结束——一个永远等在 `WaitForSingleObject(INFINITE)`
+/// 上的任务会让整个进程退出卡死（表现为托盘"退出"无效、程序无响应）。
+/// 普通线程不参与 tokio 生命周期，进程结束时随之终结。
+///
+/// ⚠ 两级通道都用**背压式**发送（`blocking_send` / `Sink::send`），绝不能
+/// 用 `try_send` 遇错即退：iced 的订阅追踪器不会重建已结束的同 id 流，
+/// 通道满（UI 忙时连续多次双开）就会让唤起功能对本次运行永久静默失效。
+/// 这里堵一下只会阻塞等事件的线程，事件本身是自动复位的，不丢信号。
+pub(crate) fn show_request_stream() -> impl iced::futures::Stream<Item = Message> {
+    iced::stream::channel(
+        4,
+        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let Some(handle) = SHOW_EVENT.get().copied() else {
+                return;
+            };
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(4);
+            if let Err(e) = std::thread::Builder::new()
+                .name("udp2cal-show-request".into())
+                .spawn(move || {
+                    loop {
+                        handle.wait_forever();
+                        // iced 退出、接收端断开后线程在此退出；否则阻塞到
+                        // 订阅端腾出槽位（背压），不丢信号。
+                        if sender.blocking_send(()).is_err() {
+                            break;
+                        }
+                    }
+                })
+            {
+                logf!("[IPC] 唤醒等待线程启动失败: {e}");
+                return;
+            }
+            while let Some(()) = receiver.recv().await {
+                if output.send(Message::ShowWindow).await.is_err() {
+                    break;
+                }
+            }
+        },
+    )
+}
+
 pub(crate) fn restore_native_window() {
     let mut search = WindowSearch {
         process_id: std::process::id(),
@@ -293,4 +436,30 @@ pub(crate) fn tray_event_stream() -> impl iced::futures::Stream<Item = Message> 
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单实例唤醒事件必须可被后续实例打开并触发（默认 DACL 即可，无需手工 ACL）。
+    /// 用独立测试名，避免与正在运行的本程序事件冲突。
+    #[test]
+    fn show_event_is_openable_and_signalable() {
+        let name = format!("UDP2CAL_ShowWindow_Event_test_{}", std::process::id());
+        let handle = create_named_show_event(&name).expect("创建唤醒事件失败");
+        unsafe {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let opened = OpenEventW(
+                SYNCHRONIZATION_ACCESS_RIGHTS(EVENT_MODIFY_STATE.0 | SYNCHRONIZE_ACCESS),
+                false,
+                PCWSTR::from_raw(wide.as_ptr()),
+            )
+            .expect("打开唤醒事件失败（访问权限过窄）");
+            SetEvent(opened).expect("触发唤醒事件失败");
+            let _ = CloseHandle(opened);
+            // 测试自建自管的句柄，用完关闭（真实路径的句柄故意泄漏）。
+            let _ = CloseHandle(handle);
+        }
+    }
 }

@@ -44,7 +44,6 @@ unit.kbps = kbps
 unit.db = dB
 unit.ms = ms
 
-msg.already_running = UDP2CAL は既に実行中です（既存のウィンドウを前面に表示しようとしました）
 
 notice.firewall_and_tray = {err}。トレイが使用できないため、ウィンドウを閉じると終了します
 notice.tray_unavailable = トレイが使用できないため、ウィンドウを閉じると終了します

@@ -44,7 +44,6 @@ unit.kbps = kbps
 unit.db = dB
 unit.ms = ms
 
-msg.already_running = 程序已在运行中（已尝试切换到已有窗口）
 
 notice.firewall_and_tray = {err}；托盘不可用，关闭窗口将直接退出
 notice.tray_unavailable = 托盘不可用，关闭窗口将直接退出
