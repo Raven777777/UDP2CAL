@@ -66,6 +66,16 @@ All technical documentation lives in [`docs/`](docs/README.md). (Documents are i
 
 ---
 
+| android-modern-main                                          | android-modern-settings                                          | android-modern-legal                                          |
+|:---------------------------------------------:|:---------------------------------------------:|:---------------------------------------------:|
+|<img src="docs/assets/android-modern-main.png" width="300" /> | <img src="docs/assets/android-modern-settings.png" width="300" /> | <img src="docs/assets/android-modern-legal.png" width="300" /> |
+
+| windows-main                                          |
+|:---------------------------------------------:|
+|<img src="docs/assets/windows-main.png" width="300" /> |
+
+---
+
 ## License
 
 © 2026 UDP2CAL Contributors. This program is free software released under the **GNU General Public License v3.0**, see [`LICENSE`](LICENSE); third-party open-source licenses are listed in [docs/LEGAL.md](docs/LEGAL.md).

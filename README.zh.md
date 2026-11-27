@@ -65,6 +65,16 @@ build.bat doctor --fix                               :: 环境体检与自动修
 
 ---
 
+| Android 主界面                                          | Android 高级设置面板                                          | Android LEGAL                                          |
+|:---------------------------------------------:|:---------------------------------------------:|:---------------------------------------------:|
+|<img src="docs/assets/android-modern-main.png" width="300" /> | <img src="docs/assets/android-modern-settings.png" width="300" /> | <img src="docs/assets/android-modern-legal.png" width="300" /> |
+
+| PC 主界面                                          |
+|:---------------------------------------------:|
+|<img src="docs/assets/windows-main.png" width="300" /> |
+
+---
+
 ## 许可证
 
 © 2026 UDP2CAL Contributors. 本程序为自由软件，以 **GNU General Public License v3.0** 发布，详见 [`LICENSE`](LICENSE)；第三方开源组件许可见 [docs/LEGAL.md](docs/LEGAL.md)。

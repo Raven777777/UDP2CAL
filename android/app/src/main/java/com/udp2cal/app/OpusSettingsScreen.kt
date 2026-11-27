@@ -1,11 +1,30 @@
 package com.udp2cal.app
 
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -13,15 +32,21 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import com.udp2cal.app.service.CaptureMode
 import com.udp2cal.app.service.CaptureService
 import com.udp2cal.app.service.VbrMode
 import com.udp2cal.app.service.labelRes
 import com.udp2cal.app.service.vbrModeOf
 import com.udp2cal.app.service.vbrRes
-import kotlin.math.roundToInt
 
+/**
+ * 高级设置（Material 3）。
+ *
+ * 只保留"配置一次就不再动"的编码器参数、语言与关于信息。
+ * 麦克风音源与预期延迟属于频繁调整项，已移到主页（见 MainScreen 的采集设置卡片）；
+ * 两处写回的 Prefs 键完全一致，因此业务侧无需任何改动。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OpusSettingsScreen(
     onBack: () -> Unit,
@@ -42,7 +67,6 @@ fun OpusSettingsScreen(
     // 而编码器实际按 CBR 运行。
     val initialCfg = remember { EncoderCfg.fromPrefs() }
     var complexity by remember { mutableStateOf(Prefs.opusComplexity.toFloat()) }
-    var signalType by remember { mutableStateOf(Prefs.opusSignal) }
     var bandwidth by remember { mutableStateOf(Prefs.opusBandwidth) }
     // dtx 归一化与 EncoderCfg 一致（等价于 Prefs.opusDtx == 1）
     var dtx by remember { mutableStateOf(initialCfg.dtx == 1) }
@@ -52,7 +76,6 @@ fun OpusSettingsScreen(
     var fec by remember { mutableStateOf(Prefs.opusFec != 0) }
     var packetLoss by remember { mutableStateOf(Prefs.opusPacketLoss.toFloat()) }
     var vbrConstraint by remember { mutableStateOf(Prefs.opusVbrConstraint == 1) }
-    var waterTarget by remember { mutableStateOf(Prefs.waterTargetMs) }
 
     // ── 运行时状态 ──
     var isRunning by remember { mutableStateOf(false) }
@@ -86,393 +109,372 @@ fun OpusSettingsScreen(
         }
     }
 
-    // 带宽码（Opus 枚举值 1101..1105）→ 显示文本由 bwDisplayName 统一处理。
-
-    Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(top = 44.dp, start = 20.dp, end = 20.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        // ═══ 顶部导航 ═══
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text(stringResource(R.string.action_back), fontSize = 16.sp, color = Color(0xFF00E676)) }
-            Spacer(Modifier.width(10.dp))
-            Text(stringResource(R.string.action_advanced), fontSize = 18.sp, color = Color.White)
-        }
-
-        // ═══ 1kHz 测试音开关（移入高级设置） ═══
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-            shape = MaterialTheme.shapes.medium
-        ) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Column {
-                    Text(stringResource(R.string.test_tone_title), fontSize = 14.sp, color = if (testToneMode) Color(0xFFFF9800) else Color(0xFFAAAAAA))
-                    Text(
-                        stringResource(if (testToneMode) R.string.test_tone_on else R.string.test_tone_off),
-                        fontSize = 11.sp, color = Color(0xFF666666)
-                    )
-                }
-                Switch(checked = testToneMode, onCheckedChange = {
-                    testToneMode = it; Prefs.testToneMode = it
-                }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFFFF9800)))
-            }
-        }
-
-        // ═══ 运行时状态卡片（仅采集运行时显示） ═══
-        if (isRunning) {
-            // ── Opus 编码状态卡片（含 P2P 独占连接状态 + 实时带宽） ──
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-                shape = MaterialTheme.shapes.medium
-            ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_status_title), fontSize = 13.sp, color = Color(0xFF888888))
-                        Text(
-                            stringResource(
-                                if (connected) R.string.opus_exclusive else R.string.opus_not_connected
-                            ),
-                            fontSize = 11.sp,
-                            color = if (connected) Color(0xFF00E676) else Color(0xFFFF5252)
-                        )
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_mode), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(
-                            stringResource(mode.labelRes),
-                            fontSize = 13.sp,
-                            color = if (mode == CaptureMode.VOICE) Color(0xFFFF9800) else Color(0xFF00B0FF)
-                        )
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_bandwidth), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        // 运行时显示**已生效**值（编码器上报），未运行时显示**已配置**值，
-                        // 这样任何时候改滑块都能在这一行看到结果
-                        Text(
-                            bwDisplayName(if (isRunning) opusBandwidth else bandwidth).ifEmpty { "—" },
-                            fontSize = 13.sp, color = Color.White
-                        )
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        // 采集/编码输入固定 48 kHz；"带宽"指的是编码后保留的频率范围，
-                        // 两者不是一回事，标签写清楚免得看起来自相矛盾
-                        Text(stringResource(R.string.opus_input_sample_rate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(if (sampleRateHz > 0) "${sampleRateHz / 1000}kHz" else "48kHz", fontSize = 13.sp, color = Color.White)
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_realtime_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        Text(if (realtimeKbps > 0f) "%.1fkbps".format(realtimeKbps) else "—", fontSize = 13.sp, color = Color(0xFF00E676))
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_target_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        val shownKbps = if (isRunning && targetKbps > 0) targetKbps else bitrate
-                        Text("${shownKbps}kbps", fontSize = 13.sp, color = Color.White)
-                    }
-                    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                        Text(stringResource(R.string.opus_vbr_mode), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                        // 与 EncoderCfg.vbrMode() 共用同一推导：DTX 会强制 VBR
-                        val shownVbr = vbrModeOf(if (vbr || dtx) 1 else 0, if (vbrConstraint) 1 else 0)
-                        Text(stringResource((if (isRunning) vbrMode else shownVbr).vbrRes), fontSize = 13.sp, color = Color(0xFFB0B0B0))
-                    }
-                }
-            }
-
-            // ── 反向串流状态卡片（仅反向活跃时显示，零值项不显示） ──
-            if (reverseAudio) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-                    shape = MaterialTheme.shapes.medium
-                ) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                            Text(stringResource(R.string.reverse_title), fontSize = 13.sp, color = Color(0xFF888888))
-                            Text(stringResource(R.string.reverse_active), fontSize = 11.sp, color = Color(0xFF00E676))
-                        }
-                        if (reverseBitrateKbps > 0f) {
-                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text(stringResource(R.string.reverse_bitrate), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                                Text("%.1fkbps".format(reverseBitrateKbps), fontSize = 13.sp, color = Color(0xFF00E676))
-                            }
-                        }
-                        if (reverseJitter.isNotEmpty()) {
-                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text(stringResource(R.string.reverse_jitter), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                                Text(reverseJitter, fontSize = 12.sp, color = Color(0xFFB0B0B0))
-                            }
-                        }
-                        if (reverseAudio) {
-                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-                                Text(stringResource(R.string.reverse_bandwidth), fontSize = 13.sp, color = Color(0xFFAAAAAA))
-                                Text(stringResource(R.string.reverse_fb_stereo), fontSize = 13.sp, color = Color.White)
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(4.dp))
-            HorizontalDivider(color = Color(0xFF333333))
-            Spacer(Modifier.height(4.dp))
-        }
-
-        // ═══ Opus 编码参数设置 ═══
-        Text(stringResource(R.string.settings_encoding), fontSize = 15.sp, color = Color(0xFF00E676))
-
-        Text(stringResource(R.string.settings_complexity, complexity.toInt()), fontSize = 14.sp, color = Color.White)
-        Slider(value = complexity, onValueChange = { complexity = it; Prefs.opusComplexity = it.toInt() }, valueRange = 1f..10f, steps = 8, modifier = Modifier.fillMaxWidth())
-
-        Text(stringResource(R.string.settings_mic_source), fontSize = 14.sp, color = Color.White)
-        StepSlider(
-            value = signalType,
-            values = MIC_SIGNAL_CODES,
-            tickLabels = MIC_SIGNAL_LABEL_RES.map { stringResource(it) },
-            onValueChange = { v ->
-                if (v != signalType) {
-                    signalType = v
-                    Prefs.opusSignal = v
-                }
-            },
-            hint = stringResource(R.string.settings_mic_source_hint),
-            fallbackIndex = 1,
-        )
-
-        Text(stringResource(R.string.settings_bandwidth), fontSize = 14.sp, color = Color.White)
-        // 与码率滑块保持完全一致的版式：标题 → 当前值 → 滑块 → 刻度 → 说明
-        StepSlider(
-            value = bandwidth,
-            values = BW_CODES,
-            tickLabels = BW_SHORT_RES.map { stringResource(it) },
-            onValueChange = { v ->
-                if (v != bandwidth) {
-                    bandwidth = v
-                    Prefs.opusBandwidth = v
-                }
-            },
-            hint = stringResource(R.string.settings_bandwidth_hint),
-        )
-
-        // 码率：五档滑块。协议上限 512 kbps（10 ms 帧下 640 字节/帧，远低于 1275）
-        Text(stringResource(R.string.settings_bitrate), fontSize = 14.sp, color = Color.White)
-        run {
-            val steps = Udp2CalProtocol.BITRATE_STEPS_KBPS
-            val idx = steps.indexOf(bitrate).takeIf { it >= 0 } ?: steps.lastIndex
-            StepSlider(
-                value = bitrate,
-                values = steps,
-                tickLabels = steps.map { it.toString() },
-                onValueChange = { v ->
-                    if (v != bitrate) {
-                        bitrate = v
-                        Prefs.opusBitrateKbps = v
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.action_advanced)) },
+                navigationIcon = {
+                    TextButton(onClick = onBack) {
+                        Text(stringResource(R.string.action_back))
                     }
                 },
-                hint = stringResource(
-                    R.string.settings_bitrate_hint,
-                    steps[idx],
-                    steps[idx] * 1000 / 8 * 10 / 1000,
-                ),
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    titleContentColor = MaterialTheme.colorScheme.onSurface,
+                    navigationIconContentColor = MaterialTheme.colorScheme.primary
+                )
             )
         }
-
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Text(stringResource(R.string.settings_dtx), fontSize = 14.sp, color = Color.White)
-            Switch(checked = dtx, onCheckedChange = {
-                dtx = it
-                Prefs.opusDtx = if (it) 1 else 0
-                if (it) { vbr = true; Prefs.opusVbr = 1 }
-            }, colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676)))
-        }
-
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Column {
-                Text(stringResource(R.string.settings_vbr), fontSize = 14.sp,
-                    color = if (dtx) Color(0xFF666666) else Color.White)
-                if (dtx) {
-                    Text(stringResource(R.string.settings_vbr_forced), fontSize = 11.sp, color = Color(0xFFFF9800))
-                }
-            }
-            Switch(
-                checked = vbr || dtx,
-                onCheckedChange = { vbr = it; Prefs.opusVbr = if (it) 1 else 0 },
-                enabled = !dtx,
-                colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00E676))
-            )
-        }
-
-        if (vbr || dtx) {
-            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-                Column {
-                    Text(stringResource(R.string.settings_vbr_constraint), fontSize = 14.sp, color = Color.White)
-                    Text(
-                        stringResource(
-                            if (vbrConstraint) R.string.settings_vbr_strict else R.string.settings_vbr_loose
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier.fillMaxSize().padding(innerPadding),
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // ═══ 1kHz 测试音 ═══
+            item {
+                SettingsCard {
+                    SettingSwitchRow(
+                        title = stringResource(R.string.test_tone_title),
+                        subtitle = stringResource(
+                            if (testToneMode) R.string.test_tone_on else R.string.test_tone_off
                         ),
-                        fontSize = 11.sp, color = Color(0xFF888888)
+                        checked = testToneMode,
+                        onCheckedChange = {
+                            testToneMode = it
+                            Prefs.testToneMode = it
+                        },
+                        titleColor = if (testToneMode) MaterialTheme.colorScheme.tertiary
+                        else MaterialTheme.colorScheme.onSurface
                     )
                 }
-                Switch(
-                    checked = vbrConstraint,
-                    onCheckedChange = { vbrConstraint = it; Prefs.opusVbrConstraint = if (it) 1 else 0 },
-                    colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFFFF9800))
-                )
             }
-        }
 
-        Spacer(Modifier.height(8.dp))
-        Text(stringResource(R.string.settings_fec_section), fontSize = 15.sp, color = Color(0xFF00E676))
-
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
-            Column {
-                Text(stringResource(R.string.settings_fec), fontSize = 14.sp, color = Color.White)
-                Text(stringResource(R.string.settings_fec_hint), fontSize = 11.sp, color = Color(0xFF888888))
-            }
-            Switch(
-                checked = fec,
-                onCheckedChange = { fec = it; Prefs.opusFec = if (it) 2 else 0 },
-                colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFF00B0FF))
-            )
-        }
-
-        Text(stringResource(R.string.settings_packet_loss, packetLoss.toInt()), fontSize = 14.sp, color = Color.White)
-        Text(
-            stringResource(
-                when {
-                    packetLoss == 0f -> R.string.settings_loss_none
-                    packetLoss <= 5f -> R.string.settings_loss_low
-                    packetLoss <= 15f -> R.string.settings_loss_medium
-                    else -> R.string.settings_loss_high
-                }
-            ),
-            fontSize = 11.sp, color = Color(0xFF888888)
-        )
-        Slider(
-            value = packetLoss,
-            onValueChange = { packetLoss = it; Prefs.opusPacketLoss = it.toInt() },
-            valueRange = 0f..30f, steps = 29, modifier = Modifier.fillMaxWidth()
-        )
-
-        Text(stringResource(R.string.settings_water_target, waterTarget), fontSize = 14.sp, color = Color.White)
-        StepSlider(
-            value = waterTarget,
-            values = Udp2CalProtocol.WATER_TARGET_STEPS_MS,
-            tickLabels = Udp2CalProtocol.WATER_TARGET_STEPS_MS.map { it.toString() },
-            onValueChange = { ms ->
-                if (ms != waterTarget) {
-                    waterTarget = ms
-                    Prefs.waterTargetMs = ms
-                    service?.setReverseWaterTargetMs(ms)
-                }
-            },
-            hint = stringResource(R.string.settings_water_target_hint),
-            fallbackIndex = Udp2CalProtocol.WATER_TARGET_STEPS_MS
-                .indexOf(Udp2CalProtocol.WATER_TARGET_MS).coerceAtLeast(0),
-        )
-
-        // ═══ 语言 ═══
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider(color = Color(0xFF333333))
-        Spacer(Modifier.height(12.dp))
-
-        Text(stringResource(R.string.language_title), fontSize = 15.sp, color = Color(0xFF00E676))
-        val languageOptions = remember {
-            listOf(AppLocale.SYSTEM to context.getString(R.string.language_system)) +
-                AppLocale.available(context)
-        }
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-            shape = MaterialTheme.shapes.medium
-        ) {
-            Column(Modifier.padding(vertical = 4.dp)) {
-                languageOptions.forEach { (tag, name) ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickable { onLanguageChanged(tag) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        RadioButton(
-                            selected = Prefs.language == tag,
-                            onClick = { onLanguageChanged(tag) },
-                            colors = RadioButtonDefaults.colors(selectedColor = Color(0xFF00E676))
+            // ═══ 运行时状态（仅采集运行时显示） ═══
+            if (isRunning) {
+                item { SectionTitle(stringResource(R.string.opus_status_title)) }
+                item {
+                    SettingsCard(spacing = 10.dp) {
+                        StatusRow(
+                            label = stringResource(R.string.opus_status_title),
+                            value = stringResource(
+                                if (connected) R.string.opus_exclusive else R.string.opus_not_connected
+                            ),
+                            valueColor = if (connected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.error
                         )
-                        Spacer(Modifier.width(8.dp))
-                        Text(name, fontSize = 14.sp, color = Color.White)
+                        StatusRow(
+                            label = stringResource(R.string.opus_mode),
+                            value = stringResource(mode.labelRes),
+                            valueColor = if (mode == CaptureMode.VOICE) MaterialTheme.colorScheme.tertiary
+                            else MaterialTheme.colorScheme.secondary
+                        )
+                        // 运行时显示**已生效**值（编码器上报），未运行时显示**已配置**值
+                        StatusRow(
+                            label = stringResource(R.string.opus_bandwidth),
+                            value = bwDisplayName(if (isRunning) opusBandwidth else bandwidth).ifEmpty { "—" }
+                        )
+                        // 采集/编码输入固定 48 kHz；"带宽"指的是编码后保留的频率范围，
+                        // 两者不是一回事，标签写清楚免得看起来自相矛盾
+                        StatusRow(
+                            label = stringResource(R.string.opus_input_sample_rate),
+                            value = if (sampleRateHz > 0) "${sampleRateHz / 1000}kHz" else "48kHz"
+                        )
+                        StatusRow(
+                            label = stringResource(R.string.opus_realtime_bitrate),
+                            value = if (realtimeKbps > 0f) "%.1fkbps".format(realtimeKbps) else "—",
+                            valueColor = MaterialTheme.colorScheme.primary
+                        )
+                        val shownKbps = if (isRunning && targetKbps > 0) targetKbps else bitrate
+                        StatusRow(
+                            label = stringResource(R.string.opus_target_bitrate),
+                            value = "${shownKbps}kbps"
+                        )
+                        // 与 EncoderCfg.vbrMode() 共用同一推导：DTX 会强制 VBR
+                        val shownVbr = vbrModeOf(if (vbr || dtx) 1 else 0, if (vbrConstraint) 1 else 0)
+                        StatusRow(
+                            label = stringResource(R.string.opus_vbr_mode),
+                            value = stringResource((if (isRunning) vbrMode else shownVbr).vbrRes)
+                        )
+                    }
+                }
+
+                // ── 反向串流（仅反向活跃时显示，零值项不显示） ──
+                if (reverseAudio) {
+                    item { SectionTitle(stringResource(R.string.reverse_title)) }
+                    item {
+                        SettingsCard(spacing = 10.dp) {
+                            StatusRow(
+                                label = stringResource(R.string.reverse_title),
+                                value = stringResource(R.string.reverse_active),
+                                valueColor = MaterialTheme.colorScheme.primary
+                            )
+                            if (reverseBitrateKbps > 0f) {
+                                StatusRow(
+                                    label = stringResource(R.string.reverse_bitrate),
+                                    value = "%.1fkbps".format(reverseBitrateKbps),
+                                    valueColor = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            if (reverseJitter.isNotEmpty()) {
+                                StatusRow(
+                                    label = stringResource(R.string.reverse_jitter),
+                                    value = reverseJitter
+                                )
+                            }
+                            StatusRow(
+                                label = stringResource(R.string.reverse_bandwidth),
+                                value = stringResource(R.string.reverse_fb_stereo)
+                            )
+                        }
                     }
                 }
             }
-        }
 
-        // ═══ 关于页面 ═══
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider(color = Color(0xFF333333))
-        Spacer(Modifier.height(12.dp))
+            // ═══ 编码参数 ═══
+            item { SectionTitle(stringResource(R.string.settings_encoding)) }
+            item {
+                SettingsCard(spacing = 18.dp) {
+                    ValueSlider(
+                        label = stringResource(R.string.settings_complexity, complexity.toInt()),
+                        value = complexity,
+                        onValueChange = {
+                            complexity = it
+                            Prefs.opusComplexity = it.toInt()
+                        },
+                        valueRange = 1f..10f,
+                        steps = 8
+                    )
 
-        Text(stringResource(R.string.about_title), fontSize = 15.sp, color = Color(0xFF00E676))
+                    SettingDivider()
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A2E)),
-            shape = MaterialTheme.shapes.medium
-        ) {
-            Column(
-                Modifier.padding(16.dp).fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Text("UDP2CAL", fontSize = 22.sp, color = Color(0xFF00E676))
-                Text(stringResource(R.string.about_version, versionName), fontSize = 13.sp, color = Color(0xFF888888))
-                Spacer(Modifier.height(4.dp))
-                Text(stringResource(R.string.about_author), fontSize = 14.sp, color = Color(0xFFCCCCCC))
-                Text(stringResource(R.string.about_license), fontSize = 12.sp, color = Color(0xFF666666))
-                Spacer(Modifier.height(8.dp))
-                Text(stringResource(R.string.about_tagline), fontSize = 14.sp, color = Color(0xFF00B0FF))
-                Text(stringResource(R.string.about_desc), fontSize = 12.sp, color = Color(0xFF888888))
-                Text(stringResource(R.string.about_features), fontSize = 12.sp, color = Color(0xFF888888))
-                Spacer(Modifier.height(8.dp))
-                Text("https://github.com/Raven777777/UDP2CAL", fontSize = 12.sp, color = Color(0xFF00E676), textAlign = TextAlign.Center)
+                    StepSlider(
+                        label = stringResource(R.string.settings_bandwidth),
+                        value = bandwidth,
+                        values = BW_CODES,
+                        tickLabels = BW_SHORT_RES.map { stringResource(it) },
+                        onValueChange = { v ->
+                            if (v != bandwidth) {
+                                bandwidth = v
+                                Prefs.opusBandwidth = v
+                            }
+                        },
+                        supportingText = stringResource(R.string.settings_bandwidth_hint)
+                    )
+
+                    SettingDivider()
+
+                    // 码率：五档滑块。协议上限 512 kbps（10 ms 帧下 640 字节/帧，远低于 1275）
+                    run {
+                        val steps = Udp2CalProtocol.BITRATE_STEPS_KBPS
+                        val idx = steps.indexOf(bitrate).takeIf { it >= 0 } ?: steps.lastIndex
+                        StepSlider(
+                            label = stringResource(R.string.settings_bitrate),
+                            value = bitrate,
+                            values = steps,
+                            tickLabels = steps.map { it.toString() },
+                            onValueChange = { v ->
+                                if (v != bitrate) {
+                                    bitrate = v
+                                    Prefs.opusBitrateKbps = v
+                                }
+                            },
+                            supportingText = stringResource(
+                                R.string.settings_bitrate_hint,
+                                steps[idx],
+                                steps[idx] * 1000 / 8 * 10 / 1000,
+                            )
+                        )
+                    }
+
+                    SettingDivider()
+
+                    SettingSwitchRow(
+                        title = stringResource(R.string.settings_dtx),
+                        checked = dtx,
+                        onCheckedChange = {
+                            dtx = it
+                            Prefs.opusDtx = if (it) 1 else 0
+                            if (it) {
+                                vbr = true
+                                Prefs.opusVbr = 1
+                            }
+                        }
+                    )
+
+                    SettingSwitchRow(
+                        title = stringResource(R.string.settings_vbr),
+                        subtitle = if (dtx) stringResource(R.string.settings_vbr_forced) else null,
+                        subtitleColor = MaterialTheme.colorScheme.tertiary,
+                        checked = vbr || dtx,
+                        onCheckedChange = { vbr = it; Prefs.opusVbr = if (it) 1 else 0 },
+                        enabled = !dtx
+                    )
+
+                    if (vbr || dtx) {
+                        SettingSwitchRow(
+                            title = stringResource(R.string.settings_vbr_constraint),
+                            subtitle = stringResource(
+                                if (vbrConstraint) R.string.settings_vbr_strict
+                                else R.string.settings_vbr_loose
+                            ),
+                            checked = vbrConstraint,
+                            onCheckedChange = {
+                                vbrConstraint = it
+                                Prefs.opusVbrConstraint = if (it) 1 else 0
+                            }
+                        )
+                    }
+                }
+            }
+
+            // ═══ 前向纠错与丢包容错 ═══
+            item { SectionTitle(stringResource(R.string.settings_fec_section)) }
+            item {
+                SettingsCard(spacing = 18.dp) {
+                    SettingSwitchRow(
+                        title = stringResource(R.string.settings_fec),
+                        subtitle = stringResource(R.string.settings_fec_hint),
+                        checked = fec,
+                        onCheckedChange = {
+                            fec = it
+                            Prefs.opusFec = if (it) 2 else 0
+                        }
+                    )
+
+                    SettingDivider()
+
+                    ValueSlider(
+                        label = stringResource(R.string.settings_packet_loss, packetLoss.toInt()),
+                        value = packetLoss,
+                        onValueChange = {
+                            packetLoss = it
+                            Prefs.opusPacketLoss = it.toInt()
+                        },
+                        valueRange = 0f..30f,
+                        steps = 29,
+                        supportingText = stringResource(
+                            when {
+                                packetLoss == 0f -> R.string.settings_loss_none
+                                packetLoss <= 5f -> R.string.settings_loss_low
+                                packetLoss <= 15f -> R.string.settings_loss_medium
+                                else -> R.string.settings_loss_high
+                            }
+                        )
+                    )
+                }
+            }
+
+            // ═══ 语言 ═══
+            item {
+                val languageOptions = remember {
+                    listOf(AppLocale.SYSTEM to context.getString(R.string.language_system)) +
+                        AppLocale.available(context)
+                }
+                // 语言 tag 不是数值，滑块按选项下标定位，选中后再映射回 tag。
+                val tags = remember(languageOptions) { languageOptions.map { it.first } }
+                val current = tags.indexOf(Prefs.language).takeIf { it >= 0 } ?: 0
+                SettingsCard {
+                    StepSlider(
+                        label = stringResource(R.string.language_title),
+                        valueText = languageOptions[current].second,
+                        value = current,
+                        values = IntArray(tags.size) { it },
+                        tickLabels = languageOptions.map { it.second },
+                        onValueChange = { onLanguageChanged(tags[it]) },
+                        fallbackIndex = 0
+                    )
+                }
+            }
+
+            // ═══ 关于 ═══
+            item { SectionTitle(stringResource(R.string.about_title)) }
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.large,
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainer
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "UDP2CAL",
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = stringResource(R.string.about_version, versionName),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = stringResource(R.string.about_author),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = stringResource(R.string.about_license),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            text = stringResource(R.string.about_tagline),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                        Text(
+                            text = stringResource(R.string.about_desc),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = stringResource(R.string.about_features),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            text = "https://github.com/Raven777777/UDP2CAL",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
             }
         }
     }
 }
 
-/**
- * 离散档位滑块：档位值数组 + 刻度文案 + 说明文案。
- * 滑块的刻度索引按 [value] 在 [values] 中的位置计算，找不到时回退到最后一档。
- */
+/** 运行时状态的一行"名称 → 值"，值贴右对齐。 */
 @Composable
-private fun StepSlider(
-    value: Int,
-    values: IntArray,
-    tickLabels: List<String>,
-    onValueChange: (Int) -> Unit,
-    hint: String,
-    fallbackIndex: Int = values.lastIndex,
+private fun StatusRow(
+    label: String,
+    value: String,
+    valueColor: Color = MaterialTheme.colorScheme.onSurface
 ) {
-    val lastIdx = values.lastIndex
-    val idx = values.indexOf(value).takeIf { it >= 0 } ?: fallbackIndex.coerceIn(0, lastIdx)
-    Slider(
-        value = idx.toFloat(),
-        onValueChange = { v ->
-            val i = v.roundToInt().coerceIn(0, lastIdx)
-            onValueChange(values[i])
-        },
-        valueRange = 0f..lastIdx.toFloat(),
-        steps = values.size - 2,
-        modifier = Modifier.fillMaxWidth()
-    )
-    Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
-        tickLabels.forEachIndexed { i, label ->
-            Text(
-                label,
-                fontSize = 10.sp,
-                color = if (i == idx) Color(0xFF00E676) else Color(0xFF888888)
-            )
-        }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = valueColor
+        )
     }
-    Text(hint, fontSize = 11.sp, color = Color(0xFF888888))
 }

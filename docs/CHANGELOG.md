@@ -5,7 +5,24 @@
 
 ---
 
-## 未发布 · Windows 单实例与防火墙修复
+## v1.5.4 — 2026-11-27 · Material 3、多语言与全链路可靠性
+
+### Android Material 3 界面
+
+- 主界面与高级设置按 Material 3 规范重新设计，统一主题、卡片、按钮、滑块、对话框与状态反馈；
+  提取共享主题和 UI 组件，更新三语文案及文档截图。
+
+### 全链路可靠性与结构收敛
+
+- 重采样器按比率调整抗混叠截止并修正全局相位轴；Windows 媒体推进保持 480 采样网格，
+  5.1/7.1 环回采集按声道掩码下混立体声。
+- Android 收紧采集/播放/控制协程的停止与原生句柄释放顺序，修复取消路径资源回收与潜在 UAF；
+  Windows 停止反向发送不再阻塞 UI，并补齐停止状态与欠载恢复期保护。
+- 跨端端口、Opus 帧、水位档位与控制头布局收敛到协议 crate；拆分 JNI、Android UI/采集与
+  Windows 解码/采集模块，统一构建脚本公共逻辑。
+- Android `versionCode` 增至 14；Windows、协议 crate 与应用版本统一为 1.5.4。
+
+### Windows 单实例与防火墙修复
 
 - **双开唤起重做**：重复启动不再弹提示框，而是静默唤起已运行实例——第二实例通过命名事件
   `UDP2CAL_ShowWindow_Event`（默认 DACL 即可，与单实例锁同一 token 授权）通知第一实例，
@@ -26,11 +43,9 @@
   自动测试；`com_check_hits_stored_rule`（环境变量 `UDP2CAL_TEST_RULE_EXE` 门控，
   依赖本机已有规则）。
 
----
+### 多语言支持
 
-## 未发布 · 多语言支持
-
-### Windows（单 exe 内嵌语言文件）
+#### Windows（单 exe 内嵌语言文件）
 
 - 新增 `windows/lang/en-US.lang` / `zh-CN.lang` / `ja-JP.lang`：`key = value` 格式，支持 `{name}` 占位符。
 - `build.rs` 自动扫描 `lang/*.lang` 生成内嵌语言表，`i18n.rs` 负责解析与取词；语言文件随 exe 编译，不产生外置文件。
@@ -38,7 +53,7 @@
 - 界面、托盘、单实例提示、端口/地址校验、防火墙/自启错误全部改为 key 取词；删除用中文子串判断连接状态的逻辑（改为 `disconnected` 布尔）。
 - 新增 `i18n` 单元测试：解析、占位符、内嵌语言 key 集合一致性。
 
-### Android（资源文件 + 应用内切换）
+#### Android（资源文件 + 应用内切换）
 
 - `res/values/strings.xml` 改为英文默认，新增 `res/values-zh/strings.xml`；主界面、高级设置、通知、运行时状态与错误全部改用资源字符串。
 - 新增 `AppLocale`：`attachBaseContext` 覆盖 locale，Service 侧 `AppLocale.s()` 取词；高级设置新增「语言」卡片（跟随系统 / English / 简体中文 / 日本語），写入 `SharedPreferences.language` 并刷新前台通知。

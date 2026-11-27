@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UDP2CAL</string>
-    <string name="app_subtitle">Android ↔ PC · LAN オーディオ</string>
 
     <string name="permission_title">マイクの権限が必要です</string>
     <string name="permission_message">UDP2CAL がスマートフォンの音声を取得するには録音権限が必要です。システム設定で「マイク」を許可してから戻ってください。</string>
@@ -90,8 +89,11 @@
     <string name="settings_loss_low">低損失：軽量な冗長保護</string>
     <string name="settings_loss_medium">中損失：冗長性と堅牢性を強化</string>
     <string name="settings_loss_high">高損失：最大限の冗長保護。ビットレート効率は低下</string>
-    <string name="settings_water_target">目標遅延: %1$dms</string>
     <string name="settings_water_target_hint">PC→スマートフォンの逆方向ストリームの目標バッファです。低いほど遅延は減りますが、ネットワークのジッタが大きいと音切れしやすくなります。</string>
+
+    <!-- ホームの「キャプチャ設定」（マイク音源 / 目標遅延を詳細設定から移動） -->
+    <string name="home_section_capture">キャプチャ設定</string>
+    <string name="home_latency_title">目標遅延</string>
 
     <string name="mic_voice">音声</string>
     <string name="mic_direct">直通</string>

@@ -1,6 +1,6 @@
 [package]
 name = "udp2cal"
-version = "1.5.3"
+version = "1.5.4"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "UDP2CAL - 局域网音频串流Windows接收端"

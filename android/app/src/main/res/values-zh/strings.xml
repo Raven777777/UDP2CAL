@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UDP2CAL</string>
-    <string name="app_subtitle">Android ↔ PC · 局域网音频</string>
 
     <string name="permission_title">需要麦克风权限</string>
     <string name="permission_message">UDP2CAL 需要录音权限才能采集手机音频。请在系统设置中允许「麦克风」后返回。</string>
@@ -90,8 +89,11 @@
     <string name="settings_loss_low">低丢包：轻量冗余保护</string>
     <string name="settings_loss_medium">中丢包：增加冗余与鲁棒性</string>
     <string name="settings_loss_high">高丢包：最大冗余保护，码率效率降低</string>
-    <string name="settings_water_target">预期延迟: %1$dms</string>
     <string name="settings_water_target_hint">PC→手机反向串流的目标缓冲；越低延迟越小，网络抖动大时更容易断音</string>
+
+    <!-- 主页"采集设置"分区（麦克风音源 / 预期延迟由高级设置上移） -->
+    <string name="home_section_capture">采集设置</string>
+    <string name="home_latency_title">预期延迟</string>
 
     <string name="mic_voice">语音</string>
     <string name="mic_direct">直出</string>

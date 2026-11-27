@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">UDP2CAL</string>
-    <string name="app_subtitle">Android ↔ PC · LAN audio</string>
 
     <string name="permission_title">Microphone permission required</string>
     <string name="permission_message">UDP2CAL needs microphone access to capture phone audio. Allow Microphone in system settings, then return.</string>
@@ -91,8 +90,11 @@
     <string name="settings_loss_low">Low loss: light redundancy</string>
     <string name="settings_loss_medium">Medium loss: more redundancy and robustness</string>
     <string name="settings_loss_high">High loss: maximum redundancy, lower bitrate efficiency</string>
-    <string name="settings_water_target">Expected latency: %1$dms</string>
     <string name="settings_water_target_hint">Target buffer for the PC→phone reverse stream; lower means less latency but more dropouts on jittery networks.</string>
+
+    <!-- 主页"采集设置"分区（麦克风音源 / 预期延迟由高级设置上移） -->
+    <string name="home_section_capture">Capture settings</string>
+    <string name="home_latency_title">Expected latency</string>
 
     <string name="mic_voice">Voice</string>
     <string name="mic_direct">Direct</string>

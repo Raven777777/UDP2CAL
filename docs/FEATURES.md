@@ -53,6 +53,8 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 - **持久化设备 ID**：8 字节标识，SharedPreferences 存储，用于连接绑定
 
 ![Android 主界面](assets/android-modern-main.png)
+![Android 高级设置面板](assets/android-modern-settings.png)
+![Android LEGAL](assets/android-modern-legal.png)
 
 ---
 
@@ -111,9 +113,6 @@ Android 手机 ↔ 双向音频 ↔ Windows PC
 | **采样率 / 帧长** | 48000 Hz / 10 ms | 固定不可调 | v3 不协商；PC 输出设备非 48 kHz 由 `AudioWriter` 重采样 |
 
 > 除"麦克风音源"和"测试音"外，所有参数在运行中热更新，无需重启采集流。
-
-![Android 高级设置面板](assets/android-modern-settings.png)
-![Android LEGAL](assets/android-modern-legal.png)
 
 ---
 

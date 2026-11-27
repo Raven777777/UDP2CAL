@@ -3542,7 +3542,7 @@ dependencies = [
 
 [[package]]
 name = "udp2cal"
-version = "1.5.3"
+version = "1.5.4"
 dependencies = [
  "audiopus",
  "cpal",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "udp2cal-protocol"
-version = "1.5.3"
+version = "1.5.4"
 
 [[package]]
 name = "unicode-bidi"

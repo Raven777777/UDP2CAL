@@ -40,8 +40,10 @@ object AppLocale {
 
     private fun config(base: Context, tag: String): Configuration =
         Configuration(base.resources.configuration).apply {
-            // 持久化值是外部输入：旧版/手工写入的非法 tag 不能导致启动崩溃，
-            // 解析失败时保持系统语言。
-            runCatching { setLocales(LocaleList.forLanguageTags(tag)) }
+            // 只接受 resources 里列出的 tag（外部输入可能来自旧版/手写）：不认识的 tag
+            // 一律回到系统语言，系统语言也没有对应翻译时由默认 values/（英文）兜底。
+            if (tag in base.resources.getStringArray(R.array.language_tags)) {
+                setLocales(LocaleList.forLanguageTags(tag))
+            }
         }
 }

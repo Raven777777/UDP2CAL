@@ -15,8 +15,10 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -124,6 +126,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // M3 界面统一走 edge-to-edge：内容由各页面的 Scaffold 通过 WindowInsets 自行避让，
+        // 状态栏/导航栏保持透明，卡片可以自然滑到系统栏下方。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
+
         Prefs.init(applicationContext)
         // 发现广播/连接前就要能选 Wi-Fi 网络；监听本身由 CaptureService 起停
         WifiNetworkBinder.init(applicationContext)
@@ -143,23 +152,21 @@ class MainActivity : ComponentActivity() {
             val window = activity.window
 
             // 息屏省电：纯黑全屏 + 隐藏系统栏，保持屏幕常亮；触屏/返回退出。
+            // edge-to-edge 常开，因此退出息屏时恢复的也是 false（由 Scaffold 再次避让系统栏）。
             DisposableEffect(blackout) {
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 if (blackout) {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    WindowCompat.setDecorFitsSystemWindows(window, false)
                     controller.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                     controller.hide(WindowInsetsCompat.Type.systemBars())
                 } else {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    WindowCompat.setDecorFitsSystemWindows(window, true)
                     controller.show(WindowInsetsCompat.Type.systemBars())
                 }
                 onDispose {
                     if (blackout) {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        WindowCompat.setDecorFitsSystemWindows(window, true)
                         controller.show(WindowInsetsCompat.Type.systemBars())
                     }
                 }
@@ -178,7 +185,7 @@ class MainActivity : ComponentActivity() {
                 else activity.moveTaskToBack(false)
             }
 
-            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF00E676), secondary = Color(0xFF00B0FF))) {
+            Udp2CalTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     Box(Modifier.fillMaxSize()) {
                         if (showOpusSettings) {
@@ -219,23 +226,24 @@ class MainActivity : ComponentActivity() {
                                     .pointerInput(Unit) { detectTapGestures { blackout = false } },
                                 contentAlignment = Alignment.Center
                             ) {
+                                val ringColor = MaterialTheme.colorScheme.primary
                                 Box(
                                     Modifier.size(150.dp)
                                         .scale(1f + bb * 0.12f)
                                         .alpha(0.06f + bb * 0.10f)
-                                        .border(1.dp, Color(0xFF00E676), CircleShape)
+                                        .border(1.dp, ringColor, CircleShape)
                                 )
                                 Box(
                                     Modifier.size(110.dp)
                                         .scale(1f + bb * 0.07f)
                                         .alpha(0.15f + bb * 0.25f)
-                                        .border(2.dp, Color(0xFF00E676), CircleShape)
+                                        .border(2.dp, ringColor, CircleShape)
                                 )
                                 Box(
                                     Modifier.size(70.dp)
                                         .scale(1f + bb * 0.05f)
                                         .alpha(0.25f + bb * 0.45f)
-                                        .border(3.dp, Color(0xFF00E676), CircleShape)
+                                        .border(3.dp, ringColor, CircleShape)
                                 )
                             }
                         }
