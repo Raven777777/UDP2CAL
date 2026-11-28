@@ -11,7 +11,6 @@
     <string name="action_start">Start</string>
     <string name="action_stop">Stop</string>
     <string name="action_advanced">Advanced</string>
-    <string name="action_blackout">Screen off</string>
     <string name="action_manual_input">Manual</string>
     <string name="action_collapse">Collapse</string>
     <string name="action_auto_discover">Auto discover</string>

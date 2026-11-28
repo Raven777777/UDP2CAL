@@ -50,9 +50,16 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import com.udp2cal.app.service.CaptureService
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 class MainActivity : ComponentActivity() {
-    companion object { private const val TAG = "MainActivity" }
+    companion object {
+        private const val TAG = "MainActivity"
+        private const val BLACKOUT_DELAY_MS = 30_000L
+    }
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppLocale.wrapActivity(newBase))
@@ -113,6 +120,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // 用户从系统设置返回后重新判定（电池优化白名单 + 麦克风权限）
         refreshBatteryWhitelist()
         if (permissionDenied.value &&
@@ -121,6 +129,11 @@ class MainActivity : ComponentActivity() {
             permissionDenied.value = false
             requestNotifIfNeeded()
         }
+    }
+
+    override fun onPause() {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        super.onPause()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -148,27 +161,60 @@ class MainActivity : ComponentActivity() {
         setContent {
             val activity = LocalContext.current as Activity
             var showOpusSettings by rememberSaveable { mutableStateOf(false) }
-            var blackout by remember { mutableStateOf(false) }
+            var blackout by rememberSaveable { mutableStateOf(false) }
+            var blackoutCancelled by rememberSaveable { mutableStateOf(false) }
+            var blackoutRestart by rememberSaveable { mutableIntStateOf(0) }
+            var blackoutDeadline by rememberSaveable { mutableStateOf(0L) }
             val window = activity.window
 
-            // 息屏省电：纯黑全屏 + 隐藏系统栏，保持屏幕常亮；触屏/返回退出。
-            // edge-to-edge 常开，因此退出息屏时恢复的也是 false（由 Scaffold 再次避让系统栏）。
+            fun restartBlackoutTimer(cancelled: Boolean = false) {
+                blackoutCancelled = cancelled
+                blackoutDeadline = 0L
+                blackout = false
+                blackoutRestart++
+            }
+
+            // 采集开始 30 s 后自动进入息屏省电；停止采集会立即取消，手动退出后重新计时。
+            // deadline 可保存：切换语言触发 recreate 后不会重新等满 30 s。
+            LaunchedEffect(serviceState.value, blackoutRestart, blackoutCancelled) {
+                val service = serviceState.value
+                if (service == null) {
+                    blackout = false
+                    blackoutDeadline = 0L
+                    return@LaunchedEffect
+                }
+                service.status
+                    .map { it.isRunning }
+                    .distinctUntilChanged()
+                    .collectLatest { running ->
+                        if (!running) {
+                            blackoutCancelled = false
+                            blackoutDeadline = 0L
+                            blackout = false
+                        } else if (!blackoutCancelled) {
+                            if (blackoutDeadline == 0L) {
+                                blackoutDeadline = System.currentTimeMillis() + BLACKOUT_DELAY_MS
+                            }
+                            delay((blackoutDeadline - System.currentTimeMillis()).coerceAtLeast(0L))
+                            blackout = true
+                        }
+                    }
+            }
+
+            // 息屏画面：纯黑全屏 + 隐藏系统栏，触屏/返回退出。
+            // 屏幕常亮由 Activity 生命周期统一控制；edge-to-edge 常开，
+            // 因此退出息屏时恢复的也是 false（由 Scaffold 再次避让系统栏）。
             DisposableEffect(blackout) {
                 val controller = WindowCompat.getInsetsController(window, window.decorView)
                 if (blackout) {
-                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     controller.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                     controller.hide(WindowInsetsCompat.Type.systemBars())
                 } else {
-                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     controller.show(WindowInsetsCompat.Type.systemBars())
                 }
                 onDispose {
-                    if (blackout) {
-                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                        controller.show(WindowInsetsCompat.Type.systemBars())
-                    }
+                    if (blackout) controller.show(WindowInsetsCompat.Type.systemBars())
                 }
             }
 
@@ -180,7 +226,7 @@ class MainActivity : ComponentActivity() {
             }
 
             BackHandler(enabled = true) {
-                if (blackout) blackout = false
+                if (blackout) restartBlackoutTimer()
                 else if (showOpusSettings) showOpusSettings = false
                 else activity.moveTaskToBack(false)
             }
@@ -200,9 +246,14 @@ class MainActivity : ComponentActivity() {
                             )
                         } else {
                             MainScreen(
-                                onStart = { ip, port -> doStart(ip, port) },
-                                onStop = { doStop() },
-                                onBlackout = { blackout = true },
+                                onStart = { ip, port ->
+                                    restartBlackoutTimer()
+                                    doStart(ip, port)
+                                },
+                                onStop = {
+                                    restartBlackoutTimer(cancelled = true)
+                                    doStop()
+                                },
                                 service = serviceState.value,
                                 onOpenSettings = { showOpusSettings = true },
                                 batteryWhitelisted = batteryWhitelisted.value
@@ -223,7 +274,9 @@ class MainActivity : ComponentActivity() {
                             )
                             Box(
                                 Modifier.fillMaxSize().background(Color.Black)
-                                    .pointerInput(Unit) { detectTapGestures { blackout = false } },
+                                    .pointerInput(Unit) {
+                                        detectTapGestures { restartBlackoutTimer() }
+                                    },
                                 contentAlignment = Alignment.Center
                             ) {
                                 val ringColor = MaterialTheme.colorScheme.primary

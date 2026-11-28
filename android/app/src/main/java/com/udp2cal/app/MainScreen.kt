@@ -72,7 +72,7 @@ import kotlinx.coroutines.launch
  * 主页（Material 3）。
  *
  * 版式遵循 M3 的"分区 + 卡片"结构：TopAppBar 承载应用标识与高级设置入口，
- * 内容区自上而下为 连接状态 → 目标设备 → 采集参数 → 省电与辅助 → 提示条。
+ * 内容区自上而下为 连接状态 → 目标设备 → 提示条 → 采集参数 → 省电与辅助。
  *
  * 麦克风音源与预期延迟两项**常用**参数已从高级设置移到此处（原始写 Prefs 的行为不变），
  * 采集链路重建 / 反向水位下发仍由既有业务逻辑响应，这里只做 UI 读写。
@@ -82,7 +82,6 @@ import kotlinx.coroutines.launch
 fun MainScreen(
     onStart: (String, Int) -> Unit,
     onStop: () -> Unit,
-    onBlackout: () -> Unit,
     service: CaptureService?,
     onOpenSettings: () -> Unit,
     batteryWhitelisted: Boolean
@@ -293,6 +292,26 @@ fun MainScreen(
                 }
             }
 
+            // ── 状态 / 错误提示条（发现提示紧贴目标设备卡片下方） ──
+            if (message.isNotEmpty()) {
+                item {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = MaterialTheme.shapes.medium,
+                        color = if (messageIsError) MaterialTheme.colorScheme.errorContainer
+                        else MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (messageIsError) MaterialTheme.colorScheme.onErrorContainer
+                            else MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                        )
+                    }
+                }
+            }
+
             // ── 采集设置（麦克风音源 + 预期延迟，自高级设置上移） ──
             item {
                 SectionTitle(stringResource(R.string.home_section_capture))
@@ -336,17 +355,6 @@ fun MainScreen(
                         fallbackIndex = Udp2CalProtocol.WATER_TARGET_STEPS_MS
                             .indexOf(Udp2CalProtocol.WATER_TARGET_MS).coerceAtLeast(0)
                     )
-                }
-            }
-
-            // ── 省电：息屏保持采集 ──
-            item {
-                FilledTonalButton(
-                    onClick = onBlackout,
-                    modifier = Modifier.fillMaxWidth().height(52.dp),
-                    shape = MaterialTheme.shapes.medium
-                ) {
-                    Text(stringResource(R.string.action_blackout))
                 }
             }
 
@@ -403,25 +411,6 @@ fun MainScreen(
                 }
             }
 
-            // ── 状态 / 错误提示条 ──
-            if (message.isNotEmpty()) {
-                item {
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = MaterialTheme.shapes.medium,
-                        color = if (messageIsError) MaterialTheme.colorScheme.errorContainer
-                        else MaterialTheme.colorScheme.secondaryContainer
-                    ) {
-                        Text(
-                            text = message,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (messageIsError) MaterialTheme.colorScheme.onErrorContainer
-                            else MaterialTheme.colorScheme.onSecondaryContainer,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                        )
-                    }
-                }
-            }
         }
     }
 

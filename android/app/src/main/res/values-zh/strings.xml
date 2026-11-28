@@ -11,7 +11,6 @@
     <string name="action_start">开始</string>
     <string name="action_stop">停止</string>
     <string name="action_advanced">高级设置</string>
-    <string name="action_blackout">息屏省电</string>
     <string name="action_manual_input">手动输入</string>
     <string name="action_collapse">收起</string>
     <string name="action_auto_discover">自动发现</string>
